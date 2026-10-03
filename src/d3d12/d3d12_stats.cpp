@@ -1,9 +1,12 @@
 #include "d3d12_stats.hpp"
+#include "util_bit.hpp"
 #include "d3d12_dxil_dump.hpp"
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include <windows.h>
+#if defined(DXMT_ARCH_X86)
 #include <x86intrin.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -20,6 +23,18 @@ bool g_stats_on = env::getEnvVar("DXMT_STATS") == "1";
 namespace {
 
 constexpr unsigned kMaxStats = 1024; // names past this share the last slot
+
+// The CPU's counter. Report() calibrates it against QueryPerformanceCounter, so its rate doesn't matter.
+inline uint64_t
+read_counter() {
+#if defined(DXMT_ARCH_X86)
+  return __rdtsc();
+#elif defined(DXMT_ARCH_ARM64)
+  return __builtin_arm_rsr64("cntvct_el0");
+#else
+#error "no counter for this architecture"
+#endif
+}
 
 // One per thread that calls into D3D12; written only by its thread, read racily by the reporter (stats only).
 struct ThreadStats {
@@ -68,7 +83,7 @@ Report(const char *why) {
   LARGE_INTEGER qpc, freq;
   QueryPerformanceCounter(&qpc);
   QueryPerformanceFrequency(&freq);
-  uint64_t tsc = __rdtsc();
+  uint64_t tsc = read_counter();
   double seconds = double(qpc.QuadPart - g_last_qpc.QuadPart) / freq.QuadPart;
   double per_us = seconds > 0 ? (tsc - g_last_tsc) / (seconds * 1e6) : 1;
   uint64_t frames = g_frames - g_prev_frames;
@@ -157,7 +172,7 @@ struct Lifetime {
       return;
     DXILCaptureMode();
     QueryPerformanceCounter(&g_last_qpc);
-    g_last_tsc = __rdtsc();
+    g_last_tsc = read_counter();
   }
   ~Lifetime() {
     if (g_stats_on)
@@ -182,12 +197,12 @@ StatCount(unsigned id, uint64_t n) {
 uint64_t
 StatBegin() {
   Mine().depth++;
-  return __rdtsc();
+  return read_counter();
 }
 
 void
 StatEnd(unsigned id, uint64_t t0) {
-  uint64_t d = __rdtsc() - t0;
+  uint64_t d = read_counter() - t0;
   auto &m = Mine();
   m.calls[id]++;
   m.ticks[id] += d;
