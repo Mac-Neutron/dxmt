@@ -3267,6 +3267,16 @@ _MTLTexture_getBytes(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* MacNeutron's MetalFX presenter, from beside this library, when the launcher asks for it (MACNEUTRON_PRESENT=1).
+ * Wine's loader runs under the hardened runtime, which ignores DYLD_INSERT_LIBRARIES, so winemetal.so loads it here,
+ * once in each process that loads winemetal.dll. */
+__attribute__((constructor)) static void
+load_presenter(void) {
+  const char *p = getenv("MACNEUTRON_PRESENT");
+  if (p && !strcmp(p, "1") && !dlopen("@loader_path/libmacneutron-present.dylib", RTLD_NOW | RTLD_LOCAL))
+    fprintf(stderr, "winemetal: can't load the MetalFX presenter: %s\n", dlerror());
+}
+
 /*
  * Definition from cache.c
  */
