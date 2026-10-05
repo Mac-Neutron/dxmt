@@ -2,13 +2,16 @@
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include <version.h>
+#include "dxmt_translator_key.h"
 
 namespace dxmt {
 
+// MacNeutron: keyed on the translator's key when the build has one (a hash of what changes translated output), so a
+// re-fetch of the same patches, or a change outside the translator, keeps the cache; otherwise on DXMT's git version.
 uint64_t
 ShaderCacheVersion() {
   uint64_t hash = 0xcbf29ce484222325ull; // FNV-1a
-  for (const char *p = DXMT_VERSION; *p; p++)
+  for (const char *p = DXMT_TRANSLATOR_KEY[0] ? DXMT_TRANSLATOR_KEY : DXMT_VERSION; *p; p++)
     hash = (hash ^ (uint8_t)*p) * 0x100000001b3ull;
   for (int i = 0; i < 4; i++)
     hash = (hash ^ (uint8_t)((uint32_t)AIRCONV_VERSION >> (8 * i))) * 0x100000001b3ull;
