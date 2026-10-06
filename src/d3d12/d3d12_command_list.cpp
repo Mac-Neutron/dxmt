@@ -2067,8 +2067,9 @@ public:
   // MacNeutron (XeSS answered by MetalFX): IMTLD3D12CommandListExt. Everything is checked before anything is recorded.
   // An input MetalFX can't take as it is (another Metal format than the upscaler's, or not readable: a depth/stencil
   // depth, typeless motion vectors) is copied into a scratch texture first, in a blit of its own; an output it can't
-  // write (MetalFX wants ShaderRead, ShaderWrite and RenderTarget, and private storage: D3D12's textures here are
-  // shared, so every output today) is written to a scratch texture and copied out after.
+  // write (MetalFX wants ShaderRead, ShaderWrite and RenderTarget, and private storage: a render-target-only output, a
+  // format Metal can't render to, a texture on a CPU-visible heap, or any with DXMT_D3D12_PRIVATE=0) is written to a
+  // scratch texture and copied out after.
   // The copies take the region MetalFX uses to the scratch texture's origin, so their offsets become 0.
   HRESULT STDMETHODCALLTYPE
   TemporalUpscale(IMTLD3D12TemporalScaler *pScaler, const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc) {
@@ -2175,6 +2176,7 @@ public:
     Texture *target = output;
     bool output_private = output->current()->flags().test(TextureAllocationFlag::GpuPrivate);
     if ((output->usage() & writable) != writable || !output_private) {
+      DXMT_STAT_COUNT("#upscale output copied", 1);
       output_scratch = scaler->GetScratch(Scratch::Output);
       props.output_offset_x = props.output_offset_y = 0;
       target = output_scratch.ptr();

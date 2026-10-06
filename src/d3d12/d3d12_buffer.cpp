@@ -61,6 +61,8 @@ public:
     buffer = new Buffer(desc_.Width, device_->GetMTLDevice());
 
     Flags<BufferAllocationFlag> flags;
+    if (pHeap && IsPrivateHeap(&heap_props_)) // committed buffers stay Shared
+      flags.set(BufferAllocationFlag::CpuInvisible);
     if (pHeap)
       buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
     else

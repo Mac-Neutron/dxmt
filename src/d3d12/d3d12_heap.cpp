@@ -84,7 +84,7 @@ public:
       return E_INVALIDARG;
 
     WMTHeapInfo info;
-    info.options = {}; // FIXME: ensure this agrees with {Buffer|Texture}AllocationFlag?
+    info.options = IsPrivateHeap(&desc_.Properties) ? WMTResourceStorageModePrivate : WMTResourceOptions{};
     info.size = size_aligned;
     info.sparse_page_size = WMTSparsePageSize16;
     info.type = WMTHeapTypePlacement;

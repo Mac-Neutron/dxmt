@@ -26,9 +26,9 @@
 namespace dxmt {
 
 HRESULT
-PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc) {
+PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc) {
   MTL_DXGI_FORMAT_DESC Format;
-  HRESULT hr = MTLQueryDXGIFormat(Device, Desc.Format, Format);
+  HRESULT hr = MTLQueryDXGIFormat(Device->GetMTLDevice(), Desc.Format, Format);
   if (FAILED(hr))
     return hr;
 
@@ -112,13 +112,19 @@ PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_
     Usage |= WMTTextureUsageRenderTarget;
   if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
     Usage |= WMTTextureUsageRenderTarget;
-  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+  if (Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
     Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
+    // MacNeutron: MetalFX wants its output ShaderRead|ShaderWrite|RenderTarget (and Private): a 2D UAV of a format
+    // Metal renders to can then be the temporal upscaler's output, written directly (no scratch, no copy).
+    if (Desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        any_bit_set(Device->GetMTLPixelFormatCapability(InfoOut.pixel_format) & FormatCapability::Color))
+      Usage |= WMTTextureUsageRenderTarget;
+  }
   if (!(Desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
     Usage |= WMTTextureUsageShaderRead;
   InfoOut.usage = Usage;
 
-  // TODO: decide storage mode
+  // The storage mode is the heap's (IsPrivateHeap): Initialize passes it to allocate().
   InfoOut.options = WMTResourceHazardTrackingModeUntracked;
 
   // MacNeutron (GPU efficiency spec E1): lossless compression, which PixelFormatView usage would otherwise turn off
@@ -149,7 +155,7 @@ PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_
       WMTTextureInfo info_one_slice = InfoOut;
       info_one_slice.mipmap_level_count = 1;
       info_one_slice.array_length = 1;
-      auto size_and_align = Device.heapTextureSizeAndAlign(info_one_slice);
+      auto size_and_align = Device->GetMTLDevice().heapTextureSizeAndAlign(info_one_slice);
       // Applications can create smaller aligned resources when the estimated size of the most-detailed mip level is a
       // total of the larger alignment restriction or less.
       if (size_and_align.size > D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
@@ -206,7 +212,7 @@ public:
     }
 
     WMTTextureInfo texture_info{};
-    HRESULT hr = PopulateWMTTextureInfo(device_->GetMTLDevice(), texture_info, desc_);
+    HRESULT hr = PopulateWMTTextureInfo(device_, texture_info, desc_);
     if (FAILED(hr))
       return hr;
 
@@ -228,6 +234,8 @@ public:
       DXMT_STAT_COUNT("#textures created compressed", 1);
     texture = new Texture(texture_info, device_->GetMTLDevice());
     Flags<TextureAllocationFlag> flags = {};
+    if (IsPrivateHeap(&heap_props_)) // committed, or placed on a heap with these properties
+      flags.set(TextureAllocationFlag::CpuInvisible);
     if (pHeap) {
       texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
     } else {
@@ -301,6 +309,8 @@ public:
       UINT DstSubresource, const D3D12_BOX *pDstBox, const void *pSrcData, UINT SrcRowPitch, UINT SrcSlicePitch
   ) {
     DXMT_STAT_SCOPE("texture.WriteToSubresource");
+    if (!IsCpuVisibleHeap(&heap_props_))
+      return E_INVALIDARG;
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
       SrcSlicePitch = 0;
     if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
@@ -339,6 +349,8 @@ public:
       void *pDstData, UINT DstRowPitch, UINT DstSlicePitch, UINT SrcSubresource, const D3D12_BOX *pSrcBox
   ) {
     DXMT_STAT_SCOPE("texture.ReadFromSubresource");
+    if (!IsCpuVisibleHeap(&heap_props_))
+      return E_INVALIDARG;
     if (desc_.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D)
       DstSlicePitch = 0;
     if (desc_.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)

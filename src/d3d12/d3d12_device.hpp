@@ -427,6 +427,8 @@ UINT DecomposeSubresource(
 
 bool IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps);
 
+bool IsPrivateHeap(const D3D12_HEAP_PROPERTIES *pHeapProps);
+
 bool IsD3D12BoxInBounds(D3D12_BOX &box, D3D12_BOX &bounds);
 
 } // namespace dxmt
