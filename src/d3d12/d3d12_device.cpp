@@ -312,6 +312,8 @@ public:
   }
 };
 
+// A new WMTFXTemporalScalerInfo field must join SameTemporalScaler's comparison; then update this size.
+static_assert(sizeof(WMTFXTemporalScalerInfo) == 52);
 static bool
 SameTemporalScaler(const WMTFXTemporalScalerInfo &a, const WMTFXTemporalScalerInfo &b) {
   return a.color_format == b.color_format && a.output_format == b.output_format && a.depth_format == b.depth_format &&
@@ -333,7 +335,8 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   bool advertise_numa_ = false;
 
   dxmt::mutex residency_lock_;
-  // MacNeutron (XeSS answered by MetalFX): the last temporal upscalers made, oldest first (CreateTemporalScaler).
+  // MacNeutron (XeSS answered by MetalFX): the temporal upscalers in use and up to 4 released, oldest first
+  // (CreateTemporalScaler).
   dxmt::mutex scalers_lock_;
   std::vector<std::pair<WMTFXTemporalScalerInfo, Rc<TemporalScaler>>> scalers_;
   std::once_flag timestamp_once_;
@@ -564,9 +567,10 @@ public:
     info.requires_synchronous_initialization = false;
     info.output_resolution_motion_vectors = d.OutputResolutionMotionVectors;
     info.jittered_motion_vectors = d.JitteredMotionVectors;
-    // macOS 27.0.1's MetalFX never frees a temporal upscaler (~230 MB each, natively too; Ruling 5): the last 4 made
-    // are kept, and one only the device still holds (its D3D12 object released and every allocator that recorded it
-    // reset, so the GPU is done with it) serves the next request for the same info.
+    // macOS 27.0.1's MetalFX never frees a temporal upscaler (~230 MB each, natively too; Ruling 5): every one made
+    // is kept while in use, and up to 4 released ones (only the device still holds them: the D3D12 object released
+    // and every allocator that recorded it reset, so the GPU is done with it); a released one serves the next request
+    // for the same info.
     Rc<TemporalScaler> metal;
     std::lock_guard<dxmt::mutex> lock(scalers_lock_);
     auto kept = std::find_if(scalers_.begin(), scalers_.end(), [&](auto &s) {
@@ -583,9 +587,10 @@ public:
         return E_OUTOFMEMORY;
       }
     }
-    scalers_.emplace_back(info, metal); // the newest last
-    if (scalers_.size() > 4)
-      scalers_.erase(scalers_.begin());
+    scalers_.emplace_back(info, metal); // the newest last; `metal` still holds it, so it isn't released
+    auto released = [](auto &s) { return s.second->refCount() == 1; };
+    while (std::count_if(scalers_.begin(), scalers_.end(), released) > 4)
+      scalers_.erase(std::find_if(scalers_.begin(), scalers_.end(), released)); // the oldest released
     *ppScaler = Com(new MTLD3D12TemporalScalerImpl(device, d, info, std::move(metal))).ref();
     return S_OK;
   }
