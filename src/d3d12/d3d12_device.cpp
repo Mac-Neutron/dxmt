@@ -21,6 +21,7 @@
 #include "d3d12_feature_data.hpp"
 #include "d3d12_dxil_dump.hpp"
 #include "d3d12_device_child.hpp"
+#include "util_env.hpp"
 #include "Metal.hpp"
 #include "com/com_pointer.hpp"
 #include "com/com_object.hpp"
@@ -305,6 +306,11 @@ public:
                                                   : info.output_format;
       t.usage = WMTTextureUsage(WMTTextureUsageShaderRead | WMTTextureUsagePixelFormatView |
                                 (which == Scratch::Output ? WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget : 0));
+      // Lossless (GPU efficiency spec E1): every access is in the scratch's own layout. CopyReinterpret writes it
+      // through its own texture or a buffer and reads it through a same-layout view or a buffer; MetalFX binds its
+      // full view, in its own format. DXMT_D3D12_COMPRESSION=0 turns it off, as for every D3D12 texture.
+      static const bool lossless = env::getEnvVar("DXMT_D3D12_COMPRESSION") != "0";
+      t.flags = lossless ? WMTTextureFlagLossless : 0;
       texture = new Texture(t, device_);
       texture->rename(texture->allocate(TextureAllocationFlag::GpuPrivate));
     }
@@ -313,6 +319,8 @@ public:
 };
 
 // A new WMTFXTemporalScalerInfo field must join SameTemporalScaler's comparison; then update this size.
+// ponytail: a bool appended after jittered_motion_vectors fits the tail padding and leaves the size at 52; no
+// static check can see it, so the comment above is the guard.
 static_assert(sizeof(WMTFXTemporalScalerInfo) == 52);
 static bool
 SameTemporalScaler(const WMTFXTemporalScalerInfo &a, const WMTFXTemporalScalerInfo &b) {
