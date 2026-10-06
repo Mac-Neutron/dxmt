@@ -637,8 +637,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     auto &d = Dumps();
     std::lock_guard<std::mutex> lock(d.mutex);
     std::string name = "pass-" + std::to_string(d.passes++);
-    static const char *const kinds[] = {"null", "clear", "render", "blit", "compute", "resolve"};
-    d.log += name + " q" + std::to_string(queue_index_) + " " + ((unsigned)pass->type < 6 ? kinds[(unsigned)pass->type] : "other");
+    static const char *const kinds[] = {"null", "clear", "render", "blit", "compute", "resolve", "upscale"};
+    d.log += name + " q" + std::to_string(queue_index_) + " " + ((unsigned)pass->type < 7 ? kinds[(unsigned)pass->type] : "other");
     if (pass->type == EncoderType::Render) {
       auto data = static_cast<RenderEncoderData *>(pass);
       for (unsigned i = 0; i < data->colors.size(); i++) {
@@ -1263,7 +1263,8 @@ public:
         if (g_stats_on) {
           static const unsigned kinds[] = {StatId("#null encoders"),   StatId("#clear passes"),
                                            StatId("#render passes"),   StatId("#blit passes"),
-                                           StatId("#compute passes"),  StatId("#resolve passes")};
+                                           StatId("#compute passes"),  StatId("#resolve passes"),
+                                           StatId("#temporal upscale passes")};
           static const unsigned boundaries = StatId("#encoder boundaries"),
                                 no_barrier = StatId("#encoder boundaries with no barrier");
           pass = StatsNextPass();
@@ -1502,6 +1503,30 @@ public:
           Encode(encoder, Order(current, strict), WMTRenderStageFragment);
           encoder.endEncoding();
 
+          break;
+        }
+        case EncoderType::TemporalUpscale: {
+          // MacNeutron (XeSS answered by MetalFX): MetalFX encodes its own passes, which wait on and update the
+          // upscaler's fence; a blit before hands earlier work over to it, a blit after hands it on (as DXMT's D3D11
+          // path, dxmt_context.cpp). D3D12 textures are untracked: without these MetalFX reads its inputs early.
+          DXMT_STAT_SCOPE("queue.(encode temporal upscale)");
+          auto data = static_cast<TemporalUpscaleEncoderData *>(current);
+          auto scaler_fence = data->scaler->fence();
+          FlushPending(cmdbuf); // E4
+          uint16_t fence = Order(current, strict);
+          auto begin = cmdbuf.blitCommandEncoder();
+          LabelPass(begin, pass, "upscale");
+          for (auto wait : waits_)
+            begin.waitForFence(fences_[wait]);
+          begin.updateFence(scaler_fence);
+          begin.endEncoding();
+          cmdbuf.encodeTemporalScale(data->scaler->scaler(), data->color.texture(), data->output.texture(),
+                                     data->depth.texture(), data->motion.texture(), data->exposure.texture(),
+                                     scaler_fence, data->props, data->reactive.texture());
+          auto end = cmdbuf.blitCommandEncoder();
+          end.waitForFence(scaler_fence);
+          end.updateFence(fences_[fence]);
+          end.endEncoding();
           break;
         }
         }

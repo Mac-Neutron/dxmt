@@ -20,6 +20,7 @@
 #include "d3d12.h"
 #include "d3d12_command_encoder.hpp"
 #include "d3d12_descriptor_heap.hpp"
+#include "d3d12_interfaces.hpp"
 #include "dxgi1_2.h"
 #include "dxgi_interfaces.h"
 #include "airconv_public.h"
@@ -99,6 +100,19 @@ public:
       UINT *TotalTileCount, D3D12_PACKED_MIP_INFO *PackedMipInfo, D3D12_TILE_SHAPE *StandardTileShape,
       UINT *SubresourceTilingCount, UINT FirstSubresourceTiling, D3D12_SUBRESOURCE_TILING *SubresourceTilings
   ) = 0;
+};
+
+// MacNeutron (XeSS answered by MetalFX): a MetalFX temporal upscaler, the description it was made from and the Metal
+// formats it takes. Scratch textures stand in for an input MetalFX can't take as it is (copied in first) and for an
+// output it can't write (copied out after), made on first use at the description's sizes in the upscaler's formats.
+class MTLD3D12TemporalScaler : public IMTLD3D12TemporalScaler {
+public:
+  MTL_TEMPORAL_SCALER_D3D12_DESC desc;
+  WMTFXTemporalScalerInfo info;
+  Rc<TemporalScaler> scaler;
+
+  enum class Scratch { Depth, Motion, Output };
+  virtual Rc<Texture> GetScratch(Scratch which) = 0;
 };
 
 class MTLD3D12Heap : public ID3D12Heap {
