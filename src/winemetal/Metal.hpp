@@ -729,9 +729,10 @@ public:
   void
   encodeTemporalScale(
       FXTemporalScaler scaler, Texture color, Texture output, Texture depth, Texture motion, Texture exposure,
-      Fence fence, const WMTFXTemporalScalerProps &props
+      Fence fence, const WMTFXTemporalScalerProps &props, Texture reactive_mask = {}
   ) {
-    MTLCommandBuffer_encodeTemporalScale(handle, scaler, color, output, depth, motion, exposure, fence, &props);
+    MTLCommandBuffer_encodeTemporalScale(handle, scaler, color, output, depth, motion, exposure, fence, &props,
+                                         reactive_mask);
   }
 };
 
@@ -988,6 +989,11 @@ public:
   bool
   supportsFXTemporalScaler() {
     return MTLDevice_supportsFXTemporalScaler(handle);
+  }
+
+  void
+  temporalScalerScaleRange(float &min, float &max) {
+    MTLDevice_temporalScalerScaleRange(handle, &min, &max);
   }
 
   void

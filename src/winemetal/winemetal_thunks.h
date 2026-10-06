@@ -214,6 +214,7 @@ struct unixcall_mtlcommandbuffer_temporal_scale {
   obj_handle_t exposure;
   obj_handle_t fence;
   struct WMTConstMemoryPointer props;
+  obj_handle_t reactive_mask;
 };
 
 struct unixcall_mtlcommandbuffer_spatial_scale {
@@ -400,6 +401,12 @@ struct unixcall_dispatchdata_copybytes {
   struct WMTMemoryPointer buffer;
   uint64_t capacity;
   uint64_t ret_size;
+};
+
+struct unixcall_mtldevice_fxtemporalscaler_scale {
+  obj_handle_t device;
+  float min_scale;
+  float max_scale;
 };
 
 struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers {

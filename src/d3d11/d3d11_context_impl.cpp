@@ -5255,7 +5255,7 @@ public:
       scaler_entry.output_pixel_format = output->pixelFormat();
       scaler_entry.depth_pixel_format = depth->pixelFormat();
       scaler_entry.motion_vector_pixel_format = motion_vector_format;
-      WMTFXTemporalScalerInfo info;
+      WMTFXTemporalScalerInfo info{};
       info.color_format = scaler_entry.color_pixel_format;
       info.output_format = scaler_entry.output_pixel_format;
       info.depth_format = scaler_entry.depth_pixel_format;

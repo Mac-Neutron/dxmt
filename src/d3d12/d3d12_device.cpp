@@ -260,7 +260,60 @@ stream_start += align(sizeof(*subobject), sizeof(void *));
   return S_OK;
 }
 
-class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device>> {
+// MacNeutron (XeSS answered by MetalFX): the upscaler IMTLD3D12DeviceExt::CreateTemporalScaler returns.
+class MTLD3D12TemporalScalerImpl : public ComObject<MTLD3D12TemporalScaler> {
+  WMT::Device device_;
+  dxmt::mutex mutex_;
+  Rc<Texture> scratch_[3];
+
+public:
+  MTLD3D12TemporalScalerImpl(WMT::Device device, const MTL_TEMPORAL_SCALER_D3D12_DESC &desc,
+                             const WMTFXTemporalScalerInfo &info)
+      : device_(device) {
+    this->desc = desc;
+    this->info = info;
+    scaler = new TemporalScaler(device, info);
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  QueryInterface(REFIID riid, void **ppvObject) final {
+    if (ppvObject == nullptr)
+      return E_POINTER;
+    *ppvObject = nullptr;
+    if (riid == __uuidof(IUnknown) || riid == __uuidof(IMTLD3D12TemporalScaler)) {
+      *ppvObject = ref(this);
+      return S_OK;
+    }
+    return E_NOINTERFACE;
+  }
+
+  // Private and untracked like D3D12's textures, and never resident through the device's set: only blits and MetalFX,
+  // which bind them directly, use them.
+  Rc<Texture>
+  GetScratch(Scratch which) final {
+    std::lock_guard<dxmt::mutex> lock(mutex_);
+    auto &texture = scratch_[(int)which];
+    if (!texture) {
+      bool output_size = which == Scratch::Output || (which == Scratch::Motion && info.output_resolution_motion_vectors);
+      WMTTextureInfo t = {};
+      t.type = WMTTextureType2D;
+      t.width = output_size ? desc.OutputWidth : desc.InputWidth;
+      t.height = output_size ? desc.OutputHeight : desc.InputHeight;
+      t.depth = t.array_length = t.mipmap_level_count = t.sample_count = 1;
+      t.pixel_format = which == Scratch::Depth    ? info.depth_format
+                       : which == Scratch::Motion ? info.motion_format
+                                                  : info.output_format;
+      t.usage = WMTTextureUsage(WMTTextureUsageShaderRead | WMTTextureUsagePixelFormatView |
+                                (which == Scratch::Output ? WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget : 0));
+      t.options = WMTResourceOptions(WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked);
+      texture = new Texture(t, device_);
+      texture->rename(texture->allocate({}));
+    }
+    return texture;
+  }
+};
+
+class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt>> {
 
   Com<IMTLDXGIAdapter> adapter_;
 
@@ -360,11 +413,130 @@ public:
     if (riid == kD3D12DeviceDownlevelUUID)
       return E_NOINTERFACE;
 
+    // MacNeutron (XeSS answered by MetalFX): only where MetalFX has a temporal upscaler.
+    if (riid == __uuidof(IMTLD3D12DeviceExt)) {
+      if (!GetMTLDevice().supportsFXTemporalScaler())
+        return E_NOINTERFACE;
+      *ppvObject = ref_and_cast<IMTLD3D12DeviceExt>(this);
+      return S_OK;
+    }
+
     if (logQueryInterfaceError(__uuidof(ID3D12Device1), riid)) {
       WARN("D3D12Device: Unknown interface query ", str::format(riid));
     }
 
     return E_NOINTERFACE;
+  }
+
+  // MacNeutron (XeSS answered by MetalFX): IMTLD3D12DeviceExt.
+  HRESULT STDMETHODCALLTYPE
+  GetTemporalScalerScaleRange(FLOAT *pMin, FLOAT *pMax) {
+    if (!pMin || !pMax)
+      return E_INVALIDARG;
+    GetMTLDevice().temporalScalerScaleRange(*pMin, *pMax);
+    return S_OK;
+  }
+
+  HRESULT STDMETHODCALLTYPE
+  CreateTemporalScaler(const MTL_TEMPORAL_SCALER_D3D12_DESC *pDesc, IMTLD3D12TemporalScaler **ppScaler) {
+    DXMT_STAT_SCOPE("device.CreateTemporalScaler");
+    if (!pDesc || !ppScaler)
+      return E_INVALIDARG;
+    *ppScaler = nullptr;
+    auto device = GetMTLDevice();
+    if (!device.supportsFXTemporalScaler())
+      return DXGI_ERROR_UNSUPPORTED;
+    auto &d = *pDesc;
+    float lo = 0, hi = 0;
+    device.temporalScalerScaleRange(lo, hi);
+    // 0: the device's bound.
+    float min = d.InputContentMinScale ? std::clamp(d.InputContentMinScale, lo, hi) : lo,
+          max = d.InputContentMaxScale ? std::clamp(d.InputContentMaxScale, lo, hi) : hi;
+    // The textures' own ratio: content (no larger than they are) can be in range only if it is no more than max.
+    if (!d.InputWidth || !d.InputHeight || !d.OutputWidth || !d.OutputHeight || !(min <= max))
+      return E_INVALIDARG;
+    float sx = (float)d.OutputWidth / d.InputWidth, sy = (float)d.OutputHeight / d.InputHeight;
+    if (sx < lo || sy < lo || sx > max || sy > max)
+      return E_INVALIDARG;
+    auto query = [&](DXGI_FORMAT format) {
+      MTL_DXGI_FORMAT_DESC f = {};
+      if (FAILED(MTLQueryDXGIFormat(device, format, f)))
+        f.PixelFormat = WMTPixelFormatInvalid;
+      return f;
+    };
+    // Colour, output and reactive mask: a float or normalized colour format, as the resource has it.
+    auto colour = [&](DXGI_FORMAT format) {
+      auto f = query(format);
+      bool ok = f.PixelFormat != WMTPixelFormatInvalid && !IsIntegerFormat(f.PixelFormat) &&
+                !(f.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER));
+      return ok ? f.PixelFormat : WMTPixelFormatInvalid;
+    };
+    // Depth: 32-bit float depth, which a depth/stencil depth (or an R32 one) is copied into first.
+    WMTPixelFormat depth = WMTPixelFormatInvalid;
+    switch (query(d.DepthFormat).PixelFormat) {
+    case WMTPixelFormatDepth32Float:
+    case WMTPixelFormatDepth32Float_Stencil8:
+    case WMTPixelFormatR32Float:
+    case WMTPixelFormatR32Uint:
+      depth = WMTPixelFormatDepth32Float;
+      break;
+    default:
+      break;
+    }
+    // Motion vectors: two or four 16-bit or two 32-bit channels, read as floats (as DXMT's D3D11 path).
+    WMTPixelFormat motion = WMTPixelFormatInvalid;
+    switch (query(d.MotionFormat).PixelFormat) {
+    case WMTPixelFormatRG16Uint:
+    case WMTPixelFormatRG16Float:
+    case WMTPixelFormatRG16Sint:
+    case WMTPixelFormatRG16Snorm:
+    case WMTPixelFormatRG16Unorm:
+      motion = WMTPixelFormatRG16Float;
+      break;
+    case WMTPixelFormatRG32Uint:
+    case WMTPixelFormatRG32Float:
+    case WMTPixelFormatRG32Sint:
+      motion = WMTPixelFormatRG32Float;
+      break;
+    case WMTPixelFormatRGBA16Sint:
+    case WMTPixelFormatRGBA16Snorm:
+    case WMTPixelFormatRGBA16Uint:
+    case WMTPixelFormatRGBA16Unorm:
+    case WMTPixelFormatRGBA16Float:
+      motion = WMTPixelFormatRGBA16Float;
+      break;
+    default:
+      break;
+    }
+    WMTFXTemporalScalerInfo info{};
+    info.color_format = colour(d.ColorFormat);
+    info.output_format = colour(d.OutputFormat);
+    info.depth_format = depth;
+    info.motion_format = motion;
+    info.reactive_mask_enabled = d.ReactiveMaskFormat != DXGI_FORMAT_UNKNOWN;
+    info.reactive_mask_format = info.reactive_mask_enabled ? colour(d.ReactiveMaskFormat) : WMTPixelFormatInvalid;
+    if (!info.color_format || !info.output_format || !depth || !motion ||
+        (info.reactive_mask_enabled && !info.reactive_mask_format))
+      return E_INVALIDARG;
+    info.input_width = d.InputWidth;
+    info.input_height = d.InputHeight;
+    info.output_width = d.OutputWidth;
+    info.output_height = d.OutputHeight;
+    info.input_content_min_scale = min;
+    info.input_content_max_scale = max;
+    info.auto_exposure = d.AutoExposure;
+    info.input_content_properties_enabled = true;
+    info.requires_synchronous_initialization = false;
+    info.output_resolution_motion_vectors = d.OutputResolutionMotionVectors;
+    info.jittered_motion_vectors = d.JitteredMotionVectors;
+    auto scaler = Com(new MTLD3D12TemporalScalerImpl(device, d, info));
+    if (!scaler->scaler->scaler()) {
+      ERR("CreateTemporalScaler: MetalFX made no upscaler for ", d.InputWidth, "x", d.InputHeight, " to ",
+          d.OutputWidth, "x", d.OutputHeight);
+      return E_OUTOFMEMORY;
+    }
+    *ppScaler = scaler.ref();
+    return S_OK;
   }
 
   HRESULT STDMETHODCALLTYPE

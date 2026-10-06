@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "dxmt_scaler.hpp"
 #include "dxmt_texture.hpp"
 #include <cstdint>
 
@@ -30,6 +31,7 @@ enum class EncoderType {
   Blit,
   Compute,
   Resolve,
+  TemporalUpscale, // MacNeutron
 };
 
 struct EncoderData {
@@ -160,6 +162,17 @@ struct ComputeEncoderData : EncoderData {
 struct ResolveEncoderData : EncoderData {
   TextureViewRef src;
   TextureViewRef dst;
+};
+
+// MacNeutron (XeSS answered by MetalFX): a MetalFX temporal upscale, encoded between two blits that hand over on the
+// upscaler's fence. The views are what MetalFX reads and writes: a scratch texture where the list copied an input in
+// before (blits of its own) or copies the output out after. They and the upscaler stay alive until the allocator resets,
+// however soon the upscaler's owner releases it.
+struct TemporalUpscaleEncoderData : EncoderData {
+  Rc<TemporalScaler> scaler;
+  TextureViewRef color, depth, motion, exposure, reactive, output;
+  Rc<Texture> depth_scratch, motion_scratch, output_scratch;
+  WMTFXTemporalScalerProps props;
 };
 
 }; // namespace dxmt

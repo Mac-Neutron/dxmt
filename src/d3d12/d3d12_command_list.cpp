@@ -165,7 +165,8 @@ WriteEnds(D3D12_RESOURCE_STATES state) {
 }
 
 // `Graphics`CommandList is a really confusing name
-class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList> {
+class MTLD3D12GraphicsCommandListImpl
+    : public MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12CommandListExt> {
 
   Com<MTLD3D12CommandAllocatorImpl, false> allocator_;
   std::vector<const void *> transitioned_; // ResourceBarrier's scratch
@@ -218,7 +219,8 @@ class MTLD3D12GraphicsCommandListImpl : public MTLD3D12DeviceChild<MTLD3D12Graph
   bool query_dirty_;
 
 public:
-  MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice) : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList>(pDevice) {}
+  MTLD3D12GraphicsCommandListImpl(MTLD3D12Device *pDevice)
+      : MTLD3D12DeviceChild<MTLD3D12GraphicsCommandList, IMTLD3D12CommandListExt>(pDevice) {}
 
   ~MTLD3D12GraphicsCommandListImpl() {}
 
@@ -301,6 +303,11 @@ public:
         riid == __uuidof(ID3D12CommandList) || riid == __uuidof(ID3D12GraphicsCommandList) ||
         riid == __uuidof(ID3D12GraphicsCommandList1) || riid == __uuidof(ID3D12GraphicsCommandList2)) {
       *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(IMTLD3D12CommandListExt)) { // MacNeutron (XeSS answered by MetalFX)
+      *ppvObject = ref_and_cast<IMTLD3D12CommandListExt>(this);
       return S_OK;
     }
 
@@ -2055,6 +2062,140 @@ public:
   SetViewInstanceMask(UINT Mask) {
     DXMT_STAT_SCOPE("list.SetViewInstanceMask");
     IMPLEMENT_ME
+  }
+
+  // MacNeutron (XeSS answered by MetalFX): IMTLD3D12CommandListExt. Everything is checked before anything is recorded.
+  // An input MetalFX can't take as it is (another Metal format than the upscaler's, or not readable: a depth/stencil
+  // depth, typeless motion vectors) is copied into a scratch texture first, in a blit of its own; an output it can't
+  // write (MetalFX wants ShaderRead, ShaderWrite and RenderTarget) is written to a scratch texture and copied out after.
+  // The copies take the region MetalFX uses to the scratch texture's origin, so their offsets become 0.
+  HRESULT STDMETHODCALLTYPE
+  TemporalUpscale(IMTLD3D12TemporalScaler *pScaler, const MTL_TEMPORAL_UPSCALE_D3D12_DESC *pDesc) {
+    DXMT_STAT_SCOPE("list.TemporalUpscale");
+    if (!pScaler || !pDesc)
+      return E_INVALIDARG;
+    auto scaler = static_cast<MTLD3D12TemporalScaler *>(pScaler);
+    auto &sd = scaler->desc;
+    auto &info = scaler->info;
+    auto &d = *pDesc;
+    // A 2D texture of the upscaler's DXGI format holding the region (x, y, w, h); null if not.
+    auto take = [&](ID3D12Resource *resource, DXGI_FORMAT format, UINT x, UINT y, UINT w, UINT h) -> Texture * {
+      auto r = static_cast<MTLD3D12Resource *>(resource);
+      if (!r || !r->texture || r->texture->textureType() != WMTTextureType2D || r->GetDesc().Format != format ||
+          (uint64_t)x + w > r->texture->width() || (uint64_t)y + h > r->texture->height())
+        return nullptr;
+      return r->texture.ptr();
+    };
+    UINT mw = sd.OutputResolutionMotionVectors ? sd.OutputWidth : sd.InputWidth,
+         mh = sd.OutputResolutionMotionVectors ? sd.OutputHeight : sd.InputHeight;
+    bool masked = info.reactive_mask_enabled;
+    auto color = take(d.Color, sd.ColorFormat, d.ColorOffsetX, d.ColorOffsetY, sd.InputWidth, sd.InputHeight);
+    auto depth = take(d.Depth, sd.DepthFormat, d.DepthOffsetX, d.DepthOffsetY, sd.InputWidth, sd.InputHeight);
+    auto motion = take(d.MotionVector, sd.MotionFormat, d.MotionOffsetX, d.MotionOffsetY, mw, mh);
+    auto output = take(d.Output, sd.OutputFormat, d.OutputOffsetX, d.OutputOffsetY, sd.OutputWidth, sd.OutputHeight);
+    auto mask = masked ? take(d.ReactiveMask, sd.ReactiveMaskFormat, d.ReactiveOffsetX, d.ReactiveOffsetY,
+                              sd.InputWidth, sd.InputHeight)
+                       : nullptr;
+    auto exposure = static_cast<MTLD3D12Resource *>(d.Exposure);
+    auto readable = [](Texture *t, WMTPixelFormat format) {
+      return t->pixelFormat() == format && (t->usage() & WMTTextureUsageShaderRead);
+    };
+    // Colour and mask go to MetalFX as they are (depth and motion vectors may be copied first, below).
+    if (!color || !depth || !motion || !output || (masked ? !mask : d.ReactiveMask != nullptr) ||
+        (exposure && !exposure->texture) || !readable(color, info.color_format) ||
+        (mask && !readable(mask, info.reactive_mask_format)) || output->pixelFormat() != info.output_format)
+      return E_INVALIDARG;
+    // Content no larger than the inputs, at a scale in the upscaler's range.
+    float sx = (float)sd.OutputWidth / d.InputContentWidth, sy = (float)sd.OutputHeight / d.InputContentHeight;
+    if (!d.InputContentWidth || !d.InputContentHeight || d.InputContentWidth > sd.InputWidth ||
+        d.InputContentHeight > sd.InputHeight || sx < info.input_content_min_scale ||
+        sy < info.input_content_min_scale || sx > info.input_content_max_scale || sy > info.input_content_max_scale)
+      return E_INVALIDARG;
+
+    WMTFXTemporalScalerProps props{};
+    props.input_content_width = d.InputContentWidth;
+    props.input_content_height = d.InputContentHeight;
+    props.reset = d.Reset;
+    props.depth_reversed = d.DepthReversed;
+    props.motion_vector_scale_x = d.MotionVectorScaleX;
+    props.motion_vector_scale_y = d.MotionVectorScaleY;
+    props.jitter_offset_x = d.JitterOffsetX;
+    props.jitter_offset_y = d.JitterOffsetY;
+    props.pre_exposure = d.PreExposure;
+    props.color_content_offset_x = d.ColorOffsetX;
+    props.color_content_offset_y = d.ColorOffsetY;
+    props.depth_content_offset_x = d.DepthOffsetX;
+    props.depth_content_offset_y = d.DepthOffsetY;
+    props.motion_content_offset_x = d.MotionOffsetX;
+    props.motion_content_offset_y = d.MotionOffsetY;
+    props.reactive_mask_content_offset_x = d.ReactiveOffsetX;
+    props.reactive_mask_content_offset_y = d.ReactiveOffsetY;
+    props.output_offset_x = d.OutputOffsetX;
+    props.output_offset_y = d.OutputOffsetY;
+
+    using Scratch = MTLD3D12TemporalScaler::Scratch;
+    const auto writable = WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget;
+    // `format` with `bytes` per texel: a depth/stencil texture's depth plane copies as 4 bytes.
+    auto as = [](WMTPixelFormat format, uint32_t bytes) {
+      MTL_DXGI_FORMAT_DESC f = {};
+      f.PixelFormat = format;
+      f.BytesPerTexel = bytes;
+      return f;
+    };
+    Rc<Texture> depth_scratch, motion_scratch, output_scratch;
+    if (!readable(depth, info.depth_format) || !readable(motion, info.motion_format)) {
+      allocator_->InvalidateCurrentPass(); // a blit of its own: the game's copies before it can't run after it
+      PreBlit(nullptr);
+      if (!readable(depth, info.depth_format)) {
+        depth_scratch = scaler->GetScratch(Scratch::Depth);
+        allocator_->Writes(depth_scratch.ptr());
+        CopyReinterpret(depth, as(depth->pixelFormat(), 4), 0, 0, {d.DepthOffsetX, d.DepthOffsetY, 0},
+                        {sd.InputWidth, sd.InputHeight, 1}, depth_scratch.ptr(), as(info.depth_format, 4), 0, 0, {});
+        props.depth_content_offset_x = props.depth_content_offset_y = 0;
+        depth = depth_scratch.ptr();
+      }
+      if (!readable(motion, info.motion_format)) {
+        motion_scratch = scaler->GetScratch(Scratch::Motion);
+        allocator_->Writes(motion_scratch.ptr());
+        CopyReinterpret(motion, as(motion->pixelFormat(), MTLGetTexelSize(motion->pixelFormat())), 0, 0,
+                        {d.MotionOffsetX, d.MotionOffsetY, 0}, {mw, mh, 1}, motion_scratch.ptr(),
+                        as(info.motion_format, MTLGetTexelSize(info.motion_format)), 0, 0, {});
+        props.motion_content_offset_x = props.motion_content_offset_y = 0;
+        motion = motion_scratch.ptr();
+      }
+    }
+    Texture *target = output;
+    if ((output->usage() & writable) != writable) {
+      output_scratch = scaler->GetScratch(Scratch::Output);
+      props.output_offset_x = props.output_offset_y = 0;
+      target = output_scratch.ptr();
+    }
+
+    allocator_->InvalidateCurrentPass();
+    auto e = allocator_->AllocatePass<TemporalUpscaleEncoderData>();
+    e->type = EncoderType::TemporalUpscale; // may write anything: it joins, and what follows waits on it
+    e->scaler = scaler->scaler;
+    e->color = color->view(color->fullView);
+    e->depth = depth->view(depth->fullView);
+    e->motion = motion->view(motion->fullView);
+    if (exposure)
+      e->exposure = exposure->texture->view(exposure->texture->fullView);
+    if (mask)
+      e->reactive = mask->view(mask->fullView);
+    e->output = target->view(target->fullView);
+    e->depth_scratch = std::move(depth_scratch);
+    e->motion_scratch = std::move(motion_scratch);
+    e->output_scratch = output_scratch;
+    e->props = props;
+    allocator_->InvalidateCurrentPass();
+
+    if (output_scratch) {
+      PreBlit(d.Output);
+      auto bytes = MTLGetTexelSize(output->pixelFormat());
+      CopyReinterpret(output_scratch.ptr(), as(info.output_format, bytes), 0, 0, {}, {sd.OutputWidth, sd.OutputHeight, 1},
+                      output, as(output->pixelFormat(), bytes), 0, 0, {d.OutputOffsetX, d.OutputOffsetY, 0});
+    }
+    return S_OK;
   }
 
   void STDMETHODCALLTYPE

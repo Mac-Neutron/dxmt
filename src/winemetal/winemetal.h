@@ -1723,6 +1723,11 @@ struct WMTFXTemporalScalerInfo {
   bool auto_exposure;
   bool input_content_properties_enabled;
   bool requires_synchronous_initialization;
+  /* MacNeutron (XeSS answered by MetalFX): macOS 27's MetalFX options */
+  bool reactive_mask_enabled;
+  enum WMTPixelFormat reactive_mask_format;
+  bool output_resolution_motion_vectors;
+  bool jittered_motion_vectors;
 };
 
 struct WMTFXSpatialScalerInfo {
@@ -1748,11 +1753,23 @@ struct WMTFXTemporalScalerProps {
   float jitter_offset_x;
   float jitter_offset_y;
   float pre_exposure;
+  /* MacNeutron: where each input's content starts, and where the output is written */
+  uint32_t color_content_offset_x;
+  uint32_t color_content_offset_y;
+  uint32_t depth_content_offset_x;
+  uint32_t depth_content_offset_y;
+  uint32_t motion_content_offset_x;
+  uint32_t motion_content_offset_y;
+  uint32_t reactive_mask_content_offset_x;
+  uint32_t reactive_mask_content_offset_y;
+  uint32_t output_offset_x;
+  uint32_t output_offset_y;
 };
 
 WINEMETAL_API void MTLCommandBuffer_encodeTemporalScale(
     obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t depth,
-    obj_handle_t motion, obj_handle_t exposure, obj_handle_t fence, const struct WMTFXTemporalScalerProps *props
+    obj_handle_t motion, obj_handle_t exposure, obj_handle_t fence, const struct WMTFXTemporalScalerProps *props,
+    obj_handle_t reactive_mask
 );
 
 WINEMETAL_API void MTLCommandBuffer_encodeSpatialScale(
@@ -2054,6 +2071,9 @@ WINEMETAL_API void MTLDevice_sampleTimestamps(obj_handle_t device, uint64_t *cpu
 
 /* MacNeutron: copies up to `capacity` bytes of `data` into `buffer`; returns the data's full size. */
 WINEMETAL_API uint64_t DispatchData_copyBytes(obj_handle_t data, void *buffer, uint64_t capacity);
+
+/* MacNeutron: the input content scales MetalFX's temporal scaler supports on `device`. */
+WINEMETAL_API void MTLDevice_temporalScalerScaleRange(obj_handle_t device, float *min, float *max);
 
 enum WMTCommandBufferProperty : uint32_t {
   WMTCommandBufferPropertyKernelStartTime,

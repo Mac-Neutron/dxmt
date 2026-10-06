@@ -1458,6 +1458,11 @@ _MTLDevice_newTemporalScaler(void *obj) {
   }
   #endif
   desc.autoExposureEnabled = info->auto_exposure;
+  desc.reactiveMaskTextureEnabled = info->reactive_mask_enabled;
+  if (info->reactive_mask_enabled)
+    desc.reactiveMaskTextureFormat = to_metal_pixel_format(info->reactive_mask_format);
+  desc.outputResolutionMotionVectorsEnabled = info->output_resolution_motion_vectors;
+  desc.jitteredMotionVectorsEnabled = info->jittered_motion_vectors;
 
   struct sigaction old_action[sizeof(SIGNALS) / sizeof(int)], new_action;
   if (@available(macOS 16, *)) {} else {
@@ -1516,6 +1521,17 @@ _MTLCommandBuffer_encodeTemporalScale(void *obj) {
   scaler.jitterOffsetX = props->jitter_offset_x;
   scaler.jitterOffsetY = props->jitter_offset_y;
   scaler.preExposure = props->pre_exposure;
+  scaler.reactiveMaskTexture = (id<MTLTexture>)params->reactive_mask;
+  scaler.colorContentOffsetX = props->color_content_offset_x;
+  scaler.colorContentOffsetY = props->color_content_offset_y;
+  scaler.depthContentOffsetX = props->depth_content_offset_x;
+  scaler.depthContentOffsetY = props->depth_content_offset_y;
+  scaler.motionContentOffsetX = props->motion_content_offset_x;
+  scaler.motionContentOffsetY = props->motion_content_offset_y;
+  scaler.reactiveMaskContentOffsetX = props->reactive_mask_content_offset_x;
+  scaler.reactiveMaskContentOffsetY = props->reactive_mask_content_offset_y;
+  scaler.outputOffsetX = props->output_offset_x;
+  scaler.outputOffsetY = props->output_offset_y;
   [scaler encodeToCommandBuffer:cmdbuf];
   return STATUS_SUCCESS;
 }
@@ -2968,6 +2984,15 @@ _DispatchData_copyBytes(void *obj) {
 }
 
 static NTSTATUS
+_MTLDevice_temporalScalerScaleRange(void *obj) {
+  struct unixcall_mtldevice_fxtemporalscaler_scale *params = obj;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  params->min_scale = [MTLFXTemporalScalerDescriptor supportedInputContentMinScaleForDevice:device];
+  params->max_scale = [MTLFXTemporalScalerDescriptor supportedInputContentMaxScaleForDevice:device];
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
 _MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(void *obj) {
   struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers *params = obj;
   id<MTLCommandBuffer> cmdbuf = (id<MTLCommandBuffer>)params->cmdbuf;
@@ -3438,6 +3463,7 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLCommandBuffer_computeCommandEncoderWithSampleBuffers,
     &_MTLDevice_sampleTimestamps,
     &_DispatchData_copyBytes,
+    &_MTLDevice_temporalScalerScaleRange,
 };
 
 #ifndef DXMT_NATIVE
@@ -3592,5 +3618,6 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLCommandBuffer_computeCommandEncoderWithSampleBuffers,
     &_MTLDevice_sampleTimestamps,
     &_DispatchData_copyBytes,
+    &_MTLDevice_temporalScalerScaleRange,
 };
 #endif
