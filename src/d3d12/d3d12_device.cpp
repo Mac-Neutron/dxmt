@@ -37,7 +37,7 @@ namespace dxmt {
 
 const GUID kD3D12DeviceDownlevelUUID = {0x74eaee3f, 0x2f4b, 0x476d, {0x82, 0xba, 0x2b, 0x85, 0xcb, 0x49, 0xe3, 0x10}};
 
-HRESULT PopulateWMTTextureInfo(WMT::Device Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc);
+HRESULT PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3D12_RESOURCE_DESC &Desc);
 
 // Fills either description from a pipeline stream, with D3D12's defaults for what the stream leaves out (MacNeutron:
 // shared by CreatePipelineState and pipeline libraries' LoadPipeline).
@@ -1742,7 +1742,7 @@ public:
         resource_info.SizeInBytes = size_and_align.size;
       } else {
         WMTTextureInfo texture_info{};
-        if (FAILED(PopulateWMTTextureInfo(GetMTLDevice(), texture_info, *desc))) {
+        if (FAILED(PopulateWMTTextureInfo(this, texture_info, *desc))) {
           DEBUG("GetResourceAllocationInfo: invalid texture descriptor\n");
           goto invalid;
         }

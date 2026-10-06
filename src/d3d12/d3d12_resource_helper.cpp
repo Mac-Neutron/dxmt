@@ -18,6 +18,7 @@
 
 #include "d3d12_device.hpp"
 #include "util_bit.hpp"
+#include "util_env.hpp"
 
 namespace dxmt {
 
@@ -307,6 +308,18 @@ IsCpuVisibleHeap(const D3D12_HEAP_PROPERTIES *pHeapProps) {
   default:
     return false;
   }
+}
+
+// MacNeutron: a heap the CPU can't see (DEFAULT, CUSTOM with no CPU pages) is Private, and so are the committed
+// textures and the placed textures and buffers on it (a placed resource is given its heap's properties, so it gets
+// the heap's storage mode, which Metal requires). DXMT_D3D12_PRIVATE=0 keeps everything Shared.
+// ponytail: sizes and alignments (GetResourceAllocationInfo, the placement bounds) are still asked for Shared: Private
+// measured the same on the M5 Pro (36 texture cases, compressed ones included, and 2 buffer cases); ask with the
+// heap's storage mode if a GPU ever differs.
+bool
+IsPrivateHeap(const D3D12_HEAP_PROPERTIES *pHeapProps) {
+  static const bool on = env::getEnvVar("DXMT_D3D12_PRIVATE") != "0";
+  return on && !IsCpuVisibleHeap(pHeapProps);
 }
 
 HRESULT
