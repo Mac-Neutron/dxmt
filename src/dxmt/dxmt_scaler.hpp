@@ -33,6 +33,11 @@ public:
 
   TemporalScaler(WMT::Device device, const WMTFXTemporalScalerInfo &info);
 
+  // MacNeutron: 1 when only its last holder has it (D3D12's pool of released upscalers)
+  uint32_t refCount() const {
+    return refcount_.load(std::memory_order_acquire);
+  }
+
   WMT::FXTemporalScaler scaler() {
     return scaler_;
   }
