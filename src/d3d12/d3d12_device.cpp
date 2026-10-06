@@ -268,11 +268,11 @@ class MTLD3D12TemporalScalerImpl : public ComObject<MTLD3D12TemporalScaler> {
 
 public:
   MTLD3D12TemporalScalerImpl(WMT::Device device, const MTL_TEMPORAL_SCALER_D3D12_DESC &desc,
-                             const WMTFXTemporalScalerInfo &info)
+                             const WMTFXTemporalScalerInfo &info, Rc<TemporalScaler> scaler)
       : device_(device) {
     this->desc = desc;
     this->info = info;
-    scaler = new TemporalScaler(device, info);
+    this->scaler = std::move(scaler);
   }
 
   HRESULT STDMETHODCALLTYPE
@@ -312,6 +312,20 @@ public:
   }
 };
 
+static bool
+SameTemporalScaler(const WMTFXTemporalScalerInfo &a, const WMTFXTemporalScalerInfo &b) {
+  return a.color_format == b.color_format && a.output_format == b.output_format && a.depth_format == b.depth_format &&
+         a.motion_format == b.motion_format && a.input_width == b.input_width && a.input_height == b.input_height &&
+         a.output_width == b.output_width && a.output_height == b.output_height &&
+         a.input_content_min_scale == b.input_content_min_scale &&
+         a.input_content_max_scale == b.input_content_max_scale && a.auto_exposure == b.auto_exposure &&
+         a.input_content_properties_enabled == b.input_content_properties_enabled &&
+         a.requires_synchronous_initialization == b.requires_synchronous_initialization &&
+         a.reactive_mask_enabled == b.reactive_mask_enabled && a.reactive_mask_format == b.reactive_mask_format &&
+         a.output_resolution_motion_vectors == b.output_resolution_motion_vectors &&
+         a.jittered_motion_vectors == b.jittered_motion_vectors;
+}
+
 class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD3D12DeviceExt>> {
 
   Com<IMTLDXGIAdapter> adapter_;
@@ -319,6 +333,9 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   bool advertise_numa_ = false;
 
   dxmt::mutex residency_lock_;
+  // MacNeutron (XeSS answered by MetalFX): the last temporal upscalers made, oldest first (CreateTemporalScaler).
+  dxmt::mutex scalers_lock_;
+  std::vector<std::pair<WMTFXTemporalScalerInfo, Rc<TemporalScaler>>> scalers_;
   std::once_flag timestamp_once_;
   uint64_t timestamp_frequency_ = 1;
   dxmt::mutex null_lock_;
@@ -467,8 +484,27 @@ public:
     auto colour = [&](DXGI_FORMAT format) {
       auto f = query(format);
       bool ok = f.PixelFormat != WMTPixelFormatInvalid && !IsIntegerFormat(f.PixelFormat) &&
-                !(f.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER));
+                !(f.Flag & (MTL_DXGI_FORMAT_BC | MTL_DXGI_FORMAT_DEPTH_PLANER | MTL_DXGI_FORMAT_STENCIL_PLANER |
+                            MTL_DXGI_FORMAT_TYPELESS));
       return ok ? f.PixelFormat : WMTPixelFormatInvalid;
+    };
+    // A TYPELESS colour or output (Unreal's are often) is read as its float or unorm variant, through a view of the
+    // same layout (TemporalUpscale); other TYPELESS formats stay refused (Ruling 6).
+    auto typed = [](DXGI_FORMAT format) {
+      switch (format) {
+      case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+      case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        return DXGI_FORMAT_R32G32B32A32_FLOAT;
+      case DXGI_FORMAT_R10G10B10A2_TYPELESS:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+      case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+      case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+      default:
+        return format;
+      }
     };
     // Depth: 32-bit float depth, which a depth/stencil depth (or an R32 one) is copied into first.
     WMTPixelFormat depth = WMTPixelFormatInvalid;
@@ -508,8 +544,8 @@ public:
       break;
     }
     WMTFXTemporalScalerInfo info{};
-    info.color_format = colour(d.ColorFormat);
-    info.output_format = colour(d.OutputFormat);
+    info.color_format = colour(typed(d.ColorFormat));
+    info.output_format = colour(typed(d.OutputFormat));
     info.depth_format = depth;
     info.motion_format = motion;
     info.reactive_mask_enabled = d.ReactiveMaskFormat != DXGI_FORMAT_UNKNOWN;
@@ -528,13 +564,29 @@ public:
     info.requires_synchronous_initialization = false;
     info.output_resolution_motion_vectors = d.OutputResolutionMotionVectors;
     info.jittered_motion_vectors = d.JitteredMotionVectors;
-    auto scaler = Com(new MTLD3D12TemporalScalerImpl(device, d, info));
-    if (!scaler->scaler->scaler()) {
-      ERR("CreateTemporalScaler: MetalFX made no upscaler for ", d.InputWidth, "x", d.InputHeight, " to ",
-          d.OutputWidth, "x", d.OutputHeight);
-      return E_OUTOFMEMORY;
+    // macOS 27.0.1's MetalFX never frees a temporal upscaler (~230 MB each, natively too; Ruling 5): the last 4 made
+    // are kept, and one only the device still holds (its D3D12 object released and every allocator that recorded it
+    // reset, so the GPU is done with it) serves the next request for the same info.
+    Rc<TemporalScaler> metal;
+    std::lock_guard<dxmt::mutex> lock(scalers_lock_);
+    auto kept = std::find_if(scalers_.begin(), scalers_.end(), [&](auto &s) {
+      return SameTemporalScaler(s.first, info) && s.second->refCount() == 1;
+    });
+    if (kept != scalers_.end()) {
+      metal = std::move(kept->second);
+      scalers_.erase(kept);
+    } else {
+      metal = new TemporalScaler(device, info);
+      if (!metal->scaler()) {
+        ERR("CreateTemporalScaler: MetalFX made no upscaler for ", d.InputWidth, "x", d.InputHeight, " to ",
+            d.OutputWidth, "x", d.OutputHeight);
+        return E_OUTOFMEMORY;
+      }
     }
-    *ppScaler = scaler.ref();
+    scalers_.emplace_back(info, metal); // the newest last
+    if (scalers_.size() > 4)
+      scalers_.erase(scalers_.begin());
+    *ppScaler = Com(new MTLD3D12TemporalScalerImpl(device, d, info, std::move(metal))).ref();
     return S_OK;
   }
 

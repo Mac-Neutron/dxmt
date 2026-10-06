@@ -2101,10 +2101,17 @@ public:
     auto readable = [](Texture *t, WMTPixelFormat format) {
       return t->pixelFormat() == format && (t->usage() & WMTTextureUsageShaderRead);
     };
+    // Colour and output may also be viewed in the upscaler's format if the layout is the same (a TYPELESS one read as
+    // its typed variant, Ruling 6); another layout would read a losslessly compressed texture wrong.
+    auto layout = [](Texture *t, WMTPixelFormat format) {
+      auto own = MTLGetUnsignedIntegerFormat(t->pixelFormat());
+      return t->pixelFormat() == format || (own != WMTPixelFormatInvalid && own == MTLGetUnsignedIntegerFormat(format));
+    };
     // Colour and mask go to MetalFX as they are (depth and motion vectors may be copied first, below).
     if (!color || !depth || !motion || !output || (masked ? !mask : d.ReactiveMask != nullptr) ||
-        (exposure && !exposure->texture) || !readable(color, info.color_format) ||
-        (mask && !readable(mask, info.reactive_mask_format)) || output->pixelFormat() != info.output_format)
+        (exposure && !exposure->texture) || !layout(color, info.color_format) ||
+        !(color->usage() & WMTTextureUsageShaderRead) || (mask && !readable(mask, info.reactive_mask_format)) ||
+        !layout(output, info.output_format))
       return E_INVALIDARG;
     // Content no larger than the inputs, at a scale in the upscaler's range.
     float sx = (float)sd.OutputWidth / d.InputContentWidth, sy = (float)sd.OutputHeight / d.InputContentHeight;
@@ -2116,7 +2123,7 @@ public:
     WMTFXTemporalScalerProps props{};
     props.input_content_width = d.InputContentWidth;
     props.input_content_height = d.InputContentHeight;
-    props.reset = d.Reset;
+    props.reset = d.Reset || scaler->fresh.exchange(false);
     props.depth_reversed = d.DepthReversed;
     props.motion_vector_scale_x = d.MotionVectorScaleX;
     props.motion_vector_scale_y = d.MotionVectorScaleY;
@@ -2177,14 +2184,14 @@ public:
     auto e = allocator_->AllocatePass<TemporalUpscaleEncoderData>();
     e->type = EncoderType::TemporalUpscale; // may write anything: it joins, and what follows waits on it
     e->scaler = scaler->scaler;
-    e->color = color->view(color->fullView);
+    e->color = color->view(color->checkViewUseFormat(color->fullView, info.color_format));
     e->depth = depth->view(depth->fullView);
     e->motion = motion->view(motion->fullView);
     if (exposure)
       e->exposure = exposure->texture->view(exposure->texture->fullView);
     if (mask)
       e->reactive = mask->view(mask->fullView);
-    e->output = target->view(target->fullView);
+    e->output = target->view(target->checkViewUseFormat(target->fullView, info.output_format));
     e->depth_scratch = std::move(depth_scratch);
     e->motion_scratch = std::move(motion_scratch);
     e->output_scratch = output_scratch;

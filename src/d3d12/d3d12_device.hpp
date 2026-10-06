@@ -105,11 +105,13 @@ public:
 // MacNeutron (XeSS answered by MetalFX): a MetalFX temporal upscaler, the description it was made from and the Metal
 // formats it takes. Scratch textures stand in for an input MetalFX can't take as it is (copied in first) and for an
 // output it can't write (copied out after), made on first use at the description's sizes in the upscaler's formats.
+// The upscaler may be one the device kept from an earlier object, with that one's history: the first upscale resets.
 class MTLD3D12TemporalScaler : public IMTLD3D12TemporalScaler {
 public:
   MTL_TEMPORAL_SCALER_D3D12_DESC desc;
   WMTFXTemporalScalerInfo info;
   Rc<TemporalScaler> scaler;
+  std::atomic<bool> fresh = true;
 
   enum class Scratch { Depth, Motion, Output };
   virtual Rc<Texture> GetScratch(Scratch which) = 0;
