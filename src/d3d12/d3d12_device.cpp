@@ -287,8 +287,8 @@ public:
     return E_NOINTERFACE;
   }
 
-  // Private and untracked like D3D12's textures, and never resident through the device's set: only blits and MetalFX,
-  // which bind them directly, use them.
+  // Private (MetalFX wants its output private; allocate() sets the storage mode from its flags) and untracked, and
+  // never resident through the device's set: only blits and MetalFX, which bind them directly, use them.
   Rc<Texture>
   GetScratch(Scratch which) final {
     std::lock_guard<dxmt::mutex> lock(mutex_);
@@ -305,9 +305,8 @@ public:
                                                   : info.output_format;
       t.usage = WMTTextureUsage(WMTTextureUsageShaderRead | WMTTextureUsagePixelFormatView |
                                 (which == Scratch::Output ? WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget : 0));
-      t.options = WMTResourceOptions(WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked);
       texture = new Texture(t, device_);
-      texture->rename(texture->allocate({}));
+      texture->rename(texture->allocate(TextureAllocationFlag::GpuPrivate));
     }
     return texture;
   }
