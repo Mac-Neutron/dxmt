@@ -1043,8 +1043,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     WMT::Reference<WMT::CommandBuffer> cmdbuf{};
     HANDLE semaphore{};
     // Done on the CPU once it completes (MacNeutron): waits for the shared events of the fences its queue waited on
-    // through their MTLEvents (GPU overlap spec §3.11), timestamp resolves, then the fence signals deferred behind
-    // them, so no fence reports the work done before its timestamps are written, or before a fence it waited on.
+    // through their MTLEvents (GPU overlap spec §3.11), the sampled timestamps' values (Task F4) and timestamp
+    // resolves, then the fence signals deferred behind them, so no fence reports the work done before its timestamps
+    // are written, or before a fence it waited on.
     bool owes_cpu = false;
     std::vector<std::pair<WMT::Reference<WMT::SharedEvent>, uint64_t>> waits{};
     std::vector<TimestampResolve> resolves{};
@@ -1099,8 +1100,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         WARN("D3D12CommandQueue: over ", kTimestampsPerBuffer, " timestamps in flight; later ones keep old values");
       return ~0ull;
     }
-    if (!sampling_->sample_count)
+    if (!sampling_->sample_count) {
       sampling_->sample_first = ring_next_;
+      Owe(*sampling_); // the waiting thread writes the queries' values: no fence passes before (the app may free them)
+    }
     for (size_t i = 0; i < n; i++)
       sampling_->sample_values.push_back({sampling_->sample_count, samples[i].value});
     sampling_->sample_count++;
