@@ -28,6 +28,7 @@ class MTLD3D12Buffer : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
   D3D12_HEAP_PROPERTIES heap_props_;
   D3D12_HEAP_FLAGS heap_flags_;
+  Com<MTLD3D12Heap, false> heap_; // MacNeutron: a placed buffer keeps its heap (and its residency), as in D3D12
 
 public:
   MTLD3D12Buffer(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Resource>(pDevice) {}
@@ -63,10 +64,12 @@ public:
     Flags<BufferAllocationFlag> flags;
     if (pHeap && IsPrivateHeap(&heap_props_)) // committed buffers stay Shared
       flags.set(BufferAllocationFlag::CpuInvisible);
-    if (pHeap)
+    if (pHeap) {
       buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
-    else
+      heap_ = pHeap;
+    } else {
       buffer->rename(buffer->allocate(flags));
+    }
     device_->RegisterResidencyAndVA(buffer->current());
 
     return S_OK;

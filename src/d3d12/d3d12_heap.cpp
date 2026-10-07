@@ -31,6 +31,7 @@ public:
   MTLD3D12HeapImpl(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Heap>(pDevice) {}
 
   ~MTLD3D12HeapImpl() {
+    DXMT_STAT_COUNT("#heaps destroyed", 1);
     if (heap)
       device_->UnregisterResidency(heap);
     heap = {};

@@ -120,6 +120,9 @@ public:
 class MTLD3D12Heap : public ID3D12Heap {
 public:
   WMT::Reference<WMT::Heap> heap;
+
+  virtual void AddRefPrivate() = 0;
+  virtual void ReleasePrivate() = 0;
 };
 
 class MTLD3D12Fence : public ID3D12Fence1 {
