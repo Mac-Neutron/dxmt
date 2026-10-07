@@ -107,7 +107,7 @@ public:
     DXMT_STAT_SCOPE("buffer.Map");
     if (Subresource)
       return E_INVALIDARG;
-    if (heap_props_.Type == D3D12_HEAP_TYPE_DEFAULT)
+    if (!IsCpuVisibleHeap(&heap_props_)) // DEFAULT, or CUSTOM with no CPU pages (Private when placed)
       return E_INVALIDARG;
     if (ppData)
       *ppData = buffer->current()->mappedMemory(0);
