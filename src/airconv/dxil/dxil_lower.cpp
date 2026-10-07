@@ -457,18 +457,25 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     return llvm::Error::success();
   }
   case op::Barrier: { // (80, i32 mode): 1 = sync threadgroup, 2 = UAV fence global, 4 = UAV fence threadgroup, 8 = TGSM fence
-    // As airconv's DXBC sync lowering (nt/dxbc_converter_base.hpp, InstSync).
+    // As airconv's DXBC sync lowering (nt/dxbc_converter_base.hpp, InstSync). A fence without the sync bit
+    // (GroupMemoryBarrier 8, AllMemoryBarrier 10, DeviceMemoryBarrier 2) orders memory but doesn't wait for the group:
+    // a fence alone, at any Metal version (Metal Shader Converter emits air.atomic.fence for them at Metal 3.1 too); it
+    // used to emit nothing below 3.2. (MacNeutron)
     using namespace llvm::air;
     uint32_t mode = ConstantU32(call->getArgOperand(1));
     bool sync = mode & 1, non_execution = ctx.metal_version >= SM50_SHADER_METAL_320;
     MemFlags flags = (mode & 8) ? MemFlags::Threadgroup : MemFlags::None;
-    if (mode & 6) {
+    auto scope = (mode & 2) ? (ThreadScope::Device | ThreadScope::Threadgroup) : ThreadScope::Threadgroup;
+    if (mode & 6)
       flags |= MemFlags::Device | MemFlags::Texture;
+    if (!sync) {
+      if (flags != MemFlags::None)
+        air.CreateAtomicFence(flags, scope);
+    } else if (mode & 6) {
       if (non_execution)
-        air.CreateAtomicFence(flags, (mode & 2) ? (ThreadScope::Device | ThreadScope::Threadgroup) : ThreadScope::Threadgroup);
-      if (sync)
-        air.CreateBarrier(non_execution ? MemFlags::None : flags);
-    } else if (sync) {
+        air.CreateAtomicFence(flags, scope);
+      air.CreateBarrier(non_execution ? MemFlags::None : flags);
+    } else {
       air.CreateBarrier(flags);
     }
     Replace(call, nullptr);
