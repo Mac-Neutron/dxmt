@@ -285,6 +285,7 @@ public:
 
     encoder_count = std::numeric_limits<size_t>::max();
     timestamp_resolves.clear();
+    timestamps = false;
     custom_resolves = false;
     barrier_names.clear();
     return allocator_->StartRecord(&entry);
@@ -1826,7 +1827,9 @@ public:
       current = allocator_->encoder_current;
       render = false;
     }
-    current->samples[current->num_samples++] = {buffer, Index % kTimestampsPerBuffer};
+    current->samples[current->num_samples++] = {buffer, Index % kTimestampsPerBuffer,
+                                                heap->values.empty() ? nullptr : &heap->values[Index]};
+    timestamps = true;
     if (!render)
       allocator_->InvalidateCurrentPass(); // later work goes to a new encoder, so this sample marks this point
   }
@@ -1872,6 +1875,8 @@ public:
         for (UINT q = i; q < i + n; q++)
           if (heap->aliases[q] != ~0u)
             job.aliases.push_back({q - i, heap->aliases[q] % kTimestampsPerBuffer});
+        if (!heap->values.empty())
+          job.values = heap->values.data() + chunk * kTimestampsPerBuffer;
         timestamp_resolves.push_back(std::move(job));
         custom_resolves |= dst_heap.Type == D3D12_HEAP_TYPE_CUSTOM;
         i += n;

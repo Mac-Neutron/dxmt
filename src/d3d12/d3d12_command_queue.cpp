@@ -192,6 +192,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   bool merge_ = env::getEnvVar("DXMT_D3D12_MERGE") != "0"; // M3 on, unless DXMT_D3D12_MERGE=0 (triage)
   std::vector<EncoderData *> merged_, folds_;               // PlanMerge's result and scratch
+  unsigned merged_list_ = 0;                                // the list of merged_'s last pass
   std::vector<std::pair<EncoderData *, uint16_t>> skipped_; // encoders M3 already encoded, with their fence
   size_t skip_ = 0;
 
@@ -288,7 +289,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       merged_.push_back(next);
       folds_.clear();
       last = next;
-      last_list = l;
+      last_list = merged_list_ = l;
       cursor = next->next;
     }
   }
@@ -403,7 +404,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   // GPU efficiency spec E4: lone timestamps (timestamp-only blits) waiting, in order, for the start of the next encoder
   // the queue encodes; and whether one of them was its list's join (the encoder after them joins then).
-  std::vector<std::pair<obj_handle_t, uint32_t>> pending_samples_;
+  std::vector<EncoderData::Sample> pending_samples_;
+  // Why a timestamp got a blit of its own (DXMT_STATS, Task F4): another counter buffer than the encoder's, the earlier
+  // of several waiting for one encoder's start, a next encoder that takes none (a clear, a resolve, the upscale, a
+  // pass's indirect resolvers, an encoder without commands), the end of the call.
+  enum LoneReason { kLoneCounterBuffer, kLoneSeveral, kLoneNoStart, kLoneEnd };
   bool pending_join_ = false;
 
   // The latest pending timestamp, for the start of an encoder whose own samples are all in `own` (0: it has none):
@@ -414,24 +419,29 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     if (pending_samples_.empty())
       return {0, ~0ull};
     auto last = pending_samples_.back();
-    bool fits = !own || own == last.first;
+    bool fits = !own || own == last.buffer;
     for (size_t k = 0; k + (fits ? 1 : 0) < pending_samples_.size(); k++)
-      SampleAfter(cmdbuf, pending_samples_[k].first, pending_samples_[k].second,
+      SampleAfter(cmdbuf, pending_samples_[k].buffer, pending_samples_[k].index,
                   k + 1 < pending_samples_.size() ? kLoneSeveral : kLoneCounterBuffer);
     pending_samples_.clear();
     if (!fits)
       return {0, ~0ull};
     DXMT_STAT_COUNT("#timestamps at the next encoder's start", 1);
-    return {last.first, last.second};
+    return {last.buffer, last.index};
   }
 
   // Waiting timestamps, each in a blit of its own: for an encoder whose start isn't ordered after earlier work (a clear
   // or resolve waits before its fragment stage only; a pass's indirect resolvers run first) or that Metal drops (no
-  // commands).
+  // commands), and after the call's last encoder. With the shared counter buffer (Task F4), one blit takes them all,
+  // only where no earlier encoder in the call could (see Trailing).
   void
-  FlushPending(WMT::CommandBuffer &cmdbuf) {
-    for (auto [buffer, index] : pending_samples_)
-      SampleAfter(cmdbuf, buffer, index, kLoneNoStart);
+  FlushPending(WMT::CommandBuffer &cmdbuf, LoneReason why = kLoneNoStart) {
+    if (!sampling_) {
+      for (auto &p : pending_samples_)
+        SampleAfter(cmdbuf, p.buffer, p.index, why);
+    } else if (uint64_t slot = Point(pending_samples_.data(), pending_samples_.size()); slot != ~0ull) {
+      SampleAfter(cmdbuf, sampling_->samples, slot, why);
+    }
     pending_samples_.clear();
   }
 
@@ -456,10 +466,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   }
 
   // A timestamp taken right after the earlier work, in a blit of its own (with the scratch fill). For counter buffers
-  // an encoder can't take beside another (GPU efficiency spec E2). DXMT_STATS counts why (Task F4): another counter
-  // buffer than the encoder's, the earlier of several waiting for one encoder's start, a next encoder that takes none
-  // (a clear, a resolve, the upscale, a pass's indirect resolvers, an encoder without commands), the end of the call.
-  enum LoneReason { kLoneCounterBuffer, kLoneSeveral, kLoneNoStart, kLoneEnd };
+  // an encoder can't take beside another (GPU efficiency spec E2). DXMT_STATS counts why (LoneReason).
   void
   SampleAfter(WMT::CommandBuffer &cmdbuf, obj_handle_t sample_buffer, uint64_t index, LoneReason why) {
     DXMT_STAT_COUNT("#timestamps given their own encoder", 1);
@@ -1042,6 +1049,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     std::vector<std::pair<WMT::Reference<WMT::SharedEvent>, uint64_t>> waits{};
     std::vector<TimestampResolve> resolves{};
     std::vector<DeferredSignal> signals{};
+    // Task F4: its slots of the queue's counter buffer (ring_), [first, first + count) modulo its size, and the
+    // queries' values each one goes to, by index in that range.
+    obj_handle_t samples = 0;
+    uint64_t sample_first = 0;
+    uint32_t sample_count = 0;
+    std::vector<std::pair<uint32_t, uint64_t *>> sample_values{};
   };
   // Command buffers still owing CPU work: while there are any, fence signals go behind them.
   std::atomic_uint32_t cpu_work_ = 0;
@@ -1058,7 +1071,95 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
   dxmt::thread inflight_cmdbuf_wait_thread_;
 
+  // Task F4 (Ruling 23): the queue samples every timestamp, whatever its query heap, into one counter buffer, so any
+  // encoder can take them: those waiting before it at its start, its own (and those after it that no encoder start can
+  // take) at its end, in one attachment. A ring of kTimestampsPerBuffer slots (Metal allows 32 counter buffers per
+  // process, and each timestamp query heap holds one): each call takes the next ones, free again once its command
+  // buffer completed and its values went to their queries (which resolves copy). A lone blit is left only where no
+  // encoder in the call can take a timestamp. DXMT_D3D12_TIMESTAMP_BLITS=1, or no buffer left for the ring: the query
+  // heaps' own counter buffers, one per encoder (GPU efficiency spec E2, E4).
+  WMT::Reference<WMT::CounterSampleBuffer> ring_;
+  bool ring_failed_ = false;
+  uint64_t ring_next_ = 0;             // slots taken (under mutex_commit_)
+  std::atomic_uint64_t ring_done_ = 0; // slots read back (by the waiting thread)
+  InflightCommandBuffer *sampling_ = nullptr; // the call's command buffer while it encodes, sampling into ring_
+  bool taken_ = false;               // the timestamp-only blits before taken_stop_ rode an earlier encoder's end
+  EncoderData *taken_stop_ = nullptr; // (null: to the end of the call)
+  std::vector<EncoderData::Sample> ends_; // scratch: the samples for an encoder's end
+
+  // One slot of the ring for `n` samples taken at one point; ~0 for none.
+  uint64_t
+  Point(const EncoderData::Sample *samples, size_t n) {
+    if (!n)
+      return ~0ull;
+    // ponytail: 4096 sample points in flight (about 200 a frame in Unreal); past that they keep their last values
+    if (ring_next_ - ring_done_.load(std::memory_order_acquire) == kTimestampsPerBuffer) {
+      static bool warned = false;
+      if (!std::exchange(warned, true))
+        WARN("D3D12CommandQueue: over ", kTimestampsPerBuffer, " timestamps in flight; later ones keep old values");
+      return ~0ull;
+    }
+    if (!sampling_->sample_count)
+      sampling_->sample_first = ring_next_;
+    for (size_t i = 0; i < n; i++)
+      sampling_->sample_values.push_back({sampling_->sample_count, samples[i].value});
+    sampling_->sample_count++;
+    return ring_next_++ % kTimestampsPerBuffer;
+  }
+
+  // The waiting timestamps' slot, for the start of the encoder being encoded; ~0 for none.
+  uint64_t
+  TakeStart() {
+    uint64_t slot = Point(pending_samples_.data(), pending_samples_.size());
+    if (slot != ~0ull)
+      DXMT_STAT_COUNT("#timestamps at the next encoder's start", 1);
+    pending_samples_.clear();
+    return slot;
+  }
+
+  // Adds to ends_ the timestamp-only blits right after `e` (of lists[l], across the call's later lists) when the
+  // encoder after them takes no start sample (a clear or resolve, which wait before their fragment stage, or none: the
+  // call's end), so they ride e's end; the main loop then skips them.
+  void
+  Trailing(EncoderData *e, unsigned l, ID3D12CommandList *const *lists, unsigned count, bool folding) {
+    size_t mark = ends_.size();
+    EncoderData *cursor = e->next;
+    for (;;) {
+      if (!cursor) {
+        if (++l == count)
+          break;
+        cursor = static_cast<MTLD3D12GraphicsCommandList *>(lists[l])->entry;
+      } else if (cursor->type == EncoderType::Null) {
+        cursor = cursor->next;
+      } else if (folding && cursor->type == EncoderType::Blit && cursor->timestamp_only) {
+        ends_.insert(ends_.end(), cursor->samples, cursor->samples + cursor->num_samples);
+        cursor = cursor->next;
+      } else {
+        break;
+      }
+    }
+    if (cursor && cursor->type != EncoderType::Clear && cursor->type != EncoderType::Resolve)
+      ends_.resize(mark);
+    else if (ends_.size() > mark)
+      taken_ = true, taken_stop_ = cursor;
+  }
+
+  // A blit or compute encoder's one attachment (in `at`): the waiting timestamps at its start, its own and Trailing's
+  // at its end. Returns the attachment count.
+  unsigned
+  Attach(EncoderData *e, unsigned l, ID3D12CommandList *const *lists, unsigned count, bool folding,
+         WMTSampleBufferAttachmentInfo &at) {
+    uint64_t start = TakeStart();
+    ends_.assign(e->samples, e->samples + e->num_samples);
+    Trailing(e, l, lists, count, folding);
+    uint64_t end = Point(ends_.data(), ends_.size());
+    at = {sampling_->samples, start, end};
+    return start != ~0ull || end != ~0ull;
+  }
+
   dxmt::mutex mutex_commit_;
+
+  std::vector<uint64_t> sample_scratch_values_; // the waiting thread's
 
   void
   CommandBufferWaitingThread() {
@@ -1081,6 +1182,18 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (inflight.semaphore)
         ReleaseSemaphore(inflight.semaphore, 1, nullptr);
 
+      if (uint32_t n = inflight.sample_count) { // Task F4: each slot's value to its queries, before resolves read them
+        auto &v = sample_scratch_values_;
+        v.resize(n);
+        uint32_t first = inflight.sample_first % kTimestampsPerBuffer, head = std::min(n, kTimestampsPerBuffer - first);
+        MTLCounterSampleBuffer_resolveCounterRange(inflight.samples, first, head, v.data(), head * sizeof(uint64_t));
+        if (head < n) // wrapped around the ring
+          MTLCounterSampleBuffer_resolveCounterRange(inflight.samples, 0, n - head, v.data() + head,
+                                                     (n - head) * sizeof(uint64_t));
+        for (auto [index, value] : inflight.sample_values)
+          *value = v[index];
+        ring_done_.store(inflight.sample_first + n, std::memory_order_release);
+      }
       if (inflight.owes_cpu) {
         // The GPU passed these MTLEvent waits, so each shared signal is encoded, being retired, or set (spec §3.11).
         // A failed buffer may not have: then its waits are skipped.
@@ -1088,6 +1201,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
           for (auto &[shared, value] : inflight.waits)
             shared.waitUntilSignaledValue(value, ~0ull);
         for (auto &r : inflight.resolves) {
+          if (r.values) { // Task F4: the values the queue wrote
+            memcpy(r.dst, r.values + r.start, r.count * sizeof(uint64_t));
+            for (auto [slot, sample] : r.aliases)
+              ((uint64_t *)r.dst)[slot] = r.values[sample];
+            continue;
+          }
           MTLCounterSampleBuffer_resolveCounterRange(r.samples, r.start, r.count, r.dst, r.count * sizeof(uint64_t));
           for (auto [slot, sample] : r.aliases)
             MTLCounterSampleBuffer_resolveCounterRange(r.samples, sample, 1, (uint64_t *)r.dst + slot, sizeof(uint64_t));
@@ -1274,6 +1393,20 @@ public:
     bool dumping = Dumps().Dumping();
     bool serial = serial_ || dumping; // F9 dumps and pixel history see the strict order
     bool fold_timestamps = !dumping && merge_; // E4; dumps keep D3D12's passes
+    sampling_ = nullptr; // Task F4: the ring, once a call samples timestamps
+    if (!TimestampBlits() && !ring_ && !ring_failed_ &&
+        std::any_of(ppCommandLists, ppCommandLists + Count,
+                    [](auto *l) { return static_cast<MTLD3D12GraphicsCommandList *>(l)->timestamps; })) {
+      ring_ = device_->GetMTLDevice().newCounterSampleBuffer(kTimestampsPerBuffer, true);
+      ring_failed_ = !ring_;
+      if (ring_failed_)
+        WARN("D3D12CommandQueue: no counter buffer left for timestamps; they go to their query heaps' own");
+    }
+    if (ring_) {
+      sampling_ = &scope.inflight;
+      sampling_->samples = ring_.handle;
+    }
+    taken_ = false;
     skipped_.clear();
     skip_ = 0;
     clear_folds_.clear();
@@ -1282,13 +1415,18 @@ public:
       custom_resolves_ |= pCommandList->custom_resolves;
       if (!pCommandList->timestamp_resolves.empty()) {
         Owe(scope.inflight);
-        scope.inflight.resolves.insert(
+        auto from = scope.inflight.resolves.insert(
             scope.inflight.resolves.end(), pCommandList->timestamp_resolves.begin(), pCommandList->timestamp_resolves.end()
         );
+        if (!sampling_) // Task F4: sampled into the heaps' own counter buffers
+          for (; from != scope.inflight.resolves.end(); ++from)
+            from->values = nullptr;
       }
       EncoderData *current = pCommandList->entry, *previous = nullptr;
       list_join_ = 0; // a list's first encoder joins, even one M3 already encoded
       while (current) {
+        if (taken_ && current == taken_stop_) // past the timestamps an earlier encoder's end took (Task F4)
+          taken_ = false;
         if (skip_ < skipped_.size() && skipped_[skip_].first == current) { // encoded inside an earlier render pass
           if (current->position >= list_fences_.size())
             list_fences_.resize(current->position + 1);
@@ -1311,8 +1449,8 @@ public:
           }
         }
         if (fold_timestamps && current->type == EncoderType::Blit && current->timestamp_only) { // E4
-          for (unsigned k = 0; k < current->num_samples; k++)
-            pending_samples_.push_back({current->samples[k].buffer, current->samples[k].index});
+          if (!taken_) // Task F4: else the encoder before took them at its end
+            pending_samples_.insert(pending_samples_.end(), current->samples, current->samples + current->num_samples);
           pending_join_ |= current->join;
           current = current->next;
           continue;
@@ -1447,9 +1585,12 @@ public:
             PlanMerge(data, i, ppCommandLists, Count, render_pass_info);
           else
             merged_.clear();
-          auto resolve_icbs = [&](uint16_t fence) { // ExecuteIndirect's resolvers, writing the pass's ICBs
+          // ExecuteIndirect's resolvers, writing the pass's ICBs (and taking the waiting timestamps, Task F4)
+          auto resolve_icbs = [&](uint16_t fence, uint64_t start = ~0ull) {
             DXMT_STAT_COUNT("#indirect resolve passes", 1);
-            auto pre = cmdbuf.computeCommandEncoder(true);
+            WMTSampleBufferAttachmentInfo at = {start == ~0ull ? 0 : sampling_->samples, start, ~0ull};
+            auto pre = at.sample_buffer ? cmdbuf.computeCommandEncoderWithSampleBuffers(true, &at, 1)
+                                        : cmdbuf.computeCommandEncoder(true);
             LabelPass(pre, pass, "indirect resolve");
             Encode(pre, fence, &data->pre_head, data->pre_tail);
             pre.endEncoding();
@@ -1459,17 +1600,34 @@ public:
               resolve_icbs(Order(nullptr, true));
             PixelHistory(cmdbuf, data, render_pass_info);
           }
-          if (data->pre_tail && !dumping)
-            FlushPending(cmdbuf); // E4
-          if (auto [buffer, index] = TakePending(cmdbuf, render_pass_info.sample_buffers[0].sample_buffer); buffer) { // E4
-            if (render_pass_info.sample_buffers[0].sample_buffer)
-              render_pass_info.sample_buffers[0].start_of_vertex_sample_index = index;
-            else
-              render_pass_info.sample_buffers[0] = {buffer, ~0ull, index};
+          uint64_t resolver_start = ~0ull;
+          if (sampling_) { // Task F4: the call's counter buffer, one attachment
+            uint64_t start = TakeStart();
+            ends_.assign(data->samples, data->samples + data->num_samples);
+            for (auto *m : merged_)
+              ends_.insert(ends_.end(), m->samples, m->samples + m->num_samples);
+            Trailing(merged_.empty() ? current : merged_.back(), merged_.empty() ? i : merged_list_, ppCommandLists,
+                     Count, fold_timestamps);
+            uint64_t end = Point(ends_.data(), ends_.size());
+            if (data->pre_tail && !dumping) // the resolvers come first
+              std::swap(start, resolver_start);
+            for (auto &b : render_pass_info.sample_buffers)
+              b = {};
+            if (start != ~0ull || end != ~0ull)
+              render_pass_info.sample_buffers[0] = {sampling_->samples, end, start};
+          } else {
+            if (data->pre_tail && !dumping)
+              FlushPending(cmdbuf); // E4
+            if (auto [buffer, index] = TakePending(cmdbuf, render_pass_info.sample_buffers[0].sample_buffer); buffer) {
+              if (render_pass_info.sample_buffers[0].sample_buffer) // E4
+                render_pass_info.sample_buffers[0].start_of_vertex_sample_index = index;
+              else
+                render_pass_info.sample_buffers[0] = {buffer, ~0ull, index};
+            }
           }
           uint16_t fence = Order(current, strict), early = early_;
           if (data->pre_tail && !dumping) { // the resolvers wait as the pass would; the pass waits on them alone
-            resolve_icbs(fence);
+            resolve_icbs(fence, resolver_start);
             waits_.assign(1, fence);
           }
           // Apple GPUs write only the last of an encoder's counter buffers (GPU efficiency spec E2): the pass keeps the
@@ -1510,6 +1668,8 @@ public:
           unsigned num_samples = data->num_samples;
           for (unsigned i = 0; i < num_samples; i++)
             samples[i] = {data->samples[i].buffer, ~0ull, data->samples[i].index};
+          if (sampling_) // Task F4
+            num_samples = Attach(current, i, ppCommandLists, Count, fold_timestamps, samples[0]);
           if (data->cmd_tail == (wmtcmd_base *)&data->cmd_head) {
             EncodeEmpty(cmdbuf, current, pass, strict, samples, num_samples);
             break;
@@ -1534,6 +1694,8 @@ public:
           unsigned num_samples = data->num_samples;
           for (unsigned i = 0; i < num_samples; i++)
             samples[i] = {data->samples[i].buffer, ~0ull, data->samples[i].index};
+          if (sampling_) // Task F4
+            num_samples = Attach(current, i, ppCommandLists, Count, fold_timestamps, samples[0]);
           if (data->cmd_tail == (wmtcmd_base *)&data->cmd_head) {
             EncodeEmpty(cmdbuf, current, pass, strict, samples, num_samples);
             break;
@@ -1577,10 +1739,22 @@ public:
           DXMT_STAT_SCOPE("queue.(encode temporal upscale)");
           auto data = static_cast<TemporalUpscaleEncoderData *>(current);
           auto scaler_fence = data->scaler->fence();
-          FlushPending(cmdbuf); // E4
+          // Task F4: the waiting timestamps at the begin blit's start, those after the upscale (that no encoder start
+          // takes) at the end blit's end. MetalFX's own passes take none.
+          WMTSampleBufferAttachmentInfo first = {0, ~0ull, ~0ull}, last = first;
+          if (sampling_) {
+            first = {sampling_->samples, TakeStart(), ~0ull};
+            ends_.clear();
+            Trailing(current, i, ppCommandLists, Count, fold_timestamps);
+            last = {sampling_->samples, ~0ull, Point(ends_.data(), ends_.size())};
+          } else {
+            FlushPending(cmdbuf); // E4
+          }
           uint16_t fence = Order(current, strict);
           auto fill = ScratchFill(); // both blits have only fences to do
-          auto begin = cmdbuf.blitCommandEncoder();
+          auto begin = first.start_of_encoder_sample_index != ~0ull
+                           ? cmdbuf.blitCommandEncoderWithSampleBuffers(&first, 1)
+                           : cmdbuf.blitCommandEncoder();
           LabelPass(begin, pass, "upscale");
           for (auto wait : waits_)
             begin.waitForFence(fences_[wait]);
@@ -1590,7 +1764,8 @@ public:
           cmdbuf.encodeTemporalScale(data->scaler->scaler(), data->color.texture(), data->output.texture(),
                                      data->depth.texture(), data->motion.texture(), data->exposure.texture(),
                                      scaler_fence, data->props, data->reactive.texture());
-          auto end = cmdbuf.blitCommandEncoder();
+          auto end = last.end_of_encoder_sample_index != ~0ull ? cmdbuf.blitCommandEncoderWithSampleBuffers(&last, 1)
+                                                              : cmdbuf.blitCommandEncoder();
           end.waitForFence(scaler_fence);
           end.encodeCommands((const wmtcmd_blit_nop *)&fill);
           end.updateFence(fences_[fence]);
@@ -1603,10 +1778,10 @@ public:
         current = current->next;
       }
     }
-    for (auto [buffer, index] : pending_samples_) // E4: lone timestamps after the call's last encoder
-      SampleAfter(cmdbuf, buffer, index, kLoneEnd);
-    pending_samples_.clear();
+    FlushPending(cmdbuf, kLoneEnd); // E4: lone timestamps after the call's last encoder
     pending_join_ = false;
+    sampling_ = nullptr;
+    taken_ = false;
   };
 
   void STDMETHODCALLTYPE SetMarker(UINT metadata, const void *data, UINT size) {
