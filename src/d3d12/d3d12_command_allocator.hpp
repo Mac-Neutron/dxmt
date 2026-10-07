@@ -68,6 +68,7 @@ struct IndirectRenderCommandData {
   DXGI_FORMAT index_buffer_format;
   uint32_t vertex_argbuf_stride;
   uint32_t vertex_slot_mask; // the pipeline's: which slots vertex_buffer's table holds
+  uint64_t null_vertex_buffer; // for null VERTEX_BUFFER_VIEW arguments (Task F2: shaders don't check)
 };
 
 class MTLD3D12CommandAllocatorImpl : public MTLD3D12Pageable<MTLD3D12CommandAllocator> {

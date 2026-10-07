@@ -248,6 +248,10 @@ public:
   // use. Null UAV textures stay nil (Metal: reads zero, writes discarded).
   virtual std::pair<Texture *, TextureViewKey> NullTexture(WMTTextureType type) = 0;
   virtual std::pair<Buffer *, BufferViewKey> NullTexelBuffer() = 0;
+  // A zeroed buffer's GPU address for vertex buffer slots a pipeline reads but nobody bound (Task F2): read with
+  // stride 0, each element reads zeros, which its format widens as D3D's rules say ((0,0,0,1) for fewer than four
+  // components). Shaders pull vertices without a null check since.
+  virtual uint64_t NullVertexBuffer() = 0;
 
   // GPU timestamp ticks per second (MacNeutron), measured once against QueryPerformanceCounter.
   virtual uint64_t TimestampFrequency() = 0;

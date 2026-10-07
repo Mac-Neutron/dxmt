@@ -353,6 +353,7 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   std::map<WMTTextureType, Rc<Texture>> null_textures_;
   Rc<Buffer> null_buffer_;
   BufferViewKey null_buffer_view_;
+  Rc<Buffer> null_vertex_buffer_;
   WMT::Reference<WMT::ResidencySet> residency_set_;
   // MacNeutron: by GPU address. Placed buffers at one heap offset share theirs (aliasing): a lookup finds the newest
   // registered, and a release removes only its own entry (it used to remove the address, or keep a released buffer).
@@ -1859,6 +1860,19 @@ public:
       null_buffer_view_ = null_buffer_->createView(BufferViewDescriptor{WMTPixelFormatRGBA32Float});
     }
     return {null_buffer_.ptr(), null_buffer_view_};
+  }
+
+  uint64_t
+  NullVertexBuffer() {
+    std::lock_guard<dxmt::mutex> lock(null_lock_);
+    if (!null_vertex_buffer_) {
+      // Read with stride 0: an element ends within 2048 bytes (D3D12_REQ_MULTI_ELEMENT_STRUCTURE_SIZE_IN_BYTES).
+      null_vertex_buffer_ = new Buffer(4096, GetMTLDevice());
+      null_vertex_buffer_->rename(null_vertex_buffer_->allocate({}));
+      memset(null_vertex_buffer_->current()->mappedMemory(0), 0, 4096);
+      RegisterResidencyAndVA(null_vertex_buffer_->current());
+    }
+    return null_vertex_buffer_->current()->gpuAddress();
   }
 
   HRESULT
