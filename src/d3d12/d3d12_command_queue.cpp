@@ -406,12 +406,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     pending_samples_.clear();
   }
 
-  // A timestamp taken right after the earlier work, in a blit of its own (Metal drops an empty encoder: it fills 4
-  // bytes of a scratch buffer). For counter buffers an encoder can't take beside another (GPU efficiency spec E2).
+  // Metal drops an encoder without commands, its samples and fence operations with it: a blit with nothing else to do
+  // gets this, a 4-byte fill of a scratch buffer.
   WMT::Reference<WMT::Buffer> sample_scratch_;
-  void
-  SampleAfter(WMT::CommandBuffer &cmdbuf, obj_handle_t sample_buffer, uint64_t index) {
-    DXMT_STAT_COUNT("#timestamps given their own encoder", 1);
+  wmtcmd_blit_fillbuffer
+  ScratchFill() {
     if (!sample_scratch_) {
       WMTBufferInfo info{};
       info.length = 16;
@@ -419,17 +418,40 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       info.memory.set(nullptr);
       sample_scratch_ = device_->GetMTLDevice().newBuffer(info);
     }
-    WMTSampleBufferAttachmentInfo attachment = {sample_buffer, ~0ull, index};
-    auto blit = cmdbuf.blitCommandEncoderWithSampleBuffers(&attachment, 1);
-    auto fence = Join(blit);
     wmtcmd_blit_fillbuffer fill = {};
     fill.type = WMTBlitCommandFillBuffer;
     fill.next.set(nullptr);
     fill.buffer = sample_scratch_.handle;
     fill.length = 4;
+    return fill;
+  }
+
+  // A timestamp taken right after the earlier work, in a blit of its own (with the scratch fill). For counter buffers
+  // an encoder can't take beside another (GPU efficiency spec E2).
+  void
+  SampleAfter(WMT::CommandBuffer &cmdbuf, obj_handle_t sample_buffer, uint64_t index) {
+    DXMT_STAT_COUNT("#timestamps given their own encoder", 1);
+    auto fill = ScratchFill();
+    WMTSampleBufferAttachmentInfo attachment = {sample_buffer, ~0ull, index};
+    auto blit = cmdbuf.blitCommandEncoderWithSampleBuffers(&attachment, 1);
+    auto fence = Join(blit);
     blit.encodeCommands((const wmtcmd_blit_nop *)&fill);
     blit.updateFence(fences_[fence]);
     blit.endEncoding();
+  }
+
+  // MacNeutron: a blit or compute encoder left without commands (a Dispatch with no pipeline still opens one) goes as a
+  // blit with the scratch fill, so its waits, its fence update and its samples happen.
+  void
+  EncodeEmpty(WMT::CommandBuffer &cmdbuf, EncoderData *current, unsigned pass, bool strict,
+              WMTSampleBufferAttachmentInfo *samples, unsigned num_samples) {
+    FlushPending(cmdbuf); // E4
+    auto fill = ScratchFill();
+    auto encoder = num_samples ? cmdbuf.blitCommandEncoderWithSampleBuffers(samples, num_samples)
+                               : cmdbuf.blitCommandEncoder();
+    LabelPass(encoder, pass, "empty");
+    Encode(encoder, Order(current, strict), (wmtcmd_blit_nop *)&fill, (wmtcmd_base *)&fill);
+    encoder.endEncoding();
   }
 
   // The queue's own encoders (pass dumps, pixel history, presents) join. Returns the fence the encoder then updates.
@@ -1449,8 +1471,10 @@ public:
           unsigned num_samples = data->num_samples;
           for (unsigned i = 0; i < num_samples; i++)
             samples[i] = {data->samples[i].buffer, ~0ull, data->samples[i].index};
-          if (data->cmd_tail == (wmtcmd_base *)&data->cmd_head)
-            FlushPending(cmdbuf); // E4: Metal drops an encoder without commands, samples and all
+          if (data->cmd_tail == (wmtcmd_base *)&data->cmd_head) {
+            EncodeEmpty(cmdbuf, current, pass, strict, samples, num_samples);
+            break;
+          }
           if (auto [buffer, index] = TakePending(cmdbuf, num_samples ? samples[0].sample_buffer : 0); buffer) { // E4
             if (!num_samples)
               samples[num_samples++] = {buffer, index, ~0ull};
@@ -1471,8 +1495,10 @@ public:
           unsigned num_samples = data->num_samples;
           for (unsigned i = 0; i < num_samples; i++)
             samples[i] = {data->samples[i].buffer, ~0ull, data->samples[i].index};
-          if (data->cmd_tail == (wmtcmd_base *)&data->cmd_head)
-            FlushPending(cmdbuf); // E4: Metal drops an encoder without commands, samples and all
+          if (data->cmd_tail == (wmtcmd_base *)&data->cmd_head) {
+            EncodeEmpty(cmdbuf, current, pass, strict, samples, num_samples);
+            break;
+          }
           if (auto [buffer, index] = TakePending(cmdbuf, num_samples ? samples[0].sample_buffer : 0); buffer) { // E4
             if (!num_samples)
               samples[num_samples++] = {buffer, index, ~0ull};
@@ -1514,10 +1540,12 @@ public:
           auto scaler_fence = data->scaler->fence();
           FlushPending(cmdbuf); // E4
           uint16_t fence = Order(current, strict);
+          auto fill = ScratchFill(); // both blits have only fences to do
           auto begin = cmdbuf.blitCommandEncoder();
           LabelPass(begin, pass, "upscale");
           for (auto wait : waits_)
             begin.waitForFence(fences_[wait]);
+          begin.encodeCommands((const wmtcmd_blit_nop *)&fill);
           begin.updateFence(scaler_fence);
           begin.endEncoding();
           cmdbuf.encodeTemporalScale(data->scaler->scaler(), data->color.texture(), data->output.texture(),
@@ -1525,6 +1553,7 @@ public:
                                      scaler_fence, data->props, data->reactive.texture());
           auto end = cmdbuf.blitCommandEncoder();
           end.waitForFence(scaler_fence);
+          end.encodeCommands((const wmtcmd_blit_nop *)&fill);
           end.updateFence(fences_[fence]);
           end.endEncoding();
           break;
