@@ -116,7 +116,9 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
     Usage |= WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite;
     // MacNeutron: MetalFX wants its output ShaderRead|ShaderWrite|RenderTarget (and Private): a 2D UAV of a format
     // Metal renders to can then be the temporal upscaler's output, written directly (no scratch, no copy).
-    if (Desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+    // DXMT_D3D12_PRIVATE=0 (IsPrivateHeap false for every heap) leaves this out too.
+    static const D3D12_HEAP_PROPERTIES gpu_only = {D3D12_HEAP_TYPE_DEFAULT};
+    if (Desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && IsPrivateHeap(&gpu_only) &&
         any_bit_set(Device->GetMTLPixelFormatCapability(InfoOut.pixel_format) & FormatCapability::Color))
       Usage |= WMTTextureUsageRenderTarget;
   }
