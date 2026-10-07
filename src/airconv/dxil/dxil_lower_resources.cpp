@@ -44,7 +44,7 @@ Lowering::ElementPointer(dxbc::BufferResourceHandle &buffer, llvm::Value *byte_o
   unsigned space = llvm::cast<llvm::PointerType>(buffer.Pointer->getType())->getAddressSpace();
   auto bytes = ir.CreateBitCast(buffer.Pointer, ir.getInt8PtrTy(space));
   auto ptr = ir.CreateBitCast(ir.CreateGEP(ir.getInt8Ty(), bytes, byte_offset), ty->getPointerTo(space));
-  if (!buffer.Metadata)
+  if (!buffer.Metadata || DxilBoundsOff())
     return ptr;
   return ir.CreateSelect(InBounds(buffer, byte_offset, ty->getPrimitiveSizeInBits() / 8), ptr,
                          llvm::Constant::getNullValue(ptr->getType()));
@@ -65,7 +65,7 @@ Lowering::AccessPointer(dxbc::BufferResourceHandle &buffer, llvm::Value *byte_of
   unsigned space = llvm::cast<llvm::PointerType>(buffer.Pointer->getType())->getAddressSpace();
   auto bytes = ir.CreateBitCast(buffer.Pointer, ir.getInt8PtrTy(space));
   auto ptr = ir.CreateBitCast(ir.CreateGEP(ir.getInt8Ty(), bytes, byte_offset), ty->getPointerTo(space));
-  if (!buffer.Metadata)
+  if (!buffer.Metadata || DxilBoundsOff())
     return ptr;
   return ir.CreateSelect(InBounds(buffer, byte_offset, count * (ty->getPrimitiveSizeInBits() / 8)), ptr,
                          llvm::Constant::getNullValue(ptr->getType()));
@@ -157,9 +157,11 @@ Lowering::LowerTypedBufferLoad(llvm::CallInst *call, const HandleInfo &h, llvm::
   tex.kind = d->ResourceKind;
   tex.sample_type = d->SampleType;
   tex.memory_access = d->MemoryAccess;
-  auto oob = ir.CreateICmpUGE(index, conv.DecodeTextureBufferElement(d->Metadata));
   auto address = ir.CreateAdd(index, conv.DecodeTextureBufferOffset(d->Metadata));
-  address = ir.CreateSelect(oob, llvm::ConstantInt::getAllOnesValue(address->getType()), address);
+  if (!DxilBoundsOff()) {
+    auto oob = ir.CreateICmpUGE(index, conv.DecodeTextureBufferElement(d->Metadata));
+    address = ir.CreateSelect(oob, llvm::ConstantInt::getAllOnesValue(address->getType()), address);
+  }
   if (tex.memory_access == llvm::air::Texture::acesss_readwrite) // as the DXBC typed UAV load: see earlier writes
     air.CreateTextureFence(tex, d->ResourceHandle);
   auto [texel, residency] = air.CreateRead(tex, d->ResourceHandle, address, nullptr, nullptr, ir.getInt32(0), d->GlobalCoherent);

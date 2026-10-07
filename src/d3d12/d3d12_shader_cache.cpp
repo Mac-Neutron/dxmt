@@ -182,7 +182,8 @@ CompileFunction(WMT::Device device, FunctionKind kind, CachedShader &first, Cach
     if (second)
       shaders.update(second->digest());
     v.update(Tag("d3d12-function")).update(name, strlen(name)).update(*variant);
-    // DXMT_DXIL_BOUNDS=component (GPU efficiency spec E5) translates differently: it keys its own entries.
+    // DXMT_DXIL_BOUNDS=component (GPU efficiency spec E5) and =off (Task F2) translate differently: any value keys its
+    // own entries.
     static const std::string bounds = env::getEnvVar("DXMT_DXIL_BOUNDS");
     if (!bounds.empty())
       v.update(bounds.data(), bounds.size());

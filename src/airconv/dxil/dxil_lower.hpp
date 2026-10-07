@@ -38,6 +38,10 @@ llvm::Expected<HandleInfo> ResolveHandle(const EntryInfo &entry, llvm::Value *ha
 // (Metal Shader Converter's form: one that straddles its view's end reads zeros); DXMT_DXIL_BOUNDS=component checks
 // each component, as before (triage).
 bool DxilBoundsPerComponent();
+// DXMT_DXIL_BOUNDS=off (Task F2, measurement only): no bounds checks on typed Buffer<> reads (the view's offset is
+// still added) nor on raw and structured accesses: a read past a view reads whatever lies there (a GPU fault where
+// nothing is mapped), a write past it lands there.
+bool DxilBoundsOff();
 
 class Lowering {
 public:
