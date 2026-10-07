@@ -94,10 +94,12 @@ ArgumentEncodingContext::encodeVertexBuffers(uint32_t slot_mask, uint64_t offset
       continue;
     auto &state = vbuf_[slot];
     auto &buffer = state.buffer;
-    if (!buffer.ptr()) {
-      entries[index].buffer_handle = 0;
+    if (!buffer.ptr()) { // unbound: the zeroed dummy buffer, stride 0 (shaders don't check, MacNeutron Task F2)
+      entries[index].buffer_handle = dummy_cbuffer_info_.gpu_address;
       entries[index].stride = 0;
       entries[index++].length = 0;
+      makeResident<PipelineStage::Vertex, kind>(dummy_cbuffer_,
+                                                GetResidencyMask<kind>(PipelineStage::Vertex, true, false));
       continue;
     }
     auto valid_length = buffer->length() > state.offset ? buffer->length() - state.offset : 0;

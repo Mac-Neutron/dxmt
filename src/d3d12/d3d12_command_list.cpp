@@ -370,6 +370,10 @@ public:
         if (!(slot_mask & (1 << slot)))
           continue;
         auto &state = vertex_buffers_[slot];
+        if (!state.BufferLocation) { // unbound: zeros (shaders no longer check, Task F2)
+          entries[index++] = {device_->NullVertexBuffer(), 0, 0};
+          continue;
+        }
         entries[index].buffer_handle = state.BufferLocation;
         entries[index].stride = state.StrideInBytes;
         entries[index++].length = state.SizeInBytes;
@@ -2023,6 +2027,7 @@ public:
     cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
     cmd->vertex_argbuf_stride = VBStride;
     cmd->vertex_slot_mask = pso_graphics_ ? pso_graphics_->slot_mask : 0;
+    cmd->null_vertex_buffer = device_->NullVertexBuffer();
   };
 
   void STDMETHODCALLTYPE
