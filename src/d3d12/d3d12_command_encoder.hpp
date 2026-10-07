@@ -39,9 +39,10 @@ struct EncoderData {
   EncoderData *next = nullptr;
   uint64_t id;
   // Timestamps written at this encoder's end (MacNeutron; Metal samples counters only at stage boundaries).
-  struct {
-    obj_handle_t buffer;
+  struct Sample {
+    obj_handle_t buffer; // the query heap's counter buffer, and the query's index in it
     uint32_t index;
+    uint64_t *value; // Task F4: the query's value in its heap, which the queue writes (null: the heap's buffer is read)
   } samples[4];
   uint8_t num_samples = 0;
   uint32_t barriers = 0; // the list's barrier calls before this encoder began (DXMT_STATS, ordering)

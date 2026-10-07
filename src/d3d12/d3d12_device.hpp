@@ -51,6 +51,9 @@ struct TimestampResolve {
   void *dst; // the destination buffer's CPU-visible memory
   // Queries that took another's sample (the same pass end): {slot in dst, sample index}.
   std::vector<std::pair<uint32_t, uint32_t>> aliases;
+  // Task F4: the counter buffer's queries' values (their heap's), copied instead of resolving `samples`; null under
+  // DXMT_D3D12_TIMESTAMP_BLITS=1.
+  const uint64_t *values = nullptr;
 };
 
 class MTLD3D12GraphicsCommandList : public ID3D12GraphicsCommandList2 {
@@ -59,6 +62,7 @@ public:
   size_t encoder_count = 0; // SIZE_MAX while recording
   uint32_t barrier_count = 0; // its barrier calls (MacNeutron: M3 merges render passes only with none between)
   std::vector<TimestampResolve> timestamp_resolves;
+  bool timestamps = false; // Task F4: it samples timestamps (the queue then needs its counter buffer)
   bool custom_resolves = false; // some of them into a custom heap, which the GPU can read (GPU overlap spec §3.11)
   // GPU efficiency spec E7: the resources each barrier call names, as {call index (1-based), ResourceKey}; null: any
   // (an aliasing or UAV barrier without a resource, or one we don't know).
@@ -172,9 +176,16 @@ public:
   std::vector<WMT::Reference<WMT::CounterSampleBuffer>> counters;
   // Per query: the sample it shares (Metal writes one sample per buffer per pass), or ~0u for its own.
   std::vector<uint32_t> aliases;
+  // Task F4 (Ruling 23): each query's last value, written by the queue that sampled it into its command buffer's
+  // counter buffer, once that completes; empty under DXMT_D3D12_TIMESTAMP_BLITS=1 (counters sampled directly).
+  std::vector<uint64_t> values;
 };
 
 constexpr uint32_t kTimestampsPerBuffer = 4096;
+
+// Task F4: DXMT_D3D12_TIMESTAMP_BLITS=1 samples timestamps into their query heaps' counter buffers, each encoder one
+// of them (GPU efficiency spec E2, E4), as before the queues' shared counter buffers.
+bool TimestampBlits();
 
 class MTLD3D12PipelineState : public ID3D12PipelineState {
 public:

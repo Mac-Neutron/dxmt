@@ -19,6 +19,7 @@
 #include "com/com_pointer.hpp"
 #include "d3d12_stats.hpp"
 #include "d3d12_pageable.hpp"
+#include "util_env.hpp"
 #include <algorithm>
 #include <cstring>
 
@@ -62,6 +63,8 @@ public:
         counters.push_back(std::move(samples));
       }
       aliases.assign(pDesc->Count, ~0u);
+      if (!counters.empty() && !TimestampBlits())
+        values.assign(pDesc->Count, 0);
     }
     return S_OK;
   }
@@ -88,6 +91,12 @@ public:
     return E_NOINTERFACE;
   }
 };
+
+bool
+TimestampBlits() {
+  static const bool on = env::getEnvVar("DXMT_D3D12_TIMESTAMP_BLITS") == "1";
+  return on;
+}
 
 HRESULT
 CreateQueryHeap(MTLD3D12Device *pDevice, const D3D12_QUERY_HEAP_DESC *pDesc, REFIID riid, void **ppQueryHeap) {
