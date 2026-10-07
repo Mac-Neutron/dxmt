@@ -117,7 +117,12 @@ MTLD3D12CommandAllocatorImpl::Reset() {
     DXMT_STAT_SCOPE("allocator.Reset");
   if (encoder_last)
     return E_FAIL;
+  DestroyEncoders();
+  return Initialize();
+};
 
+void
+MTLD3D12CommandAllocatorImpl::DestroyEncoders() {
   for (auto &encoder_list : encoder_lists_) {
     EncoderData *next = encoder_list.next;
     while (next) {
@@ -151,9 +156,7 @@ MTLD3D12CommandAllocatorImpl::Reset() {
   for (auto ptr : spilled_cpu_heap_)
     free(ptr);
   spilled_cpu_heap_.clear();
-
-  return Initialize();
-};
+}
 
 MTLD3D12CommandAllocatorImpl::PooledICB &
 MTLD3D12CommandAllocatorImpl::AcquireICB(WMTIndirectCommandBufferInfo &info, size_t MaxCount, WMTResourceOptions storage) {

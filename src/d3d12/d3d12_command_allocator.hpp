@@ -126,6 +126,9 @@ public:
   MTLD3D12CommandAllocatorImpl(MTLD3D12Device *pDevice, D3D12_COMMAND_LIST_TYPE Type);
 
   ~MTLD3D12CommandAllocatorImpl() {
+    // MacNeutron: released without a Reset, the encoders still let go of what they hold (an upscale's MetalFX
+    // upscaler goes back to the device's pool), and the spilled heaps go too.
+    DestroyEncoders();
     free(cpu_heap_);
     cpu_heap_ = nullptr;
     gpu_heap_buffer_ = {};
@@ -141,6 +144,9 @@ public:
   QueryInterface(REFIID riid, void **ppvObject);
 
   HRESULT STDMETHODCALLTYPE Reset();
+
+  // The recorded encoders' destructors, and the CPU heaps they spilled into, freed (Reset and the destructor).
+  void DestroyEncoders();
 
   HRESULT STDMETHODCALLTYPE CreateCommandList(
       UINT NodeMask, D3D12_COMMAND_LIST_TYPE Type, ID3D12PipelineState *pInitialPipelineState, REFIID riid,
