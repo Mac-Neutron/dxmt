@@ -444,9 +444,10 @@ public:
     return S_OK;
   }
 
-  // MacNeutron: vsync (Present1) paces to monitor_'s current refresh rate, read at creation, ResizeBuffers and
-  // leaving fullscreen (entering it, ChangeDisplayMode sets the mode's). ponytail: a window moved to another display
-  // keeps the old rate until its next ResizeBuffers; no test moves a window between displays (the checks have one).
+  // MacNeutron: vsync (Present1) paces to monitor_'s current refresh rate, read at creation, at every ResizeBuffers
+  // (fullscreen too: monitor_ is then the fullscreen output's, whose mode SetFullscreenState set) and leaving
+  // fullscreen (entering it, ChangeDisplayMode sets the mode's). ponytail: a window moved to another display keeps the
+  // old rate until its next ResizeBuffers; no test moves a window between displays (the checks have one).
   void
   ReadRefreshRate() {
     wsi::WsiMode mode;
@@ -508,8 +509,11 @@ public:
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT flags) final {
     DXMT_STAT_SCOPE("swapchain.ResizeBuffers");
-    if (flags) // MacNeutron: GetDesc1 and the fullscreen calls see them (ALLOW_MODE_SWITCH)
-      desc_.Flags = flags;
+    // MacNeutron: GetDesc1 and the fullscreen calls see them (ALLOW_MODE_SWITCH); the waitable object stays as created
+    // (DXGI can't add or remove it later).
+    if (flags)
+      desc_.Flags = (flags & ~DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) |
+                    (desc_.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
     if (fullscreen_desc_.Windowed) // a window moved to another display paces to it
       monitor_ = wsi::getWindowMonitor(hWnd);
     ReadRefreshRate();
