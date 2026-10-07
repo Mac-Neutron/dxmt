@@ -1550,11 +1550,9 @@ public:
   void STDMETHODCALLTYPE
   IASetVertexBuffers(UINT StartSlot, UINT Count, const D3D12_VERTEX_BUFFER_VIEW *Views) {
     DXMT_STAT_SCOPE("list.IASetVertexBuffers");
-    if (!Views)
-      return;
-    
+    // MacNeutron: no views unbinds the slots, which then read zeros (measured: D3DMetal ignores such a call).
     for (unsigned Slot = StartSlot; Slot < StartSlot + Count; Slot++) {
-      vertex_buffers_[Slot] = Views[Slot - StartSlot];
+      vertex_buffers_[Slot] = Views ? Views[Slot - StartSlot] : D3D12_VERTEX_BUFFER_VIEW{};
     }
     dirty_state_.set(DirtyState::VertexBuffer);
   };
