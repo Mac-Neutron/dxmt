@@ -201,11 +201,7 @@ public:
     }
 
     preferred_max_frame_rate = Config::getInstance().getOption<int>("d3d12.preferredMaxFrameRate", 0);
-    wsi::WsiMode current_mode;
-    if (wsi::getCurrentDisplayMode(monitor_, &current_mode) && current_mode.refreshRate.denominator != 0 &&
-        current_mode.refreshRate.numerator != 0) {
-      init_refresh_rate_ = (double)current_mode.refreshRate.numerator / (double)current_mode.refreshRate.denominator;
-    }
+    ReadRefreshRate();
 
     hud.initialize(GetVersionDescriptionText(12, device_->GetFeatureLevel()));
 
@@ -380,6 +376,7 @@ public:
     fullscreen_desc_.Windowed = TRUE;
     target_ = nullptr;
     monitor_ = wsi::getWindowMonitor(hWnd);
+    ReadRefreshRate();
 
     if (!wsi::isWindow(hWnd))
       return S_OK;
@@ -447,6 +444,16 @@ public:
     return S_OK;
   }
 
+  // MacNeutron: vsync (Present1) paces to monitor_'s current refresh rate, read at creation, ResizeBuffers and
+  // leaving fullscreen (entering it, ChangeDisplayMode sets the mode's). ponytail: a window moved to another display
+  // keeps the old rate until its next ResizeBuffers; no test moves a window between displays (the checks have one).
+  void
+  ReadRefreshRate() {
+    wsi::WsiMode mode;
+    if (wsi::getCurrentDisplayMode(monitor_, &mode) && mode.refreshRate.denominator && mode.refreshRate.numerator)
+      init_refresh_rate_ = (double)mode.refreshRate.numerator / (double)mode.refreshRate.denominator;
+  }
+
   HRESULT
   RestoreDisplayMode(HMONITOR hMonitor) {
     if (!hMonitor)
@@ -455,7 +462,6 @@ public:
     if (!wsi::restoreDisplayMode(hMonitor))
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
 
-    init_refresh_rate_ = DBL_MAX;
     return S_OK;
   }
 
@@ -502,6 +508,11 @@ public:
   STDMETHODCALLTYPE
   ResizeBuffers(UINT BufferCount, UINT Width, UINT Height, DXGI_FORMAT Format, UINT flags) final {
     DXMT_STAT_SCOPE("swapchain.ResizeBuffers");
+    if (flags) // MacNeutron: GetDesc1 and the fullscreen calls see them (ALLOW_MODE_SWITCH)
+      desc_.Flags = flags;
+    if (fullscreen_desc_.Windowed) // a window moved to another display paces to it
+      monitor_ = wsi::getWindowMonitor(hWnd);
+    ReadRefreshRate();
     if (Width == 0 || Height == 0) {
       wsi::getWindowSize(hWnd, &desc_.Width, &desc_.Height);
     } else {
