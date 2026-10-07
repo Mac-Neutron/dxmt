@@ -187,6 +187,7 @@ class MTLD3D12Texture : public MTLD3D12Pageable<MTLD3D12Resource> {
   D3D12_RESOURCE_DESC desc_;
   D3D12_HEAP_PROPERTIES heap_props_;
   D3D12_HEAP_FLAGS heap_flags_;
+  Com<MTLD3D12Heap, false> heap_; // MacNeutron: a placed texture keeps its heap (and its residency), as in D3D12
 
 public:
   MTLD3D12Texture(MTLD3D12Device *pDevice) : MTLD3D12Pageable<MTLD3D12Resource>(pDevice) {}
@@ -238,6 +239,7 @@ public:
       flags.set(TextureAllocationFlag::CpuInvisible);
     if (pHeap) {
       texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
+      heap_ = pHeap;
     } else {
       texture->rename(texture->allocate(flags));
       device_->RegisterResidency(texture->current()->texture());
