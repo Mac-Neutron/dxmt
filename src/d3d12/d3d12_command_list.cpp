@@ -2017,6 +2017,7 @@ public:
     auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount);
     cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
     cmd->vertex_argbuf_stride = VBStride;
+    cmd->vertex_slot_mask = pso_graphics_ ? pso_graphics_->slot_mask : 0;
   };
 
   void STDMETHODCALLTYPE

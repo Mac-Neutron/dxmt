@@ -307,6 +307,7 @@ MTLD3D12CommandAllocatorImpl::EncodeIndirectRenderCommand(
     data->static_samplers = 0;
     data->vertex_buffer = 0;
     data->vertex_argbuf_stride = 0;
+    data->vertex_slot_mask = 0;
     data->primitive_type = 0;
     data->index_buffer = 0;
     data->index_buffer_format = {};

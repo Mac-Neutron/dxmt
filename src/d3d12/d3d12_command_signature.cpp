@@ -85,6 +85,7 @@ struct dxmt_render_command_data {
   device void * index_buffer;
   uint index_buffer_format;
   uint vertex_argbuf_stride;
+  uint vertex_slot_mask;
 };
 
 )";
@@ -251,8 +252,11 @@ public:
         break;
       }
       case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: {
+        // MacNeutron: the table holds the slots the pipeline uses, in order (PopulateVertexBufferTable): a view goes to
+        // its slot's place there, and one for a slot the pipeline doesn't use goes nowhere.
         auto slot = arg.VertexBuffer.Slot;
-        source << "vertex_buffer[" << slot << "] = {arg.vb_" << i << ".buffer,arg.vb_" << i
+        source << "if (command_data.vertex_slot_mask & " << (1u << slot) << "u) vertex_buffer[popcount(command_data."
+               << "vertex_slot_mask & " << ((1u << slot) - 1) << "u)] = {arg.vb_" << i << ".buffer,arg.vb_" << i
                << ".stride_in_bytes,arg.vb_" << i << ".size_in_bytes};\n";
         break;
       }
