@@ -240,23 +240,25 @@ public:
     air.CreateDiscard();
   }
 
+  // MacNeutron: a UAV sync fences at its scope at any Metal version, then waits for the group if asked (a barrier's
+  // memory flags order only within the group); a TGSM fence without the group sync (GroupMemoryBarrier) is a fence
+  // alone. Both used to fence only at Metal 3.2, and the TGSM one emitted nothing. dxil_lower.cpp's Barrier does the
+  // same for DXIL.
   void
   operator()(const InstSync &sync) {
     using namespace llvm::air;
     MemFlags mem_flag = sync.tgsm_memory_barrier ? MemFlags::Threadgroup : MemFlags::None;
-    if (sync.uav_boundary != InstSync::UAVBoundary::none) {
+    bool uav = sync.uav_boundary != InstSync::UAVBoundary::none;
+    if (uav)
       mem_flag |= MemFlags::Device | MemFlags::Texture;
-      if (SupportsNonExecutionBarrier())
-        air.CreateAtomicFence(
-            mem_flag,
-            (sync.uav_boundary == InstSync::UAVBoundary::global ? (ThreadScope::Device | ThreadScope::Threadgroup)
-                                                                : ThreadScope::Threadgroup)
-        );
-      if (sync.tgsm_execution_barrier)
-        air.CreateBarrier(SupportsNonExecutionBarrier() ? MemFlags::None : mem_flag);
-    } else if (sync.tgsm_execution_barrier) {
-      air.CreateBarrier(mem_flag);
-    }
+    if (uav || (!sync.tgsm_execution_barrier && mem_flag != MemFlags::None))
+      air.CreateAtomicFence(
+          mem_flag,
+          (sync.uav_boundary == InstSync::UAVBoundary::global ? (ThreadScope::Device | ThreadScope::Threadgroup)
+                                                              : ThreadScope::Threadgroup)
+      );
+    if (sync.tgsm_execution_barrier)
+      air.CreateBarrier(uav && SupportsNonExecutionBarrier() ? MemFlags::None : mem_flag);
   }
 
   void operator()(const InstMov &);
