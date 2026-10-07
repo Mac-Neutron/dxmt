@@ -201,13 +201,32 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // (SameTarget), it resolves no indirect commands, and the samples fit (4 counter buffers, one sample each). Base
   // must be its group's join. Fills merged_ in order, and `info` with the moved samples.
   // ponytail: one ExecuteCommandLists call; merging across calls B coalesced would defer encoding to commit time.
+  // DXMT_STATS counts why a render pass that could have joined (the next encoder but for list boundaries and
+  // timestamp-only blits) didn't, for the base-pass merge (B6, Task F4).
+  enum MergeRefusal { kRefusedTimestamps, kRefusedResolver, kRefusedBarrier, kRefusedAttachments, kRefusedOther };
+  static void
+  RefuseMerge(EncoderData *e, MergeRefusal why) {
+    if (!g_stats_on)
+      return;
+    static const unsigned ids[] = {StatId("#render pass merges refused (timestamps)"),
+                                   StatId("#render pass merges refused (resolver)"),
+                                   StatId("#render pass merges refused (barrier)"),
+                                   StatId("#render pass merges refused (attachments)"),
+                                   StatId("#render pass merges refused (other)")};
+    while (e && (e->type == EncoderType::Null || (e->type == EncoderType::Blit && e->timestamp_only)))
+      e = e->next; // ponytail: within its list; a pass that starts the next list is counted only if it's e
+    if (e && e->type == EncoderType::Render)
+      StatCount(ids[why]);
+  }
   void
   PlanMerge(RenderEncoderData *base, unsigned list, ID3D12CommandList *const *lists, unsigned count,
             WMTRenderPassInfo &info) {
     merged_.clear();
     folds_.clear();
-    if (!base->join || base->visibility_buffer) // a pass counting into a query: its counting would reach the next
+    if (!base->join || base->visibility_buffer) { // a pass counting into a query: its counting would reach the next
+      RefuseMerge(base->next, kRefusedOther);
       return;
+    }
     unsigned samples = base->num_samples;
     auto fits = [&](EncoderData *e, unsigned &n) {
       for (unsigned k = 0; k < e->num_samples; k++) {
@@ -225,18 +244,24 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     auto barriers = [&]() { return l == last_list ? last->barriers_last : 0u; }; // allowed before cursor, in list l
     for (;;) {
       if (!cursor) { // the end of list l: no barrier after `last` (or anywhere in a list of timestamps alone)
-        if (static_cast<MTLD3D12GraphicsCommandList *>(lists[l])->barrier_count != barriers() || ++l == count ||
-            std::find(lists + list, lists + l, lists[l]) != lists + l) // a list executed twice in this call
+        bool barrier = static_cast<MTLD3D12GraphicsCommandList *>(lists[l])->barrier_count != barriers();
+        if (++l == count)
           break;
         cursor = static_cast<MTLD3D12GraphicsCommandList *>(lists[l])->entry;
+        if (barrier || std::find(lists + list, lists + l, lists[l]) != lists + l) { // or a list executed twice
+          RefuseMerge(cursor, barrier ? kRefusedBarrier : kRefusedOther);
+          break;
+        }
         continue;
       }
       if (cursor->type == EncoderType::Null) {
         cursor = cursor->next;
         continue;
       }
-      if (cursor->barriers_last != barriers()) // no barrier before it, or inside it, since `last`
+      if (cursor->barriers_last != barriers()) { // no barrier before it, or inside it, since `last`
+        RefuseMerge(cursor, kRefusedBarrier);
         break;
+      }
       if (cursor->type == EncoderType::Blit && cursor->timestamp_only) {
         folds_.push_back(cursor);
         cursor = cursor->next;
@@ -253,6 +278,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (!ok) { // put back what `fits` wrote past the samples kept
         for (unsigned j = samples; j < n; j++)
           info.sample_buffers[j] = {};
+        RefuseMerge(next, next->pre_tail            ? kRefusedResolver
+                          : !SameTarget(base, next) ? kRefusedAttachments
+                                                    : kRefusedTimestamps);
         break;
       }
       samples = n;
@@ -388,7 +416,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     auto last = pending_samples_.back();
     bool fits = !own || own == last.first;
     for (size_t k = 0; k + (fits ? 1 : 0) < pending_samples_.size(); k++)
-      SampleAfter(cmdbuf, pending_samples_[k].first, pending_samples_[k].second);
+      SampleAfter(cmdbuf, pending_samples_[k].first, pending_samples_[k].second,
+                  k + 1 < pending_samples_.size() ? kLoneSeveral : kLoneCounterBuffer);
     pending_samples_.clear();
     if (!fits)
       return {0, ~0ull};
@@ -402,7 +431,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   void
   FlushPending(WMT::CommandBuffer &cmdbuf) {
     for (auto [buffer, index] : pending_samples_)
-      SampleAfter(cmdbuf, buffer, index);
+      SampleAfter(cmdbuf, buffer, index, kLoneNoStart);
     pending_samples_.clear();
   }
 
@@ -427,10 +456,20 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   }
 
   // A timestamp taken right after the earlier work, in a blit of its own (with the scratch fill). For counter buffers
-  // an encoder can't take beside another (GPU efficiency spec E2).
+  // an encoder can't take beside another (GPU efficiency spec E2). DXMT_STATS counts why (Task F4): another counter
+  // buffer than the encoder's, the earlier of several waiting for one encoder's start, a next encoder that takes none
+  // (a clear, a resolve, the upscale, a pass's indirect resolvers, an encoder without commands), the end of the call.
+  enum LoneReason { kLoneCounterBuffer, kLoneSeveral, kLoneNoStart, kLoneEnd };
   void
-  SampleAfter(WMT::CommandBuffer &cmdbuf, obj_handle_t sample_buffer, uint64_t index) {
+  SampleAfter(WMT::CommandBuffer &cmdbuf, obj_handle_t sample_buffer, uint64_t index, LoneReason why) {
     DXMT_STAT_COUNT("#timestamps given their own encoder", 1);
+    if (g_stats_on) {
+      static const unsigned ids[] = {StatId("#lone timestamps (another counter buffer)"),
+                                     StatId("#lone timestamps (several waiting)"),
+                                     StatId("#lone timestamps (next encoder takes none)"),
+                                     StatId("#lone timestamps (end of call)")};
+      StatCount(ids[why]);
+    }
     auto fill = ScratchFill();
     WMTSampleBufferAttachmentInfo attachment = {sample_buffer, ~0ull, index};
     auto blit = cmdbuf.blitCommandEncoderWithSampleBuffers(&attachment, 1);
@@ -1461,7 +1500,7 @@ public:
           encoder.endEncoding();
           for (auto &t : trailing)
             if (t.sample_buffer)
-              SampleAfter(cmdbuf, t.sample_buffer, t.end_of_fragment_sample_index);
+              SampleAfter(cmdbuf, t.sample_buffer, t.end_of_fragment_sample_index, kLoneCounterBuffer);
           break;
         }
         case EncoderType::Blit: {
@@ -1565,7 +1604,7 @@ public:
       }
     }
     for (auto [buffer, index] : pending_samples_) // E4: lone timestamps after the call's last encoder
-      SampleAfter(cmdbuf, buffer, index);
+      SampleAfter(cmdbuf, buffer, index, kLoneEnd);
     pending_samples_.clear();
     pending_join_ = false;
   };
