@@ -76,6 +76,11 @@ DxilBoundsPerComponent() {
   static const bool on = Switch("DXMT_DXIL_BOUNDS", "component");
   return on;
 }
+bool
+DxilBoundsOff() {
+  static const bool on = Switch("DXMT_DXIL_BOUNDS", "off");
+  return on;
+}
 
 Lowering::Lowering(const DXILShader &dxil, dxbc::context &ctx, const EntryInfo *vertex_outputs) :
     dxil(dxil),
