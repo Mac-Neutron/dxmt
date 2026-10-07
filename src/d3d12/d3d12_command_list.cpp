@@ -2154,6 +2154,7 @@ public:
     };
     Rc<Texture> depth_scratch, motion_scratch, output_scratch;
     if (!readable(depth, info.depth_format) || !readable(motion, info.motion_format)) {
+      DXMT_STAT_COUNT("#upscale input copied", 1);
       allocator_->InvalidateCurrentPass(); // a blit of its own: the game's copies before it can't run after it
       PreBlit(nullptr);
       if (!readable(depth, info.depth_format)) {
