@@ -462,10 +462,12 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     return llvm::Error::success();
   }
   case op::Barrier: { // (80, i32 mode): 1 = sync threadgroup, 2 = UAV fence global, 4 = UAV fence threadgroup, 8 = TGSM fence
-    // As airconv's DXBC sync lowering (nt/dxbc_converter_base.hpp, InstSync). A fence without the sync bit
-    // (GroupMemoryBarrier 8, AllMemoryBarrier 10, DeviceMemoryBarrier 2) orders memory but doesn't wait for the group:
-    // a fence alone, at any Metal version (Metal Shader Converter emits air.atomic.fence for them at Metal 3.1 too); it
-    // used to emit nothing below 3.2. (MacNeutron)
+    // As airconv's DXBC sync lowering (nt/dxbc_converter_base.hpp, InstSync), at any Metal version, as Metal Shader
+    // Converter does at Metal 3.1: a fence without the sync bit (GroupMemoryBarrier 8, AllMemoryBarrier 10,
+    // DeviceMemoryBarrier 2) orders memory but doesn't wait for the group, so a fence alone; a synced UAV barrier
+    // (DeviceMemoryBarrierWithGroupSync 3, AllMemoryBarrierWithGroupSync 11) a fence at its scope, then the barrier,
+    // whose memory flags order only within the group. Both used to fence only at 3.2, and D3D12 compiles at 3.1.
+    // (MacNeutron)
     using namespace llvm::air;
     uint32_t mode = ConstantU32(call->getArgOperand(1));
     bool sync = mode & 1, non_execution = ctx.metal_version >= SM50_SHADER_METAL_320;
@@ -477,8 +479,7 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
       if (flags != MemFlags::None)
         air.CreateAtomicFence(flags, scope);
     } else if (mode & 6) {
-      if (non_execution)
-        air.CreateAtomicFence(flags, scope);
+      air.CreateAtomicFence(flags, scope);
       air.CreateBarrier(non_execution ? MemFlags::None : flags);
     } else {
       air.CreateBarrier(flags);
