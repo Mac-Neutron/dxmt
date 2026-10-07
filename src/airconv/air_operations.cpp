@@ -450,44 +450,12 @@ AIRBuilderResult pull_vec4_from_addr_checked(
   co_return value;
 };
 
+// MacNeutron (Task F2): no null check; the runtime binds a zeroed buffer with stride 0 to every unbound slot a
+// pipeline reads (D3D12 and D3D11), which reads zeros widened by the format, as D3D says.
 AIRBuilderResult pull_vec4_from_addr(
   MTLAttributeFormat format, pvalue base_addr, pvalue byte_offset
 ) {
-  return make_op([=](struct AIRBuilderContext ctx) -> llvm::Expected<pvalue> {
-    using namespace llvm;
-    auto &context = ctx.llvm;
-    auto &builder = ctx.builder;
-
-    auto current = builder.GetInsertBlock();
-
-    auto is_null_binding = builder.CreateICmpEQ(
-      builder.CreatePtrToInt(base_addr, ctx.types._long), builder.getInt64(0)
-    );
-
-    auto pull_vertex =
-      llvm::BasicBlock::Create(context, "", current->getParent());
-    auto continuation =
-      llvm::BasicBlock::Create(context, "", current->getParent());
-
-    builder.CreateCondBr(is_null_binding, continuation, pull_vertex);
-    builder.SetInsertPoint(pull_vertex);
-
-    auto ret =
-      pull_vec4_from_addr_checked(format, base_addr, byte_offset).build(ctx);
-    if (auto err = ret.takeError()) {
-      return err;
-    }
-    auto value = ret.get();
-
-    builder.CreateBr(continuation);
-    builder.SetInsertPoint(continuation);
-
-    auto phi = builder.CreatePHI(value->getType(), 2);
-    phi->addIncoming(ConstantAggregateZero::get(value->getType()), current);
-    phi->addIncoming(value, pull_vertex);
-
-    return phi;
-  });
+  return pull_vec4_from_addr_checked(format, base_addr, byte_offset);
 };
 
 }; // namespace dxmt::air
