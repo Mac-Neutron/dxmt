@@ -350,7 +350,7 @@ public:
   };
 
   std::tuple<uint64_t, uint64_t>
-  PopulateVertexBufferTable(uint32_t Count) {
+  PopulateVertexBufferTable(uint32_t Count, uint64_t null_vb = 0) {
     auto slot_mask = pso_graphics_ ? pso_graphics_->slot_mask : 0;
     if (!slot_mask)
       return {0, 0};
@@ -371,7 +371,9 @@ public:
           continue;
         auto &state = vertex_buffers_[slot];
         if (!state.BufferLocation) { // unbound: zeros (shaders no longer check, Task F2)
-          entries[index++] = {device_->NullVertexBuffer(), 0, 0};
+          if (!null_vb) // once per table: the lookup takes the device's null_lock_
+            null_vb = device_->NullVertexBuffer();
+          entries[index++] = {null_vb, 0, 0};
           continue;
         }
         entries[index].buffer_handle = state.BufferLocation;
@@ -2023,11 +2025,11 @@ public:
     cmd->rootsig_qwords_stride = rootsig_graphics_->UploadQwords;
     cmd->static_samplers = EncodeStaticSamplers(rootsig_graphics_.ptr());
     cmd->static_samplers += allocator_->gpu_heap_buffer_address_;
-    auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount);
+    cmd->null_vertex_buffer = device_->NullVertexBuffer();
+    auto [VBOffset, VBStride] = PopulateVertexBufferTable(MaxCommandCount, cmd->null_vertex_buffer);
     cmd->vertex_buffer = allocator_->gpu_heap_buffer_address_ + VBOffset;
     cmd->vertex_argbuf_stride = VBStride;
     cmd->vertex_slot_mask = pso_graphics_ ? pso_graphics_->slot_mask : 0;
-    cmd->null_vertex_buffer = device_->NullVertexBuffer();
   };
 
   void STDMETHODCALLTYPE
