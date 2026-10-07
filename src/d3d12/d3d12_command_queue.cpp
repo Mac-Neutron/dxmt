@@ -1421,7 +1421,10 @@ public:
         auto from = scope.inflight.resolves.insert(
             scope.inflight.resolves.end(), pCommandList->timestamp_resolves.begin(), pCommandList->timestamp_resolves.end()
         );
-        if (!sampling_) // Task F4: sampled into the heaps' own counter buffers
+        // Task F4: this queue sampled into the heaps' own counter buffers. A queue that never sampled (no ring) keeps
+        // the values: another queue's ring wrote them. ponytail: a heap sampled by a queue whose ring failed, resolved
+        // on one with a ring, reads the values array (zeros); per-heap buffers go with Ruling 27's follow-up.
+        if (ring_failed_)
           for (; from != scope.inflight.resolves.end(); ++from)
             from->values = nullptr;
       }
