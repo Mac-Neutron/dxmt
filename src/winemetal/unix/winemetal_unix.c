@@ -172,6 +172,17 @@ _MTLDevice_newBuffer(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* DXMT_MAX_ANISOTROPY=<1..16>: a floor on maxAnisotropy for trilinear, non-comparison samplers (0 = off). */
+static uint32_t forced_max_anisotropy;
+
+__attribute__((constructor)) static void
+read_max_anisotropy(void) {
+  const char *p = getenv("DXMT_MAX_ANISOTROPY");
+  int n = p ? atoi(p) : 0;
+  if (n >= 1 && n <= 16)
+    forced_max_anisotropy = n;
+}
+
 static NTSTATUS
 _MTLDevice_newSamplerState(void *obj) {
   struct unixcall_mtldevice_newsamplerstate *params = obj;
@@ -190,6 +201,10 @@ _MTLDevice_newSamplerState(void *obj) {
   sampler_desc.lodMaxClamp = info->lod_max_clamp;
   sampler_desc.lodMinClamp = info->lod_min_clamp;
   sampler_desc.maxAnisotropy = info->max_anisotroy;
+  if (forced_max_anisotropy && info->min_filter == WMTSamplerMinMagFilterLinear &&
+      info->mag_filter == WMTSamplerMinMagFilterLinear && info->mip_filter == WMTSamplerMipFilterLinear &&
+      info->compare_function == WMTCompareFunctionNever && info->max_anisotroy < forced_max_anisotropy)
+    sampler_desc.maxAnisotropy = forced_max_anisotropy;
   sampler_desc.lodAverage = info->lod_average;
   sampler_desc.normalizedCoordinates = info->normalized_coords;
   sampler_desc.supportArgumentBuffers = info->support_argument_buffers;
