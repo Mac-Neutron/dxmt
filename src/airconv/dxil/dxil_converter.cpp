@@ -236,6 +236,8 @@ LowerBody(const DXILShader &dxil, struct context &ctx, llvm::Function *dxil_main
   // fast flag at all (Metal's compiler treats any as leave to ignore NaN: (x < y) || (x >= y) came out true for a NaN).
   // As airconv's DXBC path (Converter::UseFastMath), pre-raster stages neither reassociate, fuse nor use reciprocals,
   // so a depth prepass and a base pass compute the same positions (their depth EQUAL test holds). (MacNeutron)
+  // A non-precise FMad still becomes air.fma there (Lowering): an explicit fma is the same in every shader the same
+  // DXIL is lowered into, whatever Metal's compiler would contract.
   bool pre_raster = dxil.entry.kind == ShaderKind::Vertex || dxil.entry.kind == ShaderKind::Geometry ||
                     dxil.entry.kind == ShaderKind::Hull || dxil.entry.kind == ShaderKind::Domain;
   for (auto *bb : blocks) {

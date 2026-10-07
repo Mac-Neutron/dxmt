@@ -117,7 +117,10 @@ Lowering::LowerMath(uint32_t opcode, llvm::CallInst *call) {
                                ir.CreateZExtOrTrunc(ir.CreateExtractValue(r, {1}), ty->getStructElementType(1))}));
   }
 
-  case op::FMad: return done(ir.CreateFAdd(ir.CreateFMul(arg(1), arg(2)), arg(3))); // not fused, like D3D's mad
+  case op::FMad: // fused unless precise (DXC marks those; Metal Shader Converter fuses the same ones). (MacNeutron)
+    if (!call->getMetadata("dx.precise"))
+      return done(air.CreateFMA(arg(1), arg(2), arg(3)));
+    return done(ir.CreateFAdd(ir.CreateFMul(arg(1), arg(2)), arg(3)));
   case op::Fma: return done(air.CreateFMA(arg(1), arg(2), arg(3)));
   case op::IMad:
   case op::UMad: return done(ir.CreateAdd(ir.CreateMul(arg(1), arg(2)), arg(3)));
