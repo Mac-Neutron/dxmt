@@ -1822,6 +1822,14 @@ Converter::operator()(const InstSampleDerivative &sample) {
     return;
   }
 
+  // MacNeutron: D3D adds the sampler's MipLODBias to sample_d's LOD; Metal's gradient sample takes no bias. Gradients
+  // scaled by 2^bias move the LOD by bias, also past the anisotropy cap.
+  auto Scale = ir.CreateVectorSplat(
+      llvm::cast<llvm::FixedVectorType>(DDX->getType())->getNumElements(), air.CreateFPUnOp(AIRBuilder::exp2, Sampler->Bias, false)
+  );
+  DDX = ir.CreateFMul(DDX, Scale);
+  DDY = ir.CreateFMul(DDY, Scale);
+
   auto [Value, Residency] = air.CreateSampleGrad(
       Tex->Texture, Tex->Handle, SamplerHandle, Coord, ArrayIndex, DDX, DDY, MinLODClamp, sample.offsets
   );

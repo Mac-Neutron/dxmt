@@ -379,6 +379,11 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
       ddx = ir.CreateInsertElement(ddx, one_d && i == 1 ? llvm::ConstantFP::get(ir.getFloatTy(), 0) : arg(10 + i), i);
       ddy = ir.CreateInsertElement(ddy, one_d && i == 1 ? llvm::ConstantFP::get(ir.getFloatTy(), 0) : arg(13 + i), i);
     }
+    // MacNeutron: D3D adds the sampler's MipLODBias to a gradient sample's LOD; Metal's gradient sample takes no bias.
+    // Gradients scaled by 2^bias move the LOD by bias, also past the anisotropy cap.
+    auto scale = ir.CreateVectorSplat(dims, air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, bias, false));
+    ddx = ir.CreateFMul(ddx, scale);
+    ddy = ir.CreateFMul(ddy, scale);
     return result(air.CreateSampleGrad(tex, d->ResourceHandle, sampler, coord, array, ddx, ddy, min_lod(arg(16)).lod, o).first);
   }
   case op::SampleCmp: // (64, ..., compare, clamp)
