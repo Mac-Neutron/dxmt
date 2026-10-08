@@ -292,7 +292,7 @@ public:
       target->GetDesc(&desc);
 
       if (!fullscreen_desc_.Windowed && Fullscreen && monitor_ != desc.Monitor) {
-        HRESULT hr = LeaveFullscreenMode();
+        HRESULT hr = LeaveFullscreenMode(true);
         if (FAILED(hr))
           return hr;
       }
@@ -366,7 +366,7 @@ public:
   }
 
   HRESULT
-  LeaveFullscreenMode() {
+  LeaveFullscreenMode(bool switching_output = false) {
     ModeSetGuard::ModeSetInProgress modeset_inprogress(modeset_guard_);
     if (modeset_inprogress)
       return DXGI_STATUS_MODE_CHANGE_IN_PROGRESS;
@@ -395,7 +395,8 @@ public:
     // game enters fullscreen again when it's restored. In the background means another process's window in front, or
     // none: the game's own popup in front of its window is still the game. Async: the caller may not be the window's
     // thread (Unreal's RHI thread), and must not wait for that thread's message loop.
-    if (!wsi::isProcessForeground()) {
+    // Not when the leave is half of a move to another output: the game enters fullscreen there at once.
+    if (!switching_output && !wsi::isProcessForeground()) {
       Logger::info("Leaving fullscreen in the background: minimising");
       wsi::minimizeWindow(hWnd);
     }
