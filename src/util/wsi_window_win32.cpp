@@ -269,4 +269,8 @@ bool isMinimized(HWND hWindow) {
   return ::IsIconic(hWindow);
 }
 
+void minimizeWindow(HWND hWindow) {
+  ::ShowWindowAsync(hWindow, SW_MINIMIZE);
+}
+
 } // namespace dxmt::wsi

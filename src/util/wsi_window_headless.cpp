@@ -64,4 +64,6 @@ bool isForeground(HWND hWindow) { return true; }
 
 bool isMinimized(HWND hWindow) { return false; }
 
+void minimizeWindow(HWND hWindow) {}
+
 } // namespace dxmt::wsi
