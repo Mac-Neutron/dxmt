@@ -372,9 +372,10 @@ public:
 
     // MacNeutron: a fullscreen window the game leaves while it's in the background is minimised, so it doesn't sit
     // at its windowed size and place after the mode reset (a corner of the screen under Wine's emulated modes); the
-    // game enters fullscreen again when it's restored. Async: the caller may not be the window's thread (Unreal's RHI
-    // thread), and must not wait for that thread's message loop.
-    if (!wsi::isForeground(hWnd)) {
+    // game enters fullscreen again when it's restored. In the background means another process's window in front, or
+    // none: the game's own popup in front of its window is still the game. Async: the caller may not be the window's
+    // thread (Unreal's RHI thread), and must not wait for that thread's message loop.
+    if (!wsi::isProcessForeground()) {
       Logger::info("Leaving fullscreen in the background: minimising");
       wsi::minimizeWindow(hWnd);
     }

@@ -119,6 +119,15 @@ bool isForeground(HWND hWindow);
 bool isMinimized(HWND hWindow);
 
 /**
+ * \brief Is a window of this process in front?
+ *
+ * A game's own popups (a dialog, an overlay) count as the game; another
+ * process's window, or none (another Mac app active), doesn't.
+ * \returns Whether the foreground window belongs to this process
+ */
+bool isProcessForeground();
+
+/**
  * \brief Minimizes a window without waiting for its thread
  *
  * \param [in] hWindow The window
