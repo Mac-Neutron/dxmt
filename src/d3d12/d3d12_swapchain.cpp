@@ -765,6 +765,7 @@ public:
       DXMT_STAT_COUNT("#presents skipped (window minimised)", 1);
       ReleaseSemaphore(present_semaphore_, 1, nullptr);
       presentation_count_ += 1;
+      StatsFrame();  // still a frame: DXMT_STATS's per-frame figures and its 5 s reports go on
       Sleep(16);
       return hr;
     }
