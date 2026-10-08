@@ -32,6 +32,9 @@ bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
   return false;
 }
 
+void saveWindowState(HWND hWindow, DXMTWindowState *pState) {
+}
+
 bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
                          DXMTWindowState *pState,
                          [[maybe_unused]] bool modeSwitch) {

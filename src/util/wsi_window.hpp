@@ -48,6 +48,17 @@ void resizeWindow(HWND hWindow, DXMTWindowState *pState, uint32_t width,
 bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode);
 
 /**
+ * \brief Saves a window's rect and styles, to be restored when it leaves fullscreen
+ *
+ * MacNeutron: called before the display mode changes, as the window may be
+ * moved or resized in response to the mode change (WM_DISPLAYCHANGE).
+ *
+ * \param [in] hWindow The window
+ * \param [out] pState The swapchain's window state
+ */
+void saveWindowState(HWND hWindow, DXMTWindowState *pState);
+
+/**
  * \brief Enter fullscreen mode for a window & monitor
  *
  * \param [in] hMonitor The monitor
