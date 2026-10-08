@@ -118,4 +118,11 @@ bool isForeground(HWND hWindow);
 
 bool isMinimized(HWND hWindow);
 
+/**
+ * \brief Minimizes a window without waiting for its thread
+ *
+ * \param [in] hWindow The window
+ */
+void minimizeWindow(HWND hWindow);
+
 } // namespace dxmt::wsi
