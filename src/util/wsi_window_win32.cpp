@@ -124,6 +124,12 @@ bool setWindowMode(HMONITOR hMonitor, HWND hWindow, const WsiMode &mode) {
   return setMonitorDisplayMode(hMonitor, &devMode);
 }
 
+void saveWindowState(HWND hWindow, DXMTWindowState *pState) {
+  ::GetWindowRect(hWindow, &pState->rect);
+  pState->style = ::GetWindowLongW(hWindow, GWL_STYLE);
+  pState->exstyle = ::GetWindowLongW(hWindow, GWL_EXSTYLE);
+}
+
 bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
                          DXMTWindowState *pState,
                          [[maybe_unused]] bool modeSwitch) {
@@ -137,15 +143,10 @@ bool enterFullscreenMode(HMONITOR hMonitor, HWND hWindow,
   escape.hContext = HandleToUlong(hWindow);
   D3DKMTEscape(&escape);
 
-  // Find a display mode that matches what we need
-  ::GetWindowRect(hWindow, &pState->rect);
-
-  // Change the window flags to remove the decoration etc.
-  LONG style = ::GetWindowLongW(hWindow, GWL_STYLE);
-  LONG exstyle = ::GetWindowLongW(hWindow, GWL_EXSTYLE);
-
-  pState->style = style;
-  pState->exstyle = exstyle;
+  // Change the window flags to remove the decoration etc. (saveWindowState
+  // recorded the windowed ones before the mode change)
+  LONG style = pState->style;
+  LONG exstyle = pState->exstyle;
 
   style &= ~WS_OVERLAPPEDWINDOW;
   exstyle &= ~WS_EX_OVERLAPPEDWINDOW;

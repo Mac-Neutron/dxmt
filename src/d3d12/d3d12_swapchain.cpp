@@ -326,6 +326,10 @@ public:
 
     std::unique_lock<dxmt::mutex> lock(mutex_);
 
+    // MacNeutron: before the mode change, which the game may answer by moving or resizing the window
+    // (WM_DISPLAYCHANGE); leaving fullscreen restores what the window had while windowed.
+    wsi::saveWindowState(hWnd, &window_state_);
+
     DXGI_MODE_DESC1 preferred_display_mode = {
         desc_.Width,
         desc_.Height,
