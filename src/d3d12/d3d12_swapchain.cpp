@@ -755,6 +755,18 @@ public:
     if (PresentFlags & DXGI_PRESENT_TEST)
       return hr;
 
+    // MacNeutron: a minimised window's layer gets no drawable worth waiting for: skip the present, as D3D11 does for
+    // an occluded window, but return S_OK (flip model never gets DXGI_STATUS_OCCLUDED), rotate the buffers and free
+    // the frame latency object's slot as a present would. ponytail: a 60 Hz sleep keeps a minimised game from
+    // spinning without the drawable's pacing; the display's refresh rate if 60 Hz is ever too slow.
+    if (wsi::isMinimized(hWnd)) {
+      DXMT_STAT_COUNT("#presents skipped (window minimised)", 1);
+      ReleaseSemaphore(present_semaphore_, 1, nullptr);
+      presentation_count_ += 1;
+      Sleep(16);
+      return hr;
+    }
+
     double vsync_duration = std::max(
         SyncInterval * 1.0 / (preferred_max_frame_rate ? preferred_max_frame_rate : init_refresh_rate_),
         preferred_max_frame_rate ? 1.0 / preferred_max_frame_rate : 0
