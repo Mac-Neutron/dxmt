@@ -269,6 +269,12 @@ bool isMinimized(HWND hWindow) {
   return ::IsIconic(hWindow);
 }
 
+bool isProcessForeground() {
+  DWORD pid = 0;
+  ::GetWindowThreadProcessId(::GetForegroundWindow(), &pid);
+  return pid == ::GetCurrentProcessId();
+}
+
 void minimizeWindow(HWND hWindow) {
   ::ShowWindowAsync(hWindow, SW_MINIMIZE);
 }
