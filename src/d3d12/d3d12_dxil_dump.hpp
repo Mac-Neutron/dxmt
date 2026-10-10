@@ -13,11 +13,13 @@ void DumpDXIL(const D3D12_SHADER_BYTECODE &Bytecode);
 
 // True when DXMT_DXIL_DUMP is set. The device then reports what Unreal Engine's SM6 check needs (feature level 12_1,
 // shader model up to 6.7, binding tier 3, wave ops, 64-bit atomics), so SM6-only games get as far as creating their
-// DXIL pipelines, which are captured and fail with E_NOTIMPL. For capture runs only: such a game can't render.
+// DXIL pipelines, which are captured; a pipeline using an op the translator lacks fails with E_NOTIMPL.
 bool DXILCaptureMode();
 
 // Report what Shader Model 6 games check for (feature level 12_1, SM 6.7, binding tier 3, wave ops, 64-bit atomics):
-// in capture mode, or with DXMT_D3D12_SM6=1. (MacNeutron)
+// by default, so Unreal Engine 5 games start. DXMT_D3D12_SM6=0 reports SM 5.1, feature level 11_1, binding tier 2,
+// no wave ops and no 64-bit atomics again, for a game whose SM6 path fails; capture mode always reports SM6.
+// (MacNeutron)
 bool SM6Caps();
 
 // Capture mode also saves each root signature as <folder>/rs-<FNV-1a 64>.bin, and appends one line per pipeline to

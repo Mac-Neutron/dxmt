@@ -60,7 +60,7 @@ bool DXILCaptureMode() {
 
 bool
 SM6Caps() {
-  static const bool on = DXILCaptureMode() || env::getEnvVar("DXMT_D3D12_SM6") == "1";
+  static const bool on = DXILCaptureMode() || env::getEnvVar("DXMT_D3D12_SM6") != "0";
   return on;
 }
 
