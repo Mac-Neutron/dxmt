@@ -165,6 +165,10 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   default: return llvm::make_error<UnsupportedFeature>("DXIL: only vertex, pixel, geometry and compute shaders are supported");
   }
   FillResourceMaps(*entry, **module, shader->shader_info);
+  // SM50Compile links airconv's msad and sample position libraries for these.
+  shader->shader_info.use_msad = ModuleCallsOp(**module, op::Msad);
+  shader->shader_info.use_samplepos = ModuleCallsOp(**module, op::Texture2DMSGetSamplePosition) ||
+                                      ModuleCallsOp(**module, op::RenderTargetGetSamplePosition);
   std::map<uint32_t, uint32_t> unpacked_inputs;
   if (auto err = AddSignatureHandlers(*entry, **module, shader, unpacked_inputs))
     return err;

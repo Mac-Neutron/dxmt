@@ -1366,6 +1366,18 @@ AIRCONV_API void SM50Destroy(sm50_shader_t pShader) {
   delete (dxmt::dxbc::SM50ShaderInternal *)pShader;
 }
 
+// Links airconv's Metal helpers (msad, sample positions) a module calls. A DXIL module (`dxil`: its stage) keeps the
+// DXIL float policy in them too: Metal compiled them with fast math. (MacNeutron)
+static void
+LinkHelpers(llvm::Module &M, bool msad, bool samplepos, std::optional<dxmt::dxil::ShaderKind> dxil) {
+  if (msad)
+    dxmt::linkMSAD(M);
+  if (samplepos)
+    dxmt::linkSamplePos(M);
+  if (dxil && (msad || samplepos))
+    dxmt::dxil::StripFastMath(M, *dxil);
+}
+
 AIRCONV_API int SM50Compile(
   sm50_shader_t pShader, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs,
   const char *FunctionName, sm50_bitcode_t *ppBitcode, sm50_error_t *ppError
@@ -1412,10 +1424,9 @@ AIRCONV_API int SM50Compile(
     return 1;
   }
 
-  if (shader_info.use_msad)
-    linkMSAD(*pModule);
-  if (shader_info.use_samplepos)
-    linkSamplePos(*pModule);
+  auto &dxil_shader = ((dxmt::dxbc::SM50ShaderInternal *)pShader)->dxil;
+  LinkHelpers(*pModule, shader_info.use_msad, shader_info.use_samplepos,
+              dxil_shader ? std::optional(dxil_shader->entry.kind) : std::nullopt);
 
   runOptimizationPasses(*pModule);
 
@@ -1644,10 +1655,13 @@ AIRCONV_API int SM50CompileGeometryPipelineVertex(
     return 1;
   }
 
-  if (shader_info.use_msad)
-    linkMSAD(*pModule);
-  if (shader_info.use_samplepos)
-    linkSamplePos(*pModule);
+  // The object function runs the vertex shader, so a DXIL pipeline links its helpers too (D3D11 links the geometry
+  // shader's only, as upstream). (MacNeutron)
+  auto vs = (dxbc::SM50ShaderInternal *)pVertexShader;
+  bool dxil_pipeline = vs->dxil || ((dxbc::SM50ShaderInternal *)pGeometryShader)->dxil;
+  LinkHelpers(*pModule, shader_info.use_msad || (dxil_pipeline && vs->shader_info.use_msad),
+              shader_info.use_samplepos || (dxil_pipeline && vs->shader_info.use_samplepos),
+              dxil_pipeline ? std::optional(dxmt::dxil::ShaderKind::Geometry) : std::nullopt);
 
   runOptimizationPasses(*pModule);
 
@@ -1719,10 +1733,11 @@ AIRCONV_API int SM50CompileGeometryPipelineGeometry(
     return 1;
   }
 
-  if (shader_info.use_msad)
-    linkMSAD(*pModule);
-  if (shader_info.use_samplepos)
-    linkSamplePos(*pModule);
+  // The mesh function runs the geometry shader alone: its helpers are the ones to link.
+  LinkHelpers(*pModule, shader_info.use_msad, shader_info.use_samplepos,
+              ((dxbc::SM50ShaderInternal *)pVertexShader)->dxil || ((dxbc::SM50ShaderInternal *)pGeometryShader)->dxil
+                  ? std::optional(dxmt::dxil::ShaderKind::Geometry)
+                  : std::nullopt);
   
   runOptimizationPasses(*pModule);
 

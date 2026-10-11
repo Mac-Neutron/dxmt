@@ -221,6 +221,16 @@ Lowering::LowerMath(uint32_t opcode, llvm::CallInst *call) {
     }
     return done(packed);
   }
+  case op::Msad: { // (ref, src, accum): airconv's msad library, linked when use_msad is set (as the DXBC msad lowering)
+    if (!ty->isIntegerTy(32))
+      return Unsupported(call);
+    auto &context = ir.getContext();
+    auto attrs = llvm::AttributeList::get(context, {{~0U, llvm::Attribute::get(context, llvm::Attribute::ReadNone)},
+                                                    {~0U, llvm::Attribute::get(context, llvm::Attribute::NoUnwind)},
+                                                    {~0U, llvm::Attribute::get(context, llvm::Attribute::WillReturn)}});
+    auto fn = air.getModule()->getOrInsertFunction("dxmt.msad.i32", llvm::FunctionType::get(ty, {ty, ty, ty}, false), attrs);
+    return done(ir.CreateCall(fn, {arg(1), arg(2), arg(3)}));
+  }
   default:
     return Unsupported(call);
   }

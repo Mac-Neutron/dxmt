@@ -73,6 +73,12 @@ llvm::Expected<std::unique_ptr<llvm::Module>> ConvertDXILGeometryPipeline(
     SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs
 );
 
+// dxil_converter.cpp: applies the DXIL float policy (no NaN or infinity assumed away; no reassociation, contraction
+// or reciprocals before the rasterizer) to every function defined in `module`, and drops their fast-math function
+// attributes. SM50Compile runs it after linking airconv's Metal helpers (msad, sample positions), which Metal compiled
+// with fast math.
+void StripFastMath(llvm::Module &module, ShaderKind kind);
+
 // dxil_converter.cpp: SM50Compile's DXIL branch; returns the AIR module, ready for airconv's passes.
 llvm::Expected<std::unique_ptr<llvm::Module>> ConvertDXIL(
     dxbc::SM50ShaderInternal *shader, const char *name, llvm::LLVMContext &context,

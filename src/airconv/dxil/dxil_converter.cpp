@@ -218,6 +218,32 @@ ApplyProbe(const DXILShader &dxil, llvm::Function &main) {
       }
 }
 
+// DXC marks most float math `fast`. D3D keeps NaN and infinity, so no stage assumes them away, and compares keep no
+// fast flag at all (Metal's compiler treats any as leave to ignore NaN: (x < y) || (x >= y) came out true for a NaN).
+// As airconv's DXBC path (Converter::UseFastMath), pre-raster stages neither reassociate, fuse nor use reciprocals,
+// so a depth prepass and a base pass compute the same positions (their depth EQUAL test holds). (MacNeutron)
+// A non-precise FMad still becomes air.fma there (Lowering): an explicit fma is the same in every shader the same
+// DXIL is lowered into, whatever Metal's compiler would contract.
+bool
+PreRaster(ShaderKind kind) {
+  return kind == ShaderKind::Vertex || kind == ShaderKind::Geometry || kind == ShaderKind::Hull || kind == ShaderKind::Domain;
+}
+
+void
+StripFastMath(llvm::Instruction &inst, bool pre_raster) {
+  if (llvm::isa<llvm::FCmpInst>(&inst)) {
+    inst.copyFastMathFlags(llvm::FastMathFlags());
+  } else if (llvm::isa<llvm::FPMathOperator>(&inst)) {
+    inst.setHasNoNaNs(false);
+    inst.setHasNoInfs(false);
+    if (pre_raster) {
+      inst.setHasAllowReassoc(false);
+      inst.setHasAllowContract(false);
+      inst.setHasAllowReciprocal(false);
+    }
+  }
+}
+
 // Moves the DXIL entry's blocks to the end of the function being built, turns its returns into branches to
 // `epilogue`, lowers every dx.op call, and returns the block that enters the body. The insertion point is kept (the
 // caller branches to the body from where its prologue ended; the prologue may have added blocks, e.g. vertex pulls).
@@ -232,31 +258,14 @@ LowerBody(const DXILShader &dxil, struct context &ctx, llvm::Function *dxil_main
     blocks.push_back(&bb);
   ctx.function->getBasicBlockList().splice(ctx.function->end(), dxil_main->getBasicBlockList());
   std::vector<llvm::CallInst *> calls; // collected first: lowering erases them
-  // DXC marks most float math `fast`. D3D keeps NaN and infinity, so no stage assumes them away, and compares keep no
-  // fast flag at all (Metal's compiler treats any as leave to ignore NaN: (x < y) || (x >= y) came out true for a NaN).
-  // As airconv's DXBC path (Converter::UseFastMath), pre-raster stages neither reassociate, fuse nor use reciprocals,
-  // so a depth prepass and a base pass compute the same positions (their depth EQUAL test holds). (MacNeutron)
-  // A non-precise FMad still becomes air.fma there (Lowering): an explicit fma is the same in every shader the same
-  // DXIL is lowered into, whatever Metal's compiler would contract.
-  bool pre_raster = dxil.entry.kind == ShaderKind::Vertex || dxil.entry.kind == ShaderKind::Geometry ||
-                    dxil.entry.kind == ShaderKind::Hull || dxil.entry.kind == ShaderKind::Domain;
+  bool pre_raster = PreRaster(dxil.entry.kind);
   for (auto *bb : blocks) {
     if (auto ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(bb->getTerminator())) {
       llvm::BranchInst::Create(epilogue, ret);
       ret->eraseFromParent();
     }
     for (auto &inst : *bb) {
-      if (llvm::isa<llvm::FCmpInst>(&inst)) {
-        inst.copyFastMathFlags(llvm::FastMathFlags());
-      } else if (llvm::isa<llvm::FPMathOperator>(&inst)) {
-        inst.setHasNoNaNs(false);
-        inst.setHasNoInfs(false);
-        if (pre_raster) {
-          inst.setHasAllowReassoc(false);
-          inst.setHasAllowContract(false);
-          inst.setHasAllowReciprocal(false);
-        }
-      }
+      StripFastMath(inst, pre_raster);
       if (auto call = llvm::dyn_cast<llvm::CallInst>(&inst); call && OpCode(*call) != ~0u)
         calls.push_back(call);
     }
@@ -289,6 +298,21 @@ llvm::Error Finish(llvm::Module &module, llvm::Function *dxil_main) {
 }
 
 } // namespace
+
+void
+StripFastMath(llvm::Module &module, ShaderKind kind) {
+  for (auto &fn : module) {
+    if (fn.isDeclaration())
+      continue;
+    // The function-level fast math Metal's compiler gives the helpers, which would allow what the flags no longer do.
+    for (auto attr :
+         {"unsafe-fp-math", "no-nans-fp-math", "no-infs-fp-math", "no-signed-zeros-fp-math", "approx-func-fp-math"})
+      fn.removeFnAttr(attr);
+    for (auto &bb : fn)
+      for (auto &inst : bb)
+        StripFastMath(inst, PreRaster(kind));
+  }
+}
 
 llvm::Expected<std::unique_ptr<llvm::Module>>
 ConvertDXIL(SM50ShaderInternal *shader, const char *name, llvm::LLVMContext &context, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs) {
