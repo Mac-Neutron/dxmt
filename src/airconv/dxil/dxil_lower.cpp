@@ -502,6 +502,64 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     Replace(call, ir.CreateAdd(lo, hi));
     return llvm::Error::success();
   }
+  case op::WaveMatch: { // (165, T) -> %dx.types.fouri32 {lanes 0-31, 0, 0, 0}: the lanes whose value equals this lane's
+    // A loop over the distinct values: each pass reads the first remaining lane's value, and the lanes holding it leave
+    // with their ballot. That first lane always leaves, a NaN too: the loop ends, and D3D's own-lane bit is set.
+    auto v = call->getArgOperand(1);
+    auto ty = v->getType();
+    auto head = call->getParent();
+    auto done = head->splitBasicBlock(call);
+    auto loop = llvm::BasicBlock::Create(ir.getContext(), "", head->getParent(), done);
+    head->getTerminator()->setSuccessor(0, loop);
+    ir.SetInsertPoint(loop);
+    auto first = Simd(ir, "air.simd_broadcast_first" + SimdSuffix(ty, false), ty, {v});
+    llvm::Value *same = ty->isFloatingPointTy()
+                            ? ir.CreateOr(ir.CreateFCmpOEQ(v, first), Simd(ir, "air.simd_is_first", ir.getInt1Ty(), {}))
+                            : ir.CreateICmpEQ(v, first);
+    auto lanes = Simd(ir, "air.simd_ballot.i64", ir.getInt64Ty(), {masked(same, ir.getFalse())});
+    ir.CreateCondBr(same, done, loop);
+    ir.SetInsertPoint(call);
+    Replace(call, Aggregate(call->getType(), {ir.CreateTrunc(lanes, ir.getInt32Ty()), ir.getInt32(0), ir.getInt32(0),
+                                              ir.getInt32(0)}));
+    return llvm::Error::success();
+  }
+  case op::WaveMultiPrefixOp:         // (166, T, i32 mask0-3, i8 op: 0 sum, 1 and, 2 or, 3 xor, 4 product, i8 sign)
+  case op::WaveMultiPrefixBitCount: { // (167, i1, i32 mask0-3)
+    // The lanes below this one in its partition, mask0 (lanes are 32 wide); D3D ignores the inactive and helper ones.
+    auto lane = ctx.function->getArg(dxil.lane_index_arg);
+    auto below = ir.CreateAnd(call->getArgOperand(2), ir.CreateSub(ir.CreateShl(ir.getInt32(1), lane), ir.getInt32(1)));
+    if (opcode == op::WaveMultiPrefixBitCount) {
+      auto ballot = Simd(ir, "air.simd_ballot.i64", ir.getInt64Ty(), {masked(call->getArgOperand(1), ir.getFalse())});
+      Replace(call, air.CreateIntUnOp(llvm::air::AIRBuilder::popcount,
+                                      ir.CreateAnd(ir.CreateTrunc(ballot, ir.getInt32Ty()), below)));
+      return llvm::Error::success();
+    }
+    auto v = call->getArgOperand(1);
+    auto ty = v->getType();
+    bool fp = ty->isFloatingPointTy();
+    uint32_t kind = ConstantU32(call->getArgOperand(6), ~0u);
+    if (kind > 4 || (fp && kind >= 1 && kind <= 3))
+      return Unsupported(call);
+    // The sign operand changes nothing: a sum or a product wraps the same either way.
+    using llvm::Instruction;
+    static const Instruction::BinaryOps ops[] = {Instruction::Add, Instruction::And, Instruction::Or, Instruction::Xor,
+                                                 Instruction::Mul};
+    auto bin = !fp ? ops[kind] : kind ? Instruction::FMul : Instruction::FAdd;
+    // The empty prefix: 0 (sum, or, xor; +0.0 for floats), all ones (and), 1 (product).
+    llvm::Value *acc = kind == 1   ? llvm::Constant::getAllOnesValue(ty)
+                       : kind == 4 ? (fp ? llvm::ConstantFP::get(ty, 1.0) : llvm::ConstantInt::get(ty, 1))
+                                   : llvm::Constant::getNullValue(ty);
+    auto from = ir.CreateAnd(below, ir.CreateTrunc(Simd(ir, "air.simd_ballot.i64", ir.getInt64Ty(), {Participates()}),
+                                                   ir.getInt32Ty()));
+    // ponytail: 32 shuffles a call; a partitioned scan if a shader ever leans on it
+    for (uint32_t j = 0; j < 32; j++) {
+      auto x = Simd(ir, "air.simd_shuffle" + SimdSuffix(ty, false), ty, {v, ir.getInt16(j)});
+      auto in = ir.CreateICmpNE(ir.CreateAnd(from, ir.getInt32(1u << j)), ir.getInt32(0));
+      acc = ir.CreateSelect(in, ir.CreateBinOp(bin, acc, x), acc);
+    }
+    Replace(call, acc);
+    return llvm::Error::success();
+  }
   case op::Barrier: { // (80, i32 mode): 1 = sync threadgroup, 2 = UAV fence global, 4 = UAV fence threadgroup, 8 = TGSM fence
     // As airconv's DXBC sync lowering (nt/dxbc_converter_base.hpp, InstSync), at any Metal version, as Metal Shader
     // Converter does at Metal 3.1: a fence without the sync bit (GroupMemoryBarrier 8, AllMemoryBarrier 10,
