@@ -617,6 +617,8 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     Replace(call, acc);
     return llvm::Error::success();
   }
+  case op::BarrierByMemoryType:   // (244, i32 MemoryTypeFlags, i32 SemanticFlags)
+  case op::BarrierByMemoryHandle: // (245, handle, i32 SemanticFlags): the handle is a UAV
   case op::Barrier: { // (80, i32 mode): 1 = sync threadgroup, 2 = UAV fence global, 4 = UAV fence threadgroup, 8 = TGSM fence
     // As airconv's DXBC sync lowering (nt/dxbc_converter_base.hpp, InstSync), at any Metal version, as Metal Shader
     // Converter does at Metal 3.1: a fence without the sync bit (GroupMemoryBarrier 8, AllMemoryBarrier 10,
@@ -626,6 +628,13 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     // (MacNeutron)
     using namespace llvm::air;
     uint32_t mode = ConstantU32(call->getArgOperand(1));
+    if (opcode != op::Barrier) {
+      // Shader Model 6.8's Barrier() as the op-80 mode it spells (DXC 1.9's DxilConstants.h): memory UAV 1, group shared
+      // 2 (node memory 4, 8 ignored: no node shader reaches the translator); semantics group sync 1, group scope 2,
+      // device scope 4.
+      uint32_t mem = opcode == op::BarrierByMemoryHandle ? 1 : mode, sem = ConstantU32(call->getArgOperand(2));
+      mode = (sem & 1 ? 1 : 0) | (mem & 1 ? (sem & 4 ? 2 : 4) : 0) | (mem & 2 ? 8 : 0);
+    }
     bool sync = mode & 1, non_execution = ctx.metal_version >= SM50_SHADER_METAL_320;
     MemFlags flags = (mode & 8) ? MemFlags::Threadgroup : MemFlags::None;
     auto scope = (mode & 2) ? (ThreadScope::Device | ThreadScope::Threadgroup) : ThreadScope::Threadgroup;
