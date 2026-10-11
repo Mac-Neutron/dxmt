@@ -99,6 +99,8 @@ struct EntryInfo {
   uint32_t sm_major = 0, sm_minor = 0;
   std::string name;
   uint32_t numthreads[3] = {0, 0, 0};
+  // [WaveSize] (entry property WaveSize, or WaveSizeRange from 6.8): the wave widths the shader runs at; 0 without it.
+  uint32_t wave_size_min = 0, wave_size_max = 0;
   // Geometry shaders (entry property GSState): primitive and topology values are D3D10_SB_PRIMITIVE(_TOPOLOGY)'s.
   uint32_t gs_input_primitive = 0, gs_max_vertex_count = 0, gs_stream_mask = 0, gs_output_topology = 0, gs_instances = 1;
   std::vector<SignatureElement> inputs, outputs;
