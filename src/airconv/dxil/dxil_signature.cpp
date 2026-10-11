@@ -408,7 +408,8 @@ void
 AddWaveInputs(const llvm::Module &module, SM50ShaderInternal *shader, uint32_t &lane_index_arg, uint32_t &lane_count_arg) {
   for (uint32_t opcode : {op::WaveIsFirstLane, op::WaveGetLaneIndex, op::WaveGetLaneCount, op::WaveAnyTrue, op::WaveAllTrue,
                           op::WaveActiveAllEqual, op::WaveActiveBallot, op::WaveReadLaneAt, op::WaveReadLaneFirst,
-                          op::WaveActiveOp, op::WaveActiveBit, op::WavePrefixOp, op::WaveAllBitCount, op::WavePrefixBitCount})
+                          op::WaveActiveOp, op::WaveActiveBit, op::WavePrefixOp, op::WaveAllBitCount, op::WavePrefixBitCount,
+                          op::WaveMatch, op::WaveMultiPrefixOp, op::WaveMultiPrefixBitCount})
     if (ModuleCallsOp(module, opcode)) {
       lane_index_arg = shader->func_signature.DefineInput(air::InputThreadIndexInSimdgroup{});
       lane_count_arg = shader->func_signature.DefineInput(air::InputThreadsPerSimdgroup{});
