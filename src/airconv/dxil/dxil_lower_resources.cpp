@@ -277,7 +277,7 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
   // Texel offsets o0.. from argument `first` (`count` of them, the rest 0). Constants (undef is 0) as immediates.
   // Runtime ones, SM 6.7's programmable offsets and Gather's at any model, pass through: wrapped to D3D's low 4 bits,
   // sign-extended, when `wrap` (Load and Sample*); Gather's unwrapped, as the DXBC path's gather4_po (spec 3.6).
-  // Returns whether all were constant.
+  // Constants wrap too: from 6.7 DXC no longer checks their range. Returns whether all were constant.
   auto offset_values = [&](unsigned first, unsigned count, bool wrap, llvm::Value *out[3]) {
     bool constant = true;
     for (unsigned i = 0; i < 3; i++) {
@@ -286,7 +286,8 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
         out[i] = wrap ? ir.CreateAShr(ir.CreateShl(v, 28), 28) : v;
         constant = false;
       } else {
-        out[i] = ir.getInt32(v ? ConstantU32(v, 0) : 0);
+        int32_t c = v ? (int32_t)ConstantU32(v, 0) : 0;
+        out[i] = ir.getInt32(wrap ? ((c & 15) ^ 8) - 8 : c);
       }
     }
     return constant;
@@ -386,11 +387,34 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
       clamp = air.CreateFPBinOp(llvm::air::AIRBuilder::fmax, clamp, shader_clamp);
     return llvm::air::sample_min_lod_clamp{clamp};
   };
+  // MacNeutron: D3D adds the sampler's MipLODBias to a gradient sample's LOD; Metal's gradient sample takes no bias.
+  // Gradients scaled by 2^bias move the LOD by bias, also past the anisotropy cap.
+  auto scaled = [&](std::pair<llvm::Value *, llvm::Value *> grad, llvm::Value *lod_bias) {
+    auto scale = ir.CreateVectorSplat(dims, air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, lod_bias, false));
+    auto ddx = ir.CreateFMul(grad.first, scale);
+    return std::make_pair(ddx, ir.CreateFMul(grad.second, scale));
+  };
+  // A compute shader has no implicit derivatives (spec 3.3): Sample, SampleBias and SampleCmp take the quad's coarse
+  // gradients of their coordinates through the gradient path (`reference`: SampleCmp's).
+  bool compute = entry.kind == ShaderKind::Compute;
+  auto coarse = [&](llvm::Value *lod_bias, llvm::Value *shader_clamp, llvm::Value *reference) {
+    auto [ddx, ddy] = scaled(CoarseGradients(coord), lod_bias);
+    auto clamp = min_lod(shader_clamp).lod;
+    auto offset = o();
+    return result((reference ? air.CreateSampleCmpGrad(tex, d->ResourceHandle, sampler, coord, array, reference, ddx, ddy,
+                                                       clamp, offset)
+                             : air.CreateSampleGrad(tex, d->ResourceHandle, sampler, coord, array, ddx, ddy, clamp, offset))
+                      .first);
+  };
 
   switch (opcode) {
   case op::Sample: // (60, srv, sampler, c0..c3, o0..o2, clamp)
+    if (compute)
+      return coarse(bias, arg(10), nullptr);
     return result(air.CreateSample(tex, d->ResourceHandle, sampler, coord, array, o(), llvm::air::sample_bias{bias}, min_lod(arg(10))).first);
   case op::SampleBias: // (61, ..., bias, clamp)
+    if (compute)
+      return coarse(ir.CreateFAdd(arg(10), bias), arg(11), nullptr);
     return result(air.CreateSample(tex, d->ResourceHandle, sampler, coord, array, o(),
                                    llvm::air::sample_bias{ir.CreateFAdd(arg(10), bias)}, min_lod(arg(11))).first);
   case op::SampleLevel: // (62, ..., lod)
@@ -402,14 +426,12 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
       ddx = ir.CreateInsertElement(ddx, one_d && i == 1 ? llvm::ConstantFP::get(ir.getFloatTy(), 0) : arg(10 + i), i);
       ddy = ir.CreateInsertElement(ddy, one_d && i == 1 ? llvm::ConstantFP::get(ir.getFloatTy(), 0) : arg(13 + i), i);
     }
-    // MacNeutron: D3D adds the sampler's MipLODBias to a gradient sample's LOD; Metal's gradient sample takes no bias.
-    // Gradients scaled by 2^bias move the LOD by bias, also past the anisotropy cap.
-    auto scale = ir.CreateVectorSplat(dims, air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, bias, false));
-    ddx = ir.CreateFMul(ddx, scale);
-    ddy = ir.CreateFMul(ddy, scale);
+    std::tie(ddx, ddy) = scaled({ddx, ddy}, bias);
     return result(air.CreateSampleGrad(tex, d->ResourceHandle, sampler, coord, array, ddx, ddy, min_lod(arg(16)).lod, o()).first);
   }
   case op::SampleCmp: // (64, ..., compare, clamp)
+    if (compute)
+      return coarse(bias, arg(11), arg(10));
     return result(air.CreateSampleCmp(tex, d->ResourceHandle, sampler, coord, array, arg(10), o(),
                                       llvm::air::sample_bias{bias}, min_lod(arg(11))).first);
   case op::SampleCmpLevelZero: // (65, ..., compare)
@@ -421,8 +443,36 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
     return result(air.CreateGatherCompare(tex, d->ResourceHandle, sampler, coord, array, arg(10),
                                           Offsets(7, 2, false)).first);
   case op::CalculateLOD: { // (81, srv, sampler, c0, c1, c2, i1 clamped)
-    auto lod = air.CreateCalculateLOD(tex, d->ResourceHandle, sampler, coord);
-    Replace(call, ConstantU32(arg(6), 1) ? lod.first : lod.second);
+    // ponytail: a cube in a compute shader keeps Metal's LOD (no derivatives in a kernel); D3D's projection onto the
+    // major face when a shader needs it
+    if (!compute || (Dimensions(logical) == 3 && logical != Texture::texture3d)) {
+      auto lod = air.CreateCalculateLOD(tex, d->ResourceHandle, sampler, coord);
+      Replace(call, ConstantU32(arg(6), 1) ? lod.first : lod.second);
+      return llvm::Error::success();
+    }
+    // Compute (spec 3.3): 0.5 log2 of the larger squared gradient in mip 0's texels; clamped to the view's mips.
+    using llvm::air::AIRBuilder;
+    auto [ddx, ddy] = CoarseGradients(coord);
+    static const Texture::Query axes[] = {Texture::width, Texture::height, Texture::depth};
+    llvm::Value *size = llvm::UndefValue::get(coord->getType());
+    for (unsigned i = 0; i < dims; i++) {
+      auto n = one_d && i == 1 ? ir.getInt32(0) : air.CreateTextureQuery(tex, d->ResourceHandle, axes[i], ir.getInt32(0));
+      size = ir.CreateInsertElement(size, ir.CreateUIToFP(n, ir.getFloatTy()), i);
+    }
+    auto texels2 = [&](llvm::Value *g) {
+      auto t = ir.CreateFMul(g, size);
+      return air.CreateDotProduct(t, t);
+    };
+    auto x2 = texels2(ddx);
+    auto lod = ir.CreateFMul(llvm::ConstantFP::get(ir.getFloatTy(), 0.5),
+                             air.CreateFPUnOp(AIRBuilder::log2, air.CreateFPBinOp(AIRBuilder::fmax, x2, texels2(ddy)), false));
+    if (ConstantU32(arg(6), 1)) {
+      auto mips = air.CreateTextureQuery(tex, d->ResourceHandle, Texture::num_mip_levels, ir.getInt32(0));
+      auto top = ir.CreateUIToFP(ir.CreateSub(mips, ir.getInt32(1)), ir.getFloatTy());
+      lod = air.CreateFPBinOp(AIRBuilder::fmin,
+                              air.CreateFPBinOp(AIRBuilder::fmax, lod, llvm::ConstantFP::get(ir.getFloatTy(), 0)), top);
+    }
+    Replace(call, lod);
     return llvm::Error::success();
   }
   default:

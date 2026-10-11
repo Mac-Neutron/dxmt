@@ -18,6 +18,7 @@
 #include "dxil.hpp"
 #include "../airconv_error.hpp"
 #include "../dxbc_converter.hpp"
+#include <algorithm>
 
 // Entry-point inputs and outputs for DXIL shaders, built from the entry's signature metadata with airconv's IO helpers
 // (as dxbc_signature.cpp builds them from DXBC dcl_* instructions). Elements live in airconv's register file at
@@ -406,15 +407,20 @@ air::OutputVertex Varying(const SignatureElement &e, uint32_t row) {
 
 void
 AddWaveInputs(const llvm::Module &module, SM50ShaderInternal *shader, uint32_t &lane_index_arg, uint32_t &lane_count_arg) {
-  for (uint32_t opcode : {op::WaveIsFirstLane, op::WaveGetLaneIndex, op::WaveGetLaneCount, op::WaveAnyTrue, op::WaveAllTrue,
-                          op::WaveActiveAllEqual, op::WaveActiveBallot, op::WaveReadLaneAt, op::WaveReadLaneFirst,
-                          op::WaveActiveOp, op::WaveActiveBit, op::WavePrefixOp, op::WaveAllBitCount, op::WavePrefixBitCount,
-                          op::WaveMatch, op::WaveMultiPrefixOp, op::WaveMultiPrefixBitCount})
-    if (ModuleCallsOp(module, opcode)) {
-      lane_index_arg = shader->func_signature.DefineInput(air::InputThreadIndexInSimdgroup{});
-      lane_count_arg = shader->func_signature.DefineInput(air::InputThreadsPerSimdgroup{});
-      return;
-    }
+  auto calls = [&](std::initializer_list<uint32_t> ops) {
+    return std::any_of(ops.begin(), ops.end(), [&](uint32_t opcode) { return ModuleCallsOp(module, opcode); });
+  };
+  // A compute shader's derivatives, implicit-LOD samples and LODs read the quad lane (Lowering::QuadDerivative).
+  if (calls({op::WaveIsFirstLane, op::WaveGetLaneIndex, op::WaveGetLaneCount, op::WaveAnyTrue, op::WaveAllTrue,
+             op::WaveActiveAllEqual, op::WaveActiveBallot, op::WaveReadLaneAt, op::WaveReadLaneFirst, op::WaveActiveOp,
+             op::WaveActiveBit, op::WavePrefixOp, op::WaveAllBitCount, op::WavePrefixBitCount, op::WaveMatch,
+             op::WaveMultiPrefixOp, op::WaveMultiPrefixBitCount}) ||
+      (shader->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER &&
+       calls({op::Sample, op::SampleBias, op::SampleCmp, op::CalculateLOD, op::DerivCoarseX, op::DerivCoarseY,
+              op::DerivFineX, op::DerivFineY}))) {
+    lane_index_arg = shader->func_signature.DefineInput(air::InputThreadIndexInSimdgroup{});
+    lane_count_arg = shader->func_signature.DefineInput(air::InputThreadsPerSimdgroup{});
+  }
 }
 
 llvm::Error

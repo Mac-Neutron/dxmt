@@ -623,6 +623,68 @@ AIRBuilder::CreateSampleGrad(
   return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
 }
 
+// MacNeutron: (texture, sampler, i32 1, coord, [slice], float ref, ddx, ddy, float clamp, [i1 true, <2 x i32> offset],
+// i32 0), the operands Metal's own depth sample_compare(..., gradient2d/gradientcube, ...) emits.
+std::pair<Value *, Value *>
+AIRBuilder::CreateSampleCmpGrad(
+    const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Reference,
+    Value *DerivX, Value *DerivY, Value *MinLOD, Value *Offset
+) {
+  assert(Texture.kind <= Texture::last_resource_kind);
+  auto &TexInfo = TextureInfo[Texture.kind];
+
+  if (!TexInfo.is_depth) {
+    debug << "invalid operation: compare on non depth texture.\n";
+    return {nullptr, nullptr};
+  }
+
+  auto &Context = getContext();
+  auto Attrs = AttributeList::get(
+      Context,
+      {
+          {1U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+          {1U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)},
+          {2U, Attribute::get(Context, Attribute::AttrKind::NoCapture)},
+          {2U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)},
+          {~0U, Attribute::get(Context, Attribute::AttrKind::ArgMemOnly)},
+          {~0U, Attribute::get(Context, Attribute::AttrKind::NoUnwind)},
+          {~0U, Attribute::get(Context, Attribute::AttrKind::WillReturn)},
+          {~0U, Attribute::get(Context, Attribute::AttrKind::ReadOnly)},
+      }
+  );
+
+  auto NaNToZero = [&](Value *V) { return options.sampleNaNToZero ? getNaNToZero(V) : V; };
+  auto CoordTy = getTextureSampleCoordType(Texture);
+  SmallVector<Value *> Ops = {Handle, Sampler, getInt(1), NaNToZero(Coord)};
+  SmallVector<Type *> Tys = {getTextureHandleType(Texture), getSamplerHandleType(), getIntTy(), CoordTy};
+  if (TexInfo.is_array) {
+    Tys.push_back(getIntTy());
+    Ops.push_back(ArrayIndex);
+  }
+  Tys.append({getFloatTy(), CoordTy, CoordTy, getFloatTy()});
+  Ops.append({Reference, NaNToZero(DerivX), NaNToZero(DerivY), MinLOD});
+  if (!TexInfo.is_cube) {
+    Tys.append({getBoolTy(), getIntTy(2)});
+    Ops.append({getBool(true), Offset});
+  }
+  /* access: always 0 = sample */
+  Tys.push_back(getIntTy());
+  Ops.push_back(getInt(0));
+
+  std::string FnName = "air.sample_compare_";
+  FnName += TexInfo.air_symbol_suffix;
+  FnName += "_grad";
+  FnName += getTypeOverloadSuffix(getTexelType(Texture), getTexelSign(Texture));
+
+  auto Fn = getModule()->getOrInsertFunction(
+      FnName, FunctionType::get(getTextureSampleResultType(Texture), Tys, false), Attrs
+  );
+
+  auto Result = builder.CreateCall(Fn, Ops);
+
+  return {builder.CreateExtractValue(Result, {0u}), builder.CreateExtractValue(Result, {1u})};
+}
+
 std::pair<Value *, Value *>
 AIRBuilder::CreateRead(
     const Texture &Texture, Value *Handle, Value *Pos, Value *ArrayIndex, Value *SampleIndexOrCubeFace, Value *Level,
