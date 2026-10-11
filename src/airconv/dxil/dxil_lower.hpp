@@ -96,6 +96,13 @@ private:
   // i1: this lane takes part, !helper when helpers are left out, true otherwise.
   llvm::Value *Participates();
 
+  // Compute shaders, which have no air.dfdx (spec 3.3): the derivative of float `v` (scalar or vector) across its quad,
+  // read with air.quad_shuffle. Quad lane l is Metal's (simd lane & 3), never D3D's flattened ID: coarse lanes 1 - 0
+  // (x) and 2 - 0 (y); fine (l | 1) - (l & 2) and (l | 2) - (l & 1).
+  llvm::Value *QuadDerivative(llvm::Value *v, bool y, bool fine);
+  // (ddx, ddy) of `coord`, coarse: the gradients implicit-LOD sampling in a compute shader uses.
+  std::pair<llvm::Value *, llvm::Value *> CoarseGradients(llvm::Value *coord);
+
   // Geometry shaders: the vertex shader output register and column holding input `e`'s row `row`, column `col`.
   llvm::Expected<llvm::Value *> VertexOutputPointer(const SignatureElement &e, llvm::Value *row, uint32_t col, llvm::Value *vertex);
 

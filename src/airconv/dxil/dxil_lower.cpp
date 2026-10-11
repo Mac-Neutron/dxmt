@@ -273,6 +273,32 @@ llvm::Value *Lowering::Participates() {
   return HelpersLeftOut() ? ir.CreateNot(Simd(ir, "air.simd_is_helper_thread", ir.getInt1Ty(), {})) : ir.getTrue();
 }
 
+llvm::Value *Lowering::QuadDerivative(llvm::Value *v, bool y, bool fine) {
+  auto ty = v->getType();
+  if (auto vec = llvm::dyn_cast<llvm::FixedVectorType>(ty)) { // per component: the quad shuffles here take scalars
+    llvm::Value *d = llvm::UndefValue::get(ty);
+    for (unsigned i = 0; i < vec->getNumElements(); i++)
+      d = ir.CreateInsertElement(d, QuadDerivative(ir.CreateExtractElement(v, i), y, fine), i);
+    return d;
+  }
+  llvm::Value *from = ir.getInt32(0), *to = ir.getInt32(y ? 2 : 1);
+  if (fine) { // the lane index is defined for these ops in a compute shader (AddWaveInputs)
+    auto l = ir.CreateAnd(ctx.function->getArg(dxil.lane_index_arg), 3);
+    from = ir.CreateAnd(l, y ? 1 : 2);
+    to = ir.CreateOr(l, y ? 2 : 1);
+  }
+  auto read = [&](llvm::Value *lane) {
+    return Simd(ir, "air.quad_shuffle" + SimdSuffix(ty, false), ty, {v, ir.CreateTrunc(lane, ir.getInt16Ty())});
+  };
+  auto a = read(to);
+  return ir.CreateFSub(a, read(from));
+}
+
+std::pair<llvm::Value *, llvm::Value *> Lowering::CoarseGradients(llvm::Value *coord) {
+  auto ddx = QuadDerivative(coord, false, false);
+  return {ddx, QuadDerivative(coord, true, false)};
+}
+
 llvm::Error
 Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
   auto &res = ctx.resource;
@@ -374,9 +400,13 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
   case op::DerivCoarseX:
   case op::DerivCoarseY:
   case op::DerivFineX:
-  case op::DerivFineY:
-    Replace(call, air.CreateDerivative(call->getArgOperand(1), opcode == op::DerivCoarseY || opcode == op::DerivFineY));
+  case op::DerivFineY: {
+    bool y = opcode == op::DerivCoarseY || opcode == op::DerivFineY;
+    Replace(call, entry.kind == ShaderKind::Compute
+                      ? QuadDerivative(call->getArgOperand(1), y, opcode == op::DerivFineX || opcode == op::DerivFineY)
+                      : air.CreateDerivative(call->getArgOperand(1), y));
     return llvm::Error::success();
+  }
   case op::PrimitiveID:
     if (entry.kind != ShaderKind::Geometry)
       goto unpacked_system_value;

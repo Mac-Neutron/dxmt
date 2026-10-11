@@ -283,6 +283,12 @@ public:
       Value *DerivY, Value *MinLOD, Value *Offset
   );
 
+  // MacNeutron: a depth comparison with explicit gradients (air.sample_compare_<depth kind>_grad; cubes take no offset).
+  std::pair<Value *, Value *> CreateSampleCmpGrad(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Reference,
+      Value *DerivX, Value *DerivY, Value *MinLOD, Value *Offset
+  );
+
   Value *CreateAtomicRMW(
       const Texture &Texture, Value *Handle, AtomicRMWInst::BinOp Op, Value *Pos, Value *ValVec4,
       Value *ArrayIndex = nullptr
