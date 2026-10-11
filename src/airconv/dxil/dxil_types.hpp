@@ -125,6 +125,9 @@ struct DXILShader {
   // The entry has [WaveOpsIncludeHelperLanes] ("waveops-include-helper-lanes"): a pixel shader's wave operations count
   // its helper lanes, which D3D otherwise leaves out (MacNeutron).
   bool include_helper_lanes = false;
+  // A compute shader with 2D numthreads (X and Y even) that reads quads (InitializeDXIL): its thread IDs are remapped
+  // so that Metal's lane quads run D3D's 2x2 quads (AddComputeHandlers) (MacNeutron).
+  bool quads_2d = false;
   uint64_t capture_hash = 0; // FNV-1a of the whole container, as capture mode names the shader (MacNeutron)
 };
 

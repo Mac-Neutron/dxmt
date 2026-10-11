@@ -19,6 +19,7 @@
 #include "../airconv_error.hpp"
 #include "../dxbc_converter.hpp"
 #include <algorithm>
+#include <array>
 
 // Entry-point inputs and outputs for DXIL shaders, built from the entry's signature metadata with airconv's IO helpers
 // (as dxbc_signature.cpp builds them from DXBC dcl_* instructions). Elements live in airconv's register file at
@@ -130,7 +131,35 @@ void Grow(uint32_t &max_register, const SignatureElement &e) {
 }
 
 llvm::Error
-AddComputeHandlers(const llvm::Module &module, SM50ShaderInternal *shader) {
+AddComputeHandlers(const EntryInfo &entry, const llvm::Module &module, SM50ShaderInternal *shader, bool quads_2d) {
+  if (quads_2d) {
+    // Metal's quads are four consecutive lanes, t & ~3 .. t | 3 of its flat thread index t; D3D's 2D quads are 2x2
+    // blocks of SV_GroupThreadID. Metal thread t runs D3D's thread (x, y, z), quad lane l = t & 3 at (l & 1, l >> 1) of
+    // the block, so derivatives and quad reads see D3D's quad. SV_GroupIndex stays D3D's flattening of (x, y, z).
+    auto t = shader->func_signature.DefineInput(air::InputThreadIndexInThreadgroup{});
+    auto group = shader->func_signature.DefineInput(air::InputThreadgroupPositionInGrid{});
+    std::array<uint32_t, 3> n = {entry.numthreads[0], entry.numthreads[1], entry.numthreads[2]};
+    shader->signature_handlers.push_back([=](SignatureContext &sig) {
+      sig.prologue << make_effect([=](struct context ctx) {
+        auto &b = ctx.builder;
+        llvm::Value *flat = ctx.function->getArg(t), *slice = b.getInt32(n[0] * n[1]), *half = b.getInt32(n[0] / 2);
+        auto z = b.CreateUDiv(flat, slice), r = b.CreateURem(flat, slice);
+        auto q = b.CreateLShr(r, 2), l = b.CreateAnd(r, 3);
+        auto x = b.CreateAdd(b.CreateShl(b.CreateURem(q, half), 1), b.CreateAnd(l, 1));
+        auto y = b.CreateAdd(b.CreateShl(b.CreateUDiv(q, half), 1), b.CreateLShr(l, 1));
+        llvm::Value *id = llvm::UndefValue::get(llvm::FixedVectorType::get(b.getInt32Ty(), 3));
+        id = b.CreateInsertElement(b.CreateInsertElement(b.CreateInsertElement(id, x, (uint64_t)0), y, 1), z, 2);
+        auto group_id = ctx.function->getArg(group);
+        ctx.resource.thread_group_id_arg = group_id;
+        ctx.resource.thread_id_in_group_arg = id;
+        ctx.resource.thread_id_in_group_flat_arg =
+            b.CreateAdd(b.CreateMul(z, slice), b.CreateAdd(b.CreateMul(y, b.getInt32(n[0])), x));
+        ctx.resource.thread_id_arg = b.CreateAdd(b.CreateMul(group_id, llvm::ConstantDataVector::get(ctx.llvm, n)), id);
+        return std::monostate{};
+      });
+    });
+    return llvm::Error::success();
+  }
   // Compute IDs aren't signature elements in DXIL: define the inputs the module's dx.op calls read.
   if (ModuleCallsOp(module, op::ThreadId))
     DefineSpecial<air::InputThreadPositionInGrid>(shader, &io_binding_map::thread_id_arg);
@@ -425,9 +454,9 @@ AddWaveInputs(const llvm::Module &module, SM50ShaderInternal *shader, uint32_t &
 
 llvm::Error
 AddSignatureHandlers(const EntryInfo &entry, const llvm::Module &module, SM50ShaderInternal *shader,
-                     std::map<uint32_t, uint32_t> &unpacked_inputs) {
+                     std::map<uint32_t, uint32_t> &unpacked_inputs, bool quads_2d) {
   switch (entry.kind) {
-  case ShaderKind::Compute: return AddComputeHandlers(module, shader);
+  case ShaderKind::Compute: return AddComputeHandlers(entry, module, shader, quads_2d);
   case ShaderKind::Vertex: return AddVertexHandlers(entry, shader, unpacked_inputs);
   case ShaderKind::Pixel: return AddPixelHandlers(entry, shader, unpacked_inputs);
   case ShaderKind::Geometry: return AddGeometryHandlers(entry, shader);
