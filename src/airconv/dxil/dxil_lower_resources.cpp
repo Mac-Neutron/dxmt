@@ -274,9 +274,32 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
     auto v = arg(first + ArrayComponent(logical));
     return v->getType()->isFloatingPointTy() ? conv.ClampArrayIndex(v, d->Metadata) : v;
   };
-  auto offsets = [&](unsigned first, unsigned count, int32_t out[3]) {
+  // Texel offsets o0.. from argument `first` (`count` of them, the rest 0). Constants (undef is 0) as immediates.
+  // Runtime ones, SM 6.7's programmable offsets and Gather's at any model, pass through: wrapped to D3D's low 4 bits,
+  // sign-extended, when `wrap` (Load and Sample*); Gather's unwrapped, as the DXBC path's gather4_po (spec 3.6).
+  // Returns whether all were constant.
+  auto offset_values = [&](unsigned first, unsigned count, bool wrap, llvm::Value *out[3]) {
+    bool constant = true;
+    for (unsigned i = 0; i < 3; i++) {
+      auto v = i < count && !(one_d && i == 1) ? arg(first + i) : nullptr;
+      if (v && !llvm::isa<llvm::Constant>(v)) {
+        out[i] = wrap ? ir.CreateAShr(ir.CreateShl(v, 28), 28) : v;
+        constant = false;
+      } else {
+        out[i] = ir.getInt32(v ? ConstantU32(v, 0) : 0);
+      }
+    }
+    return constant;
+  };
+  // The offsets as the texture kind's offset vector (AIRBuilder::GetOffset): all constant, today's immediate form.
+  auto Offsets = [&](unsigned first, unsigned count, bool wrap) -> llvm::Value * {
+    llvm::Value *v[3];
+    if (!offset_values(first, count, wrap, v))
+      return air.GetOffset(tex, v);
+    int32_t o[3];
     for (unsigned i = 0; i < 3; i++)
-      out[i] = i < count ? (int32_t)ConstantU32(arg(first + i), 0) : 0;
+      o[i] = (int32_t)ConstantU32(v[i]);
+    return air.GetOffset(tex, o);
   };
   // The texel (vector or depth scalar) as the call's ResRet struct.
   auto result = [&](llvm::Value *texel) {
@@ -294,11 +317,11 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
   switch (opcode) {
   case op::TextureLoad: { // (66, handle, i32 mipOrSample, i32 c0, c1, c2, i32 o0, o1, o2)
     auto pos = vector(3, ir.getInt32Ty());
-    int32_t o[3];
-    offsets(6, dims, o);
+    llvm::Value *o[3]; // added to pos, which GetOffset has no form for on multisampled kinds
+    offset_values(6, dims, true, o);
     llvm::Value *offset = llvm::UndefValue::get(pos->getType());
     for (unsigned i = 0; i < dims; i++)
-      offset = ir.CreateInsertElement(offset, ir.getInt32(o[i]), i);
+      offset = ir.CreateInsertElement(offset, o[i], i);
     pos = ir.CreateAdd(pos, offset);
     bool ms = IsMultisampled(logical);
     if (tex.memory_access == Texture::acesss_readwrite) // see earlier writes, as the DXBC typed UAV load
@@ -355,8 +378,8 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
   auto bias = ir.CreateBitCast(ir.CreateTrunc(s->Metadata, ir.getInt32Ty()), ir.getFloatTy()); // the sampler's LOD bias
   auto coord = vector(3, ir.getFloatTy());
   auto array = array_index(3);
-  int32_t o[3];
-  offsets(7, dims, o);
+  // Sample*'s o0..o2. Only there: Gather's argument 9 is its channel, and CalculateLOD's arguments end at 6.
+  auto o = [&] { return Offsets(7, dims, true); };
   auto min_lod = [&](llvm::Value *shader_clamp) {
     auto clamp = conv.DecodeTextureMinLODClamp(d->Metadata);
     if (shader_clamp && !llvm::isa<llvm::UndefValue>(shader_clamp))
@@ -366,12 +389,12 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
 
   switch (opcode) {
   case op::Sample: // (60, srv, sampler, c0..c3, o0..o2, clamp)
-    return result(air.CreateSample(tex, d->ResourceHandle, sampler, coord, array, o, llvm::air::sample_bias{bias}, min_lod(arg(10))).first);
+    return result(air.CreateSample(tex, d->ResourceHandle, sampler, coord, array, o(), llvm::air::sample_bias{bias}, min_lod(arg(10))).first);
   case op::SampleBias: // (61, ..., bias, clamp)
-    return result(air.CreateSample(tex, d->ResourceHandle, sampler, coord, array, o,
+    return result(air.CreateSample(tex, d->ResourceHandle, sampler, coord, array, o(),
                                    llvm::air::sample_bias{ir.CreateFAdd(arg(10), bias)}, min_lod(arg(11))).first);
   case op::SampleLevel: // (62, ..., lod)
-    return result(air.CreateSample(tex, d->ResourceHandle, sampler, coord, array, o,
+    return result(air.CreateSample(tex, d->ResourceHandle, sampler, coord, array, o(),
                                    llvm::air::sample_level{ir.CreateFAdd(arg(10), bias)}).first);
   case op::SampleGrad: { // (63, ..., ddx0..2, ddy0..2, clamp)
     llvm::Value *ddx = llvm::UndefValue::get(coord->getType()), *ddy = ddx;
@@ -384,24 +407,19 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
     auto scale = ir.CreateVectorSplat(dims, air.CreateFPUnOp(llvm::air::AIRBuilder::exp2, bias, false));
     ddx = ir.CreateFMul(ddx, scale);
     ddy = ir.CreateFMul(ddy, scale);
-    return result(air.CreateSampleGrad(tex, d->ResourceHandle, sampler, coord, array, ddx, ddy, min_lod(arg(16)).lod, o).first);
+    return result(air.CreateSampleGrad(tex, d->ResourceHandle, sampler, coord, array, ddx, ddy, min_lod(arg(16)).lod, o()).first);
   }
   case op::SampleCmp: // (64, ..., compare, clamp)
-    return result(air.CreateSampleCmp(tex, d->ResourceHandle, sampler, coord, array, arg(10), o,
+    return result(air.CreateSampleCmp(tex, d->ResourceHandle, sampler, coord, array, arg(10), o(),
                                       llvm::air::sample_bias{bias}, min_lod(arg(11))).first);
   case op::SampleCmpLevelZero: // (65, ..., compare)
-    return result(air.CreateSampleCmp(tex, d->ResourceHandle, sampler, coord, array, arg(10), o,
+    return result(air.CreateSampleCmp(tex, d->ResourceHandle, sampler, coord, array, arg(10), o(),
                                       llvm::air::sample_level{llvm::ConstantFP::get(ir.getFloatTy(), 0)}).first);
-  case op::TextureGather: { // (73, srv, sampler, c0..c3, i32 o0, o1, i32 channel)
-    int32_t go[3];
-    offsets(7, 2, go);
-    return result(air.CreateGather(tex, d->ResourceHandle, sampler, coord, array, go, arg(9)).first);
-  }
-  case op::TextureGatherCmp: { // (74, ..., i32 channel, float compare)
-    int32_t go[3];
-    offsets(7, 2, go);
-    return result(air.CreateGatherCompare(tex, d->ResourceHandle, sampler, coord, array, arg(10), go).first);
-  }
+  case op::TextureGather: // (73, srv, sampler, c0..c3, i32 o0, o1, i32 channel)
+    return result(air.CreateGather(tex, d->ResourceHandle, sampler, coord, array, Offsets(7, 2, false), arg(9)).first);
+  case op::TextureGatherCmp: // (74, ..., i32 channel, float compare)
+    return result(air.CreateGatherCompare(tex, d->ResourceHandle, sampler, coord, array, arg(10),
+                                          Offsets(7, 2, false)).first);
   case op::CalculateLOD: { // (81, srv, sampler, c0, c1, c2, i1 clamped)
     auto lod = air.CreateCalculateLOD(tex, d->ResourceHandle, sampler, coord);
     Replace(call, ConstantU32(arg(6), 1) ? lod.first : lod.second);

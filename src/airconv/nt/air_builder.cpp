@@ -519,7 +519,7 @@ AIRBuilder::CreateSampleCmpCommon(
 std::pair<Value *, Value *>
 AIRBuilder::CreateSampleGrad(
     const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
-    Value *DerivY, Value *MinLOD, const int32_t Offset[3]
+    Value *DerivY, Value *MinLOD, Value *Offset
 ) {
   assert(Texture.kind <= Texture::last_resource_kind);
   auto &TexInfo = TextureInfo[Texture.kind];
@@ -584,7 +584,7 @@ AIRBuilder::CreateSampleGrad(
     Tys.push_back(getBoolTy());
     Ops.push_back(getBool(false));
     Tys.push_back(getIntTy());
-    Ops.push_back(getInt(Offset[0])); // seems to be ignored?
+    Ops.push_back(Offset); // seems to be ignored?
     break;
   case Texture::texture2d:
   case Texture::texture2d_array:
@@ -593,13 +593,13 @@ AIRBuilder::CreateSampleGrad(
     Tys.push_back(getBoolTy());
     Ops.push_back(getBool(true));
     Tys.push_back(getIntTy(2));
-    Ops.push_back(getInt2(Offset[0], Offset[1]));
+    Ops.push_back(Offset);
     break;
   case Texture::texture3d:
     Tys.push_back(getBoolTy());
     Ops.push_back(getBool(true));
     Tys.push_back(getIntTy(3));
-    Ops.push_back(getInt3(Offset[0], Offset[1], Offset[2]));
+    Ops.push_back(Offset);
     break;
   default:
     break;
