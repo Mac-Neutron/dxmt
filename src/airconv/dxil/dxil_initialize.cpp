@@ -149,6 +149,11 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   auto entry = ReadEntry(**module);
   if (!entry)
     return entry.takeError();
+  // Apple GPUs run 32-lane SIMD groups (d3d12_device.cpp's WaveLaneCountMin/Max); the preferred size is a hint.
+  if (entry->wave_size_min && !(entry->wave_size_min <= 32 && 32 <= entry->wave_size_max))
+    return llvm::make_error<UnsupportedFeature>("DXIL: [WaveSize(" + std::to_string(entry->wave_size_min) + ", " +
+                                                std::to_string(entry->wave_size_max) +
+                                                ")] excludes this device's 32-lane waves");
   switch (entry->kind) {
   case ShaderKind::Vertex: shader->shader_type = microsoft::D3D10_SB_VERTEX_SHADER; break;
   case ShaderKind::Pixel: shader->shader_type = microsoft::D3D10_SB_PIXEL_SHADER; break;
