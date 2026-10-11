@@ -55,6 +55,7 @@ enum : uint32_t {
   CBufferLoad = 58, CBufferLoadLegacy = 59, Sample = 60, SampleBias = 61, SampleLevel = 62, SampleGrad = 63,
   SampleCmp = 64, SampleCmpLevelZero = 65, TextureLoad = 66, TextureStore = 67, BufferLoad = 68, BufferStore = 69,
   BufferUpdateCounter = 70, CheckAccessFullyMapped = 71, GetDimensions = 72, TextureGather = 73, TextureGatherCmp = 74,
+  Texture2DMSGetSamplePosition = 75, RenderTargetGetSamplePosition = 76, RenderTargetGetSampleCount = 77,
   AtomicBinOp = 78, AtomicCompareExchange = 79, Barrier = 80, CalculateLOD = 81, Discard = 82, DerivCoarseX = 83,
   DerivCoarseY = 84, DerivFineX = 85, DerivFineY = 86, SampleIndex = 90, Coverage = 91, ThreadId = 93, GroupId = 94,
   ThreadIdInGroup = 95, FlattenedThreadIdInGroup = 96, MakeDouble = 101, SplitDouble = 102, PrimitiveID = 108,
@@ -62,9 +63,11 @@ enum : uint32_t {
   WaveActiveAllEqual = 115, WaveActiveBallot = 116, WaveReadLaneAt = 117, WaveReadLaneFirst = 118, WaveActiveOp = 119,
   EmitStream = 97, CutStream = 98, EmitThenCutStream = 99, GSInstanceID = 100, WaveActiveBit = 120, WavePrefixOp = 121, QuadReadLaneAt = 122, QuadOp = 123, BitcastI16toF16 = 124, BitcastF16toI16 = 125, BitcastI32toF32 = 126,
   BitcastF32toI32 = 127, LegacyF32ToF16 = 130, LegacyF16ToF32 = 131, WaveAllBitCount = 135, WavePrefixBitCount = 136,
-  RawBufferLoad = 139, RawBufferStore = 140, Dot2AddHalf = 162, Dot4AddI8Packed = 163, Dot4AddU8Packed = 164,
+  ViewID = 138, RawBufferLoad = 139, RawBufferStore = 140, Dot2AddHalf = 162, Dot4AddI8Packed = 163,
+  Dot4AddU8Packed = 164, WaveMatch = 165, WaveMultiPrefixOp = 166, WaveMultiPrefixBitCount = 167,
   AnnotateHandle = 216, CreateHandleFromBinding = 217, CreateHandleFromHeap = 218, Unpack4x8 = 219, Pack4x8 = 220,
-  IsHelperLane = 221
+  IsHelperLane = 221, QuadVote = 222, BarrierByMemoryType = 244, BarrierByMemoryHandle = 245, SampleCmpGrad = 254,
+  SampleCmpBias = 255, StartVertexLocation = 256, StartInstanceLocation = 257
 };
 } // namespace op
 

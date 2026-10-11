@@ -579,6 +579,19 @@ Lowering::LowerResource(uint32_t opcode, llvm::CallInst *call) {
   case op::TextureGatherCmp:
   case op::CalculateLOD:
     return LowerTexture(opcode, call, h);
+  case op::Texture2DMSGetSamplePosition: { // (75, srv, i32 index) -> {f32, f32}: D3D's standard positions (air_samplepos)
+    llvm::Value *count = ir.getInt32(0); // no texture: (0, 0), as the DXBC samplepos lowering
+    if (auto d = Texture(h)) {
+      llvm::air::Texture tex;
+      tex.kind = d->ResourceKind;
+      tex.sample_type = d->SampleType;
+      tex.memory_access = d->MemoryAccess;
+      count = air.CreateTextureQuery(tex, d->ResourceHandle, Texture::num_samples, ir.getInt32(0));
+    }
+    auto pos = conv.GetSamplePos(count, call->getArgOperand(2));
+    Replace(call, Aggregate(call->getType(), {ir.CreateExtractElement(pos, (uint64_t)0), ir.CreateExtractElement(pos, 1)}));
+    return llvm::Error::success();
+  }
   default:
     return Unsupported(call);
   }

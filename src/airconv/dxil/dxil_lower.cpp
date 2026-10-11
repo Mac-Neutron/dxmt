@@ -149,6 +149,8 @@ Lowering::Lower(llvm::CallInst *call) {
       (opcode >= op::BitcastI16toF16 && opcode <= op::LegacyF16ToF32) ||
       (opcode >= op::Dot2AddHalf && opcode <= op::Dot4AddU8Packed) || opcode == op::Unpack4x8 || opcode == op::Pack4x8)
     return LowerMath(opcode, call);
+  if (opcode == op::RenderTargetGetSamplePosition || opcode == op::RenderTargetGetSampleCount)
+    return LowerOther(opcode, call); // inside the resource range, but they take no handle
   if ((opcode >= op::CBufferLoad && opcode <= op::AtomicCompareExchange) || opcode == op::CalculateLOD ||
       opcode == op::RawBufferLoad || opcode == op::RawBufferStore)
     return LowerResource(opcode, call);
@@ -487,6 +489,28 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     Replace(call, nullptr);
     return llvm::Error::success();
   }
+  case op::IsHelperLane: // (221): only a pixel shader has helper lanes
+    Replace(call, entry.kind == ShaderKind::Pixel ? Simd(ir, "air.simd_is_helper_thread", ir.getInt1Ty(), {})
+                                                  : ir.getFalse());
+    return llvm::Error::success();
+  case op::QuadVote: { // (222, i1, i8 op: 0 any, 1 all)
+    uint32_t kind = ConstantU32(call->getArgOperand(2), ~0u);
+    if (kind > 1)
+      return Unsupported(call);
+    Replace(call, Simd(ir, kind ? "air.quad_all" : "air.quad_any", ir.getInt1Ty(), {call->getArgOperand(1)}));
+    return llvm::Error::success();
+  }
+  case op::RenderTargetGetSampleCount: // (77)
+    Replace(call, air.CreateGetNumSamples());
+    return llvm::Error::success();
+  case op::RenderTargetGetSamplePosition: { // (76, i32 index) -> {f32, f32}: D3D's standard positions (air_samplepos)
+    auto pos = conv.GetSamplePos(air.CreateGetNumSamples(), call->getArgOperand(1));
+    Replace(call, Aggregate(call->getType(), {ir.CreateExtractElement(pos, (uint64_t)0), ir.CreateExtractElement(pos, 1)}));
+    return llvm::Error::success();
+  }
+  case op::ViewID: // (138): ViewInstancingTier is NOT_SUPPORTED, so the only view is 0
+    Replace(call, ir.getInt32(0));
+    return llvm::Error::success();
   default:
     return Unsupported(call);
   }
