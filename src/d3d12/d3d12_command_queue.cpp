@@ -1179,8 +1179,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (inflight.cmdbuf.status() <= WMTCommandBufferStatusScheduled)
         inflight.cmdbuf.waitUntilCompleted();
       DXMT_STAT_SCOPE("queue.(retire a completed command buffer)");
-      if (inflight.cmdbuf.status() == WMTCommandBufferStatusError)
+      if (inflight.cmdbuf.status() == WMTCommandBufferStatusError) {
         ERR("Device error: ", inflight.cmdbuf.error().description().getUTF8String());
+        device_->ResetAtomic64Locks(); // a fault inside a 64-bit atomic's critical section would hold its lock (MacNeutron)
+      }
 
       if (inflight.semaphore)
         ReleaseSemaphore(inflight.semaphore, 1, nullptr);

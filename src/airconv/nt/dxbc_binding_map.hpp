@@ -57,6 +57,14 @@ public:
   GetUAVBuffer(llvm::air::AIRBuilder &Builder, RangeId Range, llvm::Value *Index) = 0;
   virtual llvm::Optional<CounterDescriptor>
   GetUAVCounter(llvm::air::AIRBuilder &Builder, RangeId Range, llvm::Value *Index) = 0;
+
+  // DXIL 64-bit atomics (MacNeutron, Task 14a): the root-argument field holding the device's lock table, ~0u when the
+  // shader declares none; GetAtomic64Locks loads it (a device uint *), null without it.
+  uint32_t atomic64_locks = ~0u;
+  virtual llvm::Value *
+  GetAtomic64Locks(llvm::air::AIRBuilder &Builder) {
+    return nullptr;
+  }
 };
 
 } // namespace dxmt::dxbc

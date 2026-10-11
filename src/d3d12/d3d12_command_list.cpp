@@ -202,11 +202,11 @@ class MTLD3D12GraphicsCommandListImpl
 
   Com<MTLD3D12GraphicsPipelineState, false> pso_graphics_;
   Com<MTLD3D12RootSignature, false> rootsig_graphics_;
-  uint64_t rootarg_graphics_staging_[66]; // 64 qwords of parameters, then the heap bases (MacNeutron)
+  uint64_t rootarg_graphics_staging_[67]; // 64 qwords of parameters, the heap bases, the lock table (MacNeutron)
 
   Com<MTLD3D12ComputePipelineState, false> pso_compute_;
   Com<MTLD3D12RootSignature, false> rootsig_compute_;
-  uint64_t rootarg_compute_staging_[66];
+  uint64_t rootarg_compute_staging_[67];
 
   // The bound CBV/SRV/UAV heap's and sampler heap's GPU bases (SetDescriptorHeaps; 0 for none), staged at a root
   // signature's HeapQwordOffset. (MacNeutron)
@@ -1394,6 +1394,7 @@ public:
       rootsig_compute_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
       assert(rootsig_compute_->UploadQwords <= std::size(rootarg_compute_staging_));
       StageHeapBases(rootsig_compute_.ptr(), rootarg_compute_staging_);
+      rootarg_compute_staging_[rootsig_compute_->LockQwordOffset] = device_->Atomic64Locks();
     } else {
       rootsig_compute_ = nullptr;
     }
@@ -1409,6 +1410,7 @@ public:
       rootsig_graphics_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
       assert(rootsig_graphics_->UploadQwords <= std::size(rootarg_graphics_staging_));
       StageHeapBases(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
+      rootarg_graphics_staging_[rootsig_graphics_->LockQwordOffset] = device_->Atomic64Locks();
     } else {
       rootsig_graphics_ = nullptr;
     }

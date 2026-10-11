@@ -354,6 +354,8 @@ class MTLD3D12DeviceImpl : public MTLD3D12Object<ComObject<MTLD3D12Device, IMTLD
   Rc<Buffer> null_buffer_;
   BufferViewKey null_buffer_view_;
   Rc<Buffer> null_vertex_buffer_;
+  std::once_flag atomic64_once_;
+  Rc<Buffer> atomic64_locks_;
   WMT::Reference<WMT::ResidencySet> residency_set_;
   // MacNeutron: by GPU address. Placed buffers at one heap offset share theirs (aliasing): a lookup finds the newest
   // registered, and a release removes only its own entry (it used to remove the address, or keep a released buffer).
@@ -1873,6 +1875,23 @@ public:
       RegisterResidencyAndVA(null_vertex_buffer_->current());
     }
     return null_vertex_buffer_->current()->gpuAddress();
+  }
+
+  uint64_t
+  Atomic64Locks() {
+    std::call_once(atomic64_once_, [&] {
+      atomic64_locks_ = new Buffer(kAtomic64Locks * 4, GetMTLDevice());
+      atomic64_locks_->rename(atomic64_locks_->allocate({}));
+      memset(atomic64_locks_->current()->mappedMemory(0), 0, kAtomic64Locks * 4);
+      RegisterResidencyAndVA(atomic64_locks_->current());
+    });
+    return atomic64_locks_->current()->gpuAddress();
+  }
+
+  void
+  ResetAtomic64Locks() {
+    Atomic64Locks(); // ponytail: creates the table if no root signature was ever set; 256 KiB once
+    memset(atomic64_locks_->current()->mappedMemory(0), 0, kAtomic64Locks * 4);
   }
 
   HRESULT

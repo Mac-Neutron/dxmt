@@ -148,6 +148,9 @@ public:
   // the parameters', the bound CBV/SRV/UAV heap's GPU base, then the sampler heap's (UploadQwords counts them); ~0u
   // without. (MacNeutron)
   uint32_t HeapQwordOffset;
+  // The qword after those (after the parameters' without the heap flags): the device's 64-bit atomic lock table
+  // (MTLD3D12Device::Atomic64Locks), which the runtime always writes and UploadQwords counts. (MacNeutron)
+  uint32_t LockQwordOffset;
 
   size_t NumStaticSamplers;
   uint64_t const *EncodedStaticSamplers;
@@ -256,6 +259,13 @@ public:
   // stride 0, each element reads zeros, which its format widens as D3D's rules say ((0,0,0,1) for fewer than four
   // components). Shaders pull vertices without a null check since.
   virtual uint64_t NullVertexBuffer() = 0;
+  // DXIL 64-bit atomics (MacNeutron, Task 14a): the GPU address of the device's lock table, kAtomic64Locks zeroed u32
+  // in the residency set every queue uses, created on the first call: one per device, shared by every pipeline, command
+  // buffer and queue, so atomicity holds across queues. ResetAtomic64Locks zeroes it again after a command buffer
+  // fault, which could leave a lock held and hang every later atomic on it (one critical section still running on
+  // another queue can break: accepted over a permanent hang).
+  virtual uint64_t Atomic64Locks() = 0;
+  virtual void ResetAtomic64Locks() = 0;
 
   // GPU timestamp ticks per second (MacNeutron), measured once against QueryPerformanceCounter.
   virtual uint64_t TimestampFrequency() = 0;

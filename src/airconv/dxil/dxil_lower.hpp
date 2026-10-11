@@ -84,6 +84,14 @@ private:
   llvm::Error LowerTypedBufferStore(llvm::CallInst *call, const HandleInfo &h, llvm::Value *index);
   llvm::Error LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &h);
   llvm::Error LowerDimensions(llvm::CallInst *call, const HandleInfo &h);
+  // Ops 78 and 79 with the i64 overload (Task 14a): raw and structured buffers through UnderLock.
+  llvm::Error Atomic64(uint32_t opcode, llvm::CallInst *call, const HandleInfo &h);
+
+  // 64-bit atomics (dxil_lower.cpp; DXIL SM 6.8 plan, Tasks 14a-14c, spec 3.8): runs `critical`, which reads the
+  // location, computes, writes and returns the old value, while holding the u32 lock at `lock`, inside fences of
+  // `flags` at `scope`. Returns the old value; the insert point ends after it.
+  llvm::Value *UnderLock(llvm::Value *lock, llvm::air::MemFlags flags, llvm::air::ThreadScope scope,
+                         llvm::function_ref<llvm::Value *()> critical);
 
   // IO (dxil_lower.cpp).
   llvm::Value *UnpackedInput(uint32_t element_id);
@@ -119,5 +127,7 @@ private:
 };
 
 uint32_t ConstantU32(llvm::Value *v, uint32_t otherwise = 0);
+// Calls a Metal simdgroup function (AIR names as `xcrun metal -S -emit-llvm` shows them), marked convergent like Metal's.
+llvm::Value *Simd(llvm::IRBuilder<> &ir, llvm::StringRef name, llvm::Type *ret, llvm::ArrayRef<llvm::Value *> args);
 
 } // namespace dxmt::dxil

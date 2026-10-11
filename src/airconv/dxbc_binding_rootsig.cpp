@@ -344,6 +344,11 @@ public:
     return CounterDescriptor{Pointer};
   }
 
+  virtual llvm::Value *
+  GetAtomic64Locks(llvm::air::AIRBuilder &Builder) {
+    return atomic64_locks == ~0u ? nullptr : GetArgument(Builder, RootSignatureArgumentIndex, atomic64_locks);
+  }
+
   uint32_t RootSignatureArgumentIndex = ~0u;
   uint32_t StaticSamplerArgumentIndex = ~0u;
 
@@ -604,8 +609,11 @@ setup_binding_rootsig(
         bindings[info.range.range_id].first.arg_index = field;
       }
   };
+  // DXIL 64-bit atomics (Task 14a): the lock table's address is the qword after those (declared then even in a shader
+  // that indexes no heap), or after the last parameter's without the flags: MTLD3D12RootSignature::LockQwordOffset.
   if ((root_sig.Flags & 0xC00) && (in_heap(shader_info->srvMap) || in_heap(shader_info->uavMap) ||
-                                   in_heap(shader_info->cbufferMap) || in_heap(shader_info->samplerMap))) {
+                                   in_heap(shader_info->cbufferMap) || in_heap(shader_info->samplerMap) ||
+                                   shader_info->use_atomic64_locks)) {
     auto heap = builder.DefineBuffer("heap", AddressSpace::constant, MemoryAccess::read, msl_int, inc_attribute_index++);
     auto sampler_heap =
         builder.DefineBuffer("sampler_heap", AddressSpace::constant, MemoryAccess::read, msl_int, inc_attribute_index++);
@@ -614,6 +622,9 @@ setup_binding_rootsig(
     map_heap(shader_info->cbufferMap, binding_map->ConstantBuffers, heap);
     map_heap(shader_info->samplerMap, binding_map->Samplers, sampler_heap);
   }
+  if (shader_info->use_atomic64_locks)
+    binding_map->atomic64_locks =
+        builder.DefineBuffer("atomic64_locks", AddressSpace::device, MemoryAccess::read_write, msl_uint, inc_attribute_index++);
 
   auto [type, metadata] = builder.Build(module.getContext(), module.getDataLayout());
 

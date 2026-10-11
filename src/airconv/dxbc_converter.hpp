@@ -107,6 +107,8 @@ public:
   bool output_control_point_read = false;
   bool use_msad = false;
   bool use_samplepos = false;
+  // DXIL 64-bit atomics (MacNeutron, Task 14a): the root arguments carry the device's lock table (atomic64_locks).
+  bool use_atomic64_locks = false;
   std::vector<PhaseInfo> phases;
   uint32_t pull_mode_reg_mask = 0;
 };

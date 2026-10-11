@@ -249,6 +249,14 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   shader->shader_info.use_msad = ModuleCallsOp(**module, op::Msad);
   shader->shader_info.use_samplepos = ModuleCallsOp(**module, op::Texture2DMSGetSamplePosition) ||
                                       ModuleCallsOp(**module, op::RenderTargetGetSamplePosition);
+  // Ops 78 and 79 with the i64 overload take the device's lock table from the root arguments (Task 14a). Each stage of
+  // a geometry pipeline binds with its own ShaderInfo, so its function declares the field only for its own atomics.
+  for (auto &fn : **module)
+    if (fn.getName().startswith("dx.op.") && fn.getReturnType()->isIntegerTy(64))
+      for (auto *user : fn.users())
+        if (auto call = llvm::dyn_cast<llvm::CallInst>(user))
+          shader->shader_info.use_atomic64_locks |=
+              OpCode(*call) == op::AtomicBinOp || OpCode(*call) == op::AtomicCompareExchange;
   // 2D compute quads (HLSL_SM_6_6_Derivatives.md): numthreads X and Y even (Y = 1 is the 1D layout, Metal's own), in a
   // shader that takes derivatives, samples with an implicit LOD, calculates a LOD or reads its quad.
   std::initializer_list<uint32_t> quad_ops = {op::Sample, op::SampleBias, op::SampleCmp, op::CalculateLOD,
