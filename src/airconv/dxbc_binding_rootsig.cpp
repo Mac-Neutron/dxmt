@@ -21,6 +21,7 @@
 #include "dxbc_root_signature.hpp"
 #include "shader_common.hpp"
 #include "llvm/IR/DerivedTypes.h"
+#include <algorithm>
 #include <cassert>
 
 namespace dxmt::dxbc {
@@ -348,6 +349,17 @@ public:
   std::map<RangeId, std::pair<UnorderedAccessViewInfo, uint64_t>> UAVs;
 };
 
+uint32_t
+RootSignatureFlags(const void *bytecode, size_t bytecode_length) {
+  const void *raw;
+  UINT raw_size;
+  RootSignatureDeserializer deserializer;
+  if (FAILED(microsoft::DXBCGetRootSignature(bytecode, &raw, &raw_size)) ||
+      FAILED(deserializer.Deserialize(raw, raw_size)))
+    return 0;
+  return deserializer.desc_1_1_.Desc_1_1.Flags;
+}
+
 std::unique_ptr<BindingMap>
 setup_binding_rootsig(
     const ShaderInfo *shader_info, air::FunctionSignatureBuilder &func_signature, llvm::Module &module,
@@ -572,6 +584,31 @@ setup_binding_rootsig(
       break;
     }
     }
+  }
+
+  // Dynamic resources (MacNeutron): with CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED or SAMPLER_HEAP_DIRECTLY_INDEXED, two qwords
+  // follow the last parameter's: the CBV/SRV/UAV heap's GPU descriptor base, then the sampler heap's. Only a shader
+  // that indexes a heap declares them (its heap ranges are in register space ~0u, lower bound 0); each heap range reads
+  // its heap from descriptor 0, so a heap index is a descriptor index.
+  auto in_heap = [](auto &infos) {
+    return std::any_of(infos.begin(), infos.end(), [](auto &info) { return info.second.range.space == ~0u; });
+  };
+  auto map_heap = [](auto &infos, auto &bindings, uint32_t field) {
+    for (auto &[_, info] : infos)
+      if (info.range.space == ~0u) {
+        bindings[info.range.range_id] = {info, 0};
+        bindings[info.range.range_id].first.arg_index = field;
+      }
+  };
+  if ((root_sig.Flags & 0xC00) && (in_heap(shader_info->srvMap) || in_heap(shader_info->uavMap) ||
+                                   in_heap(shader_info->cbufferMap) || in_heap(shader_info->samplerMap))) {
+    auto heap = builder.DefineBuffer("heap", AddressSpace::constant, MemoryAccess::read, msl_int, inc_attribute_index++);
+    auto sampler_heap =
+        builder.DefineBuffer("sampler_heap", AddressSpace::constant, MemoryAccess::read, msl_int, inc_attribute_index++);
+    map_heap(shader_info->srvMap, binding_map->SRVs, heap);
+    map_heap(shader_info->uavMap, binding_map->UAVs, heap);
+    map_heap(shader_info->cbufferMap, binding_map->ConstantBuffers, heap);
+    map_heap(shader_info->samplerMap, binding_map->Samplers, sampler_heap);
   }
 
   auto [type, metadata] = builder.Build(module.getContext(), module.getDataLayout());

@@ -55,6 +55,72 @@ ScalerDataType ToScalerType(ComponentType type) {
   }
 }
 
+// The resource annotateHandle's ResourceProperties {p0, p1} describe (DxilResourceProperties.h): p0 bits 0-7 kind,
+// 12 UAV, 13 ROV, 14 globally coherent, 15 comparison sampler or UAV counter; p1 the component type of textures and
+// typed buffers (bits 0-7), a structured buffer's stride or a constant buffer's size. As a heap range (spec 3.4).
+Resource HeapResource(uint32_t p0, uint32_t p1) {
+  Resource r;
+  r.kind = ResourceKind(p0 & 0xff);
+  bool uav = p0 & (1u << 12), bit15 = p0 & (1u << 15);
+  r.cls = r.kind == ResourceKind::CBuffer   ? ResourceClass::CBuffer
+          : r.kind == ResourceKind::Sampler ? ResourceClass::Sampler
+          : uav                             ? ResourceClass::UAV
+                                            : ResourceClass::SRV;
+  r.space = kHeapSpace, r.lower_bound = 0, r.size = ~0u;
+  r.rasterizer_ordered = p0 & (1u << 13);
+  r.globally_coherent = p0 & (1u << 14);
+  r.comparison_sampler = r.cls == ResourceClass::Sampler && bit15;
+  r.has_counter = r.cls == ResourceClass::UAV && bit15;
+  switch (r.kind) {
+  case ResourceKind::StructuredBuffer: r.stride = p1; break;
+  case ResourceKind::CBuffer: r.cbuffer_size = p1; break;
+  case ResourceKind::RawBuffer: case ResourceKind::Sampler: break;
+  default: r.element_type = ComponentType(p1 & 0xff); break;
+  }
+  r.heap = true, r.heap_props[0] = p0, r.heap_props[1] = p1;
+  return r;
+}
+
+// Dynamic resources (spec 3.4): a heap range for each distinct ResourceProperties that annotateHandle gives a
+// createHandleFromHeap handle (ResolveHandle finds it by them), with range IDs from kHeapRangeBase.
+void AddHeapRanges(const llvm::Module &module, EntryInfo &entry) {
+  auto annotate = module.getFunction("dx.op.annotateHandle");
+  if (!annotate)
+    return;
+  uint32_t next = kHeapRangeBase;
+  for (auto *user : annotate->users()) {
+    auto call = llvm::dyn_cast<llvm::CallInst>(user);
+    uint32_t props[2];
+    if (!call || !HeapHandle(*call, props) ||
+        std::any_of(entry.resources.begin(), entry.resources.end(), [&](const Resource &r) {
+          return r.heap && r.heap_props[0] == props[0] && r.heap_props[1] == props[1];
+        }))
+      continue;
+    auto r = HeapResource(props[0], props[1]);
+    r.id = next++;
+    entry.resources.push_back(r);
+  }
+}
+
+// A 64-bit groupshared atomic: an atomicrmw or cmpxchg of i64 on addrspace(3), which no dx.op carries. Metal has no
+// threadgroup ulong atomics, and its compiler service crashes on these (the i64 spike: XPC_ERROR_CONNECTION_INTERRUPTED
+// after retries, the op unnamed), so they're refused by name until the plan's Task 14c lock path.
+llvm::Error RefuseGroupshared64BitAtomics(const llvm::Module &module) {
+  for (auto &fn : module)
+    for (auto &bb : fn)
+      for (auto &inst : bb) {
+        auto rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst);
+        if (rmw && rmw->getPointerAddressSpace() == 3 && rmw->getValOperand()->getType()->isIntegerTy(64))
+          return llvm::make_error<UnsupportedFeature>("DXIL: 64-bit groupshared atomic (atomicrmw " +
+                                                      llvm::AtomicRMWInst::getOperationName(rmw->getOperation()).str() +
+                                                      ") not supported");
+        auto cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&inst);
+        if (cx && cx->getPointerAddressSpace() == 3 && cx->getNewValOperand()->getType()->isIntegerTy(64))
+          return llvm::make_error<UnsupportedFeature>("DXIL: 64-bit groupshared atomic (cmpxchg) not supported");
+      }
+  return llvm::Error::success();
+}
+
 struct Usage {
   bool read = false, written = false, sampled = false, compared = false;
 };
@@ -149,6 +215,9 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   auto entry = ReadEntry(**module);
   if (!entry)
     return entry.takeError();
+  if (auto err = RefuseGroupshared64BitAtomics(**module))
+    return err;
+  AddHeapRanges(**module, *entry);
   // Apple GPUs run 32-lane SIMD groups (d3d12_device.cpp's WaveLaneCountMin/Max); the preferred size is a hint.
   if (entry->wave_size_min && !(entry->wave_size_min <= 32 && 32 <= entry->wave_size_max))
     return llvm::make_error<UnsupportedFeature>("DXIL: [WaveSize(" + std::to_string(entry->wave_size_min) + ", " +

@@ -297,6 +297,28 @@ llvm::Error Finish(llvm::Module &module, llvm::Function *dxil_main) {
   return llvm::Error::success();
 }
 
+// A shader that indexes a descriptor heap needs its root signature to say so (spec 3.4: only then do the heap bases
+// follow its parameters in the root arguments). The view heap's flag is checked first.
+llvm::Error CheckHeapFlags(const EntryInfo &entry, SM50_SHADER_COMPILATION_ARGUMENT_DATA *pArgs) {
+  bool views = false, samplers = false;
+  for (auto &r : entry.resources)
+    if (r.heap)
+      (r.cls == ResourceClass::Sampler ? samplers : views) = true;
+  if (!views && !samplers)
+    return llvm::Error::success();
+  SM50_SHADER_ROOT_SIGNATURE_DATA *rootsig = nullptr;
+  if (!args_get_data<SM50_SHADER_ROOT_SIGNATURE, SM50_SHADER_ROOT_SIGNATURE_DATA>(pArgs, &rootsig))
+    return llvm::make_error<UnsupportedFeature>("DXIL: ResourceDescriptorHeap needs a root signature");
+  uint32_t flags = RootSignatureFlags(rootsig->bytecode, rootsig->bytecode_length);
+  if (views && !(flags & 0x400))
+    return llvm::make_error<UnsupportedFeature>(
+        "DXIL: ResourceDescriptorHeap needs root signature flag CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED (0x400)");
+  if (samplers && !(flags & 0x800))
+    return llvm::make_error<UnsupportedFeature>(
+        "DXIL: SamplerDescriptorHeap needs root signature flag SAMPLER_HEAP_DIRECTLY_INDEXED (0x800)");
+  return llvm::Error::success();
+}
+
 } // namespace
 
 void
@@ -320,6 +342,8 @@ ConvertDXIL(SM50ShaderInternal *shader, const char *name, llvm::LLVMContext &con
   auto &entry = dxil.entry;
   if (entry.kind == ShaderKind::Geometry)
     return llvm::make_error<UnsupportedFeature>("DXIL: a geometry shader compiles only with its vertex shader");
+  if (auto err = CheckHeapFlags(entry, pArgs))
+    return std::move(err);
   auto loaded = Load(dxil, context);
   if (!loaded)
     return loaded.takeError();
@@ -462,6 +486,8 @@ ConvertDXILGeometryPipeline(bool object, SM50ShaderInternal *vs, SM50ShaderInter
   if (!vs->dxil || !gs->dxil || vs->dxil->entry.kind != ShaderKind::Vertex || gs->dxil->entry.kind != ShaderKind::Geometry)
     return llvm::make_error<UnsupportedFeature>("DXIL: a geometry pipeline needs a DXIL vertex and geometry shader");
   auto stage = object ? vs : gs;
+  if (auto err = CheckHeapFlags(stage->dxil->entry, pArgs))
+    return std::move(err);
   auto loaded = Load(*stage->dxil, context);
   if (!loaded)
     return loaded.takeError();
