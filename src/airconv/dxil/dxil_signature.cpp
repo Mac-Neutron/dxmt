@@ -445,8 +445,8 @@ AddWaveInputs(const llvm::Module &module, SM50ShaderInternal *shader, uint32_t &
              op::WaveActiveBit, op::WavePrefixOp, op::WaveAllBitCount, op::WavePrefixBitCount, op::WaveMatch,
              op::WaveMultiPrefixOp, op::WaveMultiPrefixBitCount}) ||
       (shader->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER &&
-       calls({op::Sample, op::SampleBias, op::SampleCmp, op::CalculateLOD, op::DerivCoarseX, op::DerivCoarseY,
-              op::DerivFineX, op::DerivFineY}))) {
+       calls({op::Sample, op::SampleBias, op::SampleCmp, op::SampleCmpBias, op::CalculateLOD, op::DerivCoarseX,
+              op::DerivCoarseY, op::DerivFineX, op::DerivFineY}))) {
     lane_index_arg = shader->func_signature.DefineInput(air::InputThreadIndexInSimdgroup{});
     lane_count_arg = shader->func_signature.DefineInput(air::InputThreadsPerSimdgroup{});
   }

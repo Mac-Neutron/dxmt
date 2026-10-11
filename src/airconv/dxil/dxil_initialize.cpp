@@ -147,7 +147,8 @@ ScanUsage(const EntryInfo &entry, const llvm::Module &module) {
         case op::CalculateLOD:
           u.sampled = true;
           break;
-        case op::SampleCmp: case op::SampleCmpLevelZero: case op::TextureGatherCmp:
+        case op::SampleCmp: case op::SampleCmpLevelZero: case op::TextureGatherCmp: case op::SampleCmpGrad:
+        case op::SampleCmpBias:
           u.sampled = u.compared = true;
           break;
         case op::TextureLoad: case op::BufferLoad: case op::RawBufferLoad: case op::CBufferLoad: case op::CBufferLoadLegacy:

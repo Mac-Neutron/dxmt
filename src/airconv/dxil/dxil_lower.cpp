@@ -171,7 +171,8 @@ Lowering::Lower(llvm::CallInst *call) {
   if (opcode == op::RenderTargetGetSamplePosition || opcode == op::RenderTargetGetSampleCount)
     return LowerOther(opcode, call); // inside the resource range, but they take no handle
   if ((opcode >= op::CBufferLoad && opcode <= op::AtomicCompareExchange) || opcode == op::CalculateLOD ||
-      opcode == op::RawBufferLoad || opcode == op::RawBufferStore)
+      opcode == op::RawBufferLoad || opcode == op::RawBufferStore || opcode == op::SampleCmpGrad ||
+      opcode == op::SampleCmpBias)
     return LowerResource(opcode, call);
   return LowerOther(opcode, call);
 }
