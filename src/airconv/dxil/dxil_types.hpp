@@ -92,7 +92,14 @@ struct Resource {
   uint32_t stride = 0;                                  // structured buffers
   uint32_t cbuffer_size = 0;                            // constant buffers, in bytes
   bool globally_coherent = false, has_counter = false, rasterizer_ordered = false, comparison_sampler = false;
+  // A descriptor heap range (ResourceDescriptorHeap/SamplerDescriptorHeap, op 218): space kHeapSpace, lower bound 0,
+  // unbounded, the heap index its register; one per distinct annotateHandle ResourceProperties (MacNeutron).
+  bool heap = false;
+  uint32_t heap_props[2] = {0, 0};
 };
+
+// Heap ranges' register space (no root parameter's) and their first range ID (MacNeutron).
+constexpr uint32_t kHeapSpace = ~0u, kHeapRangeBase = 1u << 24;
 
 struct EntryInfo {
   ShaderKind kind = ShaderKind::Invalid;

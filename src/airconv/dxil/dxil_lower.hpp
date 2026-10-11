@@ -32,6 +32,9 @@ struct HandleInfo {
 // Resolves a %dx.types.Handle to its resource, through annotateHandle. Only reads the handle's defining call, so it
 // also serves SM50Initialize's usage scan.
 llvm::Expected<HandleInfo> ResolveHandle(const EntryInfo &entry, llvm::Value *handle);
+// An annotateHandle (216) of a createHandleFromHeap (218): returns that call and sets `props` to the
+// ResourceProperties, which pick its heap range; nullptr for any other handle (MacNeutron).
+llvm::CallInst *HeapHandle(llvm::CallInst &annotate, uint32_t props[2]);
 
 // Replaces dx.op calls with AIR, one call at a time, inside the AIR entry function being built.
 // GPU efficiency spec E5 (MacNeutron): a raw or structured buffer load is bounds-checked once for all its components

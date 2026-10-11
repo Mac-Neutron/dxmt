@@ -31,14 +31,34 @@ ConstantU32(llvm::Value *v, uint32_t otherwise) {
   return c ? (uint32_t)c->getZExtValue() : otherwise;
 }
 
+llvm::CallInst *
+HeapHandle(llvm::CallInst &annotate, uint32_t props[2]) {
+  if (annotate.arg_size() < 3)
+    return nullptr;
+  auto heap = llvm::dyn_cast<llvm::CallInst>(annotate.getArgOperand(1));
+  auto p = llvm::dyn_cast<llvm::Constant>(annotate.getArgOperand(2));
+  if (!heap || OpCode(*heap) != op::CreateHandleFromHeap || !p || !p->getAggregateElement(1u))
+    return nullptr;
+  props[0] = ConstantU32(p->getAggregateElement(0u)), props[1] = ConstantU32(p->getAggregateElement(1u));
+  return heap;
+}
+
 llvm::Expected<HandleInfo>
 ResolveHandle(const EntryInfo &entry, llvm::Value *handle) {
   auto call = llvm::dyn_cast<llvm::CallInst>(handle);
   if (!call)
     return llvm::make_error<UnsupportedFeature>("DXIL: resource handle through phi/select");
   switch (OpCode(*call)) {
-  case op::AnnotateHandle: // (216, handle, %dx.types.ResourceProperties)
+  case op::AnnotateHandle: { // (216, handle, %dx.types.ResourceProperties)
+    uint32_t props[2];
+    if (auto heap = HeapHandle(*call, props)) { // (218, i32 index, i1 samplerHeap, i1 nonUniform): the index is the register
+      for (auto &r : entry.resources)
+        if (r.heap && r.heap_props[0] == props[0] && r.heap_props[1] == props[1])
+          return HandleInfo{r.cls, r.id, heap->getArgOperand(1), &r};
+      return llvm::make_error<UnsupportedFeature>("DXIL: createHandleFromHeap names an undeclared heap range");
+    }
     return ResolveHandle(entry, call->getArgOperand(1));
+  }
   case op::CreateHandle: { // (57, i8 class, i32 rangeId, i32 index, i1 nonUniform)
     auto cls = ResourceClass(ConstantU32(call->getArgOperand(1)));
     uint32_t id = ConstantU32(call->getArgOperand(2));
@@ -59,8 +79,8 @@ ResolveHandle(const EntryInfo &entry, llvm::Value *handle) {
         return HandleInfo{cls, r.id, call->getArgOperand(2), &r};
     return llvm::make_error<UnsupportedFeature>("DXIL: createHandleFromBinding names an undeclared resource");
   }
-  case op::CreateHandleFromHeap:
-    return llvm::make_error<UnsupportedFeature>("DXIL: dx.op.createHandleFromHeap (dynamic resources) not supported");
+  case op::CreateHandleFromHeap: // only annotateHandle says what it is
+    return llvm::make_error<UnsupportedFeature>("DXIL: createHandleFromHeap without annotateHandle");
   default:
     return llvm::make_error<UnsupportedFeature>("DXIL: resource handle from an unrecognised op");
   }
@@ -137,10 +157,9 @@ Lowering::Lower(llvm::CallInst *call) {
   switch (opcode) {
   case op::CreateHandle:
   case op::CreateHandleFromBinding:
+  case op::CreateHandleFromHeap:
   case op::AnnotateHandle:
     return llvm::Error::success(); // resolved at each use, erased by Cleanup
-  case op::CreateHandleFromHeap:
-    return ResolveHandle(entry, call).takeError();
   default:
     break;
   }
@@ -170,6 +189,7 @@ Lowering::Cleanup(llvm::Function &function) {
         switch (OpCode(*call)) {
         case op::CreateHandle:
         case op::CreateHandleFromBinding:
+        case op::CreateHandleFromHeap:
         case op::AnnotateHandle:
           call->eraseFromParent();
           erased = true;
