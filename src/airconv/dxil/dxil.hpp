@@ -53,9 +53,9 @@ bool ModuleCallsOp(const llvm::Module &module, uint32_t opcode);
 llvm::Error InitializeDXIL(const Container &container, dxbc::SM50ShaderInternal *shader, MTL_SHADER_REFLECTION *refl);
 
 // dxil_signature.cpp: pushes the signature handlers (entry point inputs/outputs) for this stage, and fills
-// `unpacked_inputs` (see DXILShader).
+// `unpacked_inputs` (see DXILShader). `quads_2d` (DXILShader's) remaps a compute shader's thread IDs.
 llvm::Error AddSignatureHandlers(const EntryInfo &entry, const llvm::Module &module, dxbc::SM50ShaderInternal *shader,
-                                 std::map<uint32_t, uint32_t> &unpacked_inputs);
+                                 std::map<uint32_t, uint32_t> &unpacked_inputs, bool quads_2d);
 // dxil_signature.cpp: defines the simdgroup lane inputs when the module uses wave operations.
 void AddWaveInputs(const llvm::Module &module, dxbc::SM50ShaderInternal *shader, uint32_t &lane_index_arg, uint32_t &lane_count_arg);
 

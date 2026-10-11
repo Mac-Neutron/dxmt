@@ -174,8 +174,15 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   shader->shader_info.use_msad = ModuleCallsOp(**module, op::Msad);
   shader->shader_info.use_samplepos = ModuleCallsOp(**module, op::Texture2DMSGetSamplePosition) ||
                                       ModuleCallsOp(**module, op::RenderTargetGetSamplePosition);
+  // 2D compute quads (HLSL_SM_6_6_Derivatives.md): numthreads X and Y even (Y = 1 is the 1D layout, Metal's own), in a
+  // shader that takes derivatives, samples with an implicit LOD, calculates a LOD or reads its quad.
+  std::initializer_list<uint32_t> quad_ops = {op::Sample, op::SampleBias, op::SampleCmp, op::CalculateLOD,
+                                              op::DerivCoarseX, op::DerivCoarseY, op::DerivFineX, op::DerivFineY,
+                                              op::QuadReadLaneAt, op::QuadOp, op::QuadVote, op::SampleCmpBias};
+  bool quads_2d = entry->kind == ShaderKind::Compute && entry->numthreads[0] % 2 == 0 && entry->numthreads[1] % 2 == 0 &&
+                  std::any_of(quad_ops.begin(), quad_ops.end(), [&](uint32_t o) { return ModuleCallsOp(**module, o); });
   std::map<uint32_t, uint32_t> unpacked_inputs;
-  if (auto err = AddSignatureHandlers(*entry, **module, shader, unpacked_inputs))
+  if (auto err = AddSignatureHandlers(*entry, **module, shader, unpacked_inputs, quads_2d))
     return err;
   uint32_t lane_index_arg = ~0u, lane_count_arg = ~0u;
   AddWaveInputs(**module, shader, lane_index_arg, lane_count_arg);
@@ -190,6 +197,7 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   dxil->capture_hash = container.capture_hash;
   dxil->entry = std::move(*entry);
   dxil->unpacked_inputs = std::move(unpacked_inputs);
+  dxil->quads_2d = quads_2d;
   dxil->lane_index_arg = lane_index_arg;
   dxil->lane_count_arg = lane_count_arg;
   shader->dxil = dxil;
