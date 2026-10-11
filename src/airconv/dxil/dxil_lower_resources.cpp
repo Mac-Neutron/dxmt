@@ -302,8 +302,11 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
       o[i] = (int32_t)ConstantU32(v[i]);
     return air.GetOffset(tex, o);
   };
-  // The texel (vector or depth scalar) as the call's ResRet struct.
-  auto result = [&](llvm::Value *texel) {
+  // The texel (vector or depth scalar) as the call's ResRet struct. No texel: the builder has no form for this texture
+  // kind (a comparison of a 1D texture, which binds as a 2D colour texture, never a depth one).
+  auto result = [&](llvm::Value *texel) -> llvm::Error {
+    if (!texel)
+      return Unsupported(call);
     auto elem = ty->getStructElementType(0);
     llvm::Value *fields[5];
     for (unsigned c = 0; c < 4; c++) {
@@ -394,8 +397,17 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
     auto ddx = ir.CreateFMul(grad.first, scale);
     return std::make_pair(ddx, ir.CreateFMul(grad.second, scale));
   };
-  // A compute shader has no implicit derivatives (spec 3.3): Sample, SampleBias and SampleCmp take the quad's coarse
-  // gradients of their coordinates through the gradient path (`reference`: SampleCmp's).
+  // SampleGrad's and SampleCmpGrad's ddx0..2 from argument `first`, ddy0..2 after them (a 1D texture's y is 0).
+  auto gradients = [&](unsigned first) {
+    llvm::Value *ddx = llvm::UndefValue::get(coord->getType()), *ddy = ddx;
+    for (unsigned i = 0; i < dims; i++) {
+      ddx = ir.CreateInsertElement(ddx, one_d && i == 1 ? llvm::ConstantFP::get(ir.getFloatTy(), 0) : arg(first + i), i);
+      ddy = ir.CreateInsertElement(ddy, one_d && i == 1 ? llvm::ConstantFP::get(ir.getFloatTy(), 0) : arg(first + 3 + i), i);
+    }
+    return scaled({ddx, ddy}, bias);
+  };
+  // A compute shader has no implicit derivatives (spec 3.3): Sample, SampleBias, SampleCmp and SampleCmpBias take the
+  // quad's coarse gradients of their coordinates through the gradient path (`reference`: the comparisons').
   bool compute = entry.kind == ShaderKind::Compute;
   auto coarse = [&](llvm::Value *lod_bias, llvm::Value *shader_clamp, llvm::Value *reference) {
     auto [ddx, ddy] = scaled(CoarseGradients(coord), lod_bias);
@@ -421,19 +433,24 @@ Lowering::LowerTexture(uint32_t opcode, llvm::CallInst *call, const HandleInfo &
     return result(air.CreateSample(tex, d->ResourceHandle, sampler, coord, array, o(),
                                    llvm::air::sample_level{ir.CreateFAdd(arg(10), bias)}).first);
   case op::SampleGrad: { // (63, ..., ddx0..2, ddy0..2, clamp)
-    llvm::Value *ddx = llvm::UndefValue::get(coord->getType()), *ddy = ddx;
-    for (unsigned i = 0; i < dims; i++) {
-      ddx = ir.CreateInsertElement(ddx, one_d && i == 1 ? llvm::ConstantFP::get(ir.getFloatTy(), 0) : arg(10 + i), i);
-      ddy = ir.CreateInsertElement(ddy, one_d && i == 1 ? llvm::ConstantFP::get(ir.getFloatTy(), 0) : arg(13 + i), i);
-    }
-    std::tie(ddx, ddy) = scaled({ddx, ddy}, bias);
+    auto [ddx, ddy] = gradients(10);
     return result(air.CreateSampleGrad(tex, d->ResourceHandle, sampler, coord, array, ddx, ddy, min_lod(arg(16)).lod, o()).first);
+  }
+  case op::SampleCmpGrad: { // (254, ..., compare, ddx0..2, ddy0..2, clamp); cubes take no offset (CreateSampleCmpGrad)
+    auto [ddx, ddy] = gradients(11);
+    return result(air.CreateSampleCmpGrad(tex, d->ResourceHandle, sampler, coord, array, arg(10), ddx, ddy,
+                                          min_lod(arg(17)).lod, o()).first);
   }
   case op::SampleCmp: // (64, ..., compare, clamp)
     if (compute)
       return coarse(bias, arg(11), arg(10));
     return result(air.CreateSampleCmp(tex, d->ResourceHandle, sampler, coord, array, arg(10), o(),
                                       llvm::air::sample_bias{bias}, min_lod(arg(11))).first);
+  case op::SampleCmpBias: // (255, ..., compare, bias, clamp)
+    if (compute)
+      return coarse(ir.CreateFAdd(arg(11), bias), arg(12), arg(10));
+    return result(air.CreateSampleCmp(tex, d->ResourceHandle, sampler, coord, array, arg(10), o(),
+                                      llvm::air::sample_bias{ir.CreateFAdd(arg(11), bias)}, min_lod(arg(12))).first);
   case op::SampleCmpLevelZero: // (65, ..., compare)
     return result(air.CreateSampleCmp(tex, d->ResourceHandle, sampler, coord, array, arg(10), o(),
                                       llvm::air::sample_level{llvm::ConstantFP::get(ir.getFloatTy(), 0)}).first);
@@ -646,6 +663,8 @@ Lowering::LowerResource(uint32_t opcode, llvm::CallInst *call) {
   case op::TextureGather:
   case op::TextureGatherCmp:
   case op::CalculateLOD:
+  case op::SampleCmpGrad:
+  case op::SampleCmpBias:
     return LowerTexture(opcode, call, h);
   case op::Texture2DMSGetSamplePosition: { // (75, srv, i32 index) -> {f32, f32}: D3D's standard positions (air_samplepos)
     llvm::Value *count = ir.getInt32(0); // no texture: (0, 0), as the DXBC samplepos lowering
