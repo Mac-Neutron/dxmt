@@ -122,7 +122,7 @@ llvm::Error RefuseGroupshared64BitAtomics(const llvm::Module &module) {
 }
 
 struct Usage {
-  bool read = false, written = false, sampled = false, compared = false;
+  bool read = false, written = false, sampled = false, compared = false, atomic = false;
 };
 
 // What each resource is used for: airconv's binding maps pick Metal access modes and depth textures from it.
@@ -158,7 +158,7 @@ ScanUsage(const EntryInfo &entry, const llvm::Module &module) {
           u.written = true;
           break;
         case op::AtomicBinOp: case op::AtomicCompareExchange:
-          u.read = u.written = true;
+          u.read = u.written = u.atomic = true;
           break;
         }
       }
@@ -189,6 +189,11 @@ void FillResourceMaps(const EntryInfo &entry, const llvm::Module &module, Shader
       uav.global_coherent = r.globally_coherent;
       uav.rasterizer_order = r.rasterizer_ordered;
       uav.with_counter = r.has_counter;
+      // Float atomics on a typed R32_FLOAT UAV (SM 6.6; spec 3.7) go through an R32Uint view of it: its loads and
+      // stores bitcast (Cast), its atomics take the integer path.
+      uav.atomic_view = u.atomic && r.element_type == ComponentType::F32 && uav.resource_type != ResourceType::NonApplicable;
+      if (uav.atomic_view)
+        uav.scaler_type = ScalerDataType::Uint;
       uav.structure_stride = r.stride;
       uav.arg_index = uav.arg_metadata_index = uav.arg_counter_index = ~0u;
       info.uavMap[r.id] = uav;

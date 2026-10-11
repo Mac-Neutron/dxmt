@@ -647,7 +647,15 @@ public:
       return E_INVALIDARG;
     }
 
-    return Heap->AddUnorderedAccessView(Index, texture.ptr(), View);
+    // MacNeutron: an R32_FLOAT UAV also carries an R32Uint view of the same subresources, for a shader's float atomics
+    // (Metal's texture atomics take integer textures only; every D3D12 texture has PixelFormatView usage).
+    // ponytail: an R32Uint view for every R32_FLOAT UAV, used or not; make it on a shader's first atomic use if view counts ever matter
+    std::optional<TextureViewKey> AtomicView;
+    if (view_descriptor.format == WMTPixelFormatR32Float) {
+      view_descriptor.format = WMTPixelFormatR32Uint;
+      AtomicView = texture->createView(view_descriptor);
+    }
+    return Heap->AddUnorderedAccessView(Index, texture.ptr(), View, AtomicView);
   };
 
   virtual HRESULT STDMETHODCALLTYPE

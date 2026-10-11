@@ -186,7 +186,7 @@ public:
   std::pair<llvm::Value *, llvm::Value *>
   GetTextureDescriptor(
       llvm::air::AIRBuilder &AIR, llvm::Value *IntPtr, llvm::Value *Index, Texture::ResourceKind Kind, RangeId RangeId,
-      uint32_t DescriptorOffset
+      uint32_t DescriptorOffset, uint32_t HandleField = 0 /* MacNeutron: 2, an atomic_view's R32Uint view */
   ) {
     auto TyTextureHandle = AIR.getTextureHandleType(Kind);
     auto TyTextureDescriptor = llvm::StructType::get(
@@ -198,9 +198,12 @@ public:
     return {
         B.CreateLoad(
             TyTextureHandle, //
-            B.CreateGEP(
-                TyTextureDescriptor, B.CreatePointerCast(IntPtr, TyTextureDescriptor->getPointerTo(2)),
-                {IdxDescriptor, AIR.getInt(0) /* pointer */}
+            B.CreatePointerCast(
+                B.CreateGEP(
+                    TyTextureDescriptor, B.CreatePointerCast(IntPtr, TyTextureDescriptor->getPointerTo(2)),
+                    {IdxDescriptor, AIR.getInt(HandleField) /* pointer */}
+                ),
+                TyTextureHandle->getPointerTo(2)
             )
         ),
         B.CreateLoad(
@@ -269,8 +272,9 @@ public:
     auto MemoryAccess = UAV.written
                             ? (UAV.read ? Texture::MemoryAccess::acesss_readwrite : Texture::MemoryAccess::access_write)
                             : Texture::MemoryAccess::access_read;
-    auto [Handle, Metadata] =
-        GetTextureDescriptor(Builder, HeapPointer, Index, ResourceKind, UAV.range.lower_bound, DescriptorOffset);
+    auto [Handle, Metadata] = GetTextureDescriptor(
+        Builder, HeapPointer, Index, ResourceKind, UAV.range.lower_bound, DescriptorOffset, UAV.atomic_view ? 2 : 0
+    );
     return TextureDescirptor{Handle,       Metadata,  UAV.global_coherent, ResourceKind, ResourceKindLogical,
                              MemoryAccess, SampleType};
   }

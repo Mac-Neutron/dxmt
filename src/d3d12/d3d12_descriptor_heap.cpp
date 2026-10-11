@@ -26,10 +26,13 @@
 
 namespace dxmt {
 
+// atomic_resource_id (MacNeutron): a UAV's R32Uint view, for float atomics on an R32_FLOAT view (airconv's
+// UnorderedAccessViewInfo::atomic_view reads it); 0 for other formats and for SRVs.
 struct SRVTextureGPUStorage {
   uint64_t resource_id;
   uint64_t metadata;
-  uint64_t padding[2];
+  uint64_t atomic_resource_id;
+  uint64_t padding;
 };
 
 using UAVTextureGPUStorage = SRVTextureGPUStorage;
@@ -37,7 +40,8 @@ using UAVTextureGPUStorage = SRVTextureGPUStorage;
 struct UAVTexelBufferGPUStorage {
   uint64_t resource_id;
   uint64_t metadata;
-  uint64_t padding[2];
+  uint64_t atomic_resource_id;
+  uint64_t padding;
 };
 
 using SRVTexelBufferGPUStorage = UAVTexelBufferGPUStorage;
@@ -210,6 +214,7 @@ public:
       auto &gpu_storage = mapped_argument_buffer_[Index];
       gpu_storage.SRVTexture.resource_id = texture_view.gpuResourceID;
       gpu_storage.SRVTexture.metadata = TextureMetadata(Texture->arrayLength(View), ResourceMinLODClamp);
+      gpu_storage.SRVTexture.atomic_resource_id = 0;
     }
     return S_OK;
   }
@@ -230,7 +235,7 @@ public:
   }
 
   virtual HRESULT
-  AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View) {
+  AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View, std::optional<TextureViewKey> AtomicView) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     auto &cpu_storage = descriptors_[Index];
@@ -242,12 +247,15 @@ public:
       auto &gpu_storage = mapped_argument_buffer_[Index];
       gpu_storage.UAVTexture.resource_id = texture_view.gpuResourceID;
       gpu_storage.UAVTexture.metadata = TextureMetadata(Texture->arrayLength(View), 0);
+      gpu_storage.UAVTexture.atomic_resource_id = AtomicView ? Texture->view(*AtomicView).gpuResourceID : 0;
     }
     return S_OK;
   }
 
   virtual HRESULT
-  AddUnorderedAccessView(UINT Index, Buffer *UAVBuffer, BufferViewKey View, BufferSlice Slice) {
+  AddUnorderedAccessView(
+      UINT Index, Buffer *UAVBuffer, BufferViewKey View, BufferSlice Slice, std::optional<BufferViewKey> AtomicView
+  ) {
     if (Index >= descriptors_.size())
       return E_INVALIDARG;
     auto &cpu_storage = descriptors_[Index];
@@ -265,6 +273,8 @@ public:
         gpu_storage.UAVTexelBuffer.resource_id = 0;
         gpu_storage.UAVTexelBuffer.metadata = 0;
       }
+      gpu_storage.UAVTexelBuffer.atomic_resource_id =
+          UAVBuffer && AtomicView ? UAVBuffer->view_(*AtomicView).gpu_resource_id : 0;
     }
     return S_OK;
   }
@@ -302,6 +312,7 @@ public:
     cpu_storage.SRVTexelBuffer.view = View;
     if (mapped_argument_buffer_) { 
       auto &gpu_storage = mapped_argument_buffer_[Index];
+      gpu_storage.UAVTexelBuffer.atomic_resource_id = 0;
       if (Buffer) {
         auto &buffer_view = Buffer->view_(View);
         gpu_storage.UAVTexelBuffer.resource_id = buffer_view.gpu_resource_id;
@@ -371,7 +382,7 @@ public:
       if (pDesc->Format == DXGI_FORMAT_UNKNOWN || (pDesc->Buffer.Flags & D3D12_BUFFER_UAV_FLAG_RAW))
         return AddUnorderedAccessView(Index, (Buffer *)nullptr, BufferSlice{}, nullptr, 0);
       auto [buffer, view] = device_->NullTexelBuffer();
-      return AddUnorderedAccessView(Index, buffer, view, BufferSlice{});
+      return AddUnorderedAccessView(Index, buffer, view, BufferSlice{}, std::nullopt);
     }
     descriptors_[Index].type = ShaderVisibleDescriptorType::Null;
     if (mapped_argument_buffer_)

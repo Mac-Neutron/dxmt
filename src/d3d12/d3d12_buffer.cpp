@@ -249,7 +249,12 @@ public:
     Slice.byteLength = Format.BytesPerTexel * ViewDesc.Buffer.NumElements;
 
     auto view = buffer->createView(view_descriptor);
-    return Heap->AddUnorderedAccessView(Index, buffer.ptr(), view, Slice);
+    // MacNeutron: an R32_FLOAT UAV also carries an R32Uint view, for a shader's float atomics (it gets ShaderAtomic usage).
+    // ponytail: an R32Uint view for every R32_FLOAT UAV, used or not; make it on a shader's first atomic use if view counts ever matter
+    std::optional<BufferViewKey> AtomicView;
+    if (Format.PixelFormat == WMTPixelFormatR32Float)
+      AtomicView = buffer->createView(BufferViewDescriptor{WMTPixelFormatR32Uint});
+    return Heap->AddUnorderedAccessView(Index, buffer.ptr(), view, Slice, AtomicView);
   };
 
   virtual HRESULT STDMETHODCALLTYPE

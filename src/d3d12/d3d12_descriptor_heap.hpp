@@ -21,6 +21,7 @@
 #include "dxmt_buffer.hpp"
 #include "dxmt_texture.hpp"
 #include <cstdint>
+#include <optional>
 
 #if UINTPTR_MAX == 0xffffffffffffffffULL
 #define DXMT_USE_EMBEDDED_HEAP_POINTER
@@ -135,9 +136,14 @@ public:
 
   virtual HRESULT AddConstantBufferView(UINT Index, UINT64 VA, UINT32 SizeInBytes) = 0;
 
-  virtual HRESULT AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View) = 0;
+  // AtomicView (MacNeutron): an R32Uint view of an R32_FLOAT UAV's subresources, for float atomics; its GPU resource ID
+  // goes in the descriptor's third qword, 0 without one.
+  virtual HRESULT
+  AddUnorderedAccessView(UINT Index, Texture *Texture, TextureViewKey View, std::optional<TextureViewKey> AtomicView) = 0;
 
-  virtual HRESULT AddUnorderedAccessView(UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice) = 0;
+  virtual HRESULT AddUnorderedAccessView(
+      UINT Index, Buffer *Buffer, BufferViewKey View, BufferSlice Slice, std::optional<BufferViewKey> AtomicView
+  ) = 0;
 
   virtual HRESULT AddUnorderedAccessView(
       UINT Index, Buffer *UAVBuffer, BufferSlice Slice, Buffer *Counter, UINT CounterOffsetInBytes
