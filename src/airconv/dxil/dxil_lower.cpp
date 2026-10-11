@@ -321,9 +321,12 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     } else {
       ptr = RegisterElementPointer(res.input, *e, call->getArgOperand(2), ConstantU32(call->getArgOperand(3)));
     }
+    // Signature registers hold 32-bit values: a half element reads a float and narrows it; i16 truncates (Cast).
     auto word = ir.CreateLoad(ir.getInt32Ty(), ptr);
     auto ty = call->getType();
-    Replace(call, ty->isIntegerTy(1) ? ir.CreateICmpNE(word, ir.getInt32(0)) : Cast(word, ty));
+    Replace(call, ty->isIntegerTy(1) ? ir.CreateICmpNE(word, ir.getInt32(0))
+                  : ty->isHalfTy()   ? ir.CreateFPTrunc(ir.CreateBitCast(word, ir.getFloatTy()), ty)
+                                     : Cast(word, ty));
     return llvm::Error::success();
   }
   case op::StoreOutput: { // (5, i32 outputSigId, i32 row, i8 col, T value)
@@ -344,8 +347,12 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     case SemanticKind::StencilRef:
       ir.CreateStore(Cast(value, ir.getInt32Ty()), res.stencil_ref_reg);
       break;
-    default: {
-      auto word = value->getType()->isIntegerTy(1) ? ir.CreateSExt(value, ir.getInt32Ty()) : Cast(value, ir.getInt32Ty());
+    default: { // as 32-bit values (LoadInput): a half widened to a float, an I16 element sign-extended, U16 zero-extended
+      auto ty = value->getType();
+      auto word = ty->isIntegerTy(1) || (ty->isIntegerTy(16) && e->type == ComponentType::I16)
+                      ? ir.CreateSExt(value, ir.getInt32Ty())
+                  : ty->isHalfTy() ? ir.CreateBitCast(ir.CreateFPExt(value, ir.getFloatTy()), ir.getInt32Ty())
+                                   : Cast(value, ir.getInt32Ty());
       ir.CreateStore(word, RegisterElementPointer(res.output, *e, call->getArgOperand(2), ConstantU32(call->getArgOperand(3))));
     }
     }
