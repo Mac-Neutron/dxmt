@@ -263,11 +263,33 @@ const SignatureElement *FindElement(const std::vector<SignatureElement> &element
 }
 } // namespace
 
+bool Lowering::HelpersLeftOut() const { return entry.kind == ShaderKind::Pixel && !dxil.include_helper_lanes; }
+
+llvm::Value *Lowering::WaveLanes() {
+  return HelpersLeftOut() ? Simd(ir, "air.simd_ballot.i64", ir.getInt64Ty(), {Participates()}) : nullptr;
+}
+
+llvm::Value *Lowering::Participates() {
+  return HelpersLeftOut() ? ir.CreateNot(Simd(ir, "air.simd_is_helper_thread", ir.getInt1Ty(), {})) : ir.getTrue();
+}
+
 llvm::Error
 Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
   auto &res = ctx.resource;
   auto component = [&](llvm::Value *vec) {
     return vec ? ir.CreateExtractElement(vec, call->getArgOperand(1)) : nullptr;
+  };
+  // Wave operations: a lane left out (HelpersLeftOut) feeds `identity` instead of `v`, which leaves the result as the
+  // other lanes make it; the first lane is the lowest one taking part (lanes are 32 wide, d3d12_device.cpp).
+  auto masked = [&](llvm::Value *v, llvm::Constant *identity) {
+    return HelpersLeftOut() ? ir.CreateSelect(Participates(), v, identity) : v;
+  };
+  auto first_lane = [&](llvm::Value *lanes) { return air.CreateCountZero(ir.CreateTrunc(lanes, ir.getInt32Ty()), true); };
+  auto read_first = [&](llvm::Value *v) {
+    if (auto lanes = WaveLanes())
+      return Simd(ir, "air.simd_shuffle" + SimdSuffix(v->getType(), false), v->getType(),
+                  {v, ir.CreateTrunc(first_lane(lanes), ir.getInt16Ty())});
+    return Simd(ir, "air.simd_broadcast_first" + SimdSuffix(v->getType(), false), v->getType(), {v});
   };
   switch (opcode) {
   case op::ThreadId: // (93, i32 component)
@@ -380,7 +402,10 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     return llvm::Error::success();
   }
   case op::WaveIsFirstLane:
-    Replace(call, Simd(ir, "air.simd_is_first", ir.getInt1Ty(), {}));
+    if (auto lanes = WaveLanes())
+      Replace(call, ir.CreateICmpEQ(ctx.function->getArg(dxil.lane_index_arg), first_lane(lanes)));
+    else
+      Replace(call, Simd(ir, "air.simd_is_first", ir.getInt1Ty(), {}));
     return llvm::Error::success();
   case op::WaveGetLaneIndex:
   case op::WaveGetLaneCount: {
@@ -389,18 +414,21 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     return llvm::Error::success();
   }
   case op::WaveAnyTrue:
-  case op::WaveAllTrue:
-    Replace(call, Simd(ir, opcode == op::WaveAnyTrue ? "air.simd_any" : "air.simd_all", ir.getInt1Ty(), {call->getArgOperand(1)}));
+  case op::WaveAllTrue: {
+    bool any = opcode == op::WaveAnyTrue;
+    auto v = masked(call->getArgOperand(1), any ? ir.getFalse() : ir.getTrue());
+    Replace(call, Simd(ir, any ? "air.simd_any" : "air.simd_all", ir.getInt1Ty(), {v}));
     return llvm::Error::success();
+  }
   case op::WaveActiveAllEqual: { // (115, T)
     auto v = call->getArgOperand(1);
-    auto first = Simd(ir, "air.simd_broadcast_first" + SimdSuffix(v->getType(), false), v->getType(), {v});
-    auto same = v->getType()->isFloatingPointTy() ? ir.CreateFCmpOEQ(v, first) : ir.CreateICmpEQ(v, first);
-    Replace(call, Simd(ir, "air.simd_all", ir.getInt1Ty(), {same}));
+    auto first = read_first(v);
+    llvm::Value *same = v->getType()->isFloatingPointTy() ? ir.CreateFCmpOEQ(v, first) : ir.CreateICmpEQ(v, first);
+    Replace(call, Simd(ir, "air.simd_all", ir.getInt1Ty(), {masked(same, ir.getTrue())}));
     return llvm::Error::success();
   }
   case op::WaveActiveBallot: { // (116, i1) -> %dx.types.fouri32 {lanes 0-31, lanes 32-63, 0, 0}
-    auto ballot = Simd(ir, "air.simd_ballot.i64", ir.getInt64Ty(), {call->getArgOperand(1)});
+    auto ballot = Simd(ir, "air.simd_ballot.i64", ir.getInt64Ty(), {masked(call->getArgOperand(1), ir.getFalse())});
     Replace(call, Aggregate(call->getType(), {ir.CreateTrunc(ballot, ir.getInt32Ty()),
                                               ir.CreateTrunc(ir.CreateLShr(ballot, 32), ir.getInt32Ty()),
                                               ir.getInt32(0), ir.getInt32(0)}));
@@ -424,11 +452,9 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     Replace(call, Simd(ir, "air.simd_shuffle" + SimdSuffix(v->getType(), false), v->getType(), {v, lane}));
     return llvm::Error::success();
   }
-  case op::WaveReadLaneFirst: { // (118, T)
-    auto v = call->getArgOperand(1);
-    Replace(call, Simd(ir, "air.simd_broadcast_first" + SimdSuffix(v->getType(), false), v->getType(), {v}));
+  case op::WaveReadLaneFirst: // (118, T)
+    Replace(call, read_first(call->getArgOperand(1)));
     return llvm::Error::success();
-  }
   case op::WaveActiveOp:
   case op::WavePrefixOp: { // (119/121, T, i8 op: 0 sum, 1 product, 2 min, 3 max, i8 sign: 0 signed, 1 unsigned)
     auto v = call->getArgOperand(1);
@@ -439,7 +465,19 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     if (kind > 3 || (opcode == op::WavePrefixOp && kind > 1))
       return Unsupported(call);
     auto name = std::string(opcode == op::WaveActiveOp ? active[kind] : prefix[kind]) + SimdSuffix(v->getType(), is_signed);
-    Replace(call, Simd(ir, name, v->getType(), {v}));
+    // The identity of each: x op identity = x (a float sum's is -0.0, for x = -0.0 too).
+    auto ty = v->getType();
+    bool fp = ty->isFloatingPointTy();
+    unsigned bits = ty->getScalarSizeInBits();
+    llvm::Constant *identity[] = {
+        fp ? llvm::ConstantFP::getNegativeZero(ty) : llvm::ConstantInt::get(ty, 0),
+        fp ? llvm::ConstantFP::get(ty, 1.0) : llvm::ConstantInt::get(ty, 1),
+        fp ? llvm::ConstantFP::getInfinity(ty)
+           : llvm::ConstantInt::get(ty, is_signed ? llvm::APInt::getSignedMaxValue(bits) : llvm::APInt::getMaxValue(bits)),
+        fp ? llvm::ConstantFP::getInfinity(ty, true)
+           : llvm::ConstantInt::get(ty, is_signed ? llvm::APInt::getSignedMinValue(bits) : llvm::APInt::getMinValue(bits)),
+    };
+    Replace(call, Simd(ir, name, ty, {masked(v, identity[kind])}));
     return llvm::Error::success();
   }
   case op::WaveActiveBit: { // (120, T, i8 op: 0 and, 1 or, 2 xor)
@@ -448,12 +486,13 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     uint32_t kind = ConstantU32(call->getArgOperand(2));
     if (kind > 2)
       return Unsupported(call);
-    Replace(call, Simd(ir, std::string(bit[kind]) + SimdSuffix(v->getType(), false), v->getType(), {v}));
+    auto identity = kind == 0 ? llvm::Constant::getAllOnesValue(v->getType()) : llvm::Constant::getNullValue(v->getType());
+    Replace(call, Simd(ir, std::string(bit[kind]) + SimdSuffix(v->getType(), false), v->getType(), {masked(v, identity)}));
     return llvm::Error::success();
   }
   case op::WaveAllBitCount:
   case op::WavePrefixBitCount: { // (135/136, i1): lanes (below this one) where the value is true
-    llvm::Value *ballot = Simd(ir, "air.simd_ballot.i64", ir.getInt64Ty(), {call->getArgOperand(1)});
+    llvm::Value *ballot = Simd(ir, "air.simd_ballot.i64", ir.getInt64Ty(), {masked(call->getArgOperand(1), ir.getFalse())});
     if (opcode == op::WavePrefixBitCount) {
       auto lane = ir.CreateZExt(ctx.function->getArg(dxil.lane_index_arg), ir.getInt64Ty());
       ballot = ir.CreateAnd(ballot, ir.CreateSub(ir.CreateShl(ir.getInt64(1), lane), ir.getInt64(1)));

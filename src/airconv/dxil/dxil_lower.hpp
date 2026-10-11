@@ -87,6 +87,15 @@ private:
   llvm::Value *UnpackedInputOfKind(SemanticKind kind);
   llvm::Value *RegisterElementPointer(dxbc::register_file &file, const SignatureElement &e, llvm::Value *row, uint32_t col);
 
+  // Wave operations (dxil_lower.cpp). A pixel shader whose entry lacks [WaveOpsIncludeHelperLanes] leaves its helper
+  // lanes out of them (D3D's Wave_Ops_Include_Helper_Lanes.md), and Metal's simdgroup functions count them.
+  bool HelpersLeftOut() const;
+  // The lanes taking part in a wave operation at the insert point: the i64 ballot of the non-helper lanes when helpers
+  // are left out, nullptr otherwise (nothing is masked). Emitted at each operation: divergence changes it.
+  llvm::Value *WaveLanes();
+  // i1: this lane takes part, !helper when helpers are left out, true otherwise.
+  llvm::Value *Participates();
+
   // Geometry shaders: the vertex shader output register and column holding input `e`'s row `row`, column `col`.
   llvm::Expected<llvm::Value *> VertexOutputPointer(const SignatureElement &e, llvm::Value *row, uint32_t col, llvm::Value *vertex);
 

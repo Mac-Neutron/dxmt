@@ -179,6 +179,8 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
     shader->func_signature.UseMaxWorkgroupSize(entry->numthreads[0] * entry->numthreads[1] * entry->numthreads[2]);
   }
   auto dxil = std::make_shared<DXILShader>();
+  if (auto fn = (*module)->getFunction(entry->name))
+    dxil->include_helper_lanes = fn->hasFnAttribute("waveops-include-helper-lanes");
   dxil->bitcode.assign(container.bitcode, container.bitcode + container.bitcode_size);
   dxil->capture_hash = container.capture_hash;
   dxil->entry = std::move(*entry);
