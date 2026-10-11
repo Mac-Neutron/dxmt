@@ -674,6 +674,16 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
   case op::ViewID: // (138): ViewInstancingTier is NOT_SUPPORTED, so the only view is 0
     Replace(call, ir.getInt32(0));
     return llvm::Error::success();
+  case op::StartVertexLocation:     // (256) -> i32: the draw's StartVertexLocation, or BaseVertexLocation when indexed
+  case op::StartInstanceLocation: { // (257) -> i32: its StartInstanceLocation
+    // [[base_vertex]] and [[base_instance]] in a vertex function, the draw's arguments in a geometry pipeline's object
+    // function (dxbc_converter_gs.cpp); no other stage has them.
+    auto v = opcode == op::StartVertexLocation ? res.base_vertex_id : res.base_instance_id;
+    if (!v)
+      return Unsupported(call);
+    Replace(call, Cast(v, call->getType()));
+    return llvm::Error::success();
+  }
   default:
     return Unsupported(call);
   }
