@@ -120,6 +120,51 @@ public:
 
   /* Texture Operations */
 
+  Value *
+  GetOffset(const Texture &Texture, const int32_t ImmOffset[3]) {
+    switch (Texture.kind) {
+    case Texture::texture1d:
+    case Texture::texture1d_array:
+      return getInt(ImmOffset[0]);
+    case Texture::texture2d:
+    case Texture::texture2d_array:
+    case Texture::depth2d:
+    case Texture::depth2d_array:
+      return getInt2(ImmOffset[0], ImmOffset[1]);
+    case Texture::texture3d:
+      return getInt3(ImmOffset[0], ImmOffset[1], ImmOffset[2]);
+    default:
+      break;
+    }
+    return nullptr;
+  }
+
+  // MacNeutron: the same offset vector from values (programmable offsets, SM 6.7).
+  Value *
+  GetOffset(const Texture &Texture, Value *const Offset[3]) {
+    unsigned N;
+    switch (Texture.kind) {
+    case Texture::texture1d:
+    case Texture::texture1d_array:
+      return Offset[0];
+    case Texture::texture2d:
+    case Texture::texture2d_array:
+    case Texture::depth2d:
+    case Texture::depth2d_array:
+      N = 2;
+      break;
+    case Texture::texture3d:
+      N = 3;
+      break;
+    default:
+      return nullptr;
+    }
+    Value *V = UndefValue::get(getIntTy(N));
+    for (unsigned i = 0; i < N; i++)
+      V = builder.CreateInsertElement(V, Offset[i], i);
+    return V;
+  }
+
   std::pair<Value *, Value *>
   CreateSample(
       const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, const int32_t Offset[3]
@@ -160,6 +205,22 @@ public:
   }
 
   std::pair<Value *, Value *>
+  CreateSample(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Offset,
+      sample_level Level
+  ) {
+    return CreateSampleCommon(Texture, Handle, Sampler, Coord, ArrayIndex, Offset, true, Level.lod, getFloat(0));
+  }
+
+  std::pair<Value *, Value *>
+  CreateSample(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Offset,
+      sample_bias Bias, sample_min_lod_clamp MinLOD
+  ) {
+    return CreateSampleCommon(Texture, Handle, Sampler, Coord, ArrayIndex, Offset, false, Bias.bias, MinLOD.lod);
+  }
+
+  std::pair<Value *, Value *>
   CreateSampleCmp(
       const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Reference,
       const int32_t Offset[3], sample_bias Bias, sample_min_lod_clamp MinLOD
@@ -180,6 +241,26 @@ public:
   }
 
   std::pair<Value *, Value *>
+  CreateSampleCmp(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Reference,
+      Value *Offset, sample_bias Bias, sample_min_lod_clamp MinLOD
+  ) {
+    return CreateSampleCmpCommon(
+        Texture, Handle, Sampler, Coord, ArrayIndex, Reference, Offset, false, Bias.bias, MinLOD.lod
+    );
+  }
+
+  std::pair<Value *, Value *>
+  CreateSampleCmp(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *Reference,
+      Value *Offset, sample_level Level
+  ) {
+    return CreateSampleCmpCommon(
+        Texture, Handle, Sampler, Coord, ArrayIndex, Reference, Offset, true, Level.lod, getFloat(0)
+    );
+  }
+
+  std::pair<Value *, Value *>
   CreateSampleGrad(
       const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
       Value *DerivY, const int32_t Offset[3]
@@ -187,9 +268,19 @@ public:
     return CreateSampleGrad(Texture, Handle, Sampler, Coord, ArrayIndex, DerivX, DerivY, getFloat(0), Offset);
   }
 
-  std::pair<Value *, Value *> CreateSampleGrad(
+  std::pair<Value *, Value *>
+  CreateSampleGrad(
       const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
       Value *DerivY, Value *MinLOD, const int32_t Offset[3]
+  ) {
+    return CreateSampleGrad(
+        Texture, Handle, Sampler, Coord, ArrayIndex, DerivX, DerivY, MinLOD, GetOffset(Texture, Offset)
+    );
+  }
+
+  std::pair<Value *, Value *> CreateSampleGrad(
+      const Texture &Texture, Value *Handle, Value *Sampler, Value *Coord, Value *ArrayIndex, Value *DerivX,
+      Value *DerivY, Value *MinLOD, Value *Offset
   );
 
   Value *CreateAtomicRMW(
@@ -548,25 +639,6 @@ public:
 protected:
   raw_ostream &debug;
   AIRBuilderOptions options;
-
-  Value *
-  GetOffset(const Texture &Texture, const int32_t ImmOffset[3]) {
-    switch (Texture.kind) {
-    case Texture::texture1d:
-    case Texture::texture1d_array:
-      return getInt(ImmOffset[0]);
-    case Texture::texture2d:
-    case Texture::texture2d_array:
-    case Texture::depth2d:
-    case Texture::depth2d_array:
-      return getInt2(ImmOffset[0], ImmOffset[1]);
-    case Texture::texture3d:
-      return getInt3(ImmOffset[0], ImmOffset[1], ImmOffset[2]);
-    default:
-      break;
-    }
-    return nullptr;
-  }
 
   std::pair<Value *, Value *>
   CreateSampleCommon(
