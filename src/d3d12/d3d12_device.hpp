@@ -144,6 +144,10 @@ public:
   uint32_t UploadQwords;
   uint32_t ParameterSlots;
   uint32_t const *SlotQwordOffsets;
+  // With CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED or SAMPLER_HEAP_DIRECTLY_INDEXED (flags 0xC00): the first of two qwords after
+  // the parameters', the bound CBV/SRV/UAV heap's GPU base, then the sampler heap's (UploadQwords counts them); ~0u
+  // without. (MacNeutron)
+  uint32_t HeapQwordOffset;
 
   size_t NumStaticSamplers;
   uint64_t const *EncodedStaticSamplers;
