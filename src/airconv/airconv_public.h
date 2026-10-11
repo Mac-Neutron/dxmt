@@ -36,6 +36,12 @@ enum SM50_BINDING_INDEX: uint32_t {
   SM50_BINDING_INDEX_STATIC_SAMPLERS = 1,
 };
 
+#ifdef __cplusplus
+// 64-bit atomics (MacNeutron, DXIL SM 6.8 plan, Task 14a): the device's lock table holds this many u32 locks (256 KiB;
+// a tuning knob). Its GPU address is the root arguments' trailing qword (MTLD3D12RootSignature::LockQwordOffset).
+constexpr uint32_t kAtomic64Locks = 1 << 16;
+#endif
+
 enum MTL_SM50_SHADER_ARGUMENT_FLAG : uint32_t {
   MTL_SM50_SHADER_ARGUMENT_BUFFER = 1 << 0,
   MTL_SM50_SHADER_ARGUMENT_TEXTURE = 1 << 1,

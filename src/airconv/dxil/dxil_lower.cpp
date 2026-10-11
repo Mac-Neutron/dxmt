@@ -251,9 +251,6 @@ Lowering::RegisterElementPointer(dxbc::register_file &file, const SignatureEleme
   return ir.CreateGEP(array_ty, file.ptr_int4, {ir.getInt32(0), reg, ir.getInt32(e.start_col + col)});
 }
 
-namespace {
-
-// Calls a Metal simdgroup function (AIR names as `xcrun metal -S -emit-llvm` shows them), marked convergent like Metal's.
 llvm::Value *Simd(llvm::IRBuilder<> &ir, llvm::StringRef name, llvm::Type *ret, llvm::ArrayRef<llvm::Value *> args) {
   auto &context = ir.getContext();
   auto attrs = llvm::AttributeList::get(context, llvm::AttributeList::FunctionIndex,
@@ -268,6 +265,8 @@ llvm::Value *Simd(llvm::IRBuilder<> &ir, llvm::StringRef name, llvm::Type *ret, 
   call->setConvergent();
   return call;
 }
+
+namespace {
 
 // ".f32", ".f16", ".s.i32", ".u.i16", ... for a simdgroup function's value type.
 std::string SimdSuffix(llvm::Type *ty, bool is_signed) {
@@ -292,6 +291,77 @@ llvm::Value *Lowering::WaveLanes() {
 
 llvm::Value *Lowering::Participates() {
   return HelpersLeftOut() ? ir.CreateNot(Simd(ir, "air.simd_is_helper_thread", ir.getInt1Ty(), {})) : ir.getTrue();
+}
+
+// The 64-bit lock path (spec 3.8), from 32-bit atomics, fences and simdgroup votes; never Metal's 64-bit atomics, which
+// fail or crash its compiler service. Phase 1: every lane tries the lock once, and the winners run the critical section
+// and release inside that branch, with no loop. Phase 2: while any lane of the simdgroup is pending, the first pending
+// lane spins until it holds the lock, runs the section and releases it. air.simd_is_first is reached by pending lanes
+// only (a branch, not an `and`: it names the first active lane, so a finished lane could be elected and let none in).
+// A spinner's own simdgroup then holds no lock, so it waits only on a resident lane of another, which finishes. No spin
+// cap: a cap would drop operations in a legitimate storm. Acquire: a relaxed cmpxchg, then a seq_cst fence; release: a
+// seq_cst fence, then a relaxed store of 0.
+llvm::Value *
+Lowering::UnderLock(llvm::Value *lock, llvm::air::MemFlags flags, llvm::air::ThreadScope scope,
+                    llvm::function_ref<llvm::Value *()> critical) {
+  auto relaxed = llvm::AtomicOrdering::Monotonic;
+  auto acquire = [&] { // whether this lane took the lock
+    return ir.CreateExtractValue(ir.CreateAtomicCmpXchg(lock, ir.getInt32(0), ir.getInt32(1), {}, relaxed, relaxed), 1);
+  };
+  // The section in `bb`, which then branches to `next` (built first: `critical` may split blocks before it). Returns the
+  // old value and the block that branches to `next`.
+  auto section = [&](llvm::BasicBlock *bb, llvm::BasicBlock *next) {
+    ir.SetInsertPoint(llvm::BranchInst::Create(next, bb));
+    air.CreateAtomicFence(flags, scope);
+    auto old = critical();
+    air.CreateAtomicFence(flags, scope);
+    ir.CreateAlignedStore(ir.getInt32(0), lock, llvm::Align(4))->setAtomic(relaxed);
+    return std::make_pair(old, ir.GetInsertBlock());
+  };
+  auto head = ir.GetInsertBlock();
+  auto done = head->splitBasicBlock(ir.GetInsertPoint());
+  head->getTerminator()->eraseFromParent();
+  auto block = [&] { return llvm::BasicBlock::Create(ir.getContext(), "", head->getParent(), done); };
+  auto first = block(), join = block(), loop = block(), pending_bb = block(), elect = block(), spin = block(),
+       held = block(), latch = block();
+  ir.SetInsertPoint(head);
+  auto won = acquire();
+  auto lost = ir.CreateNot(won);
+  ir.CreateCondBr(won, first, join);
+  auto [old1, first_end] = section(first, join);
+  auto ty = old1->getType();
+  ir.SetInsertPoint(join);
+  auto old_join = ir.CreatePHI(ty, 2);
+  old_join->addIncoming(old1, first_end);
+  old_join->addIncoming(llvm::Constant::getNullValue(ty), head);
+  ir.CreateBr(loop);
+  ir.SetInsertPoint(loop);
+  auto pending = ir.CreatePHI(ir.getInt1Ty(), 2);
+  auto old = ir.CreatePHI(ty, 2);
+  ir.CreateCondBr(Simd(ir, "air.simd_any", ir.getInt1Ty(), {pending}), pending_bb, done);
+  ir.SetInsertPoint(pending_bb);
+  ir.CreateCondBr(pending, elect, latch);
+  ir.SetInsertPoint(elect);
+  ir.CreateCondBr(Simd(ir, "air.simd_is_first", ir.getInt1Ty(), {}), spin, latch);
+  ir.SetInsertPoint(spin);
+  ir.CreateCondBr(acquire(), held, spin);
+  auto [old2, held_end] = section(held, latch);
+  ir.SetInsertPoint(latch);
+  auto pending_next = ir.CreatePHI(ir.getInt1Ty(), 3);
+  auto old_next = ir.CreatePHI(ty, 3);
+  pending_next->addIncoming(ir.getFalse(), held_end);
+  old_next->addIncoming(old2, held_end);
+  for (auto bb : {pending_bb, elect}) {
+    pending_next->addIncoming(pending, bb);
+    old_next->addIncoming(old, bb);
+  }
+  ir.CreateBr(loop);
+  pending->addIncoming(lost, join);
+  pending->addIncoming(pending_next, latch);
+  old->addIncoming(old_join, join);
+  old->addIncoming(old_next, latch);
+  ir.SetInsertPoint(&*done->begin());
+  return old;
 }
 
 llvm::Value *Lowering::QuadDerivative(llvm::Value *v, bool y, bool fine) {

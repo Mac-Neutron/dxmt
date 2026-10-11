@@ -346,8 +346,8 @@ D3D12CreateRootSignatureDeserializer(const void *pBytecode, SIZE_T DataSize, REF
 
 #pragma endregion
 
-// Each parameter's first qword, the qwords in all, and where the two heap bases go (~0u: nowhere).
-inline std::tuple<std::vector<uint32_t>, uint32_t, uint32_t>
+// Each parameter's first qword, the qwords in all, where the two heap bases go (~0u: nowhere), and the lock table's.
+inline std::tuple<std::vector<uint32_t>, uint32_t, uint32_t, uint32_t>
 CalculateRootSignatureQwordOffsets(const D3D12_ROOT_SIGNATURE_DESC1 &Desc) {
   uint32_t current_offset = 0;
   std::vector<uint32_t> out;
@@ -377,8 +377,10 @@ CalculateRootSignatureQwordOffsets(const D3D12_ROOT_SIGNATURE_DESC1 &Desc) {
     heap_offset = current_offset;
     current_offset += 2;
   }
+  // DXIL 64-bit atomics (MacNeutron, Task 14a): the lock table's address, last, where setup_binding_rootsig declares it.
+  uint32_t lock_offset = current_offset++;
 
-  return {out, current_offset, heap_offset};
+  return {out, current_offset, heap_offset, lock_offset};
 }
 
 class MTLD3D12RootSignatureImpl : public MTLD3D12DeviceChild<MTLD3D12RootSignature> {
@@ -467,10 +469,11 @@ public:
       EncodedStaticSamplers = static_samplers_encoded_.data();
     }
 
-    auto [offsets, total_qwords, heap_offset] = CalculateRootSignatureQwordOffsets(desc);
+    auto [offsets, total_qwords, heap_offset, lock_offset] = CalculateRootSignatureQwordOffsets(desc);
     qword_offsets_ = offsets;
     UploadQwords = total_qwords;
     HeapQwordOffset = heap_offset;
+    LockQwordOffset = lock_offset;
     ParameterSlots = qword_offsets_.size();
     SlotQwordOffsets = qword_offsets_.data();
 

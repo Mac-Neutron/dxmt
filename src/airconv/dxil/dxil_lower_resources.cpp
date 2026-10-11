@@ -19,6 +19,8 @@
 #include "../airconv_error.hpp"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/LowerAtomic.h"
 
 namespace dxmt::dxil {
 
@@ -543,6 +545,70 @@ Lowering::LowerDimensions(llvm::CallInst *call, const HandleInfo &h) {
   return llvm::Error::success();
 }
 
+// 64-bit atomics on raw and structured buffers (Task 14a; spec 3.8), root and heap ones included: under a lock from the
+// device's table, keyed by the element's device address (every view of the same bytes takes the same lock; a collision
+// only serialises), its halves read and written as relaxed 32-bit atomics. A pixel shader's helper lanes (D3D gives
+// them no UAV side effects, attribute or not, and a helper whose lock atomic were discarded could spin forever) and an
+// out-of-bounds element skip it and read 0.
+llvm::Error
+Lowering::Atomic64(uint32_t opcode, llvm::CallInst *call, const HandleInfo &h) {
+  auto arg = [&](unsigned i) { return call->getArgOperand(i); };
+  auto kind = h.resource->kind;
+  auto locks = ctx.binding.GetAtomic64Locks(air);
+  if ((kind != ResourceKind::RawBuffer && kind != ResourceKind::StructuredBuffer) || !locks)
+    return Unsupported(call); // typed buffers and textures: Task 14b
+  auto buffer = Buffer(h);
+  if (!buffer) {
+    Replace(call, ir.getInt64(0));
+    return llvm::Error::success();
+  }
+  bool cas = opcode == op::AtomicCompareExchange;
+  unsigned c = cas ? 2 : 3; // (78, handle, op, c0, c1, c2, value); (79, handle, c0, c1, c2, compare, value)
+  auto offset = kind == ResourceKind::StructuredBuffer
+                    ? ir.CreateAdd(ir.CreateMul(arg(c), ir.getInt32(h.resource->stride)), arg(c + 1))
+                    : arg(c);
+  auto i32 = ir.getInt32Ty(), i64 = ir.getInt64Ty();
+  auto ptr = ElementPointer(*buffer, offset, i64); // null out of bounds
+  llvm::Value *skip = ir.CreateIsNull(ptr);
+  if (entry.kind == ShaderKind::Pixel)
+    skip = ir.CreateOr(skip, Simd(ir, "air.simd_is_helper_thread", ir.getInt1Ty(), {}));
+  auto head = ir.GetInsertBlock();
+  ir.SetInsertPoint(llvm::SplitBlockAndInsertIfThen(ir.CreateNot(skip), call, false));
+  // The key, in 32-bit math: a = the address's low 32 bits; h = a >> 3; h ^= h >> 16; lock h & (kAtomic64Locks - 1).
+  auto key = ir.CreateLShr(ir.CreateTrunc(ir.CreatePtrToInt(ptr, i64), i32), 3);
+  key = ir.CreateAnd(ir.CreateXor(key, ir.CreateLShr(key, 16)), kAtomic64Locks - 1);
+  auto lo = ir.CreateBitCast(ptr, i32->getPointerTo(1)), hi = ir.CreateConstGEP1_32(i32, lo, 1);
+  auto old = UnderLock(ir.CreateGEP(i32, locks, key), llvm::air::MemFlags::Device, llvm::air::ThreadScope::Device, [&] {
+    auto half = [&](llvm::Value *p) {
+      auto load = ir.CreateAlignedLoad(i32, p, llvm::Align(4));
+      load->setAtomic(llvm::AtomicOrdering::Monotonic);
+      return ir.CreateZExt(load, i64);
+    };
+    auto value = ir.CreateOr(half(lo), ir.CreateShl(half(hi), 32));
+    auto store = [&](llvm::Value *v) {
+      ir.CreateAlignedStore(ir.CreateTrunc(v, i32), lo, llvm::Align(4))->setAtomic(llvm::AtomicOrdering::Monotonic);
+      ir.CreateAlignedStore(ir.CreateTrunc(ir.CreateLShr(v, 32), i32), hi, llvm::Align(4))
+          ->setAtomic(llvm::AtomicOrdering::Monotonic);
+    };
+    if (cas) { // stores only on a 64-bit match (CompareStore: the same, its result unused)
+      auto at = &*ir.GetInsertPoint();
+      ir.SetInsertPoint(llvm::SplitBlockAndInsertIfThen(ir.CreateICmpEQ(value, arg(5)), at, false));
+      store(arg(6));
+      ir.SetInsertPoint(at);
+    } else {
+      store(llvm::buildAtomicRMWValue(AtomicOp(arg(2)), ir, value, arg(6)));
+    }
+    return value;
+  });
+  auto end = ir.GetInsertBlock();
+  ir.SetInsertPoint(call);
+  auto result = ir.CreatePHI(i64, 2);
+  result->addIncoming(old, end);
+  result->addIncoming(ir.getInt64(0), head);
+  Replace(call, result);
+  return llvm::Error::success();
+}
+
 llvm::Error
 Lowering::LowerResource(uint32_t opcode, llvm::CallInst *call) {
   if (opcode == op::CheckAccessFullyMapped) { // (71, i32 status): every resource is fully mapped here
@@ -632,7 +698,7 @@ Lowering::LowerResource(uint32_t opcode, llvm::CallInst *call) {
   case op::AtomicBinOp:           // (78, handle, i32 op, i32 c0, c1, c2, i32 value) -> old
   case op::AtomicCompareExchange: // (79, handle, i32 c0, c1, c2, i32 compare, i32 value) -> old
     if (!call->getType()->isIntegerTy(32))
-      return Unsupported(call); // 64-bit atomics
+      return call->getType()->isIntegerTy(64) ? Atomic64(opcode, call, h) : Unsupported(call);
     if (kind == ResourceKind::RawBuffer || structured) {
       bool cas = opcode == op::AtomicCompareExchange;
       unsigned c = cas ? 2 : 3;
