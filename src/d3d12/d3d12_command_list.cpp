@@ -202,11 +202,15 @@ class MTLD3D12GraphicsCommandListImpl
 
   Com<MTLD3D12GraphicsPipelineState, false> pso_graphics_;
   Com<MTLD3D12RootSignature, false> rootsig_graphics_;
-  uint64_t rootarg_graphics_staging_[64];
+  uint64_t rootarg_graphics_staging_[66]; // 64 qwords of parameters, then the heap bases (MacNeutron)
 
   Com<MTLD3D12ComputePipelineState, false> pso_compute_;
   Com<MTLD3D12RootSignature, false> rootsig_compute_;
-  uint64_t rootarg_compute_staging_[64];
+  uint64_t rootarg_compute_staging_[66];
+
+  // The bound CBV/SRV/UAV heap's and sampler heap's GPU bases (SetDescriptorHeaps; 0 for none), staged at a root
+  // signature's HeapQwordOffset. (MacNeutron)
+  uint64_t heap_bases_[2];
 
   FLOAT blend_factor_[4];
   UINT8 stencil_ref_;
@@ -263,6 +267,8 @@ public:
 
     rootsig_compute_ = nullptr;
     memset(rootarg_compute_staging_, 0, sizeof(rootarg_compute_staging_));
+
+    memset(heap_bases_, 0, sizeof(heap_bases_));
 
     memset(vertex_buffers_.data(), 0, sizeof(vertex_buffers_));
 
@@ -712,7 +718,7 @@ public:
   };
 
   uint64_t
-  EncodeRootArgument(MTLD3D12RootSignature *pRootSig, uint64_t const pStaging[64], UINT Count = 1) {
+  EncodeRootArgument(MTLD3D12RootSignature *pRootSig, uint64_t const pStaging[66], UINT Count = 1) {
     auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t) * pRootSig->UploadQwords * Count, 64);
     for (unsigned i = 0; i < Count; i++)
       memcpy(
@@ -1361,9 +1367,22 @@ public:
   void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList *CommandList) {
     DXMT_STAT_SCOPE("list.ExecuteBundle"); IMPLEMENT_ME };
 
+  // Descriptor tables carry their full address; only a root signature with heap qwords takes the heaps' bases.
+  void
+  StageHeapBases(MTLD3D12RootSignature *pRootSig, uint64_t *pStaging) {
+    if (pRootSig && pRootSig->HeapQwordOffset != ~0u)
+      memcpy(pStaging + pRootSig->HeapQwordOffset, heap_bases_, sizeof(heap_bases_));
+  }
+
   void STDMETHODCALLTYPE SetDescriptorHeaps(UINT HeapCount, ID3D12DescriptorHeap *const *Heaps) {
     DXMT_STAT_SCOPE("list.SetDescriptorHeaps");
-    // no need to do anything here because because we encode the full descriptor table address in root argument
+    memset(heap_bases_, 0, sizeof(heap_bases_));
+    for (UINT i = 0; i < HeapCount; i++)
+      heap_bases_[Heaps[i]->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER] =
+          Heaps[i]->GetGPUDescriptorHandleForHeapStart().ptr;
+    StageHeapBases(rootsig_compute_.ptr(), rootarg_compute_staging_);
+    StageHeapBases(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
+    dirty_state_.set(DirtyState::ComputeRootArguments, DirtyState::GraphicsRootArguments);
   };
 
   void STDMETHODCALLTYPE
@@ -1373,7 +1392,8 @@ public:
       return;
     if (pRootSignature) {
       rootsig_compute_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-      assert(rootsig_compute_->UploadQwords < std::size(rootarg_compute_staging_));
+      assert(rootsig_compute_->UploadQwords <= std::size(rootarg_compute_staging_));
+      StageHeapBases(rootsig_compute_.ptr(), rootarg_compute_staging_);
     } else {
       rootsig_compute_ = nullptr;
     }
@@ -1387,7 +1407,8 @@ public:
       return;
     if (pRootSignature) {
       rootsig_graphics_ = static_cast<MTLD3D12RootSignature *>(pRootSignature);
-      assert(rootsig_graphics_->UploadQwords < std::size(rootarg_graphics_staging_));
+      assert(rootsig_graphics_->UploadQwords <= std::size(rootarg_graphics_staging_));
+      StageHeapBases(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
     } else {
       rootsig_graphics_ = nullptr;
     }
