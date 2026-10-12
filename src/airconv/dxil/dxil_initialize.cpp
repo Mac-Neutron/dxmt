@@ -122,7 +122,7 @@ llvm::Error RefuseGroupshared64BitAtomics(const llvm::Module &module) {
 }
 
 struct Usage {
-  bool read = false, written = false, sampled = false, compared = false, atomic = false;
+  bool read = false, written = false, sampled = false, compared = false, atomic = false, atomic64 = false;
 };
 
 // What each resource is used for: airconv's binding maps pick Metal access modes and depth textures from it.
@@ -159,6 +159,7 @@ ScanUsage(const EntryInfo &entry, const llvm::Module &module) {
           break;
         case op::AtomicBinOp: case op::AtomicCompareExchange:
           u.read = u.written = u.atomic = true;
+          u.atomic64 |= call->getType()->isIntegerTy(64);
           break;
         }
       }
@@ -194,6 +195,9 @@ void FillResourceMaps(const EntryInfo &entry, const llvm::Module &module, Shader
       uav.atomic_view = u.atomic && r.element_type == ComponentType::F32 && uav.resource_type != ResourceType::NonApplicable;
       if (uav.atomic_view)
         uav.scaler_type = ScalerDataType::Uint;
+      // 64-bit atomics on a typed buffer (Task 14b) go through its buffer's address: the same lock as a raw view's. By
+      // use: DXC 1.9 declares a RWBuffer<uint64_t> or <int64_t> U32, with an Atomic64Use tag that heap handles lack.
+      uav.address64 = u.atomic64 && r.kind == ResourceKind::TypedBuffer;
       uav.structure_stride = r.stride;
       uav.arg_index = uav.arg_metadata_index = uav.arg_counter_index = ~0u;
       info.uavMap[r.id] = uav;

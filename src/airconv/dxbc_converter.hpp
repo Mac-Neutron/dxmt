@@ -54,6 +54,10 @@ struct UnorderedAccessViewInfo {
   // MacNeutron (DXIL): a float typed UAV that atomics reach. Metal's texture atomics take integer textures only, so it's
   // declared uint and read through the R32Uint view in its descriptor's third qword (d3d12_descriptor_heap.cpp).
   bool atomic_view = false;
+  // MacNeutron (DXIL): a typed buffer that 64-bit atomics reach (RWBuffer<uint64_t>, <int64_t>; DXIL has no 64-bit typed
+  // load or store). They take the raw-buffer path at the buffer base in its descriptor's fourth qword
+  // (d3d12_descriptor_heap.cpp).
+  bool address64 = false;
 
   uint32_t structure_stride = 0;
   uint32_t arg_index;
