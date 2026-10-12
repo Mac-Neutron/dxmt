@@ -364,6 +364,61 @@ Lowering::UnderLock(llvm::Value *lock, llvm::air::MemFlags flags, llvm::air::Thr
   return old;
 }
 
+// Lock (byte offset >> 3) & (N - 1) of the array, so a qword always takes one lock (an addrspace(3) ptrtoint is
+// 0x10000 + the byte offset, which keeps that). The old value is a plain threadgroup load under the lock; a cmpxchg
+// stores only on a match, and its {old, success} is rebuilt for its extractvalue users. No i64 atomic reaches Metal.
+void Lowering::GroupShared64(llvm::Instruction *inst, llvm::GlobalVariable *locks) {
+  ir.SetInsertPoint(inst);
+  auto rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(inst);
+  auto cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(inst);
+  auto ptr = rmw ? rmw->getPointerOperand() : cx->getPointerOperand();
+  auto align = rmw ? rmw->getAlign() : cx->getAlign();
+  auto i64 = ir.getInt64Ty();
+  uint32_t n = llvm::cast<llvm::ArrayType>(locks->getValueType())->getNumElements();
+  auto key = ir.CreateAnd(ir.CreateLShr(ir.CreateTrunc(ir.CreatePtrToInt(ptr, i64), ir.getInt32Ty()), 3), n - 1);
+  auto lock = ir.CreateInBoundsGEP(locks->getValueType(), locks, {ir.getInt32(0), key});
+  llvm::Value *compare = cx ? cx->getCompareOperand() : nullptr;
+  auto old = UnderLock(lock, llvm::air::MemFlags::Threadgroup, llvm::air::ThreadScope::Threadgroup, [&]() -> llvm::Value * {
+    auto value = ir.CreateAlignedLoad(i64, ptr, align);
+    if (rmw) {
+      auto v = rmw->getValOperand();
+      llvm::Value *next = v; // Xchg
+      switch (rmw->getOperation()) {
+      case llvm::AtomicRMWInst::Add: next = ir.CreateAdd(value, v); break;
+      case llvm::AtomicRMWInst::And: next = ir.CreateAnd(value, v); break;
+      case llvm::AtomicRMWInst::Or: next = ir.CreateOr(value, v); break;
+      case llvm::AtomicRMWInst::Xor: next = ir.CreateXor(value, v); break;
+      case llvm::AtomicRMWInst::Max: next = ir.CreateSelect(ir.CreateICmpSGT(value, v), value, v); break;
+      case llvm::AtomicRMWInst::Min: next = ir.CreateSelect(ir.CreateICmpSLT(value, v), value, v); break;
+      case llvm::AtomicRMWInst::UMax: next = ir.CreateSelect(ir.CreateICmpUGT(value, v), value, v); break;
+      case llvm::AtomicRMWInst::UMin: next = ir.CreateSelect(ir.CreateICmpULT(value, v), value, v); break;
+      default: break; // Xchg; InitializeDXIL refused the rest
+      }
+      ir.CreateAlignedStore(next, ptr, align);
+      return value;
+    }
+    // A cmpxchg stores only on a match: the section's block splits around the store.
+    auto match = ir.CreateICmpEQ(value, compare);
+    auto cur = ir.GetInsertBlock();
+    auto tail = cur->splitBasicBlock(ir.GetInsertPoint());
+    auto store = llvm::BasicBlock::Create(ir.getContext(), "", cur->getParent(), tail);
+    cur->getTerminator()->eraseFromParent();
+    ir.SetInsertPoint(cur);
+    ir.CreateCondBr(match, store, tail);
+    ir.SetInsertPoint(store);
+    ir.CreateAlignedStore(cx->getNewValOperand(), ptr, align);
+    ir.CreateBr(tail);
+    ir.SetInsertPoint(&*tail->begin());
+    return value;
+  });
+  llvm::Value *result = old;
+  if (cx)
+    result = ir.CreateInsertValue(ir.CreateInsertValue(llvm::UndefValue::get(cx->getType()), old, 0),
+                                  ir.CreateICmpEQ(old, compare), 1);
+  inst->replaceAllUsesWith(result);
+  inst->eraseFromParent();
+}
+
 llvm::Value *Lowering::QuadDerivative(llvm::Value *v, bool y, bool fine) {
   auto ty = v->getType();
   if (auto vec = llvm::dyn_cast<llvm::FixedVectorType>(ty)) { // per component: the quad shuffles here take scalars

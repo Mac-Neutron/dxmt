@@ -102,23 +102,48 @@ void AddHeapRanges(const llvm::Module &module, EntryInfo &entry) {
   }
 }
 
-// A 64-bit groupshared atomic: an atomicrmw or cmpxchg of i64 on addrspace(3), which no dx.op carries. Metal has no
-// threadgroup ulong atomics, and its compiler service crashes on these (the i64 spike: XPC_ERROR_CONNECTION_INTERRUPTED
-// after retries, the op unnamed), so they're refused by name until the plan's Task 14c lock path.
-llvm::Error RefuseGroupshared64BitAtomics(const llvm::Module &module) {
+// 64-bit groupshared atomics: atomicrmw or cmpxchg of i64 on addrspace(3), which no dx.op carries. Metal has no
+// threadgroup ulong atomics (its compiler service crashes on them, the i64 spike), so they run under a threadgroup lock
+// array (Task 14c): 256 u32 locks (1 KiB), or the largest power of two that fits beside the shader's own groupshared
+// memory in D3D's 32768 bytes. 0 for a shader without one.
+llvm::Expected<uint32_t> GroupSharedLocks(const llvm::Module &module) {
+  bool any = false;
   for (auto &fn : module)
     for (auto &bb : fn)
       for (auto &inst : bb) {
-        auto rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst);
-        if (rmw && rmw->getPointerAddressSpace() == 3 && rmw->getValOperand()->getType()->isIntegerTy(64))
-          return llvm::make_error<UnsupportedFeature>("DXIL: 64-bit groupshared atomic (atomicrmw " +
-                                                      llvm::AtomicRMWInst::getOperationName(rmw->getOperation()).str() +
-                                                      ") not supported");
+        if (auto rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst);
+            rmw && rmw->getPointerAddressSpace() == 3 && rmw->getValOperand()->getType()->isIntegerTy(64)) {
+          switch (rmw->getOperation()) {
+          case llvm::AtomicRMWInst::Xchg: case llvm::AtomicRMWInst::Add: case llvm::AtomicRMWInst::And:
+          case llvm::AtomicRMWInst::Or: case llvm::AtomicRMWInst::Xor: case llvm::AtomicRMWInst::Max:
+          case llvm::AtomicRMWInst::Min: case llvm::AtomicRMWInst::UMax: case llvm::AtomicRMWInst::UMin:
+            break;
+          default: // DXC emits none
+            return llvm::make_error<UnsupportedFeature>("DXIL: 64-bit groupshared atomicrmw " +
+                                                        llvm::AtomicRMWInst::getOperationName(rmw->getOperation()).str() +
+                                                        " not supported");
+          }
+          any = true;
+        }
         auto cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&inst);
         if (cx && cx->getPointerAddressSpace() == 3 && cx->getNewValOperand()->getType()->isIntegerTy(64))
-          return llvm::make_error<UnsupportedFeature>("DXIL: 64-bit groupshared atomic (cmpxchg) not supported");
+          any = true;
       }
-  return llvm::Error::success();
+  if (!any)
+    return 0;
+  uint64_t used = 0;
+  for (auto &gv : module.globals())
+    if (gv.getAddressSpace() == 3)
+      used += module.getDataLayout().getTypeAllocSize(gv.getValueType());
+  uint64_t room = used < 32768 ? 32768 - used : 0;
+  if (room < 4)
+    return llvm::make_error<UnsupportedFeature>(
+        "DXIL: 64-bit groupshared atomics need 4 bytes of threadgroup memory for a lock; the shader uses " +
+        std::to_string(used) + " of 32768");
+  uint32_t n = 256;
+  while (n * 4 > room)
+    n /= 2;
+  return n;
 }
 
 struct Usage {
@@ -225,8 +250,9 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   auto entry = ReadEntry(**module);
   if (!entry)
     return entry.takeError();
-  if (auto err = RefuseGroupshared64BitAtomics(**module))
-    return err;
+  auto gs_locks = GroupSharedLocks(**module);
+  if (!gs_locks)
+    return gs_locks.takeError();
   AddHeapRanges(**module, *entry);
   // Apple GPUs run 32-lane SIMD groups (d3d12_device.cpp's WaveLaneCountMin/Max); the preferred size is a hint.
   if (entry->wave_size_min && !(entry->wave_size_min <= 32 && 32 <= entry->wave_size_max))
@@ -269,7 +295,7 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   bool quads_2d = entry->kind == ShaderKind::Compute && entry->numthreads[0] % 2 == 0 && entry->numthreads[1] % 2 == 0 &&
                   std::any_of(quad_ops.begin(), quad_ops.end(), [&](uint32_t o) { return ModuleCallsOp(**module, o); });
   std::map<uint32_t, uint32_t> unpacked_inputs;
-  if (auto err = AddSignatureHandlers(*entry, **module, shader, unpacked_inputs, quads_2d))
+  if (auto err = AddSignatureHandlers(*entry, **module, shader, unpacked_inputs, quads_2d, *gs_locks != 0))
     return err;
   uint32_t lane_index_arg = ~0u, lane_count_arg = ~0u;
   AddWaveInputs(**module, shader, lane_index_arg, lane_count_arg);
@@ -285,6 +311,7 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   dxil->entry = std::move(*entry);
   dxil->unpacked_inputs = std::move(unpacked_inputs);
   dxil->quads_2d = quads_2d;
+  dxil->gs_locks = *gs_locks;
   dxil->lane_index_arg = lane_index_arg;
   dxil->lane_count_arg = lane_count_arg;
   shader->dxil = dxil;

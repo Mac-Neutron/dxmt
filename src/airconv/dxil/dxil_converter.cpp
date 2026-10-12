@@ -254,6 +254,36 @@ StripFastMath(llvm::Instruction &inst, bool pre_raster) {
 // Moves the DXIL entry's blocks to the end of the function being built, turns its returns into branches to
 // `epilogue`, lowers every dx.op call, and returns the block that enters the body. The insertion point is kept (the
 // caller branches to the body from where its prologue ended; the prologue may have added blocks, e.g. vertex pulls).
+// The 64-bit groupshared atomics' lock array (Task 14c): an [n x i32] addrspace(3) global, as TGSM is (setup_tgsm), zeroed
+// at the body's start: thread i (its flattened index in the group) clears slots i, i + group, ..., then one threadgroup
+// barrier, before any user code (the entry block is uniform).
+llvm::GlobalVariable *ZeroGroupSharedLocks(struct context &ctx, llvm::BasicBlock *body, uint32_t n, uint32_t group) {
+  auto &ir = ctx.builder;
+  auto type = llvm::ArrayType::get(ir.getInt32Ty(), n);
+  auto locks = new llvm::GlobalVariable(ctx.module, type, false, llvm::GlobalValue::InternalLinkage,
+                                        llvm::UndefValue::get(type), "gs_locks", nullptr,
+                                        llvm::GlobalValue::NotThreadLocal, 3);
+  locks->setAlignment(llvm::Align(4));
+  auto rest = body->splitBasicBlock(body->begin()); // the body's code moves on; `body` stays the entry
+  body->getTerminator()->eraseFromParent();
+  auto loop = llvm::BasicBlock::Create(ctx.llvm, "", body->getParent(), rest);
+  auto after = llvm::BasicBlock::Create(ctx.llvm, "", body->getParent(), rest);
+  auto first = ctx.resource.thread_id_in_group_flat_arg;
+  ir.SetInsertPoint(body);
+  ir.CreateCondBr(ir.CreateICmpULT(first, ir.getInt32(n)), loop, after);
+  ir.SetInsertPoint(loop);
+  auto i = ir.CreatePHI(ir.getInt32Ty(), 2);
+  i->addIncoming(first, body);
+  ir.CreateAlignedStore(ir.getInt32(0), ir.CreateInBoundsGEP(type, locks, {ir.getInt32(0), i}), llvm::Align(4));
+  auto next = ir.CreateAdd(i, ir.getInt32(group));
+  i->addIncoming(next, loop);
+  ir.CreateCondBr(ir.CreateICmpULT(next, ir.getInt32(n)), loop, after);
+  ir.SetInsertPoint(after);
+  ctx.air.CreateBarrier(llvm::air::MemFlags::Threadgroup);
+  ir.CreateBr(rest);
+  return locks;
+}
+
 llvm::Expected<llvm::BasicBlock *>
 LowerBody(const DXILShader &dxil, struct context &ctx, llvm::Function *dxil_main, llvm::BasicBlock *epilogue,
           const EntryInfo *vertex_outputs = nullptr) {
@@ -265,6 +295,7 @@ LowerBody(const DXILShader &dxil, struct context &ctx, llvm::Function *dxil_main
     blocks.push_back(&bb);
   ctx.function->getBasicBlockList().splice(ctx.function->end(), dxil_main->getBasicBlockList());
   std::vector<llvm::CallInst *> calls; // collected first: lowering erases them
+  std::vector<llvm::Instruction *> gs64; // 64-bit groupshared atomics (Task 14c)
   bool pre_raster = PreRaster(dxil.entry.kind);
   for (auto *bb : blocks) {
     if (auto ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(bb->getTerminator())) {
@@ -275,12 +306,23 @@ LowerBody(const DXILShader &dxil, struct context &ctx, llvm::Function *dxil_main
       StripFastMath(inst, pre_raster);
       if (auto call = llvm::dyn_cast<llvm::CallInst>(&inst); call && OpCode(*call) != ~0u)
         calls.push_back(call);
+      auto rmw = llvm::dyn_cast<llvm::AtomicRMWInst>(&inst);
+      auto cx = llvm::dyn_cast<llvm::AtomicCmpXchgInst>(&inst);
+      if ((rmw && rmw->getPointerAddressSpace() == 3 && rmw->getValOperand()->getType()->isIntegerTy(64)) ||
+          (cx && cx->getPointerAddressSpace() == 3 && cx->getNewValOperand()->getType()->isIntegerTy(64)))
+        gs64.push_back(&inst);
     }
   }
   Lowering lowering(dxil, ctx, vertex_outputs);
   for (auto *call : calls)
     if (auto err = lowering.Lower(call))
       return std::move(err);
+  if (dxil.gs_locks) {
+    auto locks = ZeroGroupSharedLocks(ctx, body, dxil.gs_locks,
+                                      dxil.entry.numthreads[0] * dxil.entry.numthreads[1] * dxil.entry.numthreads[2]);
+    for (auto *inst : gs64)
+      lowering.GroupShared64(inst, locks);
+  }
   lowering.Cleanup(*ctx.function);
   ctx.builder.restoreIP(ip);
   return body;

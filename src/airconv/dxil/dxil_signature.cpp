@@ -131,7 +131,8 @@ void Grow(uint32_t &max_register, const SignatureElement &e) {
 }
 
 llvm::Error
-AddComputeHandlers(const EntryInfo &entry, const llvm::Module &module, SM50ShaderInternal *shader, bool quads_2d) {
+AddComputeHandlers(const EntryInfo &entry, const llvm::Module &module, SM50ShaderInternal *shader, bool quads_2d,
+                   bool flat_index) {
   if (quads_2d) {
     // Metal's quads are four consecutive lanes, t & ~3 .. t | 3 of its flat thread index t; D3D's 2D quads are 2x2
     // blocks of SV_GroupThreadID. Metal thread t runs D3D's thread (x, y, z), quad lane l = t & 3 at (l & 1, l >> 1) of
@@ -167,7 +168,8 @@ AddComputeHandlers(const EntryInfo &entry, const llvm::Module &module, SM50Shade
     DefineSpecial<air::InputThreadgroupPositionInGrid>(shader, &io_binding_map::thread_group_id_arg);
   if (ModuleCallsOp(module, op::ThreadIdInGroup))
     DefineSpecial<air::InputThreadPositionInThreadgroup>(shader, &io_binding_map::thread_id_in_group_arg);
-  if (ModuleCallsOp(module, op::FlattenedThreadIdInGroup))
+  // flat_index: the 64-bit groupshared lock array's zeroing reads it (Task 14c).
+  if (ModuleCallsOp(module, op::FlattenedThreadIdInGroup) || flat_index)
     DefineSpecial<air::InputThreadIndexInThreadgroup>(shader, &io_binding_map::thread_id_in_group_flat_arg);
   return llvm::Error::success();
 }
@@ -454,9 +456,9 @@ AddWaveInputs(const llvm::Module &module, SM50ShaderInternal *shader, uint32_t &
 
 llvm::Error
 AddSignatureHandlers(const EntryInfo &entry, const llvm::Module &module, SM50ShaderInternal *shader,
-                     std::map<uint32_t, uint32_t> &unpacked_inputs, bool quads_2d) {
+                     std::map<uint32_t, uint32_t> &unpacked_inputs, bool quads_2d, bool flat_index) {
   switch (entry.kind) {
-  case ShaderKind::Compute: return AddComputeHandlers(entry, module, shader, quads_2d);
+  case ShaderKind::Compute: return AddComputeHandlers(entry, module, shader, quads_2d, flat_index);
   case ShaderKind::Vertex: return AddVertexHandlers(entry, shader, unpacked_inputs);
   case ShaderKind::Pixel: return AddPixelHandlers(entry, shader, unpacked_inputs);
   case ShaderKind::Geometry: return AddGeometryHandlers(entry, shader);

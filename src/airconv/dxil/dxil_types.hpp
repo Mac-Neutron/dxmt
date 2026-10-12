@@ -135,6 +135,9 @@ struct DXILShader {
   // A compute shader with 2D numthreads (X and Y even) that reads quads (InitializeDXIL): its thread IDs are remapped
   // so that Metal's lane quads run D3D's 2x2 quads (AddComputeHandlers) (MacNeutron).
   bool quads_2d = false;
+  // 64-bit groupshared atomics (DXIL SM 6.8 plan, Task 14c; spec 3.8): the threadgroup lock array's size, a power of two
+  // up to 256 that fits beside the shader's own groupshared memory; 0 for a shader without one (MacNeutron).
+  uint32_t gs_locks = 0;
   uint64_t capture_hash = 0; // FNV-1a of the whole container, as capture mode names the shader (MacNeutron)
 };
 
