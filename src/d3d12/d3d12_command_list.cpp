@@ -718,7 +718,7 @@ public:
   };
 
   uint64_t
-  EncodeRootArgument(MTLD3D12RootSignature *pRootSig, uint64_t const pStaging[66], UINT Count = 1) {
+  EncodeRootArgument(MTLD3D12RootSignature *pRootSig, uint64_t const *pStaging, UINT Count = 1) {
     auto [Ptr, Offset] = allocator_->AllocateGPUHeap(sizeof(uint64_t) * pRootSig->UploadQwords * Count, 64);
     for (unsigned i = 0; i < Count; i++)
       memcpy(
@@ -1378,8 +1378,9 @@ public:
     DXMT_STAT_SCOPE("list.SetDescriptorHeaps");
     memset(heap_bases_, 0, sizeof(heap_bases_));
     for (UINT i = 0; i < HeapCount; i++)
-      heap_bases_[Heaps[i]->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER] =
-          Heaps[i]->GetGPUDescriptorHandleForHeapStart().ptr;
+      if (Heaps[i]) // MacNeutron: a null entry binds nothing (D3D12 leaves it undefined; a crash helps no game)
+        heap_bases_[Heaps[i]->GetDesc().Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER] =
+            Heaps[i]->GetGPUDescriptorHandleForHeapStart().ptr;
     StageHeapBases(rootsig_compute_.ptr(), rootarg_compute_staging_);
     StageHeapBases(rootsig_graphics_.ptr(), rootarg_graphics_staging_);
     dirty_state_.set(DirtyState::ComputeRootArguments, DirtyState::GraphicsRootArguments);

@@ -188,11 +188,16 @@ ReadEntry(const llvm::Module &module) {
         entry.gs_output_topology = Int(n->getOperand(3));
         entry.gs_instances = Int(n->getOperand(4));
       }
-      if (tag == 11 && n && n->getNumOperands() >= 1) // WaveSize: N
-        entry.wave_size_min = entry.wave_size_max = Int(n->getOperand(0));
-      if (tag == 23 && n && n->getNumOperands() >= 2) { // WaveSizeRange: min, max (0: min alone), preferred
-        entry.wave_size_min = Int(n->getOperand(0));
-        entry.wave_size_max = Int(n->getOperand(1)) ? Int(n->getOperand(1)) : entry.wave_size_min;
+      if (tag == 11 || tag == 23) { // WaveSize: N; WaveSizeRange: min, max (0: min alone), preferred
+        if (!n || n->getNumOperands() < (tag == 11 ? 1u : 2u)) { // malformed: refused (InitializeDXIL), not skipped
+          entry.wave_size_min = kMalformedWaveSize;
+          entry.wave_size_max = 0;
+        } else if (tag == 11) {
+          entry.wave_size_min = entry.wave_size_max = Int(n->getOperand(0));
+        } else {
+          entry.wave_size_min = Int(n->getOperand(0));
+          entry.wave_size_max = Int(n->getOperand(1)) ? Int(n->getOperand(1)) : entry.wave_size_min;
+        }
       }
     }
   return entry;
