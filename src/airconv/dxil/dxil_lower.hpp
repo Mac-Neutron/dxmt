@@ -54,6 +54,9 @@ public:
   llvm::Error Lower(llvm::CallInst *call);
   // Erases the handle-producing calls once nothing uses them.
   void Cleanup(llvm::Function &function);
+  // A 64-bit groupshared atomicrmw or cmpxchg (Task 14c) under the threadgroup lock array `locks` ([N x i32]
+  // addrspace(3)); replaces and erases it.
+  void GroupShared64(llvm::Instruction *inst, llvm::GlobalVariable *locks);
 
 private:
   llvm::Error LowerResource(uint32_t opcode, llvm::CallInst *call); // dxil_lower_resources.cpp
