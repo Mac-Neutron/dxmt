@@ -648,6 +648,14 @@ public:
   CheckFeatureSupport(D3D12_FEATURE Feature, void *pFeatureData, UINT DataSize) {
     DXMT_STAT_SCOPE("device.CheckFeatureSupport");
     auto metal = GetMTLDevice();
+    if ((UINT)Feature == kFeatureOptions22) { // 65: not a D3D12_FEATURE value llvm-mingw's switch can name
+      if (DataSize != sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS22_MN))
+        return E_INVALIDARG;
+      auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS22_MN *>(pFeatureData);
+      *out = {FALSE, FALSE, D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION,
+              D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION};
+      return S_OK;
+    }
     switch (Feature) {
     case D3D12_FEATURE_ARCHITECTURE: {
       if (DataSize != sizeof(D3D12_FEATURE_DATA_ARCHITECTURE))
@@ -757,7 +765,7 @@ public:
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_SHADER_MODEL *>(pFeatureData);
       out->HighestShaderModel =
-          SM6Caps() ? std::min(out->HighestShaderModel, D3D_SHADER_MODEL_6_7) : D3D_SHADER_MODEL_5_1;
+          SM6Caps() ? std::min(out->HighestShaderModel, kShaderModel6_8) : D3D_SHADER_MODEL_5_1;
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS: {
@@ -818,6 +826,9 @@ public:
       out->TotalLaneCount = 0;
       // If CheckFeatureSupport succeeds this value will always be true.
       out->ExpandedComputeResourceStates = TRUE;
+      // MacNeutron: FALSE until an i64 audit (the next spec): the 64-bit cbufferLoad is refused (dxil_lower_resources.cpp,
+      // "64-bit cbufferLoad") and the i64 wave overloads (air.simd_*.i64) are untested on Metal. The 64-bit atomics it
+      // would require on raw and structured buffers work (DXMT 0054).
       out->Int64ShaderOps = FALSE;
       return S_OK;
     }
@@ -826,6 +837,7 @@ public:
         return E_INVALIDARG;
       auto *out = reinterpret_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS9 *>(pFeatureData);
       *out = {};
+      // 64-bit atomics: every kind through the translator's lock path (DXMT 0054, 0055, 0057); Metal's ulong atomics are never used.
       out->AtomicInt64OnTypedResourceSupported = SM6Caps();
       out->AtomicInt64OnGroupSharedSupported = SM6Caps();
       return S_OK;
@@ -923,6 +935,9 @@ public:
     }
     case D3D12_FEATURE_D3D12_OPTIONS11: {
       FEATURE_DATA(D3D12_FEATURE_DATA_D3D12_OPTIONS11)
+      // Heap-indexed resources resolve to the same pointers as bound ones (DXMT 0048-0049), so 0054's lock path covers
+      // them (Task 14a's heap-indexed row).
+      out->AtomicInt64OnDescriptorHeapResourceSupported = SM6Caps();
       return S_OK;
     }
     case D3D12_FEATURE_D3D12_OPTIONS13: {
@@ -955,6 +970,8 @@ public:
     case kFeatureOptions21: {
       FEATURE_DATA(D3D12_FEATURE_DATA_D3D12_OPTIONS21_MN)
       out->ExecuteIndirectTier = 10; // D3D12_EXECUTE_INDIRECT_TIER_1_0
+      out->SampleCmpGradientAndBiasSupported = SM6Caps(); // ops 254/255 (DXMT 0052)
+      out->ExtendedCommandInfoSupported = SM6Caps();       // SV_StartVertex/InstanceLocation (DXMT 0051)
       return S_OK;
     }
 #undef FEATURE_DATA
