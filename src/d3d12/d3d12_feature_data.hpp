@@ -24,6 +24,9 @@ namespace dxmt {
 
 constexpr D3D12_FEATURE kFeatureOptions19 = (D3D12_FEATURE)48;
 constexpr D3D12_FEATURE kFeatureOptions21 = (D3D12_FEATURE)53;
+constexpr UINT kFeatureOptions22 = 65;
+// Shader Model 6.8, newer than llvm-mingw's D3D_SHADER_MODEL (DXIL SM 6.8 plan, Task 15).
+constexpr D3D_SHADER_MODEL kShaderModel6_8 = (D3D_SHADER_MODEL)0x68;
 
 struct D3D12_FEATURE_DATA_D3D12_OPTIONS19_MN {
   BOOL MismatchingOutputDimensionsSupported;
@@ -46,5 +49,13 @@ struct D3D12_FEATURE_DATA_D3D12_OPTIONS21_MN {
   BOOL ExtendedCommandInfoSupported;
 };
 static_assert(sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS21_MN) == 16);
+
+struct D3D12_FEATURE_DATA_D3D12_OPTIONS22_MN {
+  BOOL ShaderExecutionReorderingActuallyReorders;
+  BOOL CreateByteOffsetViewsSupported;
+  UINT Max1DDispatchSize;
+  UINT Max1DDispatchMeshSize;
+};
+static_assert(sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS22_MN) == 16);
 
 } // namespace dxmt
