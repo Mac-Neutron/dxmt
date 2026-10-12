@@ -37,11 +37,14 @@ struct SRVTextureGPUStorage {
 
 using UAVTextureGPUStorage = SRVTextureGPUStorage;
 
+// buffer_address (MacNeutron): a texel-buffer UAV's buffer GPU base (the view's first element stays in metadata), for
+// 64-bit atomics on a typed buffer (airconv's UnorderedAccessViewInfo::address64 reads it); 0 without a buffer and for
+// SRVs. A null UAV descriptor views the device's null texel buffer with 0 elements: every index is out of bounds.
 struct UAVTexelBufferGPUStorage {
   uint64_t resource_id;
   uint64_t metadata;
   uint64_t atomic_resource_id;
-  uint64_t padding;
+  uint64_t buffer_address;
 };
 
 using SRVTexelBufferGPUStorage = UAVTexelBufferGPUStorage;
@@ -275,6 +278,7 @@ public:
       }
       gpu_storage.UAVTexelBuffer.atomic_resource_id =
           UAVBuffer && AtomicView ? UAVBuffer->view_(*AtomicView).gpu_resource_id : 0;
+      gpu_storage.UAVTexelBuffer.buffer_address = UAVBuffer ? UAVBuffer->current()->gpuAddress() : 0;
     }
     return S_OK;
   }
@@ -313,6 +317,7 @@ public:
     if (mapped_argument_buffer_) { 
       auto &gpu_storage = mapped_argument_buffer_[Index];
       gpu_storage.UAVTexelBuffer.atomic_resource_id = 0;
+      gpu_storage.UAVTexelBuffer.buffer_address = 0;
       if (Buffer) {
         auto &buffer_view = Buffer->view_(View);
         gpu_storage.UAVTexelBuffer.resource_id = buffer_view.gpu_resource_id;

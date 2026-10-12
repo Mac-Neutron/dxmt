@@ -24,7 +24,9 @@ struct TextureDescirptor {
   llvm::air::Texture::ResourceKind ResourceKindLogical;
   llvm::air::Texture::MemoryAccess MemoryAccess;
   llvm::air::Texture::SampleType SampleType;
-
+  // MacNeutron (DXIL 64-bit atomics, Task 14b): an address64 typed UAV's buffer base (i8 addrspace(1)*), from its
+  // descriptor's fourth qword; null otherwise.
+  llvm::Value *BufferAddress = nullptr;
 };
 
 struct BufferDescriptor {

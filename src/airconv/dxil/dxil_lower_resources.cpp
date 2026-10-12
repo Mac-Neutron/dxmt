@@ -545,51 +545,103 @@ Lowering::LowerDimensions(llvm::CallInst *call, const HandleInfo &h) {
   return llvm::Error::success();
 }
 
-// 64-bit atomics on raw and structured buffers (Task 14a; spec 3.8), root and heap ones included: under a lock from the
-// device's table, keyed by the element's device address (every view of the same bytes takes the same lock; a collision
-// only serialises), its halves read and written as relaxed 32-bit atomics. A pixel shader's helper lanes (D3D gives
-// them no UAV side effects, attribute or not, and a helper whose lock atomic were discarded could spin forever) and an
-// out-of-bounds element skip it and read 0.
+// 64-bit atomics (Tasks 14a-14b; spec 3.8), under a lock from the device's table (a collision only serialises). Buffers
+// (raw, structured, root and heap ones, and typed ones, which DXIL can only reach with atomics: their buffer's base comes
+// from the descriptor, their first element from its metadata) are keyed by the element's device address, so every view
+// of the same bytes takes the same lock, and their halves are read and written as relaxed 32-bit atomics. Textures
+// (R32G32_UINT: RG32Uint) are keyed by the texel's (x, y) alone, which every view of it agrees on, and read and written
+// through the <4 x i32> texel (lo .x, hi .y) under device and texture fences, with a texture fence after the write. A
+// pixel shader's helper lanes (D3D gives them no UAV side effects, attribute or not, and a helper whose lock atomic were
+// discarded could spin forever) and an out-of-bounds buffer element skip it and read 0; a texture out of bounds is left
+// to Metal, as the 32-bit texture atomics are.
 llvm::Error
 Lowering::Atomic64(uint32_t opcode, llvm::CallInst *call, const HandleInfo &h) {
+  using llvm::air::MemFlags;
   auto arg = [&](unsigned i) { return call->getArgOperand(i); };
   auto kind = h.resource->kind;
   auto locks = ctx.binding.GetAtomic64Locks(air);
-  if ((kind != ResourceKind::RawBuffer && kind != ResourceKind::StructuredBuffer) || !locks)
-    return Unsupported(call); // typed buffers and textures: Task 14b
-  auto buffer = Buffer(h);
-  if (!buffer) {
+  if (!locks)
+    return Unsupported(call);
+  bool raw = kind == ResourceKind::RawBuffer || kind == ResourceKind::StructuredBuffer;
+  bool texel = !raw && kind != ResourceKind::TypedBuffer;
+  llvm::Optional<dxbc::BufferResourceHandle> buffer;
+  llvm::Optional<dxbc::TextureDescirptor> d;
+  if (raw ? !(buffer = Buffer(h)) : !(d = Texture(h))) { // unbound
     Replace(call, ir.getInt64(0));
     return llvm::Error::success();
   }
+  if (kind == ResourceKind::TypedBuffer && !d->BufferAddress)
+    return Unsupported(call);
   bool cas = opcode == op::AtomicCompareExchange;
   unsigned c = cas ? 2 : 3; // (78, handle, op, c0, c1, c2, value); (79, handle, c0, c1, c2, compare, value)
-  auto offset = kind == ResourceKind::StructuredBuffer
-                    ? ir.CreateAdd(ir.CreateMul(arg(c), ir.getInt32(h.resource->stride)), arg(c + 1))
-                    : arg(c);
   auto i32 = ir.getInt32Ty(), i64 = ir.getInt64Ty();
-  auto ptr = ElementPointer(*buffer, offset, i64); // null out of bounds
-  llvm::Value *skip = ir.CreateIsNull(ptr);
+  llvm::Value *ptr = nullptr; // a buffer's qword, null out of bounds
+  llvm::air::Texture tex;
+  llvm::Value *pos = nullptr, *array = nullptr; // a texture's texel
+  if (raw) {
+    auto offset = kind == ResourceKind::StructuredBuffer
+                      ? ir.CreateAdd(ir.CreateMul(arg(c), ir.getInt32(h.resource->stride)), arg(c + 1))
+                      : arg(c);
+    ptr = ElementPointer(*buffer, offset, i64);
+  } else if (!texel) { // qword index + first element of the buffer's base; out of bounds from the view's element count
+    auto qwords = ir.CreateBitCast(d->BufferAddress, i64->getPointerTo(1));
+    ptr = ir.CreateGEP(i64, qwords, ir.CreateZExt(ir.CreateAdd(arg(c), conv.DecodeTextureBufferOffset(d->Metadata)), i64));
+    ptr = ir.CreateSelect(ir.CreateICmpUGE(arg(c), conv.DecodeTextureBufferElement(d->Metadata)),
+                          llvm::Constant::getNullValue(ptr->getType()), ptr);
+  } else { // c0.. as LowerTexture's: a 1D texture's y is 0, an array's slice its array component
+    tex.kind = d->ResourceKind;
+    tex.sample_type = d->SampleType;
+    tex.memory_access = d->MemoryAccess;
+    auto logical = d->ResourceKindLogical;
+    bool one_d = logical == Texture::texture1d || logical == Texture::texture1d_array;
+    pos = llvm::UndefValue::get(llvm::FixedVectorType::get(i32, Dimensions(logical)));
+    for (unsigned i = 0; i < Dimensions(logical); i++)
+      pos = ir.CreateInsertElement(pos, one_d && i == 1 ? ir.getInt32(0) : arg(c + i), i);
+    array = IsArray(logical) ? arg(c + ArrayComponent(logical)) : nullptr;
+  }
+  llvm::Value *skip = ptr ? ir.CreateIsNull(ptr) : ir.getFalse();
   if (entry.kind == ShaderKind::Pixel)
     skip = ir.CreateOr(skip, Simd(ir, "air.simd_is_helper_thread", ir.getInt1Ty(), {}));
   auto head = ir.GetInsertBlock();
   ir.SetInsertPoint(llvm::SplitBlockAndInsertIfThen(ir.CreateNot(skip), call, false));
-  // The key, in 32-bit math: a = the address's low 32 bits; h = a >> 3; h ^= h >> 16; lock h & (kAtomic64Locks - 1).
-  auto key = ir.CreateLShr(ir.CreateTrunc(ir.CreatePtrToInt(ptr, i64), i32), 3);
+  // The key, in 32-bit math: h = (the address's low 32 bits) >> 3, or x * 0x9E3779B1 + y; h ^= h >> 16; lock
+  // h & (kAtomic64Locks - 1).
+  auto key = texel ? ir.CreateAdd(ir.CreateMul(ir.CreateExtractElement(pos, (uint64_t)0), ir.getInt32(0x9E3779B1)),
+                                  ir.CreateExtractElement(pos, 1))
+                   : ir.CreateLShr(ir.CreateTrunc(ir.CreatePtrToInt(ptr, i64), i32), 3);
   key = ir.CreateAnd(ir.CreateXor(key, ir.CreateLShr(key, 16)), kAtomic64Locks - 1);
-  auto lo = ir.CreateBitCast(ptr, i32->getPointerTo(1)), hi = ir.CreateConstGEP1_32(i32, lo, 1);
-  auto old = UnderLock(ir.CreateGEP(i32, locks, key), llvm::air::MemFlags::Device, llvm::air::ThreadScope::Device, [&] {
-    auto half = [&](llvm::Value *p) {
-      auto load = ir.CreateAlignedLoad(i32, p, llvm::Align(4));
+  llvm::Value *lo = nullptr, *hi = nullptr;
+  if (!texel)
+    lo = ir.CreateBitCast(ptr, i32->getPointerTo(1)), hi = ir.CreateConstGEP1_32(i32, lo, 1);
+  auto load = [&] { // one texel read, or the two halves
+    auto t = texel ? air.CreateRead(tex, d->ResourceHandle, pos, array, nullptr, ir.getInt32(0), d->GlobalCoherent).first
+                   : nullptr;
+    auto half = [&](unsigned i) {
+      if (t)
+        return ir.CreateZExt(ir.CreateExtractElement(t, i), i64);
+      auto load = ir.CreateAlignedLoad(i32, i ? hi : lo, llvm::Align(4));
       load->setAtomic(llvm::AtomicOrdering::Monotonic);
       return ir.CreateZExt(load, i64);
     };
-    auto value = ir.CreateOr(half(lo), ir.CreateShl(half(hi), 32));
-    auto store = [&](llvm::Value *v) {
-      ir.CreateAlignedStore(ir.CreateTrunc(v, i32), lo, llvm::Align(4))->setAtomic(llvm::AtomicOrdering::Monotonic);
-      ir.CreateAlignedStore(ir.CreateTrunc(ir.CreateLShr(v, 32), i32), hi, llvm::Align(4))
-          ->setAtomic(llvm::AtomicOrdering::Monotonic);
-    };
+    auto low = half(0);
+    return ir.CreateOr(low, ir.CreateShl(half(1), 32));
+  };
+  auto store = [&](llvm::Value *v) {
+    auto half = [&](unsigned i) { return ir.CreateTrunc(i ? ir.CreateLShr(v, 32) : v, i32); };
+    if (texel) { // <lo, hi, 0, 0>, then the texture fence
+      llvm::Value *t = llvm::Constant::getNullValue(llvm::FixedVectorType::get(i32, 4));
+      for (unsigned i = 0; i < 2; i++)
+        t = ir.CreateInsertElement(t, half(i), i);
+      air.CreateWrite(tex, d->ResourceHandle, pos, array, nullptr, ir.getInt32(0), t, d->GlobalCoherent);
+      air.CreateTextureFence(tex, d->ResourceHandle);
+      return;
+    }
+    for (unsigned i = 0; i < 2; i++)
+      ir.CreateAlignedStore(half(i), i ? hi : lo, llvm::Align(4))->setAtomic(llvm::AtomicOrdering::Monotonic);
+  };
+  auto flags = texel ? MemFlags::Device | MemFlags::Texture : MemFlags::Device;
+  auto old = UnderLock(ir.CreateGEP(i32, locks, key), flags, llvm::air::ThreadScope::Device, [&] {
+    auto value = load();
     if (cas) { // stores only on a 64-bit match (CompareStore: the same, its result unused)
       auto at = &*ir.GetInsertPoint();
       ir.SetInsertPoint(llvm::SplitBlockAndInsertIfThen(ir.CreateICmpEQ(value, arg(5)), at, false));

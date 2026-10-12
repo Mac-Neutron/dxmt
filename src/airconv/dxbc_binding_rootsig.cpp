@@ -186,9 +186,10 @@ public:
   std::pair<llvm::Value *, llvm::Value *>
   GetTextureDescriptor(
       llvm::air::AIRBuilder &AIR, llvm::Value *IntPtr, llvm::Value *Index, Texture::ResourceKind Kind, RangeId RangeId,
-      uint32_t DescriptorOffset, uint32_t HandleField = 0 /* MacNeutron: 2, an atomic_view's R32Uint view */
+      uint32_t DescriptorOffset, uint32_t HandleField = 0 /* MacNeutron: 2, an atomic_view's R32Uint view */,
+      llvm::Type *HandleType = nullptr /* MacNeutron: the field's type, if not Kind's texture handle */
   ) {
-    auto TyTextureHandle = AIR.getTextureHandleType(Kind);
+    auto TyTextureHandle = HandleType ? HandleType : AIR.getTextureHandleType(Kind);
     auto TyTextureDescriptor = llvm::StructType::get(
         AIR.getContext(), {TyTextureHandle, llvm::Type::getInt64Ty(AIR.getContext()),
                            llvm::Type::getInt64Ty(AIR.getContext()), llvm::Type::getInt64Ty(AIR.getContext())}
@@ -275,8 +276,13 @@ public:
     auto [Handle, Metadata] = GetTextureDescriptor(
         Builder, HeapPointer, Index, ResourceKind, UAV.range.lower_bound, DescriptorOffset, UAV.atomic_view ? 2 : 0
     );
-    return TextureDescirptor{Handle,       Metadata,  UAV.global_coherent, ResourceKind, ResourceKindLogical,
-                             MemoryAccess, SampleType};
+    // MacNeutron: an address64 UAV's buffer base, the descriptor's fourth qword.
+    llvm::Value *BufferAddress = nullptr;
+    if (UAV.address64)
+      BufferAddress = GetTextureDescriptor(Builder, HeapPointer, Index, ResourceKind, UAV.range.lower_bound,
+                                           DescriptorOffset, 3, Builder.builder.getInt8PtrTy(1)).first;
+    return TextureDescirptor{Handle,       Metadata,   UAV.global_coherent, ResourceKind, ResourceKindLogical,
+                             MemoryAccess, SampleType, BufferAddress};
   }
 
   virtual llvm::Optional<BufferDescriptor>
