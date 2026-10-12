@@ -20,6 +20,7 @@
 #include "../airconv_error.hpp"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/ModuleSlotTracker.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
@@ -77,8 +78,14 @@ llvm::Error Retarget(llvm::Value *from, llvm::Value *to) {
       if (auto err = Retarget(cast, moved))
         return err;
       cast->eraseFromParent();
+      if (moved->use_empty()) // it only fed lifetime markers
+        moved->eraseFromParent();
     } else if (auto load = llvm::dyn_cast<llvm::LoadInst>(user)) {
       load->setOperand(load->getPointerOperandIndex(), to);
+    } else if (auto marker = llvm::dyn_cast<llvm::IntrinsicInst>(user); marker && marker->isLifetimeStartOrEnd()) {
+      // DXC hoists a local array of constants to a global (<name>.hca) and keeps the array's lifetime markers on it
+      // (Palworld's NeighborOffset, SM 6.6): they mean nothing on a constant.
+      marker->eraseFromParent();
     } else {
       return llvm::make_error<UnsupportedFeature>("DXIL: a static const array used other than by loads");
     }
