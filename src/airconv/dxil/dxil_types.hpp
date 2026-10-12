@@ -101,6 +101,9 @@ struct Resource {
 // Heap ranges' register space (no root parameter's) and their first range ID (MacNeutron).
 constexpr uint32_t kHeapSpace = ~0u, kHeapRangeBase = 1u << 24;
 
+// EntryInfo::wave_size_min for a WaveSize or WaveSizeRange node too short to read (InitializeDXIL refuses it).
+constexpr uint32_t kMalformedWaveSize = ~0u;
+
 struct EntryInfo {
   ShaderKind kind = ShaderKind::Invalid;
   uint32_t sm_major = 0, sm_minor = 0;

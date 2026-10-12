@@ -254,6 +254,8 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   if (!gs_locks)
     return gs_locks.takeError();
   AddHeapRanges(**module, *entry);
+  if (entry->wave_size_min == kMalformedWaveSize)
+    return llvm::make_error<UnsupportedFeature>("DXIL: malformed WaveSize metadata");
   // Apple GPUs run 32-lane SIMD groups (d3d12_device.cpp's WaveLaneCountMin/Max); the preferred size is a hint.
   if (entry->wave_size_min && !(entry->wave_size_min <= 32 && 32 <= entry->wave_size_max))
     return llvm::make_error<UnsupportedFeature>("DXIL: [WaveSize(" + std::to_string(entry->wave_size_min) + ", " +

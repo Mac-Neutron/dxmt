@@ -251,6 +251,8 @@ Lowering::RegisterElementPointer(dxbc::register_file &file, const SignatureEleme
   return ir.CreateGEP(array_ty, file.ptr_int4, {ir.getInt32(0), reg, ir.getInt32(e.start_col + col)});
 }
 
+// A simdgroup function call: convergent, never readnone or speculatable. The 64-bit lock path's election
+// (air.simd_is_first behind a branch) and its fence ordering rely on that: a speculatable call could be hoisted.
 llvm::Value *Simd(llvm::IRBuilder<> &ir, llvm::StringRef name, llvm::Type *ret, llvm::ArrayRef<llvm::Value *> args) {
   auto &context = ir.getContext();
   auto attrs = llvm::AttributeList::get(context, llvm::AttributeList::FunctionIndex,
@@ -690,6 +692,8 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     // with their ballot. That first lane always leaves, a NaN too: the loop ends, and D3D's own-lane bit is set.
     auto v = call->getArgOperand(1);
     auto ty = v->getType();
+    if (ty->isDoubleTy()) // no f64 simdgroup functions in Metal (unreachable while DoubleOps is FALSE)
+      return Unsupported(call);
     auto head = call->getParent();
     auto done = head->splitBasicBlock(call);
     auto loop = llvm::BasicBlock::Create(ir.getContext(), "", head->getParent(), done);
@@ -721,7 +725,7 @@ Lowering::LowerOther(uint32_t opcode, llvm::CallInst *call) {
     auto ty = v->getType();
     bool fp = ty->isFloatingPointTy();
     uint32_t kind = ConstantU32(call->getArgOperand(6), ~0u);
-    if (kind > 4 || (fp && kind >= 1 && kind <= 3))
+    if (kind > 4 || (fp && kind >= 1 && kind <= 3) || ty->isDoubleTy())
       return Unsupported(call);
     // The sign operand changes nothing: a sum or a product wraps the same either way.
     using llvm::Instruction;
