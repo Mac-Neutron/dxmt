@@ -107,7 +107,8 @@ private:
   // The lanes taking part in a wave operation at the insert point: the i64 ballot of the non-helper lanes when helpers
   // are left out, nullptr otherwise (nothing is masked). Emitted at each operation: divergence changes it.
   llvm::Value *WaveLanes();
-  // i1: this lane takes part, !helper when helpers are left out, true otherwise.
+  // i1: this lane takes part. When helpers are left out: a non-helper lane, or any lane of a simdgroup with no active
+  // non-helper lane; true otherwise.
   llvm::Value *Participates();
 
   // Compute shaders, which have no air.dfdx (spec 3.3): the derivative of float `v` (scalar or vector) across its quad,

@@ -292,7 +292,14 @@ llvm::Value *Lowering::WaveLanes() {
 }
 
 llvm::Value *Lowering::Participates() {
-  return HelpersLeftOut() ? ir.CreateNot(Simd(ir, "air.simd_is_helper_thread", ir.getInt1Ty(), {})) : ir.getTrue();
+  if (!HelpersLeftOut())
+    return ir.getTrue();
+  auto live = ir.CreateNot(Simd(ir, "air.simd_is_helper_thread", ir.getInt1Ty(), {}));
+  // A simdgroup whose active lanes are all helpers (its covered lanes have left a loop, or a discard demoted them) runs
+  // the operation over them all, as Metal does: D3D leaves a helper's wave results undefined, but a loop waiting on a
+  // wave result must still end for it. Masked to nothing, a waterfall loop's helpers never leave it (a GPU hang).
+  auto none = ir.CreateICmpEQ(Simd(ir, "air.simd_ballot.i64", ir.getInt64Ty(), {live}), ir.getInt64(0));
+  return ir.CreateOr(live, none);
 }
 
 // The 64-bit lock path (spec 3.8), from 32-bit atomics, fences and simdgroup votes; never Metal's 64-bit atomics, which
