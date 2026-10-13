@@ -199,8 +199,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // M3: the render passes encoded inside `base`'s Metal render pass, and the timestamp-only blits whose samples move
   // to its end, from the encoders after base in this ExecuteCommandLists call (lists[list] is base's). A pass joins
   // when only list boundaries and timestamp-only blits come between, with no barrier, its targets are base's
-  // (SameTarget), it resolves no indirect commands, and the samples fit (4 counter buffers, one sample each). Base
-  // must be its group's join. Fills merged_ in order, and `info` with the moved samples.
+  // (SameTarget), it resolves no indirect commands, and the samples fit (4 counter buffers, one sample each; any
+  // number with the timestamp ring, which takes them all at one point). Base must be its group's join, which in strict
+  // order every encoder is (Order). Fills merged_ in order, and `info` with the moved samples.
   // ponytail: one ExecuteCommandLists call; merging across calls B coalesced would defer encoding to commit time.
   // DXMT_STATS counts why a render pass that could have joined (the next encoder but for list boundaries and
   // timestamp-only blits) didn't, for the base-pass merge (B6, Task F4).
@@ -224,12 +225,20 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
             WMTRenderPassInfo &info) {
     merged_.clear();
     folds_.clear();
-    if (!base->join || base->visibility_buffer) { // a pass counting into a query: its counting would reach the next
-      RefuseMerge(base->next, kRefusedOther);
+    // A pass counting into a query: its counting would reach the next. Overlap: a non-join base waits on its own
+    // dependencies only, not the merged passes'. (SMITE 2's base-pass segments are each a list's pass after its start
+    // timestamp, the list's join: B6.)
+    if ((!base->join && !serial_) || base->visibility_buffer) {
+      RefuseMerge(base->next ? base->next
+                  : list + 1 < count ? static_cast<MTLD3D12GraphicsCommandList *>(lists[list + 1])->entry
+                                     : nullptr,
+                  kRefusedOther);
       return;
     }
     unsigned samples = base->num_samples;
     auto fits = [&](EncoderData *e, unsigned &n) {
+      if (sampling_) // the ring (Task F4): the pass's samples are all taken at one point, in any number
+        return true;
       for (unsigned k = 0; k < e->num_samples; k++) {
         if (n == std::size(info.sample_buffers))
           return false;
