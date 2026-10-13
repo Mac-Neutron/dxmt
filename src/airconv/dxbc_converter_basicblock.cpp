@@ -237,6 +237,12 @@ IREffect init_input_reg(
         auto rcp_w = ctx.builder.CreateFDiv(
           llvm::ConstantFP::get(ctx.types._float, 1), w_component
         );
+        // MacNeutron (B6): D3D's interpolated w needs no IEEE divide, so a reciprocal, as Metal Shader Converter emits
+        // it (the DXBC path's builder already has fast flags; DXIL's has none). NaN and infinity stay.
+        if (auto *div = llvm::dyn_cast<llvm::Instruction>(rcp_w)) {
+          div->setHasAllowReciprocal(true);
+          div->setHasApproxFunc(true);
+        }
         arg = ctx.builder.CreateInsertElement(arg, rcp_w, 3);
       }
       return store_at_vec4_array_masked(
