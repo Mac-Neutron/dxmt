@@ -130,12 +130,21 @@ PopulateWMTTextureInfo(MTLD3D12Device *Device, WMTTextureInfo &InfoOut, const D3
   InfoOut.options = WMTResourceHazardTrackingModeUntracked;
 
   // MacNeutron (GPU efficiency spec E1): lossless compression, which PixelFormatView usage would otherwise turn off
-  // (D3DMetal does the same). Not for UAVs (D3D12 lets one write through a view of another layout, which corrupts a
-  // compressed texture), linear layouts, cross-adapter resources, or 4KB-aligned ones (sized uncompressed below).
-  static const bool lossless = env::getEnvVar("DXMT_D3D12_COMPRESSION") != "0";
+  // (D3DMetal does the same). Not for linear layouts, cross-adapter resources, or 4KB-aligned ones (sized uncompressed
+  // below). UAVs too (B6: SMITE 2's RGBA16 G-buffer targets), but for a 32-bit texel of more than one channel: D3D12's
+  // UAV casting of the 32-bit typeless families and our packed-format UAV clears (dxmt_command_clear.hpp) write it
+  // through an R32 view, and a write through a view of another channel layout corrupts a compressed texture (measured
+  // on M5 Pro: R11G11B10 through R32Uint; views of one layout and another type, RGBA16/RGBA8/RG32/RGBA32 float or unorm
+  // through uint, don't). DXMT_D3D12_COMPRESSION=rt leaves every UAV uncompressed, =0 every texture.
+  static const std::string compression = env::getEnvVar("DXMT_D3D12_COMPRESSION");
+  auto format = InfoOut.pixel_format;
+  bool r32_view = MTLGetTexelSize(format) == 4 && format != WMTPixelFormatR32Uint && format != WMTPixelFormatR32Sint &&
+                  format != WMTPixelFormatR32Float;
+  bool uav = Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
   InfoOut.flags = 0;
-  if (lossless && !(Desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER)) &&
-      Desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN && Desc.Alignment != D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT)
+  if (compression != "0" && !(uav && (compression == "rt" || r32_view)) &&
+      !(Desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER) && Desc.Layout == D3D12_TEXTURE_LAYOUT_UNKNOWN &&
+      Desc.Alignment != D3D12_SMALL_RESOURCE_PLACEMENT_ALIGNMENT)
     InfoOut.flags = WMTTextureFlagLossless;
 
   if (Desc.Alignment) {
