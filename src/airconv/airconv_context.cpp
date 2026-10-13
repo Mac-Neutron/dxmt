@@ -59,6 +59,8 @@ void initializeModule(llvm::Module &M) {
     Module::ModFlagBehavior::Max, "air.max_read_write_textures", 8
   );
   M.addModuleFlag(Module::ModFlagBehavior::Max, "air.max_samplers", 16);
+  // Varyings of different widths link (DXIL's are at their signature's width): as Metal Shader Converter's modules.
+  M.addModuleFlag(Module::ModFlagBehavior::Max, "agx.allow_mismatched_component_counts", 1);
 
 };
 
