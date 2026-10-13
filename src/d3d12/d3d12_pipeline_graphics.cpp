@@ -531,6 +531,7 @@ public:
     if (pDesc->PS.pShaderBytecode &&
         (FAILED(hr = shader_ps.Initialize(pDesc->PS)) || FAILED(hr = shader_ps.Reflection(&ref_ps))))
       return hr;
+    writes_uav = ref_vs.WritesUAV || ref_gs.WritesUAV || ref_ps.WritesUAV;
     WMT::InitializeMeshRenderPipelineInfo(geometry_info_);
     bool dual_source_blending = false;
     if (FAILED(hr = InitializePSO(pDesc, geometry_info_, dual_source_blending)))
@@ -709,6 +710,7 @@ public:
     if (pDesc->PS.pShaderBytecode &&
         (FAILED(hr = shader_ps.Initialize(pDesc->PS)) || FAILED(hr = shader_ps.Reflection(&ref_ps))))
       return hr;
+    writes_uav = ref_vs.WritesUAV || ref_ps.WritesUAV;
 
     if (FAILED(hr = InitializePSO(pDesc, info, dual_source_blending)))
       return hr;

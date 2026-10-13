@@ -129,6 +129,11 @@ struct MTL_SHADER_REFLECTION {
   uint32_t NumOutputElement;
   uint32_t ThreadsPerPatch;
   uint32_t ArgumentTableQwords;
+  /**
+  MacNeutron (B6): the shader may write a UAV (D3D12): a DXIL store, atomic or counter op on one, or any UAV a DXBC
+  shader declares.
+  */
+  uint32_t WritesUAV;
 };
 
 #if defined(__LP64__) || defined(_WIN64)

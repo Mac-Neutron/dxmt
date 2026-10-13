@@ -94,7 +94,7 @@ CachedShader::Parse(sm50_shader_t *out) {
 HRESULT
 CachedShader::Reflection(MTL_SHADER_REFLECTION *out) {
   if (!reflected_) {
-    Key key{digest_, Tag("d3d12-reflection")};
+    Key key{digest_, Tag("d3d12-reflection 2")}; // 2: WritesUAV (B6), which an older entry would read as 0
     bool enabled = false, cached = false;
     if (auto reader = Store().getReader()) {
       enabled = true;
