@@ -30,6 +30,7 @@
 namespace dxmt {
 
 ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Device device, InternalCommandLibrary &lib) :
+    device_(device),
     lib(lib),
     emulated_cmd(device, lib, *this),
     clear_rt_cmd(device, *this),
@@ -38,7 +39,6 @@ ArgumentEncodingContext::ArgumentEncodingContext(CommandQueue &queue, WMT::Devic
     mv_scale_cmd(device, lib, *this),
     tile_barrier_cmd(device, lib, *this),
     timestamp_state_(device),
-    device_(device),
     queue_(queue) {
   dummy_sampler_info_.support_argument_buffers = true;
   dummy_sampler_info_.border_color = WMTSamplerBorderColorTransparentBlack;
@@ -478,8 +478,8 @@ ArgumentEncodingContext::clearColor(Rc<Texture> &&texture, uint64_t viewId, unsi
   encoder_info->color = color;
   SanitizeRTVClearColor(texture->pixelFormat(viewId), encoder_info->color);
   encoder_info->array_length = arrayLength;
-  encoder_info->width = texture->width();
-  encoder_info->height = texture->height();
+  encoder_info->width = texture->width(viewId);
+  encoder_info->height = texture->height(viewId);
   encoder_current = encoder_info;
 
   encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);
@@ -502,8 +502,8 @@ ArgumentEncodingContext::clearDepthStencil(
   encoder_info->clear_dsv = flag & DepthStencilPlanarFlags(texture->pixelFormat());
   encoder_info->depth_stencil = {depth, stencil};
   encoder_info->array_length = arrayLength;
-  encoder_info->width = texture->width();
-  encoder_info->height = texture->height();
+  encoder_info->width = texture->width(viewId);
+  encoder_info->height = texture->height(viewId);
   encoder_current = encoder_info;
 
   encoder_info->attachment = access(texture, viewId, ResourceAccess::Write);

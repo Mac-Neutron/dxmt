@@ -668,15 +668,15 @@ public:
     data_ia_layout.type = SM50_SHADER_IA_INPUT_LAYOUT;
     data_ia_layout.index_buffer_format = SM50_INDEX_BUFFER_FORMAT_NONE;
     std::vector<SM50_IA_INPUT_ELEMENT> elements(pDesc->InputLayout.NumElements);
-    hr = ExtractMTLInputLayoutElements(
-        device_, pDesc->VS.pShaderBytecode, pDesc->InputLayout.pInputElementDescs, pDesc->InputLayout.NumElements,
-        elements.data(), &data_ia_layout.num_elements
-    );
+    if (FAILED(
+            hr = ExtractMTLInputLayoutElements(
+                device_, pDesc->VS.pShaderBytecode, pDesc->InputLayout.pInputElementDescs,
+                pDesc->InputLayout.NumElements, elements.data(), &data_ia_layout.num_elements
+            )
+        ))
+      return hr; // before num_elements is read (upstream a3d9005)
     elements.resize(data_ia_layout.num_elements);
     data_ia_layout.elements = elements.data();
-    if (FAILED(hr)) {
-      return hr;
-    }
     slot_mask = 0;
     for (auto &element : elements) {
       slot_mask |= (1 << element.slot);
