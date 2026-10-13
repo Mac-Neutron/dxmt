@@ -63,20 +63,26 @@ uint32_t Mask(const SignatureElement &e) {
   return ((1u << e.cols) - 1) << e.start_col;
 }
 
+// Register `reg`'s components [col, col + cols), the varying's x, y, ... at its signature's width (a scalar for one).
+pvalue Shifted(struct context &ctx, uint32_t reg, uint32_t col, uint32_t cols, llvm::Type *type) {
+  auto &b = ctx.builder;
+  auto array = ctx.resource.output.ptr_int4;
+  auto array_ty = llvm::cast<llvm::PointerType>(array->getType())->getNonOpaquePointerElementType();
+  auto row = b.CreateLoad(ctx.types._int4, b.CreateGEP(array_ty, array, {b.getInt32(0), b.getInt32(reg)}));
+  if (cols == 1)
+    return b.CreateBitCast(b.CreateExtractElement(row, col), type);
+  int idx[4];
+  for (uint32_t i = 0; i < cols; i++)
+    idx[i] = (int)(col + i);
+  return b.CreateBitCast(b.CreateShuffleVector(row, llvm::ArrayRef<int>(idx, cols)), type);
+}
+
 // Vertex output: register `reg`'s components [col, col + cols) become the varying's x, y, ...
 std::function<IRValue(pvalue)> PopShifted(uint32_t reg, uint32_t col, uint32_t cols, uint32_t to_element) {
   return [=](pvalue ret) {
     return make_irvalue([=](struct context ctx) -> pvalue {
-      auto &b = ctx.builder;
-      auto array = ctx.resource.output.ptr_int4;
-      auto array_ty = llvm::cast<llvm::PointerType>(array->getType())->getNonOpaquePointerElementType();
-      auto row = b.CreateLoad(ctx.types._int4, b.CreateGEP(array_ty, array, {b.getInt32(0), b.getInt32(reg)}));
-      int idx[4];
-      for (uint32_t i = 0; i < 4; i++)
-        idx[i] = (int)(i < cols ? col + i : col);
-      auto shifted = b.CreateShuffleVector(row, idx);
       auto field_ty = ctx.function->getReturnType()->getStructElementType(to_element);
-      return b.CreateInsertValue(ret, b.CreateBitCast(shifted, field_ty), {to_element});
+      return ctx.builder.CreateInsertValue(ret, Shifted(ctx, reg, col, cols, field_ty), {to_element});
     });
   };
 }
@@ -87,9 +93,10 @@ IREffect InitShifted(uint32_t arg_index, uint32_t reg, uint32_t col, uint32_t co
     auto &b = ctx.builder;
     auto array = ctx.resource.input.ptr_int4;
     auto array_ty = llvm::cast<llvm::PointerType>(array->getType())->getNonOpaquePointerElementType();
-    auto arg = b.CreateBitCast(ctx.function->getArg(arg_index), ctx.types._int4);
+    auto int_ty = cols == 1 ? (llvm::Type *)b.getInt32Ty() : llvm::FixedVectorType::get(b.getInt32Ty(), cols);
+    auto arg = b.CreateBitCast(ctx.function->getArg(arg_index), int_ty);
     for (uint32_t i = 0; i < cols; i++)
-      b.CreateStore(b.CreateExtractElement(arg, i),
+      b.CreateStore(cols == 1 ? arg : b.CreateExtractElement(arg, i),
                     b.CreateGEP(array_ty, array, {b.getInt32(0), b.getInt32(reg), b.getInt32(col + i)}));
     return std::monostate{};
   });
@@ -99,14 +106,7 @@ IREffect InitShifted(uint32_t arg_index, uint32_t reg, uint32_t col, uint32_t co
 IREffect MeshPopShifted(uint32_t reg, uint32_t col, uint32_t cols, uint32_t index, pvalue vertex,
                         air::MSLScalerOrVectorType type) {
   return make_effect([=](struct context ctx) {
-    auto &b = ctx.builder;
-    auto array = ctx.resource.output.ptr_int4;
-    auto array_ty = llvm::cast<llvm::PointerType>(array->getType())->getNonOpaquePointerElementType();
-    auto row = b.CreateLoad(ctx.types._int4, b.CreateGEP(array_ty, array, {b.getInt32(0), b.getInt32(reg)}));
-    int idx[4];
-    for (uint32_t i = 0; i < 4; i++)
-      idx[i] = (int)(i < cols ? col + i : col);
-    auto value = b.CreateBitCast(b.CreateShuffleVector(row, idx), air::get_llvm_type(type, ctx.llvm));
+    auto value = Shifted(ctx, reg, col, cols, air::get_llvm_type(type, ctx.llvm));
     ctx.air.CreateSetMeshVertexData(vertex, index, value);
     return std::monostate{};
   });
@@ -432,8 +432,16 @@ AddGeometryHandlers(const EntryInfo &entry, SM50ShaderInternal *shader) {
 
 } // namespace
 
+// At the signature's width, as Metal Shader Converter declares them (the module flag
+// agx.allow_mismatched_component_counts links a narrower pixel input): SMITE 2's base-pass vertex shaders stored 20-36
+// components per vertex as float4s, 16-29 at width (B6).
 air::OutputVertex Varying(const SignatureElement &e, uint32_t row) {
-  return air::OutputVertex{.user = UserName(e, row), .type = to_msl_type(RegType(e.type))};
+  air::MSLScalerType scalar = air::msl_float;
+  if (RegType(e.type) == RegisterComponentType::Uint)
+    scalar = air::msl_uint;
+  else if (RegType(e.type) == RegisterComponentType::Int)
+    scalar = air::msl_int;
+  return air::OutputVertex{.user = UserName(e, row), .type = air::MSLVector{e.cols, scalar}}; // 1: the scalar
 }
 
 void
