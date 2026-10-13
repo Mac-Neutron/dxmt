@@ -294,6 +294,7 @@ public:
     timestamps = false;
     custom_resolves = false;
     barrier_names.clear();
+    barrier_opaque.clear();
     return allocator_->StartRecord(&entry);
   }
 
@@ -1328,8 +1329,8 @@ public:
     DXMT_STAT_SCOPE("list.ResourceBarrier");
     DXMT_STAT_COUNT("#resource barriers", Count);
     transitioned_.clear();
-    bool join = false;
-    for (UINT i = 0; i < Count && !join; i++) {
+    bool join = false, opaque = false;
+    for (UINT i = 0; i < Count && !(join && opaque); i++) {
       auto &b = barriers[i];
       if (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)
         continue;
@@ -1337,20 +1338,25 @@ public:
       if (!key || (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY) ||
           (static_cast<MTLD3D12Resource *>(b.Transition.pResource)->GetDesc().Flags &
            D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) {
-        join = true;
+        join = opaque = true;
         break;
       }
       auto before = b.Transition.StateBefore, after = b.Transition.StateAfter;
       if (ReadOnly(before) && ReadOnly(after))
         continue;
-      if (!WriteEnds(before) || after == D3D12_RESOURCE_STATE_COMMON) {
+      // B6 merges can't see through these: no render pass lists its UAV writes, and COMMON hides promoted ones.
+      opaque |= before == D3D12_RESOURCE_STATE_COMMON || after == D3D12_RESOURCE_STATE_COMMON ||
+                ((before | after) & D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      if (!WriteEnds(before) || after == D3D12_RESOURCE_STATE_COMMON) { // a join that names its resource (B6)
         join = true;
-        break;
+        continue;
       }
       transitioned_.push_back(key);
     }
     allocator_->Barrier(join, transitioned_.data(), transitioned_.size());
     auto call = allocator_->BarrierCalls();
+    if (opaque)
+      barrier_opaque.push_back(call);
     for (UINT i = 0; i < Count; i++) { // E7
       auto &b = barriers[i];
       if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)
