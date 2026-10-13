@@ -1269,6 +1269,7 @@ AIRCONV_API int SM50Initialize(
     pRefl->SRVSlotMaskHi = binding_srv_hi_mask;
     pRefl->SRVSlotMaskLo = binding_srv_lo_mask;
     pRefl->UAVSlotMask = binding_uav_mask;
+    pRefl->WritesUAV = !shader_info->uavMap.empty(); // MacNeutron (B6)
     pRefl->NumConstantBuffers = sm50_shader->args_reflection_cbuffer.size();
     pRefl->NumArguments = sm50_shader->args_reflection.size();
     if (sm50_shader->shader_type == microsoft::D3D11_SB_COMPUTE_SHADER) {

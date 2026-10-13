@@ -509,6 +509,8 @@ public:
         return DrawCallStatus::Invalid;
       static_cast<RenderEncoderData *>(allocator_->encoder_current)->use_geometry = true;
     }
+    if (pso_graphics_->writes_uav)
+      static_cast<RenderEncoderData *>(allocator_->encoder_current)->uav_writes = true;
     if (geometry != bound_geometry_) {
       dirty_state_.set(DirtyState::VertexBuffer, DirtyState::GraphicsRootArguments, DirtyState::GraphicsRootSignature);
       bound_geometry_ = geometry;
@@ -1330,8 +1332,8 @@ public:
     DXMT_STAT_COUNT("#resource barriers", Count);
     transitioned_.clear();
     bool join = false;
-    int opaque = -1; // B6: why merges can't see through this call (a BarrierOpacity), its first barrier's that says
-    for (UINT i = 0; i < Count && !(join && opaque >= 0); i++) {
+    int opaque = -1; // B6: why merges can't see through this call: its barriers' strongest BarrierOpacity
+    for (UINT i = 0; i < Count && !(join && opaque >= kOpaqueAlways); i++) {
       auto &b = barriers[i];
       if (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)
         continue;
@@ -1340,21 +1342,21 @@ public:
           (static_cast<MTLD3D12Resource *>(b.Transition.pResource)->GetDesc().Flags &
            D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) {
         join = true;
-        if (opaque < 0)
-          opaque = b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV                ? kOpaqueUavBarrier
-                   : b.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING         ? kOpaqueAliasing
-                   : (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY) != 0 ? kOpaqueSplitEnd
-                   : !key                                                   ? kOpaqueUnknown
-                                                                            : kOpaqueSimultaneous;
-        break;
+        bool activates = b.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING && b.Aliasing.pResourceAfter;
+        opaque = std::max(opaque, int(b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV                ? kOpaqueUavBarrier
+                                      : activates                                              ? kOpaqueAliasing
+                                      : (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY) != 0 ? kOpaqueSplitEnd
+                                      : !key                                                   ? kOpaqueUnknown
+                                                                                               : kOpaqueSimultaneous));
+        continue;
       }
       auto before = b.Transition.StateBefore, after = b.Transition.StateAfter;
       if (ReadOnly(before) && ReadOnly(after))
         continue;
-      if (opaque < 0 && ((before | after) & D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
-        opaque = kOpaqueUavState;
-      else if (opaque < 0 && (before == D3D12_RESOURCE_STATE_COMMON || after == D3D12_RESOURCE_STATE_COMMON))
-        opaque = kOpaqueCommon;
+      if ((before | after) & D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        opaque = std::max(opaque, int(kOpaqueUavState));
+      if (before == D3D12_RESOURCE_STATE_COMMON || after == D3D12_RESOURCE_STATE_COMMON)
+        opaque = std::max(opaque, int(kOpaqueCommon));
       if (!WriteEnds(before) || after == D3D12_RESOURCE_STATE_COMMON) { // a join that names its resource (B6)
         join = true;
         continue;

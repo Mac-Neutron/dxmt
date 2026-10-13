@@ -201,9 +201,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   // B6: barrier calls between merged passes may stay inside the merged pass in strict order (the default), which puts
   // all earlier work behind the base (Order), when they order nothing between the passes: none is opaque (an unknown
-  // resource, a split barrier's end, simultaneous access, COMMON, UNORDERED_ACCESS), and none names a resource the base,
-  // a pass merged so far or `next` writes (their attachments among those writes). -1 when they may; otherwise why not,
-  // for DXMT_STATS: the first opaque barrier's BarrierOpacity, kCrossOverlap or kCrossWrite.
+  // resource, a split barrier's end, simultaneous access, COMMON; a UAV barrier, UNORDERED_ACCESS or aliasing where one
+  // of those passes writes a UAV), and none names a resource the base, a pass merged so far or `next` writes (their
+  // attachments among those writes). The null names of UAV and aliasing barriers are their opacity's to judge. -1 when
+  // they may; otherwise why not, for DXMT_STATS: the first opaque barrier's BarrierOpacity, kCrossOverlap or kCrossWrite.
   enum { kCrossOverlap = MTLD3D12GraphicsCommandList::kOpaqueKinds, kCrossWrite };
   int
   Crossable(RenderEncoderData *base, RenderEncoderData *next) {
@@ -211,6 +212,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       return -1;
     if (!serial_)
       return kCrossOverlap;
+    auto by_uav = [](EncoderData *e) {
+      return e->type == EncoderType::Render && static_cast<RenderEncoderData *>(e)->uav_writes;
+    };
+    bool uav_writes = by_uav(base) || by_uav(next) || std::any_of(merged_.begin(), merged_.end(), by_uav);
     auto writes = [&](const void *key) {
       auto by = [&](EncoderData *e) {
         if (e->writes_unknown)
@@ -225,10 +230,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     };
     for (auto &c : crossings_) {
       for (auto [call, why] : c.list->barrier_opaque)
-        if (call > c.after && call <= c.until)
+        if (call > c.after && call <= c.until && (why >= MTLD3D12GraphicsCommandList::kOpaqueAlways || uav_writes))
           return why;
       for (auto &[call, key] : c.list->barrier_names)
-        if (call > c.after && call <= c.until && (!key || writes(key)))
+        if (call > c.after && call <= c.until && key && writes(key))
           return kCrossWrite;
     }
     return -1;

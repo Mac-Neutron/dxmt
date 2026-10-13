@@ -277,6 +277,11 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
   default: return llvm::make_error<UnsupportedFeature>("DXIL: only vertex, pixel, geometry and compute shaders are supported");
   }
   FillResourceMaps(*entry, **module, shader->shader_info);
+  // B6: D3D12 render passes list their attachments as their writes; whatever this writes, they can't.
+  bool writes_uav = false;
+  for (uint32_t o : {op::TextureStore, op::BufferStore, op::RawBufferStore, op::BufferUpdateCounter, op::AtomicBinOp,
+                     op::AtomicCompareExchange})
+    writes_uav |= ModuleCallsOp(**module, o);
   // SM50Compile links airconv's msad and sample position libraries for these.
   shader->shader_info.use_msad = ModuleCallsOp(**module, op::Msad);
   shader->shader_info.use_samplepos = ModuleCallsOp(**module, op::Texture2DMSGetSamplePosition) ||
@@ -332,6 +337,7 @@ InitializeDXIL(const Container &container, SM50ShaderInternal *shader, MTL_SHADE
       refl->PixelShader.HasCoverageOutput = shader->ps_has_coverage_output;
     }
     refl->NumOutputElement = shader->max_output_register;
+    refl->WritesUAV = writes_uav;
   }
   return llvm::Error::success();
 }

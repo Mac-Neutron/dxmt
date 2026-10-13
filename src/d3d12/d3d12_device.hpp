@@ -70,14 +70,17 @@ public:
   // MacNeutron (B6): the barrier calls (1-based) a merge can't see through, with why (BarrierOpacity). (A read state's
   // move to another write state also joins, but only for the resource it names.)
   enum BarrierOpacity : uint8_t {
-    kOpaqueUavState, // a move into or out of UNORDERED_ACCESS: no render pass lists its UAV writes
+    // Opaque only among passes one of which writes a UAV (RenderEncoderData::uav_writes), as no pass lists those writes:
+    kOpaqueUavState, // a move into or out of UNORDERED_ACCESS
     kOpaqueUavBarrier,
-    kOpaqueAliasing,
+    kOpaqueAliasing, // one naming the resource it activates
+    // Opaque whatever the passes:
     kOpaqueSplitEnd,
-    kOpaqueUnknown,
+    kOpaqueUnknown, // an unknown resource, or an aliasing barrier activating any
     kOpaqueSimultaneous,
     kOpaqueCommon, // a move into or out of COMMON, which hides promoted writes
-    kOpaqueKinds
+    kOpaqueKinds,
+    kOpaqueAlways = kOpaqueSplitEnd
   };
   std::vector<std::pair<uint32_t, BarrierOpacity>> barrier_opaque;
 };
@@ -230,6 +233,7 @@ public:
   // function, the geometry shader as the mesh function); `pso` stays empty and GeometryPipeline gives the variant for a
   // draw's strip topology and index format, made on first use (0 if it can't be).
   bool geometry = false;
+  bool writes_uav = false; // MacNeutron (B6): a shader of it may write a UAV, so its draws do
   virtual obj_handle_t GeometryPipeline(bool strip, SM50_INDEX_BUFFER_FORMAT index_format) { return 0; }
 
   virtual WMT::DepthStencilState GetDepthStencilState(UINT DSVPlanar, UINT DSVReadonlyFlags) = 0;
