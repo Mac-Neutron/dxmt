@@ -192,13 +192,52 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
 
   bool merge_ = env::getEnvVar("DXMT_D3D12_MERGE") != "0"; // M3 on, unless DXMT_D3D12_MERGE=0 (triage)
   std::vector<EncoderData *> merged_, folds_;               // PlanMerge's result and scratch
+  // PlanMerge's scratch (B6): the barrier calls (after, until] of a list that lie between base and the passes it merges.
+  struct Crossing {
+    MTLD3D12GraphicsCommandList *list;
+    uint32_t after, until;
+  };
+  std::vector<Crossing> crossings_;
+
+  // B6: barrier calls between merged passes may stay inside the merged pass in strict order (the default), which puts
+  // all earlier work behind the base (Order), when they order nothing between the passes: none is opaque (an unknown
+  // resource, a split barrier's end, simultaneous access, COMMON, UNORDERED_ACCESS), and none names a resource the base,
+  // a pass merged so far or `next` writes (their attachments among those writes).
+  bool
+  Crossable(RenderEncoderData *base, RenderEncoderData *next) {
+    if (crossings_.empty())
+      return true;
+    if (!serial_)
+      return false;
+    auto writes = [&](const void *key) {
+      auto by = [&](EncoderData *e) {
+        if (e->writes_unknown)
+          return true;
+        for (unsigned i = 0; i < e->write_count; i++)
+          if (e->writes[i] == key)
+            return true;
+        return false;
+      };
+      return by(base) || by(next) || std::any_of(merged_.begin(), merged_.end(), by) ||
+             std::any_of(folds_.begin(), folds_.end(), by);
+    };
+    for (auto &c : crossings_) {
+      for (auto call : c.list->barrier_opaque)
+        if (call > c.after && call <= c.until)
+          return false;
+      for (auto &[call, key] : c.list->barrier_names)
+        if (call > c.after && call <= c.until && (!key || writes(key)))
+          return false;
+    }
+    return true;
+  }
   unsigned merged_list_ = 0;                                // the list of merged_'s last pass
   std::vector<std::pair<EncoderData *, uint16_t>> skipped_; // encoders M3 already encoded, with their fence
   size_t skip_ = 0;
 
   // M3: the render passes encoded inside `base`'s Metal render pass, and the timestamp-only blits whose samples move
   // to its end, from the encoders after base in this ExecuteCommandLists call (lists[list] is base's). A pass joins
-  // when only list boundaries and timestamp-only blits come between, with no barrier, its targets are base's
+  // when only list boundaries, timestamp-only blits and barriers Crossable lets through come between, its targets are base's
   // (SameTarget), it resolves no indirect commands, and the samples fit (4 counter buffers, one sample each; any
   // number with the timestamp ring, which takes them all at one point). Base must be its group's join, which in strict
   // order every encoder is (Order). Fills merged_ in order, and `info` with the moved samples.
@@ -252,14 +291,17 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     EncoderData *last = base, *cursor = base->next;
     unsigned l = list, last_list = list;
     auto barriers = [&]() { return l == last_list ? last->barriers_last : 0u; }; // allowed before cursor, in list l
+    crossings_.clear();
     for (;;) {
-      if (!cursor) { // the end of list l: no barrier after `last` (or anywhere in a list of timestamps alone)
-        bool barrier = static_cast<MTLD3D12GraphicsCommandList *>(lists[l])->barrier_count != barriers();
+      if (!cursor) { // the end of list l: its barriers after `last` (all of a list of timestamps alone) lie between
+        auto *done = static_cast<MTLD3D12GraphicsCommandList *>(lists[l]);
+        if (done->barrier_count != barriers())
+          crossings_.push_back({done, barriers(), done->barrier_count});
         if (++l == count)
           break;
         cursor = static_cast<MTLD3D12GraphicsCommandList *>(lists[l])->entry;
-        if (barrier || std::find(lists + list, lists + l, lists[l]) != lists + l) { // or a list executed twice
-          RefuseMerge(cursor, barrier ? kRefusedBarrier : kRefusedOther);
+        if (std::find(lists + list, lists + l, lists[l]) != lists + l) { // a list executed twice
+          RefuseMerge(cursor, kRefusedOther);
           break;
         }
         continue;
@@ -268,10 +310,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         cursor = cursor->next;
         continue;
       }
-      if (cursor->barriers_last != barriers()) { // no barrier before it, or inside it, since `last`
-        RefuseMerge(cursor, kRefusedBarrier);
-        break;
-      }
+      if (cursor->barriers_last != barriers()) // barriers before it, or inside it, since `last`
+        crossings_.push_back({static_cast<MTLD3D12GraphicsCommandList *>(lists[l]), barriers(), cursor->barriers_last});
       if (cursor->type == EncoderType::Blit && cursor->timestamp_only) {
         folds_.push_back(cursor);
         cursor = cursor->next;
@@ -280,6 +320,10 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (cursor->type != EncoderType::Render)
         break;
       auto *next = static_cast<RenderEncoderData *>(cursor);
+      if (!Crossable(base, next)) {
+        RefuseMerge(next, kRefusedBarrier);
+        break;
+      }
       unsigned n = samples;
       bool ok = !next->pre_tail && SameTarget(base, next);
       for (auto *f : folds_)
@@ -294,6 +338,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         break;
       }
       samples = n;
+      if (!crossings_.empty()) // they stay: each later pass is checked against all barriers since base
+        DXMT_STAT_COUNT("#render pass merges across barriers", 1);
       merged_.insert(merged_.end(), folds_.begin(), folds_.end());
       merged_.push_back(next);
       folds_.clear();
