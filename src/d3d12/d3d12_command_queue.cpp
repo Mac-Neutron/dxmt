@@ -342,22 +342,22 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (cursor->type != EncoderType::Render)
         break;
       auto *next = static_cast<RenderEncoderData *>(cursor);
-      if (int why = Crossable(base, next); why >= 0) {
-        RefuseMerge(next, kRefusedBarrier);
-        RefuseCrossing(why);
-        break;
-      }
       unsigned n = samples;
       bool ok = !next->pre_tail && SameTarget(base, next);
       for (auto *f : folds_)
         ok = ok && fits(f, n);
       ok = ok && fits(next, n);
-      if (!ok) { // put back what `fits` wrote past the samples kept
+      int why = ok ? Crossable(base, next) : -1; // DXMT_STATS: barriers refuse only a pass that could join but for them
+      if (!ok || why >= 0) { // put back what `fits` wrote past the samples kept
         for (unsigned j = samples; j < n; j++)
           info.sample_buffers[j] = {};
-        RefuseMerge(next, next->pre_tail            ? kRefusedResolver
-                          : !SameTarget(base, next) ? kRefusedAttachments
-                                                    : kRefusedTimestamps);
+        if (why >= 0) {
+          RefuseMerge(next, kRefusedBarrier);
+          RefuseCrossing(why);
+        } else
+          RefuseMerge(next, next->pre_tail            ? kRefusedResolver
+                            : !SameTarget(base, next) ? kRefusedAttachments
+                                                      : kRefusedTimestamps);
         break;
       }
       samples = n;
