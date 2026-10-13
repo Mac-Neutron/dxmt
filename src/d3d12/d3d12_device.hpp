@@ -67,10 +67,19 @@ public:
   // GPU efficiency spec E7: the resources each barrier call names, as {call index (1-based), ResourceKey}; null: any
   // (an aliasing or UAV barrier without a resource, or one we don't know).
   std::vector<std::pair<uint32_t, const void *>> barrier_names;
-  // MacNeutron (B6): the barrier calls (1-based) a merge can't see through: an unknown resource, a split barrier's
-  // end, simultaneous access, a move into or out of COMMON or UNORDERED_ACCESS. (A read state's move to another write
-  // state also joins, but only for the resource it names.)
-  std::vector<uint32_t> barrier_opaque;
+  // MacNeutron (B6): the barrier calls (1-based) a merge can't see through, with why (BarrierOpacity). (A read state's
+  // move to another write state also joins, but only for the resource it names.)
+  enum BarrierOpacity : uint8_t {
+    kOpaqueUavState, // a move into or out of UNORDERED_ACCESS: no render pass lists its UAV writes
+    kOpaqueUavBarrier,
+    kOpaqueAliasing,
+    kOpaqueSplitEnd,
+    kOpaqueUnknown,
+    kOpaqueSimultaneous,
+    kOpaqueCommon, // a move into or out of COMMON, which hides promoted writes
+    kOpaqueKinds
+  };
+  std::vector<std::pair<uint32_t, BarrierOpacity>> barrier_opaque;
 };
 
 class MTLD3D12CommandAllocator : public ID3D12CommandAllocator {

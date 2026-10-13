@@ -1329,8 +1329,9 @@ public:
     DXMT_STAT_SCOPE("list.ResourceBarrier");
     DXMT_STAT_COUNT("#resource barriers", Count);
     transitioned_.clear();
-    bool join = false, opaque = false;
-    for (UINT i = 0; i < Count && !(join && opaque); i++) {
+    bool join = false;
+    int opaque = -1; // B6: why merges can't see through this call (a BarrierOpacity), its first barrier's that says
+    for (UINT i = 0; i < Count && !(join && opaque >= 0); i++) {
       auto &b = barriers[i];
       if (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY)
         continue;
@@ -1338,15 +1339,22 @@ public:
       if (!key || (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY) ||
           (static_cast<MTLD3D12Resource *>(b.Transition.pResource)->GetDesc().Flags &
            D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS)) {
-        join = opaque = true;
+        join = true;
+        if (opaque < 0)
+          opaque = b.Type == D3D12_RESOURCE_BARRIER_TYPE_UAV                ? kOpaqueUavBarrier
+                   : b.Type == D3D12_RESOURCE_BARRIER_TYPE_ALIASING         ? kOpaqueAliasing
+                   : (b.Flags & D3D12_RESOURCE_BARRIER_FLAG_END_ONLY) != 0 ? kOpaqueSplitEnd
+                   : !key                                                   ? kOpaqueUnknown
+                                                                            : kOpaqueSimultaneous;
         break;
       }
       auto before = b.Transition.StateBefore, after = b.Transition.StateAfter;
       if (ReadOnly(before) && ReadOnly(after))
         continue;
-      // B6 merges can't see through these: no render pass lists its UAV writes, and COMMON hides promoted ones.
-      opaque |= before == D3D12_RESOURCE_STATE_COMMON || after == D3D12_RESOURCE_STATE_COMMON ||
-                ((before | after) & D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      if (opaque < 0 && ((before | after) & D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+        opaque = kOpaqueUavState;
+      else if (opaque < 0 && (before == D3D12_RESOURCE_STATE_COMMON || after == D3D12_RESOURCE_STATE_COMMON))
+        opaque = kOpaqueCommon;
       if (!WriteEnds(before) || after == D3D12_RESOURCE_STATE_COMMON) { // a join that names its resource (B6)
         join = true;
         continue;
@@ -1355,8 +1363,8 @@ public:
     }
     allocator_->Barrier(join, transitioned_.data(), transitioned_.size());
     auto call = allocator_->BarrierCalls();
-    if (opaque)
-      barrier_opaque.push_back(call);
+    if (opaque >= 0)
+      barrier_opaque.push_back({call, BarrierOpacity(opaque)});
     for (UINT i = 0; i < Count; i++) { // E7
       auto &b = barriers[i];
       if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION)

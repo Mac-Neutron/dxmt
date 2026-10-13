@@ -202,13 +202,15 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // B6: barrier calls between merged passes may stay inside the merged pass in strict order (the default), which puts
   // all earlier work behind the base (Order), when they order nothing between the passes: none is opaque (an unknown
   // resource, a split barrier's end, simultaneous access, COMMON, UNORDERED_ACCESS), and none names a resource the base,
-  // a pass merged so far or `next` writes (their attachments among those writes).
-  bool
+  // a pass merged so far or `next` writes (their attachments among those writes). -1 when they may; otherwise why not,
+  // for DXMT_STATS: the first opaque barrier's BarrierOpacity, kCrossOverlap or kCrossWrite.
+  enum { kCrossOverlap = MTLD3D12GraphicsCommandList::kOpaqueKinds, kCrossWrite };
+  int
   Crossable(RenderEncoderData *base, RenderEncoderData *next) {
     if (crossings_.empty())
-      return true;
+      return -1;
     if (!serial_)
-      return false;
+      return kCrossOverlap;
     auto writes = [&](const void *key) {
       auto by = [&](EncoderData *e) {
         if (e->writes_unknown)
@@ -222,14 +224,29 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
              std::any_of(folds_.begin(), folds_.end(), by);
     };
     for (auto &c : crossings_) {
-      for (auto call : c.list->barrier_opaque)
+      for (auto [call, why] : c.list->barrier_opaque)
         if (call > c.after && call <= c.until)
-          return false;
+          return why;
       for (auto &[call, key] : c.list->barrier_names)
         if (call > c.after && call <= c.until && (!key || writes(key)))
-          return false;
+          return kCrossWrite;
     }
-    return true;
+    return -1;
+  }
+  static void
+  RefuseCrossing(int why) {
+    if (!g_stats_on)
+      return;
+    static const unsigned ids[] = {StatId("#render pass merges refused (barrier): UNORDERED_ACCESS"),
+                                   StatId("#render pass merges refused (barrier): a UAV barrier"),
+                                   StatId("#render pass merges refused (barrier): an aliasing barrier"),
+                                   StatId("#render pass merges refused (barrier): a split barrier's end"),
+                                   StatId("#render pass merges refused (barrier): an unknown resource"),
+                                   StatId("#render pass merges refused (barrier): simultaneous access"),
+                                   StatId("#render pass merges refused (barrier): COMMON"),
+                                   StatId("#render pass merges refused (barrier): overlap order"),
+                                   StatId("#render pass merges refused (barrier): a resource the passes write")};
+    StatCount(ids[why]);
   }
   unsigned merged_list_ = 0;                                // the list of merged_'s last pass
   std::vector<std::pair<EncoderData *, uint16_t>> skipped_; // encoders M3 already encoded, with their fence
@@ -320,8 +337,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (cursor->type != EncoderType::Render)
         break;
       auto *next = static_cast<RenderEncoderData *>(cursor);
-      if (!Crossable(base, next)) {
+      if (int why = Crossable(base, next); why >= 0) {
         RefuseMerge(next, kRefusedBarrier);
+        RefuseCrossing(why);
         break;
       }
       unsigned n = samples;
