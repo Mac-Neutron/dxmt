@@ -173,6 +173,8 @@ NVSDK_NGX_D3D11_GetScratchBufferSize(unsigned int feature, const NVNGXParameter 
 
 NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_ReleaseFeature(unsigned int *handle) {
+  if (!handle || static_cast<CommonFeature *>((void *)handle)->api != 11)
+    return NVNGX_RESULT_OK;
   switch (static_cast<CommonFeature *>((void *)handle)->feature) {
   case NVNGX_FEATURE_SUPERSAMPLING:
     delete static_cast<DLSSFeature *>((void *)handle);
@@ -269,36 +271,43 @@ NVNGX_DLSS_GetStatsCallback(NVNGXParameter *params) {
   return NVNGX_RESULT_OK;
 }
 
+void
+PopulateCapabilityParameters(NVNGXParameter *params) {
+  params->Set("SuperSampling.Available", 1u);
+  params->Set(NVSDK_NGX_EParameter_SuperSampling_Available, 1u);
+  params->Set("SuperSampling.MinDriverVersionMajor", 0);
+  params->Set("SuperSampling.MinDriverVersionMinor", 0);
+
+  params->Set("SuperSampling.NeedsUpdatedDriver", 0);
+  params->Set("SuperSampling.FeatureInitResult", 1u);
+  params->Set("Snippet.OptLevel", 0);
+  params->Set("Snippet.IsDevBranch", 0);
+  params->Set(NVNGX_Parameter_DLSSOptimalSettingsCallback, (void *)&NVNGX_DLSS_GetOptimalSettingsCallback);
+  params->Set("DLSSGetStatsCallback", (void *)&NVNGX_DLSS_GetStatsCallback);
+  params->Set(NVNGX_Parameter_Sharpness, 0.0f);
+  params->Set(NVNGX_Parameter_MV_Scale_X, 1.0f);
+  params->Set(NVNGX_Parameter_MV_Scale_Y, 1.0f);
+  params->Set("MV.Offset.X", 0.0f);
+  params->Set("MV.Offset.Y", 0.0f);
+  params->Set("DLSS.Exposure.Scale", 1.0f);
+  params->Set(NVNGX_Parameter_PerfQualityValue, 2);
+
+  params->Set("CreationNodeMask", 1);
+  params->Set("VisibilityNodeMask", 1);
+  params->Set("DLSS.Enable.Output.Subrects", 1);
+  params->Set("RTXValue", 0);
+}
+
+NVNGXParameter *
+NewCapabilityParameters() {
+  auto params = new ParametersImpl();
+  PopulateCapabilityParameters(params);
+  return params;
+}
+
 NVNGX_API NVNGX_RESULT
 NVSDK_NGX_D3D11_GetCapabilityParameters(NVNGXParameter **out_params) {
-  auto out_parameters = new ParametersImpl();
-
-  out_parameters->Set("SuperSampling.Available", 1u);
-  out_parameters->Set(NVSDK_NGX_EParameter_SuperSampling_Available, 1u);
-  out_parameters->Set("SuperSampling.MinDriverVersionMajor", 0);
-  out_parameters->Set("SuperSampling.MinDriverVersionMinor", 0);
-
-  out_parameters->Set("SuperSampling.NeedsUpdatedDriver", 0);
-  out_parameters->Set("SuperSampling.FeatureInitResult", 1u);
-  out_parameters->Set("Snippet.OptLevel", 0);
-  out_parameters->Set("Snippet.IsDevBranch", 0);
-  out_parameters->Set(NVNGX_Parameter_DLSSOptimalSettingsCallback, (void *)&NVNGX_DLSS_GetOptimalSettingsCallback);
-  out_parameters->Set("DLSSGetStatsCallback", (void *)&NVNGX_DLSS_GetStatsCallback);
-  out_parameters->Set(NVNGX_Parameter_Sharpness, 0.0f);
-  out_parameters->Set(NVNGX_Parameter_MV_Scale_X, 1.0f);
-  out_parameters->Set(NVNGX_Parameter_MV_Scale_Y, 1.0f);
-  out_parameters->Set("MV.Offset.X", 0.0f);
-  out_parameters->Set("MV.Offset.Y", 0.0f);
-  out_parameters->Set("DLSS.Exposure.Scale", 1.0f);
-  out_parameters->Set(NVNGX_Parameter_PerfQualityValue, 2);
-
-  out_parameters->Set("CreationNodeMask", 1);
-  out_parameters->Set("VisibilityNodeMask", 1);
-  out_parameters->Set("DLSS.Enable.Output.Subrects", 1);
-  out_parameters->Set("RTXValue", 0);
-
-  *out_params = out_parameters;
-
+  *out_params = NewCapabilityParameters();
   return NVNGX_RESULT_OK;
 }
 
