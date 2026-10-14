@@ -7,6 +7,7 @@ namespace dxmt {
 struct CommonFeature {
   unsigned int handle;
   NVNGX_FEATURE feature;
+  unsigned int api = 11; // MacNeutron: 12 for a feature NVSDK_NGX_D3D12_CreateFeature made (nvngx_d3d12.cpp)
 };
 
 struct DLSSFeature : CommonFeature {
@@ -18,5 +19,9 @@ struct DLSSFeature : CommonFeature {
   int flag;
   int enable_output_subrects;
 };
+
+// MacNeutron: the capability map both APIs hand out (nvngx.cpp): a new one, or `params` filled with it.
+NVNGXParameter *NewCapabilityParameters();
+void PopulateCapabilityParameters(NVNGXParameter *params);
 
 }
