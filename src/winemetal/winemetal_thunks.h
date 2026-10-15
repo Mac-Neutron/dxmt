@@ -403,6 +403,24 @@ struct unixcall_dispatchdata_copybytes {
   uint64_t ret_size;
 };
 
+struct unixcall_mtldevice_newfxframeinterpolator {
+  obj_handle_t device;
+  struct WMTConstMemoryPointer info;
+  obj_handle_t ret;
+};
+
+struct unixcall_mtlcommandbuffer_frame_interpolate {
+  obj_handle_t cmdbuf;
+  obj_handle_t interpolator;
+  obj_handle_t color;
+  obj_handle_t prev_color;
+  obj_handle_t depth;
+  obj_handle_t motion;
+  obj_handle_t output;
+  obj_handle_t fence;
+  struct WMTConstMemoryPointer props;
+};
+
 struct unixcall_mtldevice_fxtemporalscaler_scale {
   obj_handle_t device;
   float min_scale;

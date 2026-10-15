@@ -1772,6 +1772,44 @@ WINEMETAL_API void MTLCommandBuffer_encodeTemporalScale(
     obj_handle_t reactive_mask
 );
 
+/* MacNeutron (frame generation on MetalFX): MetalFX's frame interpolator, paired with the temporal upscaler that
+ * upscaled the frames it interpolates (`scaler`, 0: alone). */
+struct WMTFXFrameInterpolatorInfo {
+  enum WMTPixelFormat color_format;
+  enum WMTPixelFormat output_format;
+  enum WMTPixelFormat depth_format;
+  enum WMTPixelFormat motion_format;
+  uint32_t input_width;
+  uint32_t input_height;
+  uint32_t output_width;
+  uint32_t output_height;
+  obj_handle_t scaler;
+};
+
+WINEMETAL_API obj_handle_t MTLDevice_newFrameInterpolator(obj_handle_t device, const struct WMTFXFrameInterpolatorInfo *info);
+
+struct WMTFXFrameInterpolatorProps {
+  float motion_vector_scale_x;
+  float motion_vector_scale_y;
+  float delta_time;
+  float near_plane;
+  float far_plane;
+  float field_of_view;
+  float aspect_ratio;
+  float jitter_offset_x;
+  float jitter_offset_y;
+  bool reset;
+  bool depth_reversed;
+  bool ui_composited;
+};
+
+/* Interpolates between `prev_color` and `color` into `output` (MetalFX encodes its own passes, behind and ahead of
+ * `fence`). */
+WINEMETAL_API void MTLCommandBuffer_encodeFrameInterpolate(
+    obj_handle_t cmdbuf, obj_handle_t interpolator, obj_handle_t color, obj_handle_t prev_color, obj_handle_t depth,
+    obj_handle_t motion, obj_handle_t output, obj_handle_t fence, const struct WMTFXFrameInterpolatorProps *props
+);
+
 WINEMETAL_API void MTLCommandBuffer_encodeSpatialScale(
     obj_handle_t cmdbuf, obj_handle_t scaler, obj_handle_t color, obj_handle_t output, obj_handle_t fence
 );

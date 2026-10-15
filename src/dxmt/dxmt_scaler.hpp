@@ -46,7 +46,13 @@ public:
     return fence_;
   }
 
+  // MacNeutron: what it was made for (frame generation pairs an interpolator with it).
+  const WMTFXTemporalScalerInfo &info() const {
+    return info_;
+  }
+
 private:
+  WMTFXTemporalScalerInfo info_;
   WMT::Reference<WMT::FXTemporalScaler> scaler_;
   WMT::Reference<WMT::Fence> fence_;
   std::atomic<uint32_t> refcount_;

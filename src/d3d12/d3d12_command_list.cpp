@@ -803,8 +803,10 @@ public:
   };
 
   // The open blit encoder, or a new one; it writes `dst` (null: nothing a D3D12 resource shows, as a timestamp's fill).
+  // `timestamp_resolve`: the command about to be added is a timestamp resolve (B7). An open blit that gets another
+  // command is no longer timestamps alone, nor resolves alone unless this is one too.
   bool
-  PreBlit(ID3D12Resource *dst) {
+  PreBlit(ID3D12Resource *dst, bool timestamp_resolve = false) {
     if (!allocator_->encoder_current || allocator_->encoder_current->type != EncoderType::Blit) {
       allocator_->InvalidateCurrentPass();
       auto render = allocator_->AllocatePass<BlitEncoderData>();
@@ -813,6 +815,10 @@ public:
       render->cmd_head.next.set(0);
       render->cmd_tail = (wmtcmd_base *)&render->cmd_head;
       render->writes_unknown = false;
+      render->query_resolve_only = timestamp_resolve;
+    } else {
+      allocator_->encoder_current->timestamp_only = false;
+      allocator_->encoder_current->query_resolve_only &= timestamp_resolve;
     }
     if (dst)
       allocator_->Writes(ResourceKey(dst));
@@ -1931,7 +1937,7 @@ public:
     // Only now: a CPU resolve above needs no encoder (an empty blit each, Unreal resolves ~27 a frame). Query heaps
     // have no barriers, so this resolve waits on all earlier work (GPU overlap spec §3.4).
     allocator_->Barrier(true);
-    PreBlit(pDstBuffer);
+    PreBlit(pDstBuffer, Type == D3D12_QUERY_TYPE_TIMESTAMP);
     allocator_->Writes((const void *)(uintptr_t)heap->results.handle); // it zeroes the counts it read
     auto &copy = allocator_->EncodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_buffer>();
     copy.type = WMTBlitCommandCopyFromBufferToBuffer;
