@@ -1396,3 +1396,31 @@ MTLDevice_temporalScalerScaleRange(obj_handle_t device, float *min, float *max) 
   *min = params.min_scale;
   *max = params.max_scale;
 }
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newFrameInterpolator(obj_handle_t device, const struct WMTFXFrameInterpolatorInfo *info) {
+  struct unixcall_mtldevice_newfxframeinterpolator params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  params.ret = 0;
+  UNIX_CALL(151, &params);
+  return params.ret;
+}
+
+WINEMETAL_API void
+MTLCommandBuffer_encodeFrameInterpolate(
+    obj_handle_t cmdbuf, obj_handle_t interpolator, obj_handle_t color, obj_handle_t prev_color, obj_handle_t depth,
+    obj_handle_t motion, obj_handle_t output, obj_handle_t fence, const struct WMTFXFrameInterpolatorProps *props
+) {
+  struct unixcall_mtlcommandbuffer_frame_interpolate params;
+  params.cmdbuf = cmdbuf;
+  params.interpolator = interpolator;
+  params.color = color;
+  params.prev_color = prev_color;
+  params.depth = depth;
+  params.motion = motion;
+  params.output = output;
+  params.fence = fence;
+  WMT_MEMPTR_SET(params.props, props);
+  UNIX_CALL(152, &params);
+}

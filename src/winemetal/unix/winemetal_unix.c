@@ -3007,6 +3007,61 @@ _MTLDevice_temporalScalerScaleRange(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* MacNeutron (frame generation on MetalFX): macOS 26's frame interpolator; nil before it, or when MetalFX makes none. */
+static NTSTATUS
+_MTLDevice_newFrameInterpolator(void *obj) {
+  struct unixcall_mtldevice_newfxframeinterpolator *params = obj;
+  params->ret = 0;
+  if (@available(macOS 26, *)) {
+    const struct WMTFXFrameInterpolatorInfo *info = params->info.ptr;
+    MTLFXFrameInterpolatorDescriptor *desc = [[MTLFXFrameInterpolatorDescriptor alloc] init];
+    desc.colorTextureFormat = to_metal_pixel_format(info->color_format);
+    desc.outputTextureFormat = to_metal_pixel_format(info->output_format);
+    desc.depthTextureFormat = to_metal_pixel_format(info->depth_format);
+    desc.motionTextureFormat = to_metal_pixel_format(info->motion_format);
+    desc.uiTextureFormat = MTLPixelFormatInvalid;
+    desc.inputWidth = info->input_width;
+    desc.inputHeight = info->input_height;
+    desc.outputWidth = info->output_width;
+    desc.outputHeight = info->output_height;
+    if (info->scaler)
+      desc.scaler = (id<MTLFXFrameInterpolatableScaler>)info->scaler;
+    if ([MTLFXFrameInterpolatorDescriptor supportsDevice:(id<MTLDevice>)params->device])
+      params->ret = (obj_handle_t)[desc newFrameInterpolatorWithDevice:(id<MTLDevice>)params->device];
+    [desc release];
+  }
+  return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+_MTLCommandBuffer_encodeFrameInterpolate(void *obj) {
+  struct unixcall_mtlcommandbuffer_frame_interpolate *params = obj;
+  if (@available(macOS 26, *)) {
+    id<MTLFXFrameInterpolator> interpolator = (id<MTLFXFrameInterpolator>)params->interpolator;
+    const struct WMTFXFrameInterpolatorProps *props = params->props.ptr;
+    interpolator.colorTexture = (id<MTLTexture>)params->color;
+    interpolator.prevColorTexture = (id<MTLTexture>)params->prev_color;
+    interpolator.depthTexture = (id<MTLTexture>)params->depth;
+    interpolator.motionTexture = (id<MTLTexture>)params->motion;
+    interpolator.outputTexture = (id<MTLTexture>)params->output;
+    interpolator.fence = (id<MTLFence>)params->fence;
+    interpolator.motionVectorScaleX = props->motion_vector_scale_x;
+    interpolator.motionVectorScaleY = props->motion_vector_scale_y;
+    interpolator.deltaTime = props->delta_time;
+    interpolator.nearPlane = props->near_plane;
+    interpolator.farPlane = props->far_plane;
+    interpolator.fieldOfView = props->field_of_view;
+    interpolator.aspectRatio = props->aspect_ratio;
+    interpolator.jitterOffsetX = props->jitter_offset_x;
+    interpolator.jitterOffsetY = props->jitter_offset_y;
+    interpolator.shouldResetHistory = props->reset;
+    interpolator.depthReversed = props->depth_reversed;
+    interpolator.isUITextureComposited = props->ui_composited;
+    [interpolator encodeToCommandBuffer:(id<MTLCommandBuffer>)params->cmdbuf];
+  }
+  return STATUS_SUCCESS;
+}
+
 static NTSTATUS
 _MTLCommandBuffer_blitCommandEncoderWithSampleBuffers(void *obj) {
   struct unixcall_mtlcommandbuffer_blitcommandencoderwithsamplebuffers *params = obj;
@@ -3479,6 +3534,8 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_sampleTimestamps,
     &_DispatchData_copyBytes,
     &_MTLDevice_temporalScalerScaleRange,
+    &_MTLDevice_newFrameInterpolator,
+    &_MTLCommandBuffer_encodeFrameInterpolate,
 };
 
 #ifndef DXMT_NATIVE
@@ -3634,5 +3691,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
     &_MTLDevice_sampleTimestamps,
     &_DispatchData_copyBytes,
     &_MTLDevice_temporalScalerScaleRange,
+    &_MTLDevice_newFrameInterpolator,
+    &_MTLCommandBuffer_encodeFrameInterpolate,
 };
 #endif

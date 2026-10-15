@@ -602,6 +602,11 @@ class FXSpatialScaler : public Object {
 public:
 };
 
+// MacNeutron (frame generation on MetalFX).
+class FXFrameInterpolator : public Object {
+public:
+};
+
 class LogContainer : public Object {
 public:
   std::vector<Object>
@@ -733,6 +738,15 @@ public:
   ) {
     MTLCommandBuffer_encodeTemporalScale(handle, scaler, color, output, depth, motion, exposure, fence, &props,
                                          reactive_mask);
+  }
+
+  void
+  encodeFrameInterpolate(
+      FXFrameInterpolator interpolator, Texture color, Texture prev_color, Texture depth, Texture motion,
+      Texture output, Fence fence, const WMTFXFrameInterpolatorProps &props
+  ) {
+    MTLCommandBuffer_encodeFrameInterpolate(handle, interpolator, color, prev_color, depth, motion, output, fence,
+                                            &props);
   }
 };
 
@@ -969,6 +983,11 @@ public:
   Reference<FXTemporalScaler>
   newTemporalScaler(const WMTFXTemporalScalerInfo &info) {
     return Reference<FXTemporalScaler>(MTLDevice_newTemporalScaler(handle, &info));
+  }
+
+  Reference<FXFrameInterpolator>
+  newFrameInterpolator(const WMTFXFrameInterpolatorInfo &info) {
+    return Reference<FXFrameInterpolator>(MTLDevice_newFrameInterpolator(handle, &info));
   }
 
   Reference<FXSpatialScaler>

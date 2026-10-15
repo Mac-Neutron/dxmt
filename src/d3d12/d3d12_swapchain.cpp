@@ -27,14 +27,34 @@
 #include "log/log.hpp"
 #include "wsi_window.hpp"
 #include "util_hotpatch.h"
+#include "util_env.hpp"
 #include "config/config.hpp"
+#include <algorithm>
 #include <cfloat>
+#include <cmath>
 
 /**
 Ref: https://learn.microsoft.com/en-us/windows/win32/api/dxgi1_3/nf-dxgi1_3-idxgiswapchain2-setmaximumframelatency
 This value is 1 by default.
 */
 constexpr size_t kSwapchainLatency = 1;
+
+// MacNeutron: DXMT_RENDER_SCALE, for example 0.667, makes the game's back buffer the window's size times this, so it
+// renders fewer pixels; the MetalFX presenter upscales the smaller drawable back to the window. 1, an unparsable value,
+// or unset keeps the window's size (nothing to upscale). Clamped to [0.25, 1]. The launcher's MACNEUTRON_UPSCALE
+// reports a smaller desktop instead (MACNEUTRON_DISPLAY_SCALE), which keeps the game's UI, in the same back buffer, in
+// proportion; this knob is left for a game whose UI does not follow the buffer's size.
+static double
+RenderScale() {
+  auto s = dxmt::env::getEnvVar("DXMT_RENDER_SCALE");
+  if (s.empty())
+    return 1.0;
+  try {
+    return std::clamp(std::stod(s), 0.25, 1.0);
+  } catch (const std::exception &) {
+    return 1.0;
+  }
+}
 
 /**
 TODO: some implementations can be shared with d3d11 swapchain
@@ -143,6 +163,7 @@ class MTLD3D12SwapChain final : public MTLDXGISubObject<IDXGISwapChain4, MTLD3D1
   uint32_t frame_latency;
   DXGI_COLOR_SPACE_TYPE colorspace_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
   float scale_factor = 1.0;
+  const double render_scale_ = RenderScale();
   HUDState hud;
   double init_refresh_rate_ = DBL_MAX;
   int preferred_max_frame_rate = 0;
@@ -537,6 +558,10 @@ public:
     } else {
       desc_.Width = Width;
       desc_.Height = Height;
+    }
+    if (render_scale_ != 1.0 && desc_.Width != 0 && desc_.Height != 0) { // MacNeutron: the MetalFX presenter upscales it
+      desc_.Width = std::max<UINT>(1, (UINT)std::lround(desc_.Width * render_scale_));
+      desc_.Height = std::max<UINT>(1, (UINT)std::lround(desc_.Height * render_scale_));
     }
     if (Format != DXGI_FORMAT_UNKNOWN) {
       if (ConvertSwapChainFormat(Format) != WMTPixelFormatInvalid)

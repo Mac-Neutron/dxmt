@@ -57,6 +57,9 @@ struct EncoderData {
   uint32_t dep_count = 0;
   const uint32_t *deps = nullptr; // positions of the encoders since its list's last join that it waits on
   bool timestamp_only = false; // MacNeutron: an empty blit holding timestamps alone (M3 moves them into a render pass)
+  // MacNeutron (B7): a blit of timestamp resolves into GPU memory alone (Unreal's at each command list's end, between
+  // its base-pass segments): M3 may encode it after the render pass it merges past.
+  bool query_resolve_only = false;
 };
 
 struct ClearEncoderData : EncoderData {

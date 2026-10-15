@@ -27,6 +27,7 @@
 #include "dxmt_capture.hpp"
 #include "dxmt_format.hpp"
 #include "d3d12_dxil_dump.hpp"
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -41,7 +42,13 @@
 
 namespace dxmt {
 
-constexpr auto kCommandQueueSize = 32u;
+// The in-flight command buffer pool's capacity, and the default number of slots the queue takes from it (B6). Each slot
+// holds a Metal command buffer and its CPU-side bookkeeping; the queue waits in Open() when none is free. Palworld's
+// submission thread stalled about 12 ms a frame on the old default of 32 (DXMT_STATS: "queue.(wait for a command
+// buffer slot)") and about 0 at 64, so 64 is the default; DXMT_D3D12_CMDBUF_SLOTS lowers or raises the slots taken,
+// never past the capacity. Metal's own concurrent limit is higher than either.
+constexpr auto kCommandQueueSize = 64u;
+constexpr auto kCommandQueueSlots = 64u;
 
 const GUID kD3D12CommandQueueDownlevelUUID = {
     0x38a8c5ef, 0x7ccb, 0x4e81, {0x91, 0x4f, 0xa6, 0xe9, 0xd0, 0x72, 0xc4, 0x94}
@@ -70,6 +77,25 @@ LabelPass(Encoder &encoder, unsigned pass, const char *kind, RenderEncoderData *
                (unsigned long long)first.height());
   }
   encoder.setLabel(WMT::String::string(name, WMTUTF8StringEncoding));
+}
+
+// MacNeutron (frame generation on MetalFX, MACNEUTRON_FRAMEGEN=1): the last temporal upscale any queue encoded, for
+// the next present to pair MetalFX's frame interpolator with: the upscaler and the depth and motion vectors it read
+// (held until replaced, so the textures outlive the present that reads them). Process-wide: a game may present from
+// another queue than the one it upscales on.
+struct FrameGenSlot {
+  std::mutex mutex;
+  Rc<TemporalScaler> scaler;
+  TextureViewRef depth, motion;
+  WMTFXTemporalScalerProps props{};
+  bool fresh = false; // an upscale since the last present
+};
+static FrameGenSlot g_framegen_slot;
+
+static bool
+FrameGenOn() {
+  static const bool on = env::getEnvVar("MACNEUTRON_FRAMEGEN") == "1";
+  return on;
 }
 
 class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory> {
@@ -191,7 +217,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   }
 
   bool merge_ = env::getEnvVar("DXMT_D3D12_MERGE") != "0"; // M3 on, unless DXMT_D3D12_MERGE=0 (triage)
+  // B7: timestamp-resolve blits deferred past a merged pass, unless DXMT_D3D12_DEFER_RESOLVES=0 (triage).
+  bool deferred_resolves_ = env::getEnvVar("DXMT_D3D12_DEFER_RESOLVES") != "0";
   std::vector<EncoderData *> merged_, folds_;               // PlanMerge's result and scratch
+  // B7: the timestamp-resolve blits among merged_ (query_resolve_only), encoded after the merged Metal render pass.
+  std::vector<EncoderData *> deferred_;
   // PlanMerge's scratch (B6): the barrier calls (after, until] of a list that lie between base and the passes it merges.
   struct Crossing {
     MTLD3D12GraphicsCommandList *list;
@@ -202,9 +232,14 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // B6: barrier calls between merged passes may stay inside the merged pass in strict order (the default), which puts
   // all earlier work behind the base (Order), when they order nothing between the passes: none is opaque (an unknown
   // resource, a split barrier's end, simultaneous access, COMMON; a UAV barrier, UNORDERED_ACCESS or aliasing where one
-  // of those passes writes a UAV), and none names a resource the base, a pass merged so far or `next` writes (their
-  // attachments among those writes). The null names of UAV and aliasing barriers are their opacity's to judge. -1 when
-  // they may; otherwise why not, for DXMT_STATS: the first opaque barrier's BarrierOpacity, kCrossOverlap or kCrossWrite.
+  // of those passes writes a UAV). A barrier naming a resource the passes write (their attachments: `writes` lists
+  // those, not their shaders' UAVs) orders their own writes of it: only null and timestamp-only encoders lie between
+  // (a compute, clear or copy ends PlanMerge's walk), so nothing between reads it, and in strict order the base's join
+  // already orders everything earlier, so their writes stay in order inside the merged Metal pass with the resource
+  // left in the state the last of them needs: such a barrier crosses too. A pass that doesn't list its writes
+  // (writes_unknown: DXMT's own passes) keeps every barrier apart, as a merge can't tell what it writes. The null names
+  // of UAV and aliasing barriers are their opacity's to judge. -1 when they may; otherwise why not, for DXMT_STATS: the
+  // first opaque barrier's BarrierOpacity, kCrossOverlap or kCrossWrite.
   enum { kCrossOverlap = MTLD3D12GraphicsCommandList::kOpaqueKinds, kCrossWrite };
   int
   Crossable(RenderEncoderData *base, RenderEncoderData *next) {
@@ -216,10 +251,11 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       return e->type == EncoderType::Render && static_cast<RenderEncoderData *>(e)->uav_writes;
     };
     bool uav_writes = by_uav(base) || by_uav(next) || std::any_of(merged_.begin(), merged_.end(), by_uav);
-    auto writes = [&](const void *key) {
+    auto unlisted = [](EncoderData *e) { return e->writes_unknown; };
+    bool opaque_writes = unlisted(base) || unlisted(next) || std::any_of(merged_.begin(), merged_.end(), unlisted) ||
+                         std::any_of(folds_.begin(), folds_.end(), unlisted);
+    auto writes = [&](const void *key) { // an attachment base, a merged pass, `next` or a folded blit writes
       auto by = [&](EncoderData *e) {
-        if (e->writes_unknown)
-          return true;
         for (unsigned i = 0; i < e->write_count; i++)
           if (e->writes[i] == key)
             return true;
@@ -228,13 +264,28 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       return by(base) || by(next) || std::any_of(merged_.begin(), merged_.end(), by) ||
              std::any_of(folds_.begin(), folds_.end(), by);
     };
+    auto deferred_write = [&](const void *key) { // a resolve blit encoded after the passes writes it (B7)
+      auto by = [&](EncoderData *e) {
+        if (e->type != EncoderType::Blit || !e->query_resolve_only)
+          return false;
+        for (unsigned i = 0; i < e->write_count; i++)
+          if (e->writes[i] == key)
+            return true;
+        return false;
+      };
+      return std::any_of(merged_.begin(), merged_.end(), by) || std::any_of(folds_.begin(), folds_.end(), by);
+    };
     for (auto &c : crossings_) {
       for (auto [call, why] : c.list->barrier_opaque)
         if (call > c.after && call <= c.until && (why >= MTLD3D12GraphicsCommandList::kOpaqueAlways || uav_writes))
           return why;
       for (auto &[call, key] : c.list->barrier_names)
-        if (call > c.after && call <= c.until && key && writes(key))
-          return kCrossWrite;
+        if (call > c.after && call <= c.until && key) {
+          if (opaque_writes || deferred_write(key))
+            return kCrossWrite;
+          if (writes(key))
+            DXMT_STAT_COUNT("#render pass merges across a barrier naming their target", 1);
+        }
     }
     return -1;
   }
@@ -286,6 +337,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
             WMTRenderPassInfo &info) {
     merged_.clear();
     folds_.clear();
+    deferred_.clear();
     // A pass counting into a query: its counting would reach the next. Overlap: a non-join base waits on its own
     // dependencies only, not the merged passes'. (SMITE 2's base-pass segments are each a list's pass after its start
     // timestamp, the list's join: B6.)
@@ -339,6 +391,15 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         cursor = cursor->next;
         continue;
       }
+      // B7: a blit of timestamp resolves alone (Unreal's, at the end of each base-pass segment's list) moves after the
+      // merged pass. Timestamps into GPU memory resolve as zeros here (ResolveQueryData), so the move changes no
+      // value; no merged pass reads its destination, as reading it needs a barrier naming it, which refuses (Crossable).
+      if (deferred_resolves_ && cursor->type == EncoderType::Blit && cursor->query_resolve_only &&
+          !cursor->num_samples && !cursor->writes_unknown) {
+        folds_.push_back(cursor);
+        cursor = cursor->next;
+        continue;
+      }
       if (cursor->type != EncoderType::Render)
         break;
       auto *next = static_cast<RenderEncoderData *>(cursor);
@@ -364,6 +425,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       if (!crossings_.empty()) // they stay: each later pass is checked against all barriers since base
         DXMT_STAT_COUNT("#render pass merges across barriers", 1);
       merged_.insert(merged_.end(), folds_.begin(), folds_.end());
+      for (auto *f : folds_)
+        if (f->query_resolve_only)
+          deferred_.push_back(f);
       merged_.push_back(next);
       folds_.clear();
       last = next;
@@ -411,10 +475,24 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     return false;
   }
 
+  // A barrier call in (after, until] of `list` names an unknown resource (a resourceless aliasing barrier, or one DXMT
+  // can't attribute): a clear can't fold across it. B6: one naming the clear's own texture doesn't refuse the fold. The
+  // clear is deferred to a later pass's load action; only null and timestamp-only encoders and other textures' clears
+  // lie between (a compute, clear or copy ends ClearTarget's walk), and in D3D12 a render target can only be read
+  // through an encoder after a transition naming it, so nothing between can see the clear done late.
+  static bool
+  BarrierUnknown(MTLD3D12GraphicsCommandList *list, uint32_t after, uint32_t until) {
+    for (auto &[call, key] : list->barrier_names)
+      if (call > after && call <= until && !key)
+        return true;
+    return false;
+  }
+
   // E7: the render pass in this call (from lists[l], after `clear`) that `clear` can be the load action of: the first
-  // encoder after it but for list boundaries, timestamp-only blits and other textures' clears, with no barrier
-  // naming its texture between. In D3D12 a render target can only be read through an encoder after a transition
-  // naming it, so nothing between can see the clear done late. Null (counting why) if none.
+  // encoder after it but for list boundaries, timestamp-only blits and other textures' clears, with no barrier naming
+  // an unknown resource between. B6: a barrier naming the clear's own texture doesn't refuse the fold (BarrierUnknown).
+  // In D3D12 a render target can only be read through an encoder after a transition naming it, so nothing between can
+  // see the clear done late. Null (counting why) if none.
   RenderEncoderData *
   ClearTarget(ClearEncoderData *clear, unsigned l, ID3D12CommandList *const *lists, unsigned count, unsigned &at) {
     auto texture = clear->write_count ? clear->writes[0] : nullptr;
@@ -422,13 +500,16 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       return nullptr;
     EncoderData *cursor = clear->next;
     uint32_t after = clear->barriers;
+    bool named = false; // a barrier between names the clear's own texture: the fold crossed it (B6, counted)
     for (;;) {
       auto list = static_cast<MTLD3D12GraphicsCommandList *>(lists[l]);
       if (!cursor) {
-        if (BarrierNames(list, after, UINT32_MAX, texture)) {
+        if (BarrierUnknown(list, after, UINT32_MAX)) {
           DXMT_STAT_COUNT("#clear folds refused (barrier)", 1);
           return nullptr;
         }
+        if (BarrierNames(list, after, UINT32_MAX, texture))
+          named = true;
         if (++l == count) {
           DXMT_STAT_COUNT("#clear folds refused (no target)", 1);
           return nullptr;
@@ -442,10 +523,12 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         cursor = cursor->next;
         continue;
       }
-      if (BarrierNames(list, after, cursor->barriers, texture)) {
+      if (BarrierUnknown(list, after, cursor->barriers)) {
         DXMT_STAT_COUNT("#clear folds refused (barrier)", 1);
         return nullptr;
       }
+      if (BarrierNames(list, after, cursor->barriers, texture))
+        named = true;
       if (cursor->type != EncoderType::Render) {
         DXMT_STAT_COUNT("#clear folds refused (no target)", 1);
         return nullptr;
@@ -455,6 +538,8 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
         DXMT_STAT_COUNT("#clear folds refused (mismatch)", 1);
         return nullptr;
       }
+      if (named)
+        DXMT_STAT_COUNT("#clear folds across a barrier naming its texture", 1);
       at = l;
       return r;
     }
@@ -778,13 +863,33 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     d.dumps.push_back(std::move(dump));
   }
 
+  uint64_t execute_calls_ = 0; // ExecuteCommandLists calls on this queue: a pass dump names each pass's (B7)
+
   void
   DumpPass(WMT::CommandBuffer &cmdbuf, EncoderData *pass) {
     auto &d = Dumps();
     std::lock_guard<std::mutex> lock(d.mutex);
     std::string name = "pass-" + std::to_string(d.passes++);
     static const char *const kinds[] = {"null", "clear", "render", "blit", "compute", "resolve", "upscale"};
-    d.log += name + " q" + std::to_string(queue_index_) + " " + ((unsigned)pass->type < 7 ? kinds[(unsigned)pass->type] : "other");
+    d.log += name + " q" + std::to_string(queue_index_) + " x" + std::to_string(execute_calls_) + " " +
+             ((unsigned)pass->type < 7 ? kinds[(unsigned)pass->type] : "other");
+    // MacNeutron: what a blit does (B7, Palworld's base-pass segments split by blits): its commands by kind, with a
+    // buffer copy's length, and whether it only takes timestamps.
+    if (pass->type == EncoderType::Blit) {
+      auto data = static_cast<BlitEncoderData *>(pass);
+      static const char *const ops[] = {"nop",   "buf>buf",     "buf>tex",      "tex>buf",   "tex>tex",
+                                        "mips",  "waitfence",   "updatefence",  "fill",      "counters",
+                                        "buf>tex+opt", "tex>buf+opt", "reset-icb", "copytex"};
+      if (pass->timestamp_only)
+        d.log += " timestamps";
+      if (pass->query_resolve_only)
+        d.log += " query-resolve";
+      for (auto *cmd = (wmtcmd_base *)data->cmd_head.next.get(); cmd; cmd = (wmtcmd_base *)cmd->next.get()) {
+        d.log += std::string(" ") + (cmd->type < std::size(ops) ? ops[cmd->type] : "?");
+        if (cmd->type == WMTBlitCommandCopyFromBufferToBuffer)
+          d.log += ":" + std::to_string(((wmtcmd_blit_copy_from_buffer_to_buffer *)cmd)->copy_length);
+      }
+    }
     if (pass->type == EncoderType::Render) {
       auto data = static_cast<RenderEncoderData *>(pass);
       for (unsigned i = 0; i < data->colors.size(); i++) {
@@ -1148,6 +1253,9 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   }
 
   std::array<InflightCommandBuffer, kCommandQueueSize> inflight_cmdbuf_pool_;
+  // The slots taken from the pool (B6, DXMT_D3D12_CMDBUF_SLOTS), at most kCommandQueueSize. Declared before the wait
+  // thread, which reads it as it starts.
+  unsigned cmdbuf_slots_ = kCommandQueueSlots;
   dxmt::thread inflight_cmdbuf_wait_thread_;
 
   // Task F4 (Ruling 23): the queue samples every timestamp, whatever its query heap, into one counter buffer, so any
@@ -1252,7 +1360,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       inflight_cmdbuf_seq_.wait(internal_seq, std::memory_order_acquire);
       if (inflight_cmdbuf_stop_.load() == internal_seq)
         break;
-      auto &inflight = inflight_cmdbuf_pool_[internal_seq % kCommandQueueSize];
+      auto &inflight = inflight_cmdbuf_pool_[internal_seq % cmdbuf_slots_];
 
       if (inflight.cmdbuf.status() <= WMTCommandBufferStatusScheduled)
         inflight.cmdbuf.waitUntilCompleted();
@@ -1318,15 +1426,16 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
   // nothing ever waits on uncommitted work.
   bool open_ = false;
 
-  // The open command buffer, after taking one of the 32 slots for a new one when none is open (under mutex_commit_).
+  // The open command buffer, after taking one of the pool's slots (cmdbuf_slots_) for a new one when none is open
+  // (under mutex_commit_).
   InflightCommandBuffer &
   Open() {
-    auto &inflight = inflight_cmdbuf_pool_[inflight_cmdbuf_seq_.load(std::memory_order_relaxed) % kCommandQueueSize];
+    auto &inflight = inflight_cmdbuf_pool_[inflight_cmdbuf_seq_.load(std::memory_order_relaxed) % cmdbuf_slots_];
     if (open_)
       return inflight;
     {
-      DXMT_STAT_SCOPE("queue.(wait for one of 32 command buffer slots)");
-      inflight_cmdbuf_count_.wait(kCommandQueueSize, std::memory_order_acquire);
+      DXMT_STAT_SCOPE("queue.(wait for a command buffer slot)");
+      inflight_cmdbuf_count_.wait(cmdbuf_slots_, std::memory_order_acquire);
     }
     DXMT_STAT_SCOPE("queue.(new command buffer)");
     inflight.cmdbuf = queue_.commandBuffer();
@@ -1340,7 +1449,7 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
       return;
     DXMT_STAT_SCOPE("queue.(commit)");
     DXMT_STAT_COUNT("#command buffers committed", 1);
-    inflight_cmdbuf_pool_[inflight_cmdbuf_seq_.load(std::memory_order_relaxed) % kCommandQueueSize].cmdbuf.commit();
+    inflight_cmdbuf_pool_[inflight_cmdbuf_seq_.load(std::memory_order_relaxed) % cmdbuf_slots_].cmdbuf.commit();
     open_ = false;
     inflight_cmdbuf_seq_.fetch_add(1, std::memory_order_release);
     inflight_cmdbuf_seq_.notify_one();
@@ -1372,9 +1481,23 @@ class MTLD3D12CommandQueueImpl : public MTLD3D12Pageable<MTLD3D12CommandQueue, I
     return CommittingScope(this, commit);
   }
 
+  // B6: DXMT_D3D12_CMDBUF_SLOTS, the number of command buffers that may be in flight (default kCommandQueueSlots,
+  // clamped to [1, kCommandQueueSize]). Read once, before the wait thread starts.
+  static unsigned
+  SlotsFromEnv() {
+    unsigned slots = kCommandQueueSlots;
+    if (auto s = env::getEnvVar("DXMT_D3D12_CMDBUF_SLOTS"); !s.empty()) {
+      try {
+        slots = std::min<unsigned>(std::max<unsigned>(std::stoul(s), 1), kCommandQueueSize);
+      } catch (const std::exception &) {
+      }
+    }
+    return slots;
+  }
+
 public:
   MTLD3D12CommandQueueImpl(MTLD3D12Device *pDevice) :
-      MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory>(pDevice),
+      MTLD3D12Pageable<MTLD3D12CommandQueue, IMTLSwapChainFactory>(pDevice), cmdbuf_slots_(SlotsFromEnv()),
       inflight_cmdbuf_wait_thread_([this]() { this->CommandBufferWaitingThread(); }) {
     auto frame = env::getEnvVar("DXMT_CAPTURE_FRAME");
     if (!frame.empty()) {
@@ -1386,6 +1509,7 @@ public:
   }
 
   ~MTLD3D12CommandQueueImpl() {
+    StopPacing(); // MacNeutron (frame generation): the frames it holds are committed or dropped
     std::lock_guard<dxmt::mutex> lock(mutex_commit_);
     Commit(); // what ExecuteCommandLists left open
     inflight_cmdbuf_stop_.store(inflight_cmdbuf_seq_.fetch_add(1));
@@ -1401,7 +1525,7 @@ public:
     desc_.NodeMask = 1; // typically 1 GPU only
 
     auto metal_device = device_->GetMTLDevice();
-    queue_ = metal_device.newCommandQueue(kCommandQueueSize);
+    queue_ = metal_device.newCommandQueue(cmdbuf_slots_);
     if (!queue_)
       return E_FAIL;
     queue_.addResidencySet(device_->GetGlobalResidencySet());
@@ -1471,6 +1595,7 @@ public:
   void STDMETHODCALLTYPE
   ExecuteCommandLists(UINT Count, ID3D12CommandList *const *ppCommandLists) {
     DXMT_STAT_SCOPE("queue.ExecuteCommandLists");
+    execute_calls_++;
     auto scope = StartCommitting(true); // commits at once: the GPU starts on it (a Wait before it rides along)
     auto &cmdbuf = scope.inflight.cmdbuf;
     bool dumping = Dumps().Dumping();
@@ -1519,6 +1644,8 @@ public:
           list_fences_[current->position] = skipped_[skip_++].second;
           if (current->type == EncoderType::Render) // DXMT_STAT_COUNT keeps one counter id per call site
             DXMT_STAT_COUNT("#render passes merged", 1);
+          else if (current->query_resolve_only)
+            DXMT_STAT_COUNT("#timestamp resolves moved after a merged pass", 1);
           else
             DXMT_STAT_COUNT("#timestamp blits folded", 1);
           current = current->next;
@@ -1734,6 +1861,7 @@ public:
           Encode(encoder, fence, data->use_geometry ? WMTRenderStagePreRaster : WMTRenderStageVertex, &data->cmd_head,
                  tail, early);
           tail = data->cmd_tail;
+          size_t first_skipped = skipped_.size();
           for (auto *m : merged_) {
             if (m->type == EncoderType::Render) {
               tail->next.set(nullptr);
@@ -1745,6 +1873,18 @@ public:
           for (auto &t : trailing)
             if (t.sample_buffer)
               SampleAfter(cmdbuf, t.sample_buffer, t.end_of_fragment_sample_index, kLoneCounterBuffer);
+          // B7: the timestamp resolves merged past, in their order, each after all before it (the merged pass too).
+          for (auto *d : deferred_) {
+            auto blit = static_cast<BlitEncoderData *>(d);
+            auto deferred = cmdbuf.blitCommandEncoder();
+            LabelPass(deferred, pass, "blit (resolves after the merged pass)");
+            uint16_t after = Order(nullptr, true);
+            Encode(deferred, after, &blit->cmd_head, blit->cmd_tail);
+            deferred.endEncoding();
+            for (size_t k = first_skipped; k < skipped_.size(); k++)
+              if (skipped_[k].first == d)
+                skipped_[k].second = after;
+          }
           break;
         }
         case EncoderType::Blit: {
@@ -1850,6 +1990,14 @@ public:
           cmdbuf.encodeTemporalScale(data->scaler->scaler(), data->color.texture(), data->output.texture(),
                                      data->depth.texture(), data->motion.texture(), data->exposure.texture(),
                                      scaler_fence, data->props, data->reactive.texture());
+          if (FrameGenOn()) {
+            std::lock_guard<std::mutex> lock(g_framegen_slot.mutex);
+            g_framegen_slot.scaler = data->scaler;
+            g_framegen_slot.depth = data->depth;
+            g_framegen_slot.motion = data->motion;
+            g_framegen_slot.props = data->props;
+            g_framegen_slot.fresh = true;
+          }
           auto end = last.end_of_encoder_sample_index != ~0ull ? cmdbuf.blitCommandEncoderWithSampleBuffers(&last, 1)
                                                               : cmdbuf.blitCommandEncoder();
           end.waitForFence(scaler_fence);
@@ -2002,27 +2150,289 @@ public:
     return hr;
   }
 
+  // MacNeutron (frame generation on MetalFX, MACNEUTRON_FRAMEGEN=1): MetalFX's frame interpolator, paired with the
+  // upscaler of the last temporal upscale (g_framegen_slot), and a ring of three frames: each present's frame copied
+  // out of the back buffer (`real`, the next interpolation's previous frame too) and the frame generated before it.
+  // The game's command buffer writes them; a pacing thread presents them on a queue of its own, behind an event the
+  // game's command buffer signals, so the game never waits on a drawable: two drawables a frame, taken on the game's
+  // thread, held it for most of each frame (Palworld: Present 13.7 ms a frame, stalls to 480 ms). The thread signals
+  // another event once it has read a slot, which the game's command buffer waits on before writing that slot again.
+  static constexpr unsigned kFrameGenRing = 3;
+  struct FramePair {
+    uint64_t index;
+    bool generated;
+    Rc<Presenter> presenter;
+    DXMTPresentMetadata metadata;
+  };
+  struct FrameGen {
+    WMT::Reference<WMT::FXFrameInterpolator> interpolator;
+    WMT::Reference<WMT::Fence> fence;
+    WMT::Reference<WMT::Texture> real[kFrameGenRing], generated[kFrameGenRing];
+    WMTFXFrameInterpolatorInfo info{};
+    WMTPixelFormat format = WMTPixelFormatInvalid;
+    uint64_t width = 0, height = 0;
+    bool failed = false;
+    double interval = 0.0; // seconds between presents, smoothed
+    std::chrono::steady_clock::time_point last{};
+    uint64_t enqueued = 0;  // frames handed to the pacing thread (the slot of frame n is n % kFrameGenRing)
+    bool has_prev = false;  // the slot before `enqueued`'s holds the previous present's frame
+    WMT::Reference<WMT::CommandQueue> queue;
+    WMT::Reference<WMT::Event> written, read; // game to pacer: frame n's slot written; pacer to game: frame n's read
+    dxmt::mutex mutex;
+    dxmt::condition_variable cv;
+    std::vector<FramePair> pending;
+    uint64_t committed = 0; // frames the pacing thread has committed
+    bool stop = false;
+    dxmt::thread thread;
+  } framegen_;
+
+  void
+  PacingThread() {
+    auto &fg = framegen_;
+    for (;;) {
+      FramePair pair;
+      {
+        std::unique_lock<dxmt::mutex> lock(fg.mutex);
+        fg.cv.wait(lock, [&] { return fg.stop || !fg.pending.empty(); });
+        if (fg.pending.empty())
+          return;
+        pair = std::move(fg.pending.front());
+        fg.pending.erase(fg.pending.begin());
+      }
+      auto pool = WMT::MakeAutoreleasePool();
+      unsigned slot = pair.index % kFrameGenRing;
+      auto cmdbuf = fg.queue.commandBuffer();
+      cmdbuf.encodeWaitForEvent(fg.written, pair.index + 1);
+      auto none = [](auto) {};
+      if (pair.generated) {
+        DXMT_STAT_SCOPE("pacer.(generated frame: drawable and blit)");
+        auto drawable = pair.presenter->encodeCommands(cmdbuf, fg.generated[slot], pair.metadata, none, none);
+        cmdbuf.presentDrawable(drawable);
+      }
+      WMT::MetalDrawable drawable;
+      {
+        DXMT_STAT_SCOPE("pacer.(real frame: drawable and blit)");
+        drawable = pair.presenter->encodeCommands(cmdbuf, fg.real[slot], pair.metadata, none, none);
+      }
+      // As soon as it can, as the generated frame: the drawables themselves pace the pair, one display refresh each
+      // (macOS's compositor returns a drawable once it has shown the next). A minimum duration on top held each pair
+      // for more refreshes (the test: 34 ms a pair, against 18 without).
+      cmdbuf.presentDrawable(drawable);
+      cmdbuf.encodeSignalEvent(fg.read, pair.index + 1);
+      cmdbuf.commit();
+      {
+        std::lock_guard<dxmt::mutex> lock(fg.mutex);
+        fg.committed = pair.index + 1;
+      }
+      fg.cv.notify_all();
+    }
+  }
+
+  void
+  StopPacing() {
+    auto &fg = framegen_;
+    if (!fg.thread.joinable())
+      return;
+    {
+      std::lock_guard<dxmt::mutex> lock(fg.mutex);
+      fg.stop = true;
+    }
+    fg.cv.notify_all();
+    fg.thread.join();
+  }
+
+  // Waits until the pacing thread has committed every frame handed to it (a present it can't take must come after).
+  void
+  DrainPacing() {
+    auto &fg = framegen_;
+    std::unique_lock<dxmt::mutex> lock(fg.mutex);
+    fg.cv.wait(lock, [&] { return fg.committed == fg.enqueued; });
+  }
+
+  // Frame generation's present: true when the pacing thread took it (frame copied, maybe a frame generated before it),
+  // false when the frame is presented as rendered (then after every frame the thread had). Generates only right after a
+  // temporal upscale of this frame's size, with the previous present's frame in the ring, no reset, and a present
+  // interval under 50 ms.
+  bool
+  PresentFrameGen(WMT::CommandBuffer &cmdbuf, Presenter *presenter, WMT::Texture frame,
+                  const DXMTPresentMetadata &metadata) {
+    auto &fg = framegen_;
+    auto now = std::chrono::steady_clock::now();
+    double since = fg.last.time_since_epoch().count() ? std::chrono::duration<double>(now - fg.last).count() : 1.0;
+    fg.last = now;
+    if (since < 0.05)
+      fg.interval = fg.interval > 0.0 ? fg.interval * 0.9 + since * 0.1 : since;
+    Rc<TemporalScaler> scaler;
+    TextureViewRef depth, motion;
+    WMTFXTemporalScalerProps props{};
+    bool fresh = false;
+    {
+      std::lock_guard<std::mutex> lock(g_framegen_slot.mutex);
+      fresh = g_framegen_slot.fresh;
+      g_framegen_slot.fresh = false;
+      scaler = g_framegen_slot.scaler;
+      depth = g_framegen_slot.depth;
+      motion = g_framegen_slot.motion;
+      props = g_framegen_slot.props;
+    }
+    if (fg.failed)
+      return false;
+    auto device = device_->GetMTLDevice();
+    // The ring, for this frame's size and format; another size or format waits for the frames in flight.
+    if (frame.width() != fg.width || frame.height() != fg.height || frame.pixelFormat() != fg.format) {
+      if (!fresh || !scaler || scaler->info().output_width != frame.width() ||
+          scaler->info().output_height != frame.height())
+        return false; // nothing to pair with at this size: as rendered
+      DrainPacing();
+      WMTTextureInfo t{};
+      t.pixel_format = frame.pixelFormat();
+      t.width = frame.width();
+      t.height = frame.height();
+      t.depth = 1;
+      t.array_length = 1;
+      t.type = WMTTextureType2D;
+      t.mipmap_level_count = 1;
+      t.sample_count = 1;
+      t.usage = WMTTextureUsage(WMTTextureUsageShaderRead | WMTTextureUsageShaderWrite | WMTTextureUsageRenderTarget);
+      t.options = WMTResourceOptions(WMTResourceStorageModePrivate | WMTResourceHazardTrackingModeUntracked);
+      for (unsigned i = 0; i < kFrameGenRing; i++) {
+        fg.real[i] = device.newTexture(t);
+        fg.generated[i] = device.newTexture(t);
+      }
+      fg.width = frame.width();
+      fg.height = frame.height();
+      fg.format = frame.pixelFormat();
+      fg.has_prev = false;
+      if (!fg.queue) {
+        fg.queue = device.newCommandQueue(kFrameGenRing + 1);
+        fg.written = device.newEvent();
+        fg.read = device.newEvent();
+        fg.fence = device.newFence();
+        fg.thread = dxmt::thread([this]() { PacingThread(); });
+      }
+    }
+    bool generate = fresh && fg.has_prev && !props.reset && since < 0.05 && fg.interval > 0.0 && depth && motion &&
+                    scaler->info().output_width == fg.width && scaler->info().output_height == fg.height;
+    if (generate) {
+      auto &si = scaler->info();
+      WMTFXFrameInterpolatorInfo info{};
+      info.color_format = fg.format;
+      info.output_format = fg.format;
+      info.depth_format = depth.texture().pixelFormat();
+      info.motion_format = motion.texture().pixelFormat();
+      info.input_width = si.input_width;
+      info.input_height = si.input_height;
+      info.output_width = si.output_width;
+      info.output_height = si.output_height;
+      info.scaler = scaler->scaler().handle;
+      if (!fg.interpolator || memcmp(&info, &fg.info, sizeof(info))) {
+        DXMT_STAT_SCOPE("queue.(frame generation: make the interpolator)");
+        fg.interpolator = device.newFrameInterpolator(info);
+        fg.info = info;
+        if (!fg.interpolator) {
+          fprintf(stderr, "macneutron-framegen: MetalFX made no frame interpolator for %ux%u to %ux%u (colour %u, "
+                          "depth %u, motion %u): frames are presented as rendered\n",
+                  info.input_width, info.input_height, info.output_width, info.output_height,
+                  (unsigned)info.color_format, (unsigned)info.depth_format, (unsigned)info.motion_format);
+          fg.failed = true;
+          DrainPacing();
+          return false;
+        }
+        fprintf(stderr, "macneutron-framegen: generating a frame between each two, %ux%u (paired with the %ux%u "
+                        "upscaler)\n", info.output_width, info.output_height, info.input_width, info.input_height);
+      }
+    }
+    // The game's thread runs ahead of the pacing thread by the ring's depth at most.
+    uint64_t n = fg.enqueued;
+    {
+      DXMT_STAT_SCOPE("queue.(frame generation: wait for the pacing thread)");
+      std::unique_lock<dxmt::mutex> lock(fg.mutex);
+      fg.cv.wait(lock, [&] { return fg.committed + kFrameGenRing - 1 > n; });
+    }
+    unsigned slot = n % kFrameGenRing, prev = (n + kFrameGenRing - 1) % kFrameGenRing;
+    uint16_t done = Order(nullptr, true);
+    auto fill = ScratchFill();
+    auto begin = cmdbuf.blitCommandEncoder();
+    for (auto wait : waits_)
+      begin.waitForFence(fences_[wait]);
+    begin.encodeCommands((const wmtcmd_blit_nop *)&fill);
+    begin.updateFence(fg.fence);
+    begin.endEncoding();
+    if (n >= kFrameGenRing) // the pacing thread's last read of this slot
+      cmdbuf.encodeWaitForEvent(fg.read, n - kFrameGenRing + 1);
+    if (generate) {
+      DXMT_STAT_SCOPE("queue.(encode frame interpolation)");
+      DXMT_STAT_COUNT("#frames generated", 1);
+      WMTFXFrameInterpolatorProps p{};
+      p.motion_vector_scale_x = props.motion_vector_scale_x;
+      p.motion_vector_scale_y = props.motion_vector_scale_y;
+      p.delta_time = (float)fg.interval;
+      p.near_plane = 0.1f;
+      p.far_plane = 10000.0f;
+      p.field_of_view = 70.0f;
+      p.aspect_ratio = (float)fg.width / (float)fg.height;
+      p.jitter_offset_x = props.jitter_offset_x;
+      p.jitter_offset_y = props.jitter_offset_y;
+      p.depth_reversed = props.depth_reversed;
+      cmdbuf.encodeFrameInterpolate(fg.interpolator, frame, fg.real[prev], depth.texture(), motion.texture(),
+                                    fg.generated[slot], fg.fence, p);
+    }
+    wmtcmd_blit_copy_texture copy = {};
+    copy.type = WMTBlitCommandCopyTexture;
+    copy.next.set(nullptr);
+    copy.src = frame.handle;
+    copy.dst = fg.real[slot].handle;
+    auto end = cmdbuf.blitCommandEncoder();
+    end.waitForFence(fg.fence);
+    end.encodeCommands((const wmtcmd_blit_nop *)&copy);
+    end.updateFence(fences_[done]);
+    end.endEncoding();
+    cmdbuf.encodeSignalEvent(fg.written, n + 1);
+    {
+      std::lock_guard<dxmt::mutex> lock(fg.mutex);
+      fg.pending.push_back({n, generate, Rc<Presenter>(presenter), metadata});
+      fg.enqueued = n + 1;
+    }
+    fg.has_prev = true;
+    // Handed over only once this command buffer is committed (the scope's end), so the thread's wait on `written`
+    // never comes first: notified then (PresentFrame).
+    return true;
+  }
+
   HRESULT
   PresentFrame(Presenter *presenter, ID3D12Resource *backbuffer, HANDLE hLantecyWaitable, double after) {
-    auto scope = StartCommitting(true);
-    auto &cmdbuf = scope.inflight.cmdbuf;
+    bool handed = false;
+    {
+      auto scope = StartCommitting(true);
+      auto &cmdbuf = scope.inflight.cmdbuf;
 
-    auto g = reinterpret_cast<MTLD3D12Resource *>(backbuffer);
-    auto &view = g->texture->view(g->texture->fullView);
+      auto g = reinterpret_cast<MTLD3D12Resource *>(backbuffer);
+      auto &view = g->texture->view(g->texture->fullView);
 
-    auto state = presenter->synchronizeLayerProperties();
-    uint16_t fence = 0;
-    auto drawable = presenter->encodeCommands(
-        cmdbuf, view.texture, state.metadata,
-        [&](auto encoder) { fence = Join(encoder, WMTRenderStageFragment); },
-        [&](auto encoder) { encoder.updateFence(fences_[fence], WMTRenderStageFragment); }
-    );
+      auto state = presenter->synchronizeLayerProperties();
+      // MacNeutron (frame generation): the pacing thread presents this frame, and a generated one before it. A game
+      // that waits for vsync (`after`) already presents at the display's rate: nothing is generated for it.
+      if (FrameGenOn() && after <= 0.0)
+        handed = PresentFrameGen(cmdbuf, presenter, view.texture, state.metadata);
+      if (!handed) {
+        if (FrameGenOn() && framegen_.thread.joinable())
+          DrainPacing();
+        uint16_t fence = 0;
+        auto drawable = presenter->encodeCommands(
+            cmdbuf, view.texture, state.metadata,
+            [&](auto encoder) { fence = Join(encoder, WMTRenderStageFragment); },
+            [&](auto encoder) { encoder.updateFence(fences_[fence], WMTRenderStageFragment); }
+        );
 
-    if (after > 0)
-      cmdbuf.presentDrawableAfterMinimumDuration(drawable, after);
-    else
-      cmdbuf.presentDrawable(drawable);
-    scope.inflight.semaphore = hLantecyWaitable;
+        if (after > 0)
+          cmdbuf.presentDrawableAfterMinimumDuration(drawable, after);
+        else
+          cmdbuf.presentDrawable(drawable);
+      }
+      scope.inflight.semaphore = hLantecyWaitable;
+    }
+    if (handed)
+      framegen_.cv.notify_all();
 
     return S_OK;
   }
