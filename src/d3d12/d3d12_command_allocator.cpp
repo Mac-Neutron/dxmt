@@ -60,7 +60,11 @@ MTLD3D12CommandAllocatorImpl::Initialize() {
   cpu_heap_offset_ = 0;
 
   if (!gpu_heap_)
+#ifdef DXMT_GUEST_VM
+    gpu_heap_ = WMTMemoryAlloc(kGPUHeapSize);
+#else
     gpu_heap_ = malloc(kGPUHeapSize);
+#endif
   if (!gpu_heap_)
     return E_OUTOFMEMORY;
   gpu_heap_offset_ = 0;

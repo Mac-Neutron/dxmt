@@ -490,6 +490,14 @@ struct unixcall_mtldevice_newicb {
   obj_handle_t ret;
 };
 
+#ifdef DXMT_GUEST_VM
+/* MacNeutron: WMTMemoryAlloc (153) and WMTMemoryFree (154), answered in the EAC microVM's guest. */
+struct unixcall_wmtmemory {
+  uint64_t length;
+  struct WMTMemoryPointer ptr;
+};
+#endif
+
 #pragma pack(pop)
 
 #endif

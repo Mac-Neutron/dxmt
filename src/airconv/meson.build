@@ -115,6 +115,6 @@ executable('airconv', airconv_src + airconv_cli_src,
 
 endif
 
-if cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild
+if (cpu_family == 'x86_64' or cpu_family == 'aarch64' or not dxmt_crossbuild) and not get_option('guest_vm')
   subdir('darwin')
 endif

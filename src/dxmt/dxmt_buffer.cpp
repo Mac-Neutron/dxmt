@@ -42,7 +42,11 @@ BufferAllocation::BufferAllocation(WMT::Device device, const WMTBufferInfo &info
   }
   fenceTrackers.resize(suballocation_count_);
   if (flags_.test(BufferAllocationFlag::CpuPlaced)) {
+#ifdef DXMT_GUEST_VM
+    placed_buffer = WMTMemoryAlloc(info_.length);
+#else
     placed_buffer = wsi::aligned_malloc(info_.length, DXMT_PAGE_SIZE);
+#endif
     info_.memory.set(placed_buffer);
   }
   obj_ = device.newBuffer(info_);
@@ -73,7 +77,11 @@ BufferAllocation::BufferAllocation(
 void
 BufferAllocation::free() {
   if (placed_buffer) {
+#ifdef DXMT_GUEST_VM
+    WMTMemoryFree(placed_buffer);
+#else
     wsi::aligned_free(placed_buffer);
+#endif
     placed_buffer = nullptr;
   }
   delete this;

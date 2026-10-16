@@ -1424,3 +1424,22 @@ MTLCommandBuffer_encodeFrameInterpolate(
   WMT_MEMPTR_SET(params.props, props);
   UNIX_CALL(152, &params);
 }
+
+#ifdef DXMT_GUEST_VM
+WINEMETAL_API void *
+WMTMemoryAlloc(uint64_t length) {
+  struct unixcall_wmtmemory params;
+  params.length = length;
+  WMT_MEMPTR_SET(params.ptr, NULL);
+  UNIX_CALL(153, &params);
+  return params.ptr.ptr;
+}
+
+WINEMETAL_API void
+WMTMemoryFree(void *ptr) {
+  struct unixcall_wmtmemory params;
+  params.length = 0;
+  WMT_MEMPTR_SET(params.ptr, ptr);
+  UNIX_CALL(154, &params);
+}
+#endif

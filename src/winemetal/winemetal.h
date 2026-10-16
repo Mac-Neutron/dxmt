@@ -2239,4 +2239,12 @@ WINEMETAL_API void MTLTexture_getBytes(
     struct WMTMemoryPointer data, uint64_t bytes_per_row, uint64_t bytes_per_image
 );
 
+#ifdef DXMT_GUEST_VM
+/* MacNeutron: memory a Metal object can be made over (a buffer's info.memory) in the EAC microVM's guest, where the
+ * host maps it too: whole 16 KiB pages, page-aligned. Freed memory comes back for reuse only once every Metal object
+ * made over it is gone. */
+WINEMETAL_API void *WMTMemoryAlloc(uint64_t length);
+WINEMETAL_API void WMTMemoryFree(void *ptr);
+#endif
+
 #endif

@@ -97,7 +97,11 @@ public:
 
     ~Block() {
       if (mapped_address) {
+#ifdef DXMT_GUEST_VM
+        WMTMemoryFree(mapped_address);
+#else
         free(mapped_address);
+#endif
         mapped_address = nullptr;
       }
     };
@@ -116,7 +120,11 @@ public:
   Block
   allocate(size_t block_size) {
     Block block{};
+#ifdef DXMT_GUEST_VM
+    block.mapped_address = placed_buffer_ ? WMTMemoryAlloc(block_size) : nullptr;
+#else
     block.mapped_address = placed_buffer_ ? malloc(block_size) : nullptr;
+#endif
     WMTBufferInfo info;
     info.options = buffer_info_;
     info.memory.set(block.mapped_address);

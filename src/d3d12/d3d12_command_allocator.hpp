@@ -132,7 +132,11 @@ public:
     free(cpu_heap_);
     cpu_heap_ = nullptr;
     gpu_heap_buffer_ = {};
+#ifdef DXMT_GUEST_VM
+    WMTMemoryFree(gpu_heap_);
+#else
     free(gpu_heap_);
+#endif
     gpu_heap_ = nullptr;
   }
 

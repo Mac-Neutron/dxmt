@@ -57,6 +57,7 @@ custom_target('postprocess_lib',
   build_by_default : true
 )
 
-if cpu_family == 'x86_64' or cpu_family == 'aarch64'
+# MacNeutron: a guest_vm build's winemetal.so is the VM's own (eac-vm/metal/wm).
+if (cpu_family == 'x86_64' or cpu_family == 'aarch64') and not get_option('guest_vm')
   subdir('unix')
 endif

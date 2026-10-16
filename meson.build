@@ -139,6 +139,11 @@ endif
 
 add_project_arguments('-DDXMT_PAGE_SIZE=4096', language: 'cpp')
 
+# MacNeutron: memory DXMT hands to Metal comes from winemetal (WMTMemoryAlloc), which the VM's host maps too.
+if get_option('guest_vm')
+  add_project_arguments('-DDXMT_GUEST_VM', language: ['c', 'cpp'])
+endif
+
 dxmt_version = vcs_tag(
   command: ['git', 'describe', '--always'],
   input:  'version.h.in',
