@@ -2,6 +2,7 @@
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include <windows.h>
+#include "util_win32_compat.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstring>

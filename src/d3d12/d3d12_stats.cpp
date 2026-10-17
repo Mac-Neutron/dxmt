@@ -4,6 +4,7 @@
 #include "util_env.hpp"
 #include "util_string.hpp"
 #include <windows.h>
+#include "util_win32_compat.h"
 #if defined(DXMT_ARCH_X86)
 #include <x86intrin.h>
 #endif

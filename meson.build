@@ -21,13 +21,19 @@ dxmt_include_dirs = [
   './libs'
 ]
 
+# include/native/d3d12 first: the D3D12 headers the PE build compiles against (llvm-mingw's, dxmt/pins in MacNeutron),
+# newer than the directx submodule's.
 dxmt_native_include_dirs = [
+  './include/native/d3d12',
   './include/native/windows',
   './include/native/directx',
 ]
 
 if not dxmt_crossbuild
   dxmt_include_dirs += dxmt_native_include_dirs
+  # As the PE build's mingw headers: methods that return a struct take its address (D3D12's GetDesc and siblings),
+  # so native callers of these headers see the signatures DXMT implements.
+  add_project_arguments('-DWIDL_EXPLICIT_AGGREGATE_RETURNS', language: ['c', 'cpp'])
 endif
 
 source_prefix_path = fs.relative_to(

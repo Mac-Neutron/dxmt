@@ -14,7 +14,10 @@ subdir('d3d10')
 
 if get_option('enable_d3d12')
 subdir('d3d12')
+# The replay tool is a Windows program (wmain, d3d12.dll by name): the PE build's alone.
+if dxmt_crossbuild
 subdir('replay')
+endif
 endif
 
 if get_option('enable_nvapi')

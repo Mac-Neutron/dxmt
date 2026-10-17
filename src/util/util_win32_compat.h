@@ -44,6 +44,10 @@ inline DWORD MAKELONG(WORD a, WORD b) {
   return (((DWORD)a) << 16) | ((DWORD)b);
 }
 
+/* winerror.h's, which the native headers lack. */
+#define D3D12_ERROR_ADAPTER_NOT_FOUND ((HRESULT)0x887E0001)
+#define D3D12_ERROR_DRIVER_VERSION_MISMATCH ((HRESULT)0x887E0002)
+
 #define ARRAYSIZE(a) (sizeof(a)/sizeof(*(a)))
 
 #endif

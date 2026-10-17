@@ -19,6 +19,7 @@
 #include <ctime>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <libproc.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string>
@@ -77,7 +78,9 @@ typedef struct SYSTEMTIME {
 #define DLL_THREAD_DETACH 3
 #define VK_F9 0x78
 
-enum mn_win32_kind : uint32_t { MN_WIN32_EVENT = 0x6e657665, MN_WIN32_SEMAPHORE = 0x6d657373, MN_WIN32_FILE = 0x656c6966 };
+enum mn_win32_kind : uint32_t {
+  MN_WIN32_EVENT = 0x6e657665, MN_WIN32_SEMAPHORE = 0x6d657373, MN_WIN32_FILE = 0x656c6966, MN_WIN32_THREAD = 0x64726874
+};
 
 struct mn_win32_handle {
   uint32_t kind;
@@ -89,6 +92,8 @@ struct mn_win32_handle {
   BOOL manual;
   /* files */
   int fd;
+  /* threads (OpenThread): the thread's id */
+  uint64_t tid;
 };
 
 static inline DWORD &mn_win32_error() {
@@ -230,12 +235,13 @@ static inline DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
 static inline BOOL CloseHandle(HANDLE h) {
   if (h == (HANDLE)(intptr_t)-1 || h == (HANDLE)(intptr_t)-2) return TRUE; /* the pseudo-handles */
   mn_win32_handle *o = (mn_win32_handle *)h;
-  if (!h || (o->kind != MN_WIN32_EVENT && o->kind != MN_WIN32_SEMAPHORE && o->kind != MN_WIN32_FILE))
+  if (!h || (o->kind != MN_WIN32_EVENT && o->kind != MN_WIN32_SEMAPHORE && o->kind != MN_WIN32_FILE &&
+             o->kind != MN_WIN32_THREAD))
     return SetLastError(ERROR_INVALID_HANDLE), FALSE;
   if (o->refs.fetch_sub(1) != 1) return TRUE;
   if (o->kind == MN_WIN32_FILE) {
     close(o->fd);
-  } else {
+  } else if (o->kind != MN_WIN32_THREAD) {
     pthread_mutex_destroy(&o->m);
     pthread_cond_destroy(&o->c);
   }
@@ -257,7 +263,8 @@ static inline DWORD GetCurrentThreadId() {
 static inline BOOL DuplicateHandle(HANDLE, HANDLE source, HANDLE, LPHANDLE target, DWORD, BOOL, DWORD options) {
   mn_win32_handle *o = (mn_win32_handle *)source;
   if (!target || !source || source == INVALID_HANDLE_VALUE || source == (HANDLE)(intptr_t)-2 ||
-      (o->kind != MN_WIN32_EVENT && o->kind != MN_WIN32_SEMAPHORE && o->kind != MN_WIN32_FILE))
+      (o->kind != MN_WIN32_EVENT && o->kind != MN_WIN32_SEMAPHORE && o->kind != MN_WIN32_FILE &&
+       o->kind != MN_WIN32_THREAD))
     return SetLastError(ERROR_INVALID_HANDLE), FALSE;
   if (o->kind == MN_WIN32_FILE) {
     mn_win32_handle *d = mn_win32_new(MN_WIN32_FILE);
@@ -339,6 +346,15 @@ static inline DWORD SetFilePointer(HANDLE h, LONG distance, PLONG high, DWORD me
   if (high) *high = (LONG)(at >> 32);
   SetLastError(ERROR_SUCCESS);
   return (DWORD)at;
+}
+
+static inline BOOL SetFilePointerEx(HANDLE h, LARGE_INTEGER distance, PLARGE_INTEGER position, DWORD method) {
+  mn_win32_handle *o = mn_win32_get(h, MN_WIN32_FILE);
+  if (!o || method > FILE_END) return SetLastError(o ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE), FALSE;
+  off_t at = lseek(o->fd, distance.QuadPart, method == FILE_BEGIN ? SEEK_SET : method == FILE_CURRENT ? SEEK_CUR : SEEK_END);
+  if (at < 0) return SetLastError(mn_win32_from_errno(errno)), FALSE;
+  if (position) position->QuadPart = at;
+  return TRUE;
 }
 
 static inline BOOL SetEndOfFile(HANDLE h) {
@@ -424,11 +440,29 @@ static inline void GetLocalTime(LPSYSTEMTIME st) {
 
 static inline BOOL SetThreadPriority(HANDLE, int) { return TRUE; }
 
-/* The calling thread's name only (pthread_getname_np), freed with LocalFree. */
+/* A thread of this process by its id (GetCurrentThreadId's), for GetThreadDescription; NULL if there is none. */
+static inline HANDLE OpenThread(DWORD, BOOL, DWORD tid) {
+  struct proc_threadinfo info;
+  if (!tid || proc_pidinfo(getpid(), PROC_PIDTHREADID64INFO, tid, &info, sizeof info) != sizeof info)
+    return SetLastError(ERROR_INVALID_PARAMETER), nullptr;
+  mn_win32_handle *o = mn_win32_new(MN_WIN32_THREAD);
+  o->tid = tid;
+  return o;
+}
+
+/* A thread's name: the calling thread's (pthread_getname_np) or an opened one's (proc_pidinfo), freed with
+ * LocalFree. */
 static inline HRESULT GetThreadDescription(HANDLE thread, LPWSTR *description) {
-  char name[64] = "";
-  if (!description || thread != GetCurrentThread()) return E_NOTIMPL;
-  pthread_getname_np(pthread_self(), name, sizeof name);
+  char name[MAXTHREADNAMESIZE] = "";
+  mn_win32_handle *o = mn_win32_get(thread, MN_WIN32_THREAD);
+  if (!description || (!o && thread != GetCurrentThread())) return E_INVALIDARG;
+  if (o) {
+    struct proc_threadinfo info;
+    if (proc_pidinfo(getpid(), PROC_PIDTHREADID64INFO, o->tid, &info, sizeof info) != sizeof info) return E_FAIL;
+    strlcpy(name, info.pth_name, sizeof name);
+  } else {
+    pthread_getname_np(pthread_self(), name, sizeof name);
+  }
   size_t n = strlen(name);
   LPWSTR w = (LPWSTR)malloc((n + 1) * sizeof(WCHAR));
   if (!w) return E_OUTOFMEMORY;

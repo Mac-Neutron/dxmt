@@ -32,6 +32,7 @@
 #include "dxmt_presenter.hpp"
 #include "dxmt_texture.hpp"
 #include "log/log.hpp"
+#include "util_win32_compat.h"
 
 #define IMPLEMENT_ME                                                                                                   \
   do {                                                                                                                 \
