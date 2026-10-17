@@ -12,7 +12,8 @@
 
 #include <windows.h>
 
-#include <atomic>
+#include "win32_native_event.h"
+
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -77,24 +78,6 @@ typedef struct SYSTEMTIME {
 #define DLL_THREAD_ATTACH 2
 #define DLL_THREAD_DETACH 3
 #define VK_F9 0x78
-
-enum mn_win32_kind : uint32_t {
-  MN_WIN32_EVENT = 0x6e657665, MN_WIN32_SEMAPHORE = 0x6d657373, MN_WIN32_FILE = 0x656c6966, MN_WIN32_THREAD = 0x64726874
-};
-
-struct mn_win32_handle {
-  uint32_t kind;
-  std::atomic<int> refs;
-  /* events and semaphores */
-  pthread_mutex_t m;
-  pthread_cond_t c;
-  LONG count, max; /* an event: 1 when set; a semaphore: its count and maximum */
-  BOOL manual;
-  /* files */
-  int fd;
-  /* threads (OpenThread): the thread's id */
-  uint64_t tid;
-};
 
 static inline DWORD &mn_win32_error() {
   static thread_local DWORD error = ERROR_SUCCESS;
@@ -164,12 +147,7 @@ static inline HANDLE CreateEventA(LPSECURITY_ATTRIBUTES sa, BOOL manual, BOOL in
 }
 
 static inline BOOL SetEvent(HANDLE h) {
-  mn_win32_handle *o = mn_win32_get(h, MN_WIN32_EVENT);
-  if (!o) return SetLastError(ERROR_INVALID_HANDLE), FALSE;
-  pthread_mutex_lock(&o->m);
-  o->count = 1;
-  pthread_cond_broadcast(&o->c);
-  pthread_mutex_unlock(&o->m);
+  if (!mn_win32_set_event(h)) return SetLastError(ERROR_INVALID_HANDLE), FALSE;
   return TRUE;
 }
 
@@ -238,7 +216,7 @@ static inline BOOL CloseHandle(HANDLE h) {
   if (!h || (o->kind != MN_WIN32_EVENT && o->kind != MN_WIN32_SEMAPHORE && o->kind != MN_WIN32_FILE &&
              o->kind != MN_WIN32_THREAD))
     return SetLastError(ERROR_INVALID_HANDLE), FALSE;
-  if (o->refs.fetch_sub(1) != 1) return TRUE;
+  if (__atomic_fetch_sub(&o->refs, 1, __ATOMIC_ACQ_REL) != 1) return TRUE;
   if (o->kind == MN_WIN32_FILE) {
     close(o->fd);
   } else if (o->kind != MN_WIN32_THREAD) {
@@ -271,7 +249,7 @@ static inline BOOL DuplicateHandle(HANDLE, HANDLE source, HANDLE, LPHANDLE targe
     if ((d->fd = dup(o->fd)) < 0) return SetLastError(mn_win32_from_errno(errno)), delete d, FALSE;
     *target = d;
   } else {
-    o->refs++;
+    __atomic_fetch_add(&o->refs, 1, __ATOMIC_RELAXED);
     *target = o;
   }
   if (options & DUPLICATE_CLOSE_SOURCE) CloseHandle(source);

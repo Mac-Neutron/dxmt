@@ -2574,14 +2574,18 @@ _MTLSharedEvent_signalValue(void *obj) {
   return STATUS_SUCCESS;
 }
 
-#ifndef DXMT_NATIVE
-
 typedef struct {
   _Atomic(CFRunLoopRef) runloop_ref;
   MTLSharedEventListener *shared_listener;
 } *shared_event_listener_t;
 
+#ifdef DXMT_NATIVE
+/* Natively the events are src/util's (win32_native.h), set on the same listener's run loop. */
+#include "../../util/win32_native_event.h"
+#define NtSetEvent(handle, prev_state) mn_win32_set_event(handle)
+#else
 extern NTSTATUS NtSetEvent(void *handle, void *prev_state);
+#endif
 
 static NTSTATUS
 _MTLSharedEvent_setWin32EventAtValue(void *obj) {
@@ -2688,35 +2692,6 @@ _SharedEventListener_destroy(void *obj) {
   return STATUS_SUCCESS;
 }
 
-#else
-static NTSTATUS
-_MTLSharedEvent_setWin32EventAtValue(void *obj) {
-  // nop
-  return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-_MTLSharedEvent_setWin32EventAtValues(void *obj) {
-  // nop
-  return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-_SharedEventListener_start(void *obj) {
-  return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-_SharedEventListener_create(void *obj) {
-  return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-_SharedEventListener_destroy(void *obj) {
-  return STATUS_SUCCESS;
-}
-
-#endif
 
 static NTSTATUS
 _MTLDevice_newFence(void *obj) {
