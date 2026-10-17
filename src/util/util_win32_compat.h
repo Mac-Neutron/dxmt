@@ -5,32 +5,11 @@
 #include <windows.h>
 
 #include "log/log.hpp"
-
-#define THREAD_PRIORITY_TIME_CRITICAL 15
-
-inline HANDLE GetCurrentProcess() {
-  dxmt::Logger::warn("GetCurrentProcess not implemented.");
-  return nullptr;
-}
-
-inline HANDLE GetCurrentThread() {
-  dxmt::Logger::warn("GetCurrentThread not implemented.");
-  return nullptr;
-}
-
-inline DWORD GetCurrentProcessId() {
-  dxmt::Logger::warn("GetCurrentProcessId not implemented.");
-  return 0;
-}
+#include "win32_native.h"
 
 inline BOOL ProcessIdToSessionId(DWORD pid, DWORD *id) {
   dxmt::Logger::warn("ProcessIdToSessionId not implemented.");
   *id = 0;
-  return FALSE;
-}
-
-inline BOOL SetThreadPriority(HANDLE hThread, int nPriority) {
-  dxmt::Logger::warn("SetThreadPriority not implemented.");
   return FALSE;
 }
 
@@ -64,41 +43,6 @@ inline DWORD GetWindowThreadProcessId(HWND hWnd, LPDWORD lpdwProcessId) {
 inline DWORD MAKELONG(WORD a, WORD b) {
   return (((DWORD)a) << 16) | ((DWORD)b);
 }
-
-typedef SECURITY_ATTRIBUTES *LPSECURITY_ATTRIBUTES;
-
-inline HANDLE CreateSemaphore(LPSECURITY_ATTRIBUTES lpSemaphoreAttributes,
-                              LONG                  lInitialCount,
-                              LONG                  lMaximumCount,
-                              LPCSTR                lpName) {
-  dxmt::Logger::warn("CreateSemaphore not implemented.");
-  return nullptr;
-}
-
-inline BOOL ReleaseSemaphore(HANDLE hSemaphore,
-                             LONG   lReleaseCount,
-                             LPLONG lpPreviousCount) {
-  dxmt::Logger::warn("ReleaseSemaphore not implemented.");
-  return FALSE;
-}
-
-inline BOOL CloseHandle(HANDLE hObject) {
-  dxmt::Logger::warn("CloseHandle not implemented.");
-  return FALSE;
-}
-
-inline BOOL DuplicateHandle(HANDLE   hSourceProcessHandle,
-                            HANDLE   hSourceHandle,
-                            HANDLE   hTargetProcessHandle,
-                            LPHANDLE lpTargetHandle,
-                            DWORD    dwDesiredAccess,
-                            BOOL     bInheritHandle,
-                            DWORD    dwOptions)
-{
-  dxmt::Logger::warn("DuplicateHandle not implemented.");
-  return FALSE;
-}
-
 
 #define ARRAYSIZE(a) (sizeof(a)/sizeof(*(a)))
 
