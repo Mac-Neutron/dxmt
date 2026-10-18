@@ -31,8 +31,9 @@ struct mn_win32_handle {
   int fd;
   /* threads (OpenThread): the thread's id */
   uint64_t tid;
-  /* relays: what SetEvent calls instead of waking waiters */
+  /* relays: what SetEvent calls instead of waking waiters, and what the last reference's drop calls */
   void (*relay)(void *ctx);
+  void (*relay_end)(void *ctx);
   void *relay_ctx;
 };
 
@@ -56,7 +57,9 @@ static inline int mn_win32_unref(void *h) {
   if (__atomic_fetch_sub(&o->refs, 1, __ATOMIC_ACQ_REL) != 1) return 1;
   if (o->kind == MN_WIN32_FILE) {
     close(o->fd);
-  } else if (o->kind != MN_WIN32_THREAD && o->kind != MN_WIN32_RELAY) {
+  } else if (o->kind == MN_WIN32_RELAY) {
+    if (o->relay_end) o->relay_end(o->relay_ctx);
+  } else if (o->kind != MN_WIN32_THREAD) {
     pthread_mutex_destroy(&o->m);
     pthread_cond_destroy(&o->c);
   }
@@ -66,11 +69,12 @@ static inline int mn_win32_unref(void *h) {
 }
 
 /* An event whose SetEvent calls fn(ctx) on the setter's thread instead of waking waiters (it can't be waited on): how
- * a host that holds DXMT learns a fence's completion. CloseHandle frees it. */
-static inline void *mn_win32_relay_event(void (*fn)(void *ctx), void *ctx) {
+ * a host that holds DXMT learns a fence's completion. Its last reference's drop calls end(ctx) (if not NULL), whether
+ * it was set or not (a fence released before reaching its value), then frees it. */
+static inline void *mn_win32_relay_event(void (*fn)(void *ctx), void (*end)(void *ctx), void *ctx) {
   struct mn_win32_handle *o = (struct mn_win32_handle *)calloc(1, sizeof *o);
   if (!o) return 0;
-  o->kind = MN_WIN32_RELAY, o->refs = 1, o->fd = -1, o->relay = fn, o->relay_ctx = ctx;
+  o->kind = MN_WIN32_RELAY, o->refs = 1, o->fd = -1, o->relay = fn, o->relay_end = end, o->relay_ctx = ctx;
   return o;
 }
 
