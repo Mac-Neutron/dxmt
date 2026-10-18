@@ -105,7 +105,7 @@ static inline mn_win32_handle *mn_win32_get(HANDLE h, uint32_t kind) {
 }
 
 static inline mn_win32_handle *mn_win32_new(uint32_t kind) {
-  mn_win32_handle *o = new mn_win32_handle();
+  mn_win32_handle *o = (mn_win32_handle *)calloc(1, sizeof *o); /* calloc: freed in C too (win32_native_event.h) */
   o->kind = kind;
   o->refs = 1;
   o->fd = -1;
@@ -116,12 +116,16 @@ static inline mn_win32_handle *mn_win32_new(uint32_t kind) {
   return o;
 }
 
-/* Native paths: the wide string (UTF-32) as UTF-8. */
+/* Native paths: the wide string (UTF-32) as UTF-8. DXMT builds Wine's paths, "Z:" (Wine's drive for the root) and
+ * backslashes: natively the same path is the POSIX one. */
 static inline std::string mn_win32_utf8(LPCWSTR s) {
   std::string out;
+  if (s && (s[0] == L'Z' || s[0] == L'z') && s[1] == L':' && (s[2] == L'/' || s[2] == L'\\')) s += 2;
   for (; s && *s; s++) {
     uint32_t c = (uint32_t)*s;
-    if (c < 0x80) {
+    if (c == L'\\') {
+      out += '/';
+    } else if (c < 0x80) {
       out += (char)c;
     } else if (c < 0x800) {
       out += (char)(0xc0 | c >> 6), out += (char)(0x80 | (c & 0x3f));
@@ -212,19 +216,7 @@ static inline DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
 
 static inline BOOL CloseHandle(HANDLE h) {
   if (h == (HANDLE)(intptr_t)-1 || h == (HANDLE)(intptr_t)-2) return TRUE; /* the pseudo-handles */
-  mn_win32_handle *o = (mn_win32_handle *)h;
-  if (!h || (o->kind != MN_WIN32_EVENT && o->kind != MN_WIN32_SEMAPHORE && o->kind != MN_WIN32_FILE &&
-             o->kind != MN_WIN32_THREAD))
-    return SetLastError(ERROR_INVALID_HANDLE), FALSE;
-  if (__atomic_fetch_sub(&o->refs, 1, __ATOMIC_ACQ_REL) != 1) return TRUE;
-  if (o->kind == MN_WIN32_FILE) {
-    close(o->fd);
-  } else if (o->kind != MN_WIN32_THREAD) {
-    pthread_mutex_destroy(&o->m);
-    pthread_cond_destroy(&o->c);
-  }
-  o->kind = 0;
-  delete o;
+  if (!mn_win32_unref(h)) return SetLastError(ERROR_INVALID_HANDLE), FALSE;
   return TRUE;
 }
 
@@ -246,7 +238,7 @@ static inline BOOL DuplicateHandle(HANDLE, HANDLE source, HANDLE, LPHANDLE targe
     return SetLastError(ERROR_INVALID_HANDLE), FALSE;
   if (o->kind == MN_WIN32_FILE) {
     mn_win32_handle *d = mn_win32_new(MN_WIN32_FILE);
-    if ((d->fd = dup(o->fd)) < 0) return SetLastError(mn_win32_from_errno(errno)), delete d, FALSE;
+    if ((d->fd = dup(o->fd)) < 0) return SetLastError(mn_win32_from_errno(errno)), free(d), FALSE;
     *target = d;
   } else {
     __atomic_fetch_add(&o->refs, 1, __ATOMIC_RELAXED);

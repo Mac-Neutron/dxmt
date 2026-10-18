@@ -2580,11 +2580,16 @@ typedef struct {
 } *shared_event_listener_t;
 
 #ifdef DXMT_NATIVE
-/* Natively the events are src/util's (win32_native.h), set on the same listener's run loop. */
+/* Natively the events are src/util's (win32_native.h), set on the same listener's run loop, and held from the
+ * registration to the set, as the Windows kernel holds them: the program may close one before its fence fires. */
 #include "../../util/win32_native_event.h"
 #define NtSetEvent(handle, prev_state) mn_win32_set_event(handle)
+#define EVENT_HOLD(handle) mn_win32_ref(handle)
+#define EVENT_DROP(handle) mn_win32_unref(handle)
 #else
 extern NTSTATUS NtSetEvent(void *handle, void *prev_state);
+#define EVENT_HOLD(handle) ((void)0)
+#define EVENT_DROP(handle) ((void)0)
 #endif
 
 static NTSTATUS
@@ -2592,6 +2597,7 @@ _MTLSharedEvent_setWin32EventAtValue(void *obj) {
   struct unixcall_mtlsharedevent_setevent *params = obj;
   void *nt_event_handle = (shared_event_listener_t)params->event_handle;
   shared_event_listener_t q = (shared_event_listener_t)params->shared_event_listener;
+  EVENT_HOLD(nt_event_handle);
   [(id<MTLSharedEvent>)params->shared_event
       notifyListener:q->shared_listener
              atValue:params->value
@@ -2606,6 +2612,7 @@ _MTLSharedEvent_setWin32EventAtValue(void *obj) {
                  }
                  CFRunLoopPerformBlock(q->runloop_ref, kCFRunLoopCommonModes, ^{
                    NtSetEvent(nt_event_handle, NULL);
+                   EVENT_DROP(nt_event_handle);
                  });
                  CFRunLoopWakeUp(q->runloop_ref);
                }];
@@ -2626,6 +2633,7 @@ _MTLSharedEvent_setWin32EventAtValues(void *obj) {
   } *c = malloc(sizeof(*c));
   atomic_init(&c->needed, params->needed);
   atomic_init(&c->refs, params->count);
+  EVENT_HOLD(nt_event_handle);
   for (uint32_t i = 0; i < params->count; i++) {
     [(id<MTLSharedEvent>)events[i]
         notifyListener:q->shared_listener
@@ -2641,6 +2649,7 @@ _MTLSharedEvent_setWin32EventAtValues(void *obj) {
                    if (atomic_fetch_sub(&c->needed, 1) == 1) {
                      CFRunLoopPerformBlock(q->runloop_ref, kCFRunLoopCommonModes, ^{
                        NtSetEvent(nt_event_handle, NULL);
+                       EVENT_DROP(nt_event_handle);
                      });
                      CFRunLoopWakeUp(q->runloop_ref);
                    }
