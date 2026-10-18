@@ -1391,6 +1391,18 @@ WMTSetPresentHook(void (*hook)(void *cmdbuf, void *drawable)) {
   present_hook = hook;
 }
 #define PRESENT_HOOK(cmdbuf, drawable) (present_hook ? present_hook((void *)(cmdbuf), (void *)(drawable)) : (void)0)
+
+static const struct WMTWsiHooks *wsi_hooks;
+
+__attribute__((visibility("default"))) void
+WMTSetWsiHooks(const struct WMTWsiHooks *hooks) {
+  wsi_hooks = hooks;
+}
+
+__attribute__((visibility("default"))) const struct WMTWsiHooks *
+WMTGetWsiHooks(void) {
+  return wsi_hooks;
+}
 #else
 #define PRESENT_HOOK(cmdbuf, drawable) ((void)0)
 #endif

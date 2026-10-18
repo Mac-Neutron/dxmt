@@ -791,7 +791,12 @@ public:
       ReleaseSemaphore(present_semaphore_, 1, nullptr);
       presentation_count_ += 1;
       StatsFrame();  // still a frame: DXMT_STATS's per-frame figures and its 5 s reports go on
+#ifdef _WIN32
       Sleep(16);
+#else
+      if (!WMTGetWsiHooks()) // a VM host's guest sleeps for itself (its Present): never on the host's vCPU thread
+        Sleep(16);
+#endif
       return hr;
     }
 

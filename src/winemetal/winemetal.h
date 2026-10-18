@@ -2265,6 +2265,20 @@ WINEMETAL_API void WMTSetPresentHook(void (*hook)(void *cmdbuf, void *drawable))
 #if defined(DXMT_NATIVE) || !defined(_WIN32)
 /* Whether they are set: then a CPU-visible D3D12 heap is DXMT's own over one buffer of theirs (d3d12_heap.cpp). */
 WINEMETAL_API int WMTMemoryHooked(void);
+/* MacNeutron, the native build: the window system a VM host answers for its guest (Direct3D forwarding), from what the
+ * guest last told it; set before any device. Unset, the native build's window system is headless. window: a window's
+ * state (flags: 1 minimised, 2 foreground, 4 a window), 1, or 0 for one it doesn't know; display: the index-th display,
+ * 1, or 0 past the last; mode: a display's index-th mode, 0 the current one, 1, or 0 past the last. */
+struct WMTWsiWindow { uint64_t monitor; uint32_t width, height, flags; };
+struct WMTWsiDisplay { uint64_t monitor; int32_t left, top, right, bottom; uint16_t name[32]; };
+struct WMTWsiMode { uint32_t width, height, refresh_num, refresh_den; };
+struct WMTWsiHooks {
+  int (*window)(uint64_t hwnd, struct WMTWsiWindow *out);
+  int (*display)(uint32_t index, struct WMTWsiDisplay *out);
+  int (*mode)(uint64_t monitor, uint32_t index, struct WMTWsiMode *out);
+};
+WINEMETAL_API void WMTSetWsiHooks(const struct WMTWsiHooks *hooks);
+WINEMETAL_API const struct WMTWsiHooks *WMTGetWsiHooks(void); /* NULL: none */
 #endif
 
 #endif
