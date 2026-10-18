@@ -11,9 +11,17 @@ extern "C" void _massert (const char *_Message, const char *_File, unsigned _Lin
   (_massert(#_Expression,__FILE__,__LINE__),0))
 #endif
 
+#ifdef _WIN32
+#define UNIMPLEMENTED_END abort();
+#else
+// MacNeutron, the native build: a VM host's stubs catch it and fail the call, rather than lose the VM.
+#include <stdexcept>
+#define UNIMPLEMENTED_END throw std::logic_error("not implemented");
+#endif
+
 #define UNIMPLEMENTED(text)                                                                                            \
   Logger::err(str::format(__FILE__, ":", __FUNCTION__, ": ", #text, "."));                                             \
-  abort();                                                                                                             \
+  UNIMPLEMENTED_END                                                                                                    \
   __builtin_unreachable();
 
 #define UNREACHABLE                                                                                                    \
