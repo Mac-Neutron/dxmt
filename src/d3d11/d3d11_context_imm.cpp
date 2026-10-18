@@ -312,6 +312,90 @@ public:
     }
   }
 
+  // MacNeutron (IMTLD3D11ContextExt2): pieces of a dynamic buffer's or dynamic texture's memory, lent to a VM host's
+  // guest, which answers WRITE_DISCARD and WRITE_NO_OVERWRITE maps itself. A piece is one suballocation of an
+  // allocation (its id: the allocation's, DynamicBuffer::lend's, and the suballocation); an allocation's are lent in
+  // order, and it goes back to the recycling once another becomes current.
+  static UINT64 PieceId(uint64_t allocation, uint32_t suballocation) { return allocation << 16 | suballocation; }
+
+  HRESULT GetPieces(ID3D11Resource *pResource, UINT Subresource, UINT Count, MTLD3D11Piece *pPieces) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+    if (unlikely(!pResource || !pPieces))
+      return E_INVALIDARG;
+    UINT buffer_length = 0, bind_flag = 0, row_pitch = 0, depth_pitch = 0;
+    Rc<DynamicBuffer> dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag);
+    if (dynamic)
+      row_pitch = depth_pitch = buffer_length;
+    else if (!(dynamic = GetDynamicTexture(pResource, Subresource, &row_pitch, &depth_pitch)))
+      return E_NOTIMPL;
+    if (!Count) {
+      pPieces[0] = {PieceId(dynamic->immediatePiece(), dynamic->immediateSuballocation()),
+                    dynamic->immediateMappedMemory(), row_pitch, depth_pitch};
+      return S_OK;
+    }
+    auto coherent_seq_id = cmd_queue.CoherentSeqId();
+    for (UINT i = 0; i < Count;) {
+      auto [id, allocation] = dynamic->lend(coherent_seq_id);
+      for (uint32_t sub = 0; i < Count && sub < 0x10000 && allocation->hasSuballocatoin(sub); sub++, i++)
+        pPieces[i] = {PieceId(id, sub), allocation->mappedMemory(sub), row_pitch, depth_pitch};
+    }
+    return S_OK;
+  }
+
+  // The piece the guest wrote becomes the subresource's memory, as Map(WRITE_DISCARD) renames it (and a dynamic
+  // texture's Unmap uploads it). An id it never lent (nor the current allocation's) is ignored.
+  void UsePiece(ID3D11Resource *pResource, UINT Subresource, UINT64 Piece) override {
+    std::lock_guard<d3d11_device_mutex> lock(mutex);
+    if (unlikely(!pResource))
+      return;
+    UINT buffer_length = 0, bind_flag = 0, row_pitch = 0, depth_pitch = 0;
+    bool texture = false;
+    Rc<DynamicBuffer> dynamic = GetDynamicBuffer(pResource, &buffer_length, &bind_flag);
+    if (!dynamic) {
+      if (!(dynamic = GetDynamicTexture(pResource, Subresource, &row_pitch, &depth_pitch)))
+        return;
+      texture = true;
+    }
+    uint64_t id = Piece >> 16;
+    uint32_t sub = Piece & 0xffff;
+    if (id == dynamic->immediatePiece()) {
+      if (!dynamic->immediateName()->hasSuballocatoin(sub))
+        return;
+      dynamic->useImmediateSuballocation(sub);
+      EmitST([allocation = dynamic->immediateName(), sub](ArgumentEncodingContext &enc) mutable {
+        allocation->useSuballocation(sub);
+      });
+    } else {
+      Rc<BufferAllocation> lent = dynamic->takeLent(id);
+      if (!lent)
+        return;
+      if (!lent->hasSuballocatoin(sub))
+        sub = 0;
+      dynamic->updateImmediateName(cmd_queue.CurrentSeqId(), std::move(lent), sub, false);
+      dynamic->setImmediatePiece(id);
+      EmitST([allocation = dynamic->immediateName(), sub,
+              buffer = Rc(dynamic->buffer)](ArgumentEncodingContext &enc) mutable {
+        allocation->useSuballocation(sub);
+        auto _ = buffer->rename(forward_rc(allocation));
+      });
+    }
+    if (texture) {
+      for (auto &stage : state_.ShaderStages)
+        stage.SRVs.set_dirty();
+      BlitObject blit(device, pResource);
+      UpdateTexture(TextureUpdateCommand(blit, Subresource, nullptr), dynamic->buffer, row_pitch, depth_pitch);
+      return;
+    }
+    if (bind_flag & D3D11_BIND_VERTEX_BUFFER)
+      state_.InputAssembler.VertexBuffers.set_dirty();
+    if (bind_flag & D3D11_BIND_CONSTANT_BUFFER)
+      for (auto &stage : state_.ShaderStages)
+        stage.ConstantBuffers.set_dirty();
+    if (bind_flag & D3D11_BIND_SHADER_RESOURCE)
+      for (auto &stage : state_.ShaderStages)
+        stage.SRVs.set_dirty();
+  }
+
   void
   STDMETHODCALLTYPE
   Begin(ID3D11Asynchronous *pAsync) override {

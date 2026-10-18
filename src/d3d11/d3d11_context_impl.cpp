@@ -645,7 +645,8 @@ public:
       return S_OK;
     }
 
-    if (riid == __uuidof(IMTLD3D11ContextExt) || riid == __uuidof(IMTLD3D11ContextExt1)) {
+    if (riid == __uuidof(IMTLD3D11ContextExt) || riid == __uuidof(IMTLD3D11ContextExt1) ||
+        riid == __uuidof(IMTLD3D11ContextExt2)) {
       *ppvObject = ref(&ext_);
       return S_OK;
     }
@@ -5154,6 +5155,13 @@ public:
 
 #pragma endregion
 
+public:
+  // IMTLD3D11ContextExt2's (MacNeutron): the immediate context's; a deferred one has none.
+  virtual HRESULT GetPieces(ID3D11Resource *pResource, UINT Subresource, UINT Count, MTLD3D11Piece *pPieces) {
+    return E_NOTIMPL;
+  }
+  virtual void UsePiece(ID3D11Resource *pResource, UINT Subresource, UINT64 Piece) {}
+
 protected:
   D3D11ContextState state_;
   D3D11UserDefinedAnnotation annotation_;
@@ -5184,7 +5192,7 @@ public:
 };
 
 template <typename ContextInternalState>
-class MTLD3D11ContextExt : public IMTLD3D11ContextExt1 {
+class MTLD3D11ContextExt : public IMTLD3D11ContextExt2 {
   class CachedTemporalScaler {
   public:
     WMTPixelFormat color_pixel_format;
@@ -5201,6 +5209,15 @@ class MTLD3D11ContextExt : public IMTLD3D11ContextExt1 {
   };
 public:
   MTLD3D11ContextExt(MTLD3D11DeviceContextImplBase<ContextInternalState> *context) : ctx_(context){};
+
+  HRESULT STDMETHODCALLTYPE GetPieces(ID3D11Resource *pResource, UINT Subresource, UINT Count,
+                                      MTLD3D11Piece *pPieces) final {
+    return ctx_->GetPieces(pResource, Subresource, Count, pPieces);
+  }
+
+  void STDMETHODCALLTYPE UsePiece(ID3D11Resource *pResource, UINT Subresource, UINT64 Piece) final {
+    ctx_->UsePiece(pResource, Subresource, Piece);
+  }
 
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
                                            void **ppvObject) final {
