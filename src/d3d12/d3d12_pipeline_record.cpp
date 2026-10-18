@@ -242,7 +242,9 @@ RecordingPath() {
       folder = "Z:" + folder; // the launcher passes a Mac path; Wine's Z: drive is the Mac's root
     std::wstring wide = str::tows(folder.c_str());
     CreateDirectoryW(wide.c_str(), nullptr); // may exist; any other failure shows when the file doesn't open
-    return wide + L"\\" + str::tows(env::getCacheExeName().c_str()) + L".pipelines";
+    // MacNeutron: natively (a VM host's) the program has no name: "game", one game a VM
+    std::string exe = env::getCacheExeName();
+    return wide + L"\\" + str::tows(exe.empty() ? "game" : exe.c_str()) + L".pipelines";
   }();
   return path;
 }

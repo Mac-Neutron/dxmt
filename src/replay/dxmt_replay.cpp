@@ -22,6 +22,7 @@
 #include "d3d12_pipeline_record.hpp"
 #include "log/log.hpp"
 #include <windows.h>
+#include "util_win32_compat.h" // natively, the Win32 calls it makes (win32_native.h)
 #include <d3d12.h>
 #include <algorithm>
 #include <atomic>
@@ -75,7 +76,11 @@ wmain(int argc, wchar_t **argv) {
   }
   // DXMT loads only now, after DXMT_CACHE_EXE is set: dxgi.dll picks the Metal cache folder as it loads.
   using CreateDevice = HRESULT(WINAPI *)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
+#ifdef _WIN32
   HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
+#else
+  HMODULE d3d12 = LoadLibraryW(L"@executable_path/d3d12.dylib"); // MacNeutron: native DXMT beside it
+#endif
   auto create = d3d12 ? reinterpret_cast<CreateDevice>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
   ID3D12Device *device = nullptr;
   if (!create || FAILED(create(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), (void **)&device))) {
