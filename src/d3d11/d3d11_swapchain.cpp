@@ -739,9 +739,19 @@ public:
     }
   };
 
+  // MacNeutron: a VM host's guest paces its frames (its own frame latency object and fence), so the host's vCPU never
+  // waits for the GPU here; the chunks' backpressure stays.
+  static bool GuestPaces() {
+#ifdef _WIN32
+    return false;
+#else
+    return WMTGetWsiHooks() != nullptr;
+#endif
+  }
+
   SyncFrameState SyncFrame(uint64_t current_frame_id) {
     if (frame_latency_fence_) {
-      if (current_frame_id > frame_latency)
+      if (current_frame_id > frame_latency && !GuestPaces())
         frame_latency_fence_->wait(current_frame_id - frame_latency);
       return SyncFrameState(current_frame_id, frame_latency_fence_.get());
     }
@@ -827,7 +837,7 @@ public:
 
     lock.unlock(); // since PresentBoundary() will and should only stall current thread
 
-    cmd_queue.PresentBoundary();
+    cmd_queue.PresentBoundary(!GuestPaces());
 
     return hr;
   };

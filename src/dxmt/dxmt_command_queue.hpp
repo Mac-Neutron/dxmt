@@ -257,13 +257,14 @@ public:
     return statistics.at(frame_count);
   }
 
+  // wait: false, a VM host's (its guest paces the frames): the frame isn't waited for here
   void
-  PresentBoundary() {
+  PresentBoundary(bool wait = true) {
     statistics.compute(frame_count);
     frame_count++;
     statistics.at(frame_count).reset();
     // After present N-th frame (N starts from 1), wait for (N - max_latency)-th frame to finish rendering 
-    if (likely(frame_count > max_latency_)) {
+    if (wait && likely(frame_count > max_latency_)) {
       auto t0 = clock::now();
       frame_latency_fence_.wait(frame_count - max_latency_);
       auto t1 = clock::now();
