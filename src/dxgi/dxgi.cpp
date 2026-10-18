@@ -9,9 +9,9 @@ namespace dxmt {
 Logger Logger::s_instance("dxgi.log");
 
 VendorExtension g_extension_enabled = VendorExtension::None;
+std::once_flag nvext_init;
 
 #ifdef _WIN32
-std::once_flag nvext_init;
 
 static void InitializeVendorExtensionNV() {
 #ifdef __i386__
@@ -75,6 +75,16 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason,
 
 #endif
 
+#ifndef _WIN32
+// At load, before the logger's own static object may be: no log line.
+__attribute__((constructor)) static void InitializeVendorExtensionNVNative() {
+  std::call_once(nvext_init, [] {
+    if (env::getEnvVar("DXMT_ENABLE_NVEXT") == "1")
+      g_extension_enabled = VendorExtension::Nvidia;
+  });
+}
+#endif
+
 extern "C" HRESULT __stdcall DXGIGetDebugInterface1(UINT Flags, REFIID riid,
                                                     void **ppDebug) {
 #ifdef _WIN32
@@ -83,6 +93,11 @@ extern "C" HRESULT __stdcall DXGIGetDebugInterface1(UINT Flags, REFIID riid,
     std::call_once(nvext_init, InitializeVendorExtensionNV);
     return g_extension_enabled == VendorExtension::Nvidia ? S_OK : E_NOINTERFACE;
   }
+#else
+  // MacNeutron, the native build (a VM host's): the extension from DXMT_ENABLE_NVEXT=1 alone, at load as DllMain has it;
+  // the registry keys NVIDIA's loader reads are its guest's.
+  if (riid == DXMT_NVEXT_GUID)
+    return g_extension_enabled == VendorExtension::Nvidia ? S_OK : E_NOINTERFACE;
 #endif
 
   return E_NOINTERFACE;
