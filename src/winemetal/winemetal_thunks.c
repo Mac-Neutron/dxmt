@@ -1442,4 +1442,11 @@ WMTMemoryFree(void *ptr) {
   WMT_MEMPTR_SET(params.ptr, ptr);
   UNIX_CALL(154, &params);
 }
+
+WINEMETAL_API uint32_t
+WMTForward(uint32_t call, void *params) {
+  if (call != 155)
+    return 0xC000000D; /* STATUS_INVALID_PARAMETER: winemetal's own calls aren't forwarded, and none is past 155 */
+  return WINE_UNIX_CALL(call, params);
+}
 #endif

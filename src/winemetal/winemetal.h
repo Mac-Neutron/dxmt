@@ -2245,6 +2245,10 @@ WINEMETAL_API void MTLTexture_getBytes(
  * made over it is gone. */
 WINEMETAL_API void *WMTMemoryAlloc(uint64_t length);
 WINEMETAL_API void WMTMemoryFree(void *ptr);
+/* A call of the guest winemetal.so's past winemetal's own (155: Direct3D forwarding's), for a DLL with no unix lib of
+ * its own (the VM's mnd3d.dll): its NTSTATUS. STATUS_INVALID_PARAMETER for any other call (winemetal's own, or past
+ * the guest's table). */
+WINEMETAL_API uint32_t WMTForward(uint32_t call, void *params);
 #endif
 
 #ifdef DXMT_NATIVE
