@@ -2267,15 +2267,35 @@ WINEMETAL_API void WMTSetPresentHook(void (*hook)(void *cmdbuf, void *drawable))
 WINEMETAL_API int WMTMemoryHooked(void);
 /* MacNeutron, the native build: the window system a VM host answers for its guest (Direct3D forwarding), from what the
  * guest last told it; set before any device. Unset, the native build's window system is headless. window: a window's
- * state (flags: 1 minimised, 2 foreground, 4 a window), 1, or 0 for one it doesn't know; display: the index-th display,
- * 1, or 0 past the last; mode: a display's index-th mode, 0 the current one, 1, or 0 past the last. */
+ * state (flags: 1 minimised, 2 foreground, 4 a window, 8 its process in front; hwnd 0: any of the caller's), 1, or 0
+ * for one it doesn't know; display: the index-th display, 1, or 0 past the last; mode: a display's index-th mode, 0 the
+ * current one, 1, or 0 past the last; action: a change to a window or a display's mode that DXMT makes, for the guest
+ * to make (it does nothing natively): WMTWsiAction's kind is the wsi function's, its other members that function's
+ * arguments (arg: enterFullscreenMode's modeSwitch, leaveFullscreenMode's restoreCoordinates,
+ * updateFullscreenWindow's forceTopmost; the mode: setWindowMode's, or resizeWindow's width and height). */
 struct WMTWsiWindow { uint64_t monitor; uint32_t width, height, flags; };
 struct WMTWsiDisplay { uint64_t monitor; int32_t left, top, right, bottom; uint16_t name[32]; };
 struct WMTWsiMode { uint32_t width, height, refresh_num, refresh_den; };
+enum {
+  WMTWsiSaveWindowState = 1,
+  WMTWsiSetWindowMode,
+  WMTWsiEnterFullscreenMode,
+  WMTWsiLeaveFullscreenMode,
+  WMTWsiRestoreDisplayMode,
+  WMTWsiResizeWindow,
+  WMTWsiUpdateFullscreenWindow,
+  WMTWsiMinimizeWindow,
+};
+struct WMTWsiAction {
+  uint32_t kind, arg;
+  uint64_t hwnd, monitor;
+  uint32_t width, height, refresh_num, refresh_den, bits_per_pixel, interlaced;
+};
 struct WMTWsiHooks {
   int (*window)(uint64_t hwnd, struct WMTWsiWindow *out);
   int (*display)(uint32_t index, struct WMTWsiDisplay *out);
   int (*mode)(uint64_t monitor, uint32_t index, struct WMTWsiMode *out);
+  void (*action)(const struct WMTWsiAction *action);
 };
 WINEMETAL_API void WMTSetWsiHooks(const struct WMTWsiHooks *hooks);
 WINEMETAL_API const struct WMTWsiHooks *WMTGetWsiHooks(void); /* NULL: none */
