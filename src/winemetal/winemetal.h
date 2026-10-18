@@ -2258,6 +2258,9 @@ WINEMETAL_API uint32_t WMTForward(uint32_t call, void *params);
  * Unset, Metal's own memory. */
 WINEMETAL_API void WMTSetMemoryHooks(void *(*alloc)(uint64_t length, void *ctx), void (*free)(void *ptr, void *ctx),
                                      void *ctx);
+/* MacNeutron, the native build: hook(cmdbuf, drawable) runs before each presentDrawable (and its after-minimum-duration
+ * form) on the presenting thread: the VM host's frame probe and count. NULL: none. */
+WINEMETAL_API void WMTSetPresentHook(void (*hook)(void *cmdbuf, void *drawable));
 #endif
 #if defined(DXMT_NATIVE) || !defined(_WIN32)
 /* Whether they are set: then a CPU-visible D3D12 heap is DXMT's own over one buffer of theirs (d3d12_heap.cpp). */

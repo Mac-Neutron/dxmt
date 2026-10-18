@@ -1383,9 +1383,22 @@ _MTLBuffer_didModifyRange(void *obj) {
   return STATUS_SUCCESS;
 }
 
+#ifdef DXMT_NATIVE
+static void (*present_hook)(void *cmdbuf, void *drawable);
+
+__attribute__((visibility("default"))) void
+WMTSetPresentHook(void (*hook)(void *cmdbuf, void *drawable)) {
+  present_hook = hook;
+}
+#define PRESENT_HOOK(cmdbuf, drawable) (present_hook ? present_hook((void *)(cmdbuf), (void *)(drawable)) : (void)0)
+#else
+#define PRESENT_HOOK(cmdbuf, drawable) ((void)0)
+#endif
+
 static NTSTATUS
 _MTLCommandBuffer_presentDrawable(void *obj) {
   struct unixcall_generic_obj_obj_noret *params = obj;
+  PRESENT_HOOK(params->handle, params->arg);
   [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg];
   return STATUS_SUCCESS;
 }
@@ -1393,6 +1406,7 @@ _MTLCommandBuffer_presentDrawable(void *obj) {
 static NTSTATUS
 _MTLCommandBuffer_presentDrawableAfterMinimumDuration(void *obj) {
   struct unixcall_generic_obj_obj_double_noret *params = obj;
+  PRESENT_HOOK(params->handle, params->arg0);
   [(id<MTLCommandBuffer>)params->handle presentDrawable:(id<MTLDrawable>)params->arg0
                                    afterMinimumDuration:params->arg1];
   return STATUS_SUCCESS;
@@ -1805,13 +1819,17 @@ _CreateMetalViewFromHWND(void *obj) {
   if (pfn_get_win_data && pfn_release_win_data && pfn_macdrv_view_create_metal_view &&
       pfn_macdrv_view_get_metal_layer) {
     struct macdrv_win_data *win_data = pfn_get_win_data((HWND)params->hwnd);
-    macdrv_metal_view view =
-        pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view, (macdrv_metal_device)params->device);
+    /* MacNeutron: no window data, or no view in it (a window the driver doesn't know): no view, as without a driver */
+    macdrv_metal_view view = win_data && win_data->client_cocoa_view
+                                 ? pfn_macdrv_view_create_metal_view(win_data->client_cocoa_view,
+                                                                     (macdrv_metal_device)params->device)
+                                 : NULL;
     params->ret_view = (obj_handle_t)view;
     if (view) {
       params->ret_layer = (obj_handle_t)pfn_macdrv_view_get_metal_layer(view);
     }
-    pfn_release_win_data(win_data);
+    if (win_data)
+      pfn_release_win_data(win_data);
   }
 
   return STATUS_SUCCESS;
