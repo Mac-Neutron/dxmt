@@ -2247,4 +2247,13 @@ WINEMETAL_API void *WMTMemoryAlloc(uint64_t length);
 WINEMETAL_API void WMTMemoryFree(void *ptr);
 #endif
 
+#ifdef DXMT_NATIVE
+/* MacNeutron, the native build: where a CPU-visible buffer's memory comes from when it brings none of its own. With
+ * hooks set (the VM host, before any device), alloc gives whole 16 KiB pages, page-aligned, in memory a VM's guest
+ * shares; free runs once Metal lets the buffer go. NULL from alloc fails the buffer, as running out of memory does.
+ * Unset, Metal's own memory. */
+WINEMETAL_API void WMTSetMemoryHooks(void *(*alloc)(uint64_t length, void *ctx), void (*free)(void *ptr, void *ctx),
+                                     void *ctx);
+#endif
+
 #endif

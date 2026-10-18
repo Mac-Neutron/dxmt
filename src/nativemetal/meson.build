@@ -17,7 +17,9 @@ winemetal_dll = shared_library('winemetal', winemetal_src,
   name_prefix         : '',
   dependencies        : [ airconv_dep_darwin ],
   include_directories : [ dxmt_include_path, include_directories('.') ],
-  c_args              : ['-ObjC', '-DDXMT_NATIVE=1'],
+  # The Wine build's winemetal.so defines the same classes: both load in the VM host (macneutron-vm).
+  c_args              : ['-ObjC', '-DDXMT_NATIVE=1', '-DCacheReader=DXMTNativeCacheReader',
+                         '-DCacheWriter=DXMTNativeCacheWriter'],
   link_args           : winemetal_ld_args,
   build_rpath         : '@loader_path/:@loader_path/../../',
 )

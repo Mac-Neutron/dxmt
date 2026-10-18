@@ -17,6 +17,7 @@
 #define MN_WIN32_SEMAPHORE 0x6d657373u
 #define MN_WIN32_FILE 0x656c6966u
 #define MN_WIN32_THREAD 0x64726874u
+#define MN_WIN32_RELAY 0x79616c72u
 
 struct mn_win32_handle {
   uint32_t kind;
@@ -30,13 +31,16 @@ struct mn_win32_handle {
   int fd;
   /* threads (OpenThread): the thread's id */
   uint64_t tid;
+  /* relays: what SetEvent calls instead of waking waiters */
+  void (*relay)(void *ctx);
+  void *relay_ctx;
 };
 
 static inline int mn_win32_is_handle(void *h) {
   struct mn_win32_handle *o = (struct mn_win32_handle *)h;
   return o && h != (void *)(intptr_t)-1 && h != (void *)(intptr_t)-2 &&
          (o->kind == MN_WIN32_EVENT || o->kind == MN_WIN32_SEMAPHORE || o->kind == MN_WIN32_FILE ||
-          o->kind == MN_WIN32_THREAD);
+          o->kind == MN_WIN32_THREAD || o->kind == MN_WIN32_RELAY);
 }
 
 /* Another reference to h: a fence's listener holds the event it will set, as the Windows kernel does, so the program
@@ -52,7 +56,7 @@ static inline int mn_win32_unref(void *h) {
   if (__atomic_fetch_sub(&o->refs, 1, __ATOMIC_ACQ_REL) != 1) return 1;
   if (o->kind == MN_WIN32_FILE) {
     close(o->fd);
-  } else if (o->kind != MN_WIN32_THREAD) {
+  } else if (o->kind != MN_WIN32_THREAD && o->kind != MN_WIN32_RELAY) {
     pthread_mutex_destroy(&o->m);
     pthread_cond_destroy(&o->c);
   }
@@ -61,10 +65,24 @@ static inline int mn_win32_unref(void *h) {
   return 1;
 }
 
-/* Sets h if it is an event: 1, else 0. */
+/* An event whose SetEvent calls fn(ctx) on the setter's thread instead of waking waiters (it can't be waited on): how
+ * a host that holds DXMT learns a fence's completion. CloseHandle frees it. */
+static inline void *mn_win32_relay_event(void (*fn)(void *ctx), void *ctx) {
+  struct mn_win32_handle *o = (struct mn_win32_handle *)calloc(1, sizeof *o);
+  if (!o) return 0;
+  o->kind = MN_WIN32_RELAY, o->refs = 1, o->fd = -1, o->relay = fn, o->relay_ctx = ctx;
+  return o;
+}
+
+/* Sets h if it is an event, or calls a relay's function: 1, else 0. */
 static inline int mn_win32_set_event(void *h) {
   struct mn_win32_handle *o = (struct mn_win32_handle *)h;
-  if (!o || h == (void *)(intptr_t)-1 || h == (void *)(intptr_t)-2 || o->kind != MN_WIN32_EVENT) return 0;
+  if (!o || h == (void *)(intptr_t)-1 || h == (void *)(intptr_t)-2) return 0;
+  if (o->kind == MN_WIN32_RELAY) {
+    o->relay(o->relay_ctx);
+    return 1;
+  }
+  if (o->kind != MN_WIN32_EVENT) return 0;
   pthread_mutex_lock(&o->m);
   o->count = 1;
   pthread_cond_broadcast(&o->c);

@@ -152,12 +152,56 @@ _MTLCommandBuffer_encodeSignalEvent(void *obj) {
   return STATUS_SUCCESS;
 }
 
+#ifdef DXMT_NATIVE
+static void *(*memory_alloc)(uint64_t length, void *ctx);
+static void (*memory_free)(void *ptr, void *ctx);
+static void *memory_ctx;
+
+__attribute__((visibility("default"))) void
+WMTSetMemoryHooks(void *(*alloc)(uint64_t length, void *ctx), void (*free)(void *ptr, void *ctx), void *ctx) {
+  memory_alloc = alloc, memory_free = free, memory_ctx = ctx;
+}
+
+/* A CPU-visible buffer over the hooks' memory (whole pages, as newBufferWithBytesNoCopy takes them); nil if they gave
+ * none. */
+static id<MTLBuffer>
+hooked_buffer(id<MTLDevice> device, struct WMTBufferInfo *info) {
+  uint64_t page = 16384, length = (info->length + page - 1) / page * page;
+  void *ptr = memory_alloc(length, memory_ctx);
+  if (!ptr)
+    return nil;
+  void (*release)(void *, void *) = memory_free;
+  void *ctx = memory_ctx;
+  id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:ptr
+                                                   length:length
+                                                  options:(enum MTLResourceOptions)info->options
+                                              deallocator:^(void *p, NSUInteger n) {
+                                                (void)n;
+                                                release(p, ctx);
+                                              }];
+  if (!buffer)
+    release(ptr, ctx);
+  else
+    info->memory.ptr = ptr;
+  return buffer;
+}
+#endif
+
 static NTSTATUS
 _MTLDevice_newBuffer(void *obj) {
   struct unixcall_mtldevice_newbuffer *params = obj;
   id<MTLDevice> device = (id<MTLDevice>)params->device;
   struct WMTBufferInfo *info = params->info.ptr;
   id<MTLBuffer> buffer;
+#ifdef DXMT_NATIVE
+  enum MTLStorageMode storage = (enum MTLStorageMode)((info->options >> MTLResourceStorageModeShift) & 0xf);
+  if (!info->memory.ptr && memory_alloc && storage != MTLStorageModePrivate && storage != MTLStorageModeMemoryless) {
+    buffer = hooked_buffer(device, info);
+    params->ret = (obj_handle_t)buffer;
+    info->gpu_address = buffer ? [buffer gpuAddress] : 0;
+    return STATUS_SUCCESS;
+  }
+#endif
   if (info->memory.ptr) {
     buffer = [device newBufferWithBytesNoCopy:info->memory.ptr
                                        length:info->length
