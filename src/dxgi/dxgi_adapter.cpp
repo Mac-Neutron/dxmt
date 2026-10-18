@@ -153,7 +153,10 @@ public:
           sizeof(pDesc->Description) / sizeof(pDesc->Description[0]) - 1,
           options_.customDeviceDesc.c_str(), options_.customDeviceDesc.size());
     } else {
-      device_.name().getCString((char *)pDesc->Description, sizeof(pDesc->Description), WMTUTF16StringEncoding);
+      // MacNeutron: the native build's WCHAR is wchar_t, 4 bytes: UTF-32 there, UTF-16 in the PE build.
+      device_.name().getCString((char *)pDesc->Description, sizeof(pDesc->Description),
+                                sizeof(pDesc->Description[0]) == 4 ? WMTUTF32LittleEndianStringEncoding
+                                                                    : WMTUTF16StringEncoding);
     }
 
     if (options_.customVendorId >= 0) {
