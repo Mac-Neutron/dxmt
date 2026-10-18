@@ -34,10 +34,18 @@
 #include "log/log.hpp"
 #include "util_win32_compat.h"
 
+#ifdef _WIN32
+#define IMPLEMENT_ME_END abort();
+#else
+// MacNeutron, the native build: a VM host's stubs catch it and fail the call, rather than lose the VM.
+#include <stdexcept>
+#define IMPLEMENT_ME_END throw std::logic_error("not implemented");
+#endif
+
 #define IMPLEMENT_ME                                                                                                   \
   do {                                                                                                                 \
     Logger::err(str::format(__FILE__, ":", __FUNCTION__, "(", __LINE__, ") is not implemented."));                     \
-    abort();                                                                                                           \
+    IMPLEMENT_ME_END                                                                                                   \
     __builtin_unreachable();                                                                                           \
   } while (0);
 
