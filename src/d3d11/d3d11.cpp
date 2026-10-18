@@ -24,6 +24,7 @@
 #include "log/log.hpp"
 #include "util_string.hpp"
 #include "dxmt_capture.hpp"
+#include "dxmt_tasks.hpp"
 #include <exception>
 
 namespace dxmt {
@@ -238,6 +239,15 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
   return TRUE;
 }
 
+#endif
+
+#ifndef _WIN32
+// MacNeutron: a VM host waits here, before a guest process's objects go, until D3D11's compiles (each device's
+// pipeline cache's tasks, which its shaders and pipelines own) are done, at most 10 s: 1 if they were.
+extern "C" int
+MTLD3D11WaitIdle(void) {
+  return dxmt::wait_schedulers_idle(10000) ? 1 : 0;
+}
 #endif
 
 extern "C" void _massert(const char *_Message, const char *_File,

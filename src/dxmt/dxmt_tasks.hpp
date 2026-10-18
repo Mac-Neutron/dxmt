@@ -14,9 +14,34 @@ template <typename Task> struct task_trait {
   void set_done(Task task);
 };
 
-template <typename Task> class task_scheduler {
+// MacNeutron: the process's schedulers, so a VM host can wait until none holds or runs a task before it releases what
+// their tasks use (a guest process's end: its shaders and pipelines own their compile tasks).
+class task_scheduler_base {
+public:
+  virtual bool idle() = 0;
+
+protected:
+  void enlist();
+  void delist();
+  ~task_scheduler_base() = default;
+};
+// Until every scheduler of the process is idle, at most timeout_ms: whether they all were.
+bool wait_schedulers_idle(unsigned timeout_ms);
+
+template <typename Task> class task_scheduler : public task_scheduler_base {
 public:
   void submit(Task task);
+
+  bool
+  idle() override {
+    {
+      std::unique_lock<dxmt::mutex> lock(worker_mutex_);
+      if (!task_queue_.empty() || !task_continuation_queue_.empty() || running.load())
+        return false;
+    }
+    std::unique_lock<dxmt::mutex> lock(deps_mutex_);
+    return task_continuation_.empty();
+  }
 
   task_scheduler();
   ~task_scheduler();
@@ -53,9 +78,11 @@ template <typename Task> task_scheduler<Task>::task_scheduler() {
   for (unsigned i = 0; i < threads; i++) {
     workers_.emplace_back([this]() { worker_func(); });
   }
+  enlist();
 }
 
 template <typename Task> task_scheduler<Task>::~task_scheduler() {
+  delist();
   destroyed.store(true);
   worker_cond_.notify_all();
 
@@ -93,8 +120,8 @@ task_scheduler<Task>::worker_func() {
       } else {
         break;
       }
+      running.fetch_add(1, std::memory_order_relaxed); // under the lock: idle() never sees a task between queue and run
     }
-    running.fetch_add(1, std::memory_order_relaxed);
     while (true) {
       Task continuation = task_trait.run_task(task);
       if (continuation == task) {
