@@ -84,6 +84,14 @@ public:
     if (!size_aligned)
       return E_INVALIDARG;
 
+#ifndef _WIN32 // the native build
+    if (!IsPrivateHeap(&desc_.Properties) && WMTMemoryHooked()) {
+      cpu_buffer = new Buffer(size_aligned, device_->GetMTLDevice());
+      cpu_buffer->rename(cpu_buffer->allocate({}));
+      cpu_memory = cpu_buffer->current()->mappedMemory(0);
+      return cpu_memory ? S_OK : E_OUTOFMEMORY;
+    }
+#endif
     WMTHeapInfo info;
     info.options = IsPrivateHeap(&desc_.Properties) ? WMTResourceStorageModePrivate : WMTResourceOptions{};
     info.size = size_aligned;

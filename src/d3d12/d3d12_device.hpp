@@ -141,6 +141,10 @@ public:
 class MTLD3D12Heap : public ID3D12Heap {
 public:
   WMT::Reference<WMT::Heap> heap;
+  // MacNeutron, the native build with memory hooks (a VM host): a CPU-visible heap is no MTLHeap but one buffer's
+  // memory from the hooks, which a VM's guest shares; its placed buffers are buffers over it (d3d12_buffer.cpp).
+  Rc<Buffer> cpu_buffer;
+  void *cpu_memory = nullptr;
 
   virtual void AddRefPrivate() = 0;
   virtual void ReleasePrivate() = 0;

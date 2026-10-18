@@ -248,6 +248,10 @@ public:
     Flags<TextureAllocationFlag> flags = {};
     if (IsPrivateHeap(&heap_props_)) // committed, or placed on a heap with these properties
       flags.set(TextureAllocationFlag::CpuInvisible);
+    if (pHeap && pHeap->cpu_memory) {
+      ERR("CreatePlacedResource: a texture in a CPU-visible heap is not supported with memory hooks");
+      return E_INVALIDARG;
+    }
     if (pHeap) {
       texture->rename(texture->allocate(flags, pHeap->heap, HeapOffset));
       heap_ = pHeap;

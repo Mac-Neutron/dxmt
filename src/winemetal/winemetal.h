@@ -2255,5 +2255,9 @@ WINEMETAL_API void WMTMemoryFree(void *ptr);
 WINEMETAL_API void WMTSetMemoryHooks(void *(*alloc)(uint64_t length, void *ctx), void (*free)(void *ptr, void *ctx),
                                      void *ctx);
 #endif
+#if defined(DXMT_NATIVE) || !defined(_WIN32)
+/* Whether they are set: then a CPU-visible D3D12 heap is DXMT's own over one buffer of theirs (d3d12_heap.cpp). */
+WINEMETAL_API int WMTMemoryHooked(void);
+#endif
 
 #endif

@@ -64,7 +64,10 @@ public:
     Flags<BufferAllocationFlag> flags;
     if (pHeap && IsPrivateHeap(&heap_props_)) // committed buffers stay Shared
       flags.set(BufferAllocationFlag::CpuInvisible);
-    if (pHeap) {
+    if (pHeap && pHeap->cpu_memory) {
+      buffer->rename(buffer->allocate_over(flags, (char *)pHeap->cpu_memory + Offset));
+      heap_ = pHeap;
+    } else if (pHeap) {
       buffer->rename(buffer->allocate(flags, pHeap->heap, Offset));
       heap_ = pHeap;
     } else {

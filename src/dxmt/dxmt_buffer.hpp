@@ -185,6 +185,9 @@ public:
 
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags);
   Rc<BufferAllocation> allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t heap_offset);
+  // MacNeutron: over memory it doesn't own (a CPU-visible heap's, natively with memory hooks): no heap's buffer, so in
+  // the device's residency set itself.
+  Rc<BufferAllocation> allocate_over(Flags<BufferAllocationFlag> flags, void *memory);
 
   Rc<BufferAllocation> rename(Rc<BufferAllocation> &&newAllocation);
 

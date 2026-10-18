@@ -216,6 +216,17 @@ Buffer::allocate(Flags<BufferAllocationFlag> flags, WMT::Heap heap, uint64_t hea
 };
 
 Rc<BufferAllocation>
+Buffer::allocate_over(Flags<BufferAllocationFlag> flags, void *memory) {
+  WMTBufferInfo info;
+  info.memory.set(memory);
+  info.length = align(length_, 16384ull); // newBufferWithBytesNoCopy takes whole pages
+  info.options = WMTResourceHazardTrackingModeUntracked;
+  if (flags.test(BufferAllocationFlag::CpuWriteCombined))
+    info.options |= WMTResourceOptionCPUCacheModeWriteCombined;
+  return new BufferAllocation(device_, info, flags);
+}
+
+Rc<BufferAllocation>
 Buffer::rename(Rc<BufferAllocation> &&newAllocation) {
   Rc<BufferAllocation> old = std::move(current_);
   current_ = std::move(newAllocation);

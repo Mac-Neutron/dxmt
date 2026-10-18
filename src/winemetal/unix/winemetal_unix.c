@@ -162,6 +162,11 @@ WMTSetMemoryHooks(void *(*alloc)(uint64_t length, void *ctx), void (*free)(void 
   memory_alloc = alloc, memory_free = free, memory_ctx = ctx;
 }
 
+__attribute__((visibility("default"))) int
+WMTMemoryHooked(void) {
+  return memory_alloc != NULL;
+}
+
 /* A CPU-visible buffer over the hooks' memory (whole pages, as newBufferWithBytesNoCopy takes them); nil if they gave
  * none. */
 static id<MTLBuffer>
