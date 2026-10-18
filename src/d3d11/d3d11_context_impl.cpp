@@ -645,11 +645,18 @@ public:
       return S_OK;
     }
 
-    if (riid == __uuidof(IMTLD3D11ContextExt) || riid == __uuidof(IMTLD3D11ContextExt1) ||
-        riid == __uuidof(IMTLD3D11ContextExt2)) {
+    if (riid == __uuidof(IMTLD3D11ContextExt) || riid == __uuidof(IMTLD3D11ContextExt1)) {
       *ppvObject = ref(&ext_);
       return S_OK;
     }
+
+#ifndef _WIN32
+    // MacNeutron: a VM host's pieces (IMTLD3D11ContextExt2), the native build's only.
+    if (riid == __uuidof(IMTLD3D11ContextExt2)) {
+      *ppvObject = ref(&ext_);
+      return S_OK;
+    }
+#endif
 
     if (riid == __uuidof(ID3DUserDefinedAnnotation)) {
       *ppvObject = ref(&annotation_);
