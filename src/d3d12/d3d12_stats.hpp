@@ -8,6 +8,15 @@ namespace dxmt {
 // <folder>/stats.txt every 5 seconds of presents, and once at exit: calls and microseconds per frame of each call,
 // the time each thread spends in D3D12 (outermost calls only), counters such as encoder boundaries with no barrier,
 // and Metal encoders labelled "pass-<n> <kind>" (n counts as F9's passes.txt does) for Instruments. Off: one branch.
+#ifdef DXMT_PERF_BUILD // MacNeutron's performance build: no stats, every call site's branch compiled out
+constexpr bool g_stats_on = false;
+inline unsigned StatId(const char *) { return 0; }
+inline void StatCount(unsigned, uint64_t = 1) {}
+inline void StatsFrame() {}
+inline unsigned StatsNextPass() { return 0; }
+inline uint64_t StatBegin() { return 0; }
+inline void StatEnd(unsigned, uint64_t) {}
+#else
 extern bool g_stats_on;
 
 unsigned StatId(const char *name); // registers a name; call sites keep the id in a static
@@ -16,6 +25,7 @@ void StatsFrame();         // at each present
 unsigned StatsNextPass(); // numbers encoders from 0 at each present, as passes.txt does
 uint64_t StatBegin();
 void StatEnd(unsigned id, uint64_t t0);
+#endif
 
 struct StatScope {
   unsigned id;
@@ -29,6 +39,10 @@ struct StatScope {
 
 } // namespace dxmt
 
+#ifdef DXMT_PERF_BUILD
+#define DXMT_STAT_SCOPE(name) ((void)0)
+#define DXMT_STAT_COUNT(name, n) ((void)0)
+#else
 #define DXMT_STAT_SCOPE(name)                                                                                          \
   static const unsigned dxmt_stat_id_ = ::dxmt::StatId(name);                                                          \
   ::dxmt::StatScope dxmt_stat_scope_(dxmt_stat_id_)
@@ -39,3 +53,4 @@ struct StatScope {
       ::dxmt::StatCount(dxmt_stat_id_, n);                                                                             \
     }                                                                                                                  \
   } while (0)
+#endif

@@ -41,9 +41,15 @@ public:
   Logger(const std::string &file_name);
   ~Logger();
 
+#ifdef DXMT_PERF_BUILD // MacNeutron's performance build: below warnings, nothing is logged
+  static void trace(const std::string &) {}
+  static void debug(const std::string &) {}
+  static void info(const std::string &) {}
+#else
   static void trace(const std::string &message);
   static void debug(const std::string &message);
   static void info(const std::string &message);
+#endif
   static void warn(const std::string &message);
   static void err(const std::string &message);
   static void log(LogLevel level, const std::string &message);
@@ -72,9 +78,14 @@ private:
 } // namespace dxmt
 
 
+#ifdef DXMT_PERF_BUILD // MacNeutron's performance build: no trace or debug call, nor its arguments
+#define TRACE(...) ((void)0)
+#define DEBUG(...) ((void)0)
+#else
 #define TRACE(...) Logger::trace(str::format(__VA_ARGS__))
 
 #define DEBUG(...) Logger::debug(str::format(__VA_ARGS__))
+#endif
 
 #define WARN(...) Logger::warn(str::format(__VA_ARGS__))
 

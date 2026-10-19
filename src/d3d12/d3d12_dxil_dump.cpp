@@ -40,6 +40,10 @@ const char *DXILStage(const uint8_t *blob, size_t size) {
 // DXMT_DXIL_DUMP as a Windows path, created on first use; empty when capture is off. Wide, because the variable
 // arrives as UTF-8 and the ANSI APIs would misread any name outside ASCII.
 const std::wstring &CaptureFolder() {
+#ifdef DXMT_PERF_BUILD // never set: the performance build doesn't capture
+  static const std::wstring folder;
+  return folder;
+#else
   static const std::wstring folder = [] {
     std::string value = env::getEnvVar("DXMT_DXIL_DUMP");
     // Launch options carry Mac paths; Wine's Z: drive is the Mac's root.
@@ -51,13 +55,16 @@ const std::wstring &CaptureFolder() {
     return wide;
   }();
   return folder;
+#endif
 }
 
 } // namespace
 
+#ifndef DXMT_PERF_BUILD
 bool DXILCaptureMode() {
   return !CaptureFolder().empty();
 }
+#endif
 
 bool
 SM6Caps() {

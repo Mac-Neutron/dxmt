@@ -17,6 +17,7 @@
 #include <string>
 #include <vector>
 
+#ifndef DXMT_PERF_BUILD // MacNeutron's performance build has no stats (d3d12_stats.hpp)
 namespace dxmt {
 
 bool g_stats_on = env::getEnvVar("DXMT_STATS") == "1";
@@ -234,3 +235,4 @@ StatsFrame() {
 }
 
 } // namespace dxmt
+#endif

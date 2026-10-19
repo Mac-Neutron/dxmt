@@ -23,6 +23,7 @@ Logger::Logger(const std::string &fileName)
 
 Logger::~Logger() {}
 
+#ifndef DXMT_PERF_BUILD
 void Logger::trace(const std::string &message) {
   s_instance.emitMsg(LogLevel::Trace, message);
 }
@@ -34,6 +35,7 @@ void Logger::debug(const std::string &message) {
 void Logger::info(const std::string &message) {
   s_instance.emitMsg(LogLevel::Info, message);
 }
+#endif
 
 void Logger::warn(const std::string &message) {
   s_instance.emitMsg(LogLevel::Warn, message);
