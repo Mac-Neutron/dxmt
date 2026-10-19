@@ -194,17 +194,19 @@ static inline DWORD WaitForSingleObject(HANDLE h, DWORD ms) {
   mn_win32_handle *o = (mn_win32_handle *)h;
   if (!mn_win32_get(h, MN_WIN32_EVENT) && !mn_win32_get(h, MN_WIN32_SEMAPHORE))
     return SetLastError(ERROR_INVALID_HANDLE), WAIT_FAILED;
-  struct timespec deadline;
-  clock_gettime(CLOCK_REALTIME, &deadline); /* pthread_cond_timedwait's clock on macOS */
-  deadline.tv_sec += ms / 1000;
-  deadline.tv_nsec += (long)(ms % 1000) * 1000000;
-  if (deadline.tv_nsec >= 1000000000) deadline.tv_sec++, deadline.tv_nsec -= 1000000000;
+  /* The deadline on the uptime clock, each wait relative to it: a wall-clock change doesn't stretch it (MacNeutron, M1's
+   * deferred minors). */
+  uint64_t end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + (uint64_t)ms * 1000000;
   pthread_mutex_lock(&o->m);
   int r = 0;
   while (o->count == 0 && r != ETIMEDOUT) {
-    if (ms == 0) r = ETIMEDOUT;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (ms == 0 || (ms != INFINITE && now >= end)) r = ETIMEDOUT;
     else if (ms == INFINITE) pthread_cond_wait(&o->c, &o->m);
-    else r = pthread_cond_timedwait(&o->c, &o->m, &deadline);
+    else {
+      struct timespec left = {(time_t)((end - now) / 1000000000), (long)((end - now) % 1000000000)};
+      r = pthread_cond_timedwait_relative_np(&o->c, &o->m, &left);
+    }
   }
   BOOL got = o->count > 0;
   if (got && (o->kind == MN_WIN32_SEMAPHORE || !o->manual)) o->count--;
@@ -365,6 +367,11 @@ static inline BOOL MoveFileExW(LPCWSTR from, LPCWSTR to, DWORD flags) {
   std::string a = mn_win32_utf8(from), b = mn_win32_utf8(to);
   int r = flags & MOVEFILE_REPLACE_EXISTING ? rename(a.c_str(), b.c_str())
                                             : renamex_np(a.c_str(), b.c_str(), RENAME_EXCL);
+  if (r && errno == ENOTSUP) { /* exFAT and SMB volumes have no RENAME_EXCL (MacNeutron, M1's deferred minors) */
+    struct stat st;
+    if (!stat(b.c_str(), &st)) errno = EEXIST; /* ponytail: the check and the rename race; a lock if it ever matters */
+    else r = rename(a.c_str(), b.c_str());
+  }
   if (r) return SetLastError(mn_win32_from_errno(errno)), FALSE;
   return TRUE;
 }
