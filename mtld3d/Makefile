@@ -767,8 +767,8 @@ endef
 define arm64x_link
 $(ARM64X_LLD) -lldmingw /dll /machine:arm64x /nodefaultlib /opt:ref,icf \
 	/entry:DllMainCRTStartup /def:windows/$(2) /defarm64native:windows/$(2) \
-	/debug /pdb:$(OUT_arm64x)/$(1).pdb /out:$(OUT_arm64x)/$(1).dll \
-	$(ARM64X_CRT)/dllcrt2.o $(OUT_arm64)/$(1).lib $(OUT_arm64ec)/$(1).lib \
+	/debug /pdb:$(OUT_arm64x)/$(1).pdb /pdbaltpath:%_PDB% /out:$(OUT_arm64x)/$(1).dll \
+	$(ARM64X_CRT)/dllcrt2.o $(OUT_arm64)/$(1).lib $(OUT_arm64ec)/$(1).lib $(3) \
 	$(foreach lib,$(ARM64X_SYSLIBS),$(ARM64X_CRT)/lib$(lib).a) \
 	$(WINE_SDK)/lib/wine/aarch64-windows/libntdll.a
 endef
@@ -787,7 +787,9 @@ windows-arm64x:
 	$(ARM64X_CHECK_ARCHIVES)
 	mkdir -p $(OUT_arm64x)
 	$(call arm64x_link,mtld3d,shim/mtld3d.def)
-	$(call arm64x_link,d3d9,d3d9/d3d9.def)
+	# d3d9.dll's version resource (windows/d3d9/version.rc): installers, launchers and some games read it.
+	$(LLVM_MINGW)/bin/llvm-rc /nologo /fo $(OUT_arm64x)/d3d9.res windows/d3d9/version.rc
+	$(call arm64x_link,d3d9,d3d9/d3d9.def,$(OUT_arm64x)/d3d9.res)
 	$(WINEBUILD) --builtin $(OUT_arm64x)/mtld3d.dll
 	# A stock arm64 Wine's wineboot copies each builtin it finds into a prefix as its marker, so the bundle's hybrid
 	# placeholder has no use there, and its winebuild writes none (no ARM64EC metadata in a -marm64x fake module).

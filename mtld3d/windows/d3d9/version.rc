@@ -1,0 +1,31 @@
+// d3d9.dll's version resource, which installers and launchers read and some games check before they start: the file
+// version is the one Wine's own d3d9.dll reports, Direct3D 9.0c's 5.3.1.904. Numeric constants, so it compiles
+// without an SDK's headers: VOS_NT_WINDOWS32, VFT_DLL.
+1 VERSIONINFO
+FILEVERSION    5,3,1,904
+PRODUCTVERSION 5,3,1,904
+FILEFLAGSMASK  0x3f
+FILEFLAGS      0x0
+FILEOS         0x40004
+FILETYPE       0x2
+FILESUBTYPE    0x0
+{
+    BLOCK "StringFileInfo"
+    {
+        BLOCK "040904B0"
+        {
+            VALUE "CompanyName", "mtld3d"
+            VALUE "FileDescription", "mtld3d Direct3D 9 on Metal"
+            VALUE "FileVersion", "5.3.1.904"
+            VALUE "InternalName", "d3d9.dll"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Alexander Theissen (zlib licence)"
+            VALUE "OriginalFilename", "d3d9.dll"
+            VALUE "ProductName", "mtld3d"
+            VALUE "ProductVersion", "5.3.1.904"
+        }
+    }
+    BLOCK "VarFileInfo"
+    {
+        VALUE "Translation", 0x0409, 0x04B0
+    }
+}
