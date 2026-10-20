@@ -90,10 +90,12 @@ fn extract_unix_lib(llvm_ar: &str, archive: &str, object_arch: &str, out_dir: &s
     );
     let listing = String::from_utf8(listing.stdout).expect("ar member names are UTF-8");
 
-    let member = listing
+    let Some(member) = listing
         .lines()
         .find(|member| member.ends_with(&format!("{object_arch}/unix_lib.o")))
-        .unwrap_or_else(|| panic!("{archive} carries no {object_arch}/unix_lib.o"));
+    else {
+        return extract_unix_lib_by_machine(llvm_ar, archive, &listing, object_arch, out_dir);
+    };
 
     let status = std::process::Command::new(llvm_ar)
         .current_dir(out_dir)
@@ -105,6 +107,48 @@ fn extract_unix_lib(llvm_ar: &str, archive: &str, object_arch: &str, out_dir: &s
         "extracting {member} from {archive} failed"
     );
     format!("{out_dir}/unix_lib.o")
+}
+
+/// Extract `unix_lib.o` for `object_arch` from an `archive` that stores its members under bare names.
+///
+/// An archiver that drops the directories (llvm-mingw's `llvm-ar`, which a stock
+/// Wine built with llvm-mingw packs `libwinecrt0.a` with) stores an ARM64X
+/// archive's two `unix_lib.o` members under the same name. `N` counts instances
+/// of one stored name, so each instance is extracted in turn and the one whose
+/// COFF machine field is the target's is kept.
+///
+/// # Panics
+///
+/// If no instance carries the target's machine, or `llvm-ar` cannot extract one.
+fn extract_unix_lib_by_machine(
+    llvm_ar: &str,
+    archive: &str,
+    listing: &str,
+    object_arch: &str,
+    out_dir: &str,
+) -> String {
+    let wanted: u16 = match object_arch {
+        "aarch64-windows" => 0xaa64,
+        "arm64ec-windows" => 0xa641,
+        "x86_64-windows" => 0x8664,
+        "i386-windows" => 0x014c,
+        arch => panic!("no COFF machine known for {arch}"),
+    };
+    let path = format!("{out_dir}/unix_lib.o");
+    let instances = listing.lines().filter(|member| *member == "unix_lib.o").count();
+    for instance in 1..=instances {
+        let status = std::process::Command::new(llvm_ar)
+            .current_dir(out_dir)
+            .args(["xN", &instance.to_string(), archive, "unix_lib.o"])
+            .status()
+            .expect("ar failed");
+        assert!(status.success(), "extracting unix_lib.o #{instance} from {archive} failed");
+        let header = std::fs::read(&path).unwrap_or_else(|err| panic!("{path}: {err}"));
+        if header.len() >= 2 && u16::from_le_bytes([header[0], header[1]]) == wanted {
+            return path;
+        }
+    }
+    panic!("{archive} carries no {object_arch}/unix_lib.o, by path or by COFF machine")
 }
 
 /// Wrap `unix_lib` in a COFF archive in `out_dir` and link it as a native library.
