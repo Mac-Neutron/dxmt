@@ -111,3 +111,10 @@ not_unsafe_ptr_arg_deref = "warn"
 transmute_ptr_to_ref = "warn"
 multiple_unsafe_ops_per_block = "warn"
 undocumented_unsafe_blocks = "warn"
+
+# snmalloc-sys 0.7.6 with its ARM64EC tests taking GNU mode's `__arm64ec__` as well as MSVC's `_M_ARM64EC`
+# (aal/aal.h, aal/aal_arm.h, global/memcpy.h): a build whose ARM64X halves compile its C++ for the mingw triples
+# (MacNeutron's, against llvm-mingw's headers rather than xwin's) otherwise takes ARM64EC for x86-64, whose
+# macros it also defines, down to `rep movsb` inline assembly. Every other target compiles the same code as upstream's.
+[patch.crates-io]
+snmalloc-sys = { path = "vendor/snmalloc-sys" }

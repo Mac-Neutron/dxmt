@@ -1,0 +1,46 @@
+#pragma once
+#include <cstddef>
+#include <cstdint>
+#ifdef _MSC_VER
+#  define __PRETTY_FUNCTION__ __FUNCSIG__
+#endif
+
+namespace snmalloc
+{
+  /**
+   * The name of the function under test.  This is set in the START_TEST macro
+   * and used for error reporting in EXPECT.
+   */
+  const char* current_test = "";
+
+  /**
+   * Log that the test started.
+   */
+#define START_TEST(msg, ...) \
+  do \
+  { \
+    current_test = __PRETTY_FUNCTION__; \
+    snmalloc::message<1024>("Starting test: " msg, ##__VA_ARGS__); \
+  } while (0)
+
+  /**
+   * An assertion that fires even in debug builds.  Uses the value set by
+   * START_TEST.
+   */
+#define EXPECT(x, msg, ...) \
+  SNMALLOC_CHECK_MSG(x, " in test {} " msg "\n", current_test, ##__VA_ARGS__)
+
+#define INFO(msg, ...) \
+  do \
+  { \
+    snmalloc::message<1024>(msg, ##__VA_ARGS__); \
+  } while (0)
+
+}
+
+// Based on:
+// https://en.cppreference.com/w/cpp/memory/is_sufficiently_aligned.html
+bool is_aligned(void* ptr, std::size_t align_val_size)
+{
+  return reinterpret_cast<std::uintptr_t>(ptr) % align_val_size == 0;
+}
