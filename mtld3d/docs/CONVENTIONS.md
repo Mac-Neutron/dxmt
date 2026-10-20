@@ -1,0 +1,530 @@
+# Conventions
+
+Code-organisation and style rules enforced across the codebase. New code follows these without exception; existing code is brought along on any touch.
+
+## Mechanical audit
+
+Most of this document is enforced by `make check`: `cargo +nightly fmt --check`, then clippy with `nursery` + `pedantic` enabled workspace-wide, then `make audit`, then `make doc`. Lint levels are `warn` in the Cargo manifests so a plain `cargo clippy` (or an editor) reports without blocking a build; the `check` legs pass cargo's `build.warnings = "deny"` config, which fails the run if any warning was emitted — so `make check` is the hard gate, and it shares the build cache with plain invocations because no compiler flags change, except for its `PERF=1` legs, which build into `target/perf` (`CONTRIBUTING.md` lists the gate's legs). But a lint can only express a lint-shaped rule, and the rules a lint *can't* express are exactly the ones that drift — nothing runs them, so they decay into prose nobody rereads.
+
+`make audit` (`scripts/audit.sh`) closes that gap, and `make check` runs it — so a violation fails the same gate as a clippy warning, and the tree stays at zero rather than drifting until someone notices. It covers:
+
+| Check | Section |
+| --- | --- |
+| Doc-block shape (title / blank / body) and the 100-column doc line cap | §Doc comments |
+| The `Clone` / `Copy` derive inventory, diffed against `scripts/derive_inventory.txt` | §No default `Copy` / `Clone` |
+| `#[allow(...)]` confined to the three accepted files | §Warning suppressions |
+| `#[inline(always)]` confined to the one measured site | §Inline attributes |
+| `static … : OnceLock` confined to the three runtime-argument sites | §`LazyLock` over `OnceLock` |
+| `pub(crate)` = 0 | §No `pub(crate)` |
+| `extern "stdcall"` = 0 | §`extern "system"` everywhere |
+| `msg_send!` / `class!` / `sel!` = 0 | §No raw `msg_send!` |
+| `MainThreadMarker::new_unchecked` = 0 | §AppKit work runs on the main thread |
+| `HashMap` / `HashSet` = 0 (maps are `FxHashMap` / `FxHashSet`) | §FxHash for maps, xxh3 for content |
+| `DefaultHasher` / `RandomState` = 0 (content hashes are xxh3) | §FxHash for maps, xxh3 for content |
+| `mod.rs` files = 0 | §Module style |
+| Inline `#[cfg(test)] mod tests { … }` blocks = 0 | §Unit tests live in `<stem>/tests.rs` |
+| Every end-to-end test file (`windows/tests/tests/*.rs` and `tests/e2e/*.rs`, `main.rs` aside) has a row in `windows/tests/COVERAGE.md`, and every row a file | §End-to-end tests are listed in `COVERAGE.md` |
+| Raw thread spawns (`.spawn(`, `.spawn_scoped(`, `thread::spawn(`, `thread::Builder`) = 0 under `windows/tests/tests/e2e/` | §Every end-to-end test names itself |
+| Every `extern "system" fn` in the device and child-object files opens with `let _api =`, the cursor window procedure excepted | §Every device entry point holds the API lock |
+| `.join()` / `JoinHandle::join` = 0 under `windows/`, unit tests and the end-to-end crate aside | §The PE side waits for its threads, it never joins them |
+| In an `extern "system" fn` under `windows/d3d9/src`, a pointer parameter turned into a reference, read or written through `*p`, `p.read()` or `p.write()`, or made a typed slice = 0, and `InPtr` / `InPtrMut` over a `D3D*`, `Guid` or `LUID` type = 0 | §An application's pointer promises no alignment |
+| Release hygiene (see below) | §Release hygiene |
+
+Every finding names the section it came from. The confined-pattern checks compare **sets of files**, not counts, so moving an exception to a new file fails even though the count is unchanged — which is the point: each of those files earned its exception with an argument recorded here, and a new one needs a new argument.
+
+`scripts/audit.sh --file <path>` runs the per-file subset, for an editor hook that wants feedback at edit time.
+
+### `make doc`
+
+`make check` also builds the docs (with the same `build.warnings = "deny"` config, which counts rustdoc warnings too), because rustdoc holds the last set of rules nothing else sees: whether a doc link actually **resolves**. Audit gates the *shape* of a doc block and clippy gates its *prose*; only rustdoc knows that `[`foo`]` points at something real, that a public item isn't linking to a private one the reader can't open, and that `"D3DFMT_<code>"` in running text is a malformed HTML tag rather than words.
+
+Two traps worth knowing, since both were live in the tree:
+
+- **Square brackets in prose are link syntax.** `palette[0]`, `saturate to [0,1]` — rustdoc reads each as an intra-doc link and warns. Backtick them.
+- **A bare method name doesn't resolve from inside an `impl`.** Intra-doc links resolve against the *module*, so a doc on one method linking to a sibling with ``[`restore_into`]`` is broken; it needs ``[`Self::restore_into`]``.
+
+The windows workspace is documented for the **i686 PE target**, not the host: `d3d9` and `mtld3d` are `cdylib`s with raw-dylib imports and don't build for the host, so a host-only run would silently skip them.
+
+## Release hygiene
+
+The repository is public. Source should read as the engineering itself — not as a diary of how the engineering got written, and not as a document that assumes the reader has access to things they don't. Every rule below was written down long before anything ran it, and every one of them had drifted by the time it was checked. `make audit` now enforces them.
+
+Do not write, in any comment:
+
+- **A reference to a competing D3D9 implementation** (`DXVK`, `dxmt`, `wined3d`, `d9vk`). State the contract in spec terms instead — "per the D3D9 spec", not "matches what the other one does".
+- **A citation of Wine's d3d9 test suite** (`device.c`, `visual.c`, `test_refcount`, `test_fog`) outside `unix/conformance/`. Somebody who clones this repo cannot open `device.c`, and the behavioural statement never needed it: keep "GetStreamSource reports the last non-null stride", drop "(Wine device.c test_refcount)". Inside `unix/conformance/` the citations *are* the data — that crate exists to run Wine's suite and key failures by `file:line` — so they stay.
+- **A reference to private or non-public work**, e.g. a reverse-engineered third-party binary, or shorthand for a machine that came up while debugging. Keep the technical claim; drop the provenance.
+- **Incident provenance**: "the bug class that bit us", "until commit `abc1234`", a date. State the invariant and why it holds. If a comment only makes sense to someone who knows what changed, restate the change as prose.
+- **A tooling signal or a reference to a private note** (`project_*`, `feedback_*`), or an absolute `/Users/...` path.
+
+**Wine itself is not on this list, and never will be.** mtld3d *is* a d3d9 layer *for* Wine: SEH/NTSTATUS, the unix-call boundary, `macdrv`, `wineserver`, `winebuild`, `server/thread.c`, and Wine's own d3d9 source all document the real host, and they belong in the source. The ban is on the *competing implementation* and on the *test suite cited as provenance* — not on the runtime this thing is built to live inside.
+
+## Production carries no debug assertions
+
+The `production` cargo profile (`PROD=1`) is the only build that ships and the only one a benchmark measures, and it carries no debug assertions, in Rust or in C/C++. In both workspaces the profile turns off `debug-assertions` and `overflow-checks`. For C and C++, the Makefile's `PROD=1` path exports `-DNDEBUG` in `CFLAGS` and `CXXFLAGS`, which cc-rs adds to every object a build script compiles, on every target of both workspaces: i686 and x86_64 windows-msvc, the aarch64 and arm64ec windows-msvc halves of the ARM64X build, and x86_64 and aarch64 apple-darwin. `release`, the build the tests run against, keeps the Rust checks on both sides. Its C and C++ checks differ by target. snmalloc-sys is linked into the PE DLLs and into the Unix dylib. zstd-sys is linked into the Unix dylib and the PE end-to-end test executables, not the DLLs, since only `mtld3d-core`'s `disk-cache` feature pulls it in. snmalloc-sys defines `NDEBUG` itself on msvc whenever its build is not a debug one, and the `debug = 0` override that both workspaces set for it (on the PE side for the CRT it links) makes that every profile, so only the Unix dylib keeps snmalloc's assertions in `release`. zstd follows its own `DEBUGLEVEL`, not `NDEBUG`, and keeps its assertions off in every profile. The Unix dylib's other C-family object, `mtld3d-unix`'s Objective-C delegate forward, has no assertions. The `NDEBUG` export is what keeps production free of them when a C dependency does not arrange it itself, as snmalloc-sys does not off msvc.
+
+The Makefile enforces the C/C++ half after the build. Every production install leaf and `make bundle` run `PRODUCTION_ASSERT_GATE` on the binaries they ship, and it fails the build if one imports the C library's assertion handler (`__assert_rtn` in a Mach-O image, `_assert` or `_wassert` in a PE) or carries snmalloc's own assertion message, which does not go through that handler. The message check runs on every file, since the PE DLLs and the Unix dylib both link snmalloc. `make PROD=1 production-assert-gate ASSERT_GATE_FILES=<files>` runs the same check on any files; without `PROD=1` it refuses, since the default files would be the `release` build. Production is built through make: a plain `cargo build --profile production` gets no `NDEBUG`. A new C dependency that has an assertion path of its own, one neither signal sees, extends the gate in the same change.
+
+## Every device entry point holds the API lock
+
+A device created with `D3DCREATE_MULTITHREADED` serialises its entry points on a reentrant per-device lock (`mtld3d-core`'s `api_lock`, ARCHITECTURE.md §Threading model). The guard is taken by the first statement of every `extern "system" fn` in `device.rs`, `device/extended.rs` (the `IDirect3DDevice9Ex` entry points), `cursor.rs`, `texture.rs`, `surface.rs`, `vertex_buffer.rs`, `index_buffer.rs`, `swapchain.rs`, `query.rs`, `state_block.rs`, `vertex_decl.rs`, `vertex_shader.rs` and `pixel_shader.rs`: `let _api = device_api_lock(this);` on the device, `let _api = crate::com_ref::com_api_lock::<T>(this);` on a child, ahead of the `_timer`, so the timer's drop runs under the lock. Items (`use`, `const`) and comments may precede it; a statement may not. `make audit` checks every such function, so a thunk added later cannot escape the lock silently. The one exception is `cursor_wnd_proc`, which runs on the window thread that a locked `Reset` sends messages to and must not wait for the lock; the audit names it.
+
+## The PE side waits for its threads, it never joins them
+
+A thread that `d3d9.dll` or `mtld3d-core` starts on the PE side is waited for by polling `JoinHandle::is_finished` and then dropping the handle, never by `JoinHandle::join`. Under Wine the Win32 handle behind a `JoinHandle` held for a long session can come back invalid, and `join` panics on the failed wait, which under `panic = "abort"` ends the game at device release. `is_finished` reads the count std keeps on the thread's result and never waits on the handle. Every such wait goes through `mtld3d_core::thread_wait::wait_until_finished`, which sleeps a millisecond between polls, a cost only teardown pays. On the PE side the source-clock calibration worker (`encoder/calibration.rs`) and the address-space watch thread (`device/mem_watch.rs`) wait through it; the unix side's shader prewarm (`PrewarmHandle::cancel_and_join`, in `mtld3d-core` and run inside `mtld3d.so`) uses it too, although the Wine handle problem does not arise for a native thread, whose `JoinHandle` holds no Win32 handle. The watch thread's release skips the wait when its caller holds the loader lock: in a process exit Wine has terminated the thread before any `DLL_PROCESS_DETACH` runs, so its result is never released and `is_finished` would never turn true, and the thread borrows nothing from the device, and `d3d9.dll` is pinned from the first `CreateDevice`. The one other wait allowed is `WaitForSingleObject` on a handle opened just for it while the thread is known to be alive, as the log thread's stop does (`log_sink.rs`): the handle is never held long enough for Wine to invalidate it. `make audit` bans `.join()` with no argument (a slice or path join takes one) and `JoinHandle::join` in every `.rs` file under `windows/` except unit tests, which run natively on the host, and the end-to-end crate under `windows/tests/`, which joins scoped workers it spawned moments before.
+
+## Factor pure functionality into `mtld3d-core`; `d3d9` is wiring
+
+`windows/d3d9` is the COM-wrapper layer: vtables, refcount accounting,
+`extern "system"` dispatchers, the `unix_call` stub, `DllMain`, Win32
+integration and application-facing state capture. Platform-independent logic
+belongs in `mtld3d-core`: format mapping, state packing, bytecode parsing and
+MSL emission, allocator bookkeeping, geometry math, key hashing, render-pass
+sequencing, fixed-function state and identifiers. Pure logic does not become
+PE-only because the crate lives under `windows/`.
+
+Native orchestration and Metal integration belong in `mtld3d-unix`; reuse core
+logic there rather than copying it. Apply the Unix-first runtime placement
+policy in [`ARCHITECTURE.md`](ARCHITECTURE.md#runtime-placement-policy).
+`mtld3d-shared` owns fixed-layout transport definitions and cross-runtime pure
+helpers, not native workers or Win32 integration.
+
+`windows/d3d9` is a `cdylib` with `raw-dylib` imports, so it only builds for `*-pc-windows-msvc`. Any `#[test]` inside `d3d9` is unreachable without Wine. `mtld3d-core` is an rlib that builds on the macOS host target (C dependencies like `zstd` are fine; Win32 API dependencies are not), so `cargo test -p mtld3d-core --features disk-cache --target aarch64-apple-darwin` runs natively in ~0 s. The `disk-cache` feature builds the on-disk shader cache and its zstd dependency, which only the Unix dylib and the tests enable, so the PE DLLs link no zstd. `make test` already invokes it with that feature, auto-detecting the host triple so tests run on the native arch (no Rosetta) rather than the shipped `x86_64-apple-darwin` target.
+
+How to apply:
+
+- New `IDirect3DXxx9::Method` body: "unpack args → call helper → route return". Helper lives in `mtld3d-core` with a unit test.
+- Helpers needing `DeviceInner` data take the leaf field/accessor slice they actually use — never `DeviceInner` itself. E.g. `FfStateSnapshot::restore_into(&mut FfState)`.
+- Pure helpers needing a platform operation receive an injected function or trait in their own runtime. Native callers use direct native operations. An injected Rust callback is never part of the PE/Unix wire protocol.
+- "Done" = green host tests, not only a green Windows build.
+
+Refactor signals: a module in `windows/d3d9/src/` has a `#[cfg(test)] mod tests;` · a function references nothing outside its own args + well-known types · a comment says "wrapper around …" · the same mapping table appears in two `d3d9` modules.
+
+## End every edit cycle with `make fmt` + `make install`
+
+After any `.rs` change, run both before declaring the task done. `make` only rebuilds: it does **not** copy DLLs/.so into `$WINE_SDK` or `$WINE_INSTALL_DIR`, so launching the game without `make install` tests stale bits. `make test` implicitly runs both.
+
+## winecrt0 TLS conflict
+
+Linking the full `libwinecrt0.a` causes duplicate TLS symbols (`__tls_index`, `__tls_start`, …) with the CRT. Fix: `windows/shim/build.rs` extracts only `unix_lib.o`, by its full member name with `llvm-ar xP`, since an ARM64X archive carries one `unix_lib.o` per half under two directories and a basename match would hand back the first.
+
+## `extern "system"` everywhere, not `extern "stdcall"`
+
+`extern "system"` maps to stdcall on i386 and the x64 ABI on x86_64, so the same code compiles correctly for both targets.
+
+## DLL exports: `.def` file + `import_name_type = "undecorated"`
+
+On MSVC i386, `raw-dylib` imports add stdcall decoration (`_Name@N`), but DLL exports use undecorated names (matching real Windows DLLs).
+
+- **Export side**: every export is listed in `d3d9.def` (linked via `/DEF:` in `build.rs`). The d3d9 API exports are declared through `hookable_export!` (`windows/d3d9/src/hookable.rs`), never as a plain `#[unsafe(no_mangle)]` or `export_name` function: on i386 and x86_64 the macro emits a naked entry that starts with a fixed prologue inline-hook engines (overlays, capture tools) decode and relocate, then jumps to the Rust body, whose signature it checks against the entry's. What a compiler emits for a short function is not something a hook engine's length decoder is guaranteed to know. The end-to-end test `export_prologues.rs` reads the export list from `d3d9.def` and fails on any export that does not start with the prologue.
+- **Import side**: `import_name_type = "undecorated"` on i386:
+
+```rust
+#[cfg_attr(target_arch = "x86", link(name = "d3d9", kind = "raw-dylib", import_name_type = "undecorated"))]
+#[cfg_attr(not(target_arch = "x86"), link(name = "d3d9", kind = "raw-dylib"))]
+```
+
+## Module style: `foo.rs` + `foo/`, not `foo/mod.rs`
+
+Rust 2018+ module layout. Keeps meaningful filenames in editor tabs.
+
+## Unit tests live in `<stem>/tests.rs`
+
+A module's unit tests are a child module in their own file: `foo.rs` carries the two-line declaration, and the tests themselves live in `foo/tests.rs`.
+
+```rust
+// foo.rs, last item in the file
+#[cfg(test)]
+mod tests;
+```
+
+Never an inline `#[cfg(test)] mod tests { ... }` block. Two reasons. Editing a test then produces a diff against `foo/tests.rs` instead of against the production file, so review and `git blame` on `foo.rs` stay about `foo.rs`; before this rule, `passes.rs` was 7,714 lines of which 3,471 were tests. And nothing is lost by moving them, because a child module still sees every private item of its parent and the module path `foo::tests` is unchanged, so `super::`, `crate::` and private-item access all keep working exactly as they did inline.
+
+Carry the cfg predicate verbatim. `perf.rs` declares `#[cfg(all(test, perf_tracking))] mod tests;`, and weakening that to a plain `#[cfg(test)]` compiles clean while silently dropping the tests from every run.
+
+Two things do not move. A `#[cfg(test)]` helper that is an inherent method on a production type stays in the parent next to that type (`passes.rs` keeps a test-only `emit_scissor`), as does a `#[cfg(test)] pub fn` the tests import through `super::` (`log_helpers.rs` keeps `first_seen`).
+
+Watch relative paths on the way out: `include_str!` resolves against the containing file, so a path that was `../tests/fixtures/x.txt` inline becomes `../../tests/fixtures/x.txt` one directory down.
+
+## End-to-end tests are listed in `COVERAGE.md`
+
+`windows/tests/COVERAGE.md` is the index of the end-to-end suite: one row per test file, saying what that file pins. The files are the modules of `windows/tests/tests/e2e/main.rs`, the one binary whose tests share a process, plus the five files beside it under `windows/tests/tests/` that need a process of their own (`exit_code.rs`, `unload.rs`, `unload_after_device.rs`, `snmalloc_drift.rs`, `thread_exit.rs`); `main.rs` declares the modules, pins nothing, and has no row. It is how a reader finds whether a behaviour is already covered, and how a reviewer sees what a change is claiming, so it is only useful while it is complete. `make audit` matches it against both directories in both directions: a test file with no row fails, and a row naming a file that is not there fails too. A new test file lands as a module of `main.rs` with its row in the same change, and a deleted one takes its row and its `mod` line with it.
+
+The row is one sentence per behaviour the file pins, not a summary of the file. A test added to an existing file extends that file's row rather than adding a new one.
+
+## Every end-to-end test names itself
+
+A thread an end-to-end test spawns is created through `mtld3d_tests::spawn_scoped`, never through `Scope::spawn`, `thread::spawn` or a `thread::Builder` of its own. The helper names the worker after the thread that spawns it, which libtest named after the test, so a worker of a worker is named after the test too.
+
+The tests of the `e2e` binary share one Wine process, and the harness's panic hook ends that process at the first failed assertion. What the runner then has to go on is the `thread '<name>' panicked at` line the default hook printed and the `[e2e] running <name>` line each thread wrote when it created its device. Both carry the thread's name. An unnamed worker prints `thread '<unnamed>'` and announces nothing, so a failure on it names no test, and the runner has to run every test that was in flight again, one at a time, to find which one it was. A worker carrying its test's name fails as that test, and the run costs one extra process instead of a serial round.
+
+`make audit` bans `.spawn(`, `.spawn_scoped(`, `thread::spawn(` and `thread::Builder` in `windows/tests/tests/e2e/*.rs`. The harness under `windows/tests/src` is where the one `Builder::spawn_scoped` call lives, outside the banned directory.
+
+## No `pub(crate)` — use module hierarchy
+
+Visibility via module hierarchy: private modules already restrict `pub` items to the crate.
+
+## File layout: pub first, private last
+
+1. Inner attributes (`#![...]`)
+2. `use` imports
+3. `mod foo;` / `pub mod foo;` declarations (grouped, not split by visibility)
+4. All `const` / `static` / `type` aliases (pub then private) at the top regardless of visibility
+5. `unsafe extern "ABI" { ... }` blocks with `#[link(...)]` attributes (top, not in the private section)
+6. `pub use` re-exports + all `pub` items including `pub mod foo { ... }` inline modules
+7. All private items including private inline `mod foo { ... }` blocks
+8. `#[cfg(test)] mod tests;` last (the one `mod` declaration that does *not* join the group at 3; see §Unit tests live in `<stem>/tests.rs`)
+
+`impl` blocks stay adjacent to their type. Inline `mod foo { ... }` follows the same pub/private rule as other items.
+
+## Encapsulation: minimize public fields
+
+Prefer private fields with accessor methods. `pub` is for FFI data structs in `types/` (`D3DCAPS9`, vtable structs) and `*CreateInfo` parameter bags. COM wrappers' `vtbl` field is first but **private** — `#[repr(C)]` fixes layout independent of visibility; expose via a `vtbl(&self)` method.
+
+## Submodule state: struct-in-submodule + one accessor pair
+
+When a submodule needs state on a parent struct, define `FooState` *inside the submodule* with private fields, embed it as one field, and expose a single `foo()` / `foo_mut()` accessor pair. Never per-field getters on the parent. The parent's surface grows by 2 methods, not 2N. See `FfState`, `CursorState`.
+
+## Data structure discipline
+
+State carried on the hot path — every per-draw snapshot, every cache key, every encoder op — is shaped for the move/borrow semantics that keep memcpys out of the inner loop. Wide derives and wide field types are accidents waiting to happen: the compiler won't flag a 200 B `Copy` deref or a `Vec` `.clone()` until profiling does, by which point the cost is baked into every frame. The rules below get applied to every new struct and to existing structs on any touch.
+
+### No default `Copy` / `Clone` on aggregate structs
+
+The default for a struct >16 B is **no derive**. `Copy` and `Clone` are added only when a concrete callsite needs them and the structural alternative (passing references, moving once, building in place into the scratch arena) doesn't fit.
+
+- **`Copy`** turns every accidental whole-struct read into a silent memcpy. Aggregate snapshot types (`CurrentSnapshot`, `RenderStateSnapshot`, `StageBinding`, `TextureInfo`, `FfVsKey`, `FfPsKey`, `PipelineSnapshot`, etc.) do not derive `Copy`. Removing `Copy` is how silent per-draw memcpys become compile errors — it has exposed ~200 B/draw copies hiding on the snapshot path.
+- **`Clone`** is the opt-in form of the same hazard: a `.clone()` call on a wide aggregate is a per-call heap-bandwidth tax, just one the compiler doesn't flag. The default replacement for "I need a copy of this big struct in scratch" is `ScratchArena::alloc_from(&value)` (bytewise copy, no `Clone` bound) or `scratch.alloc_uninit::<T>()` + per-field `addr_of_mut!().write()` for in-place construction. The `scratch.alloc_from(&cache)` form — replacing per-field writes — is the canonical construction pattern.
+- **Small types keep `Copy`.** Single-word newtypes (`MetalHandle<K>`, `TextureId`, `ProgramId`, `ScratchSlice`, the various `*Flags` bitflag bytes) keep `Copy` because they exist to be cheap pointer-sized handles and the trait is structurally needed (Op enum payload, `Option<...>` field load). The rough threshold is 16 B. Wider than that, justify each derive at the use site or don't derive it.
+- **Tests stay unaffected.** Removing `Copy`/`Clone` doesn't break `#[derive(PartialEq, Eq, Hash, Debug)]`; tests compare via reference.
+
+When a callsite *seems* to require `Clone`, the structural fix is almost always "build it in scratch once and pass the pointer" — the same lesson as the snapshot work. The `[[T; N]; M]` initialization pattern (which requires `Copy` to use the `[expr; N]` form) is the common exception; use array-of-`const`-default or `core::array::from_fn` instead.
+
+**Derives are never speculative.** A `Clone` or `Copy` derive needs a concrete callsite *today* — not one it might plausibly need later. "It's a small struct, might as well" is how the tree accumulated a dozen `Clone`s that nothing called. Every type deriving either trait is recorded in `scripts/derive_inventory.txt`, which `make audit` diffs against the tree: adding a derive is a deliberate act that shows up in the diff, and the reviewer gets to ask for the callsite. Regenerate with `scripts/audit.sh --update-derives` once the callsite exists.
+
+Note that a derive can be *structurally* required without any visible `.clone()`: `vec![elem; n]` fills by cloning, and a `Clone` type containing a field by value requires that field to be `Clone` too. Those are real callsites. Let the compiler arbitrate — remove the derive, build, and put back only what fails.
+
+### Booleans pack
+
+Two or more `bool` fields on the same struct collapse into `bitflags!`. A single bool field is fine as `bool`. The `bitflags` crate is already a workspace dep and the macro is used throughout: `DepthScissorFlags`, `PipelineRsFlags`, `PipelineAttachFlags`, `FfVsFlags`, `SnapshotDirty`. The bitflag value lives in the smallest int that holds the bit count (u8 ≤8 bits, u16 ≤16, u64 ≤64). Derive `Clone, Copy, Debug, Default, PartialEq, Eq` on the bitflag struct — the value is a single integer, so `Copy` is fine and structurally needed for the bitwise ops.
+
+Per-`[stage][type]` once-warn latches (`tss_warn_fired`, `samp_warn_fired`) and per-slot enable arrays (`light_enabled`) follow the same rule: `[[bool; N]; M]` becomes `[uN; M]` packed at the bit level, with accessor methods (`mark_warn(stage, ty)`, `warn_fired(stage, ty)`) replacing direct array indexing. The savings are sometimes large (`[[bool; 33]; 8]` is 264 B; `[u64; 8]` is 64 B).
+
+### Narrowest type for the range
+
+Field types match the value range, not the on-the-wire format. D3D9 ships enum render states as `u32`, but the enum spaces (`D3DCMP_*`, `D3DCULL_*`, `D3DBLEND_*`, `D3DBLENDOP_*`) all fit in `u8`; snapshot/cache-key structs store them as `u8`. Scissor coordinates fit in `u16` (D3D9 max RT dim is 16384). Indices into bounded arrays (stages ≤16, samplers ≤16, RTs ≤4, RS slots ≤210) are `u8`. The wide types stay in the source RS array (FFI wire format) and in the `*CreateInfo` parameter bags — narrowing happens at the snapshot/cache-key boundary, where each byte matters per-draw.
+
+`u32`-storing-a-bit-pattern fields (raw `D3DCOLOR`, raw `f32` bit pattern for depth bias) keep `u32` — the storage type is the right one, just with a non-numeric interpretation. Decode at the consumer site (`u32::to_le_bytes` for D3DCOLOR, `f32::from_bits` for the bias floats).
+
+### Composition over flat fields
+
+Fields that appear on ≥2 sibling structs with the same name + same type belong in a named substruct, embedded by value. See `PipelineRsBits` (10-field rasterizer/blend cluster shared by `PipelineSnapshot` and `RenderStateSnapshot`) and `PipelineAttachFlags` (3-bool collapse of `has_depth` / `has_stencil` / `has_color_output`). The signal to extract:
+
+- The same field name + type appears on two sibling structs.
+- ≥5 fields encode one conceptual thing ("blend state", "rasterizer state", "viewport", "presentation handles", "creation params").
+- Two fields are always read/written as a pair (e.g. `depth_bias` + `slope_scale_depth_bias` always travel together into `Command::set_depth_bias`).
+
+When extracting, derive `Copy`/`Clone` on the substruct only if the substruct is ≤16 B and gets embedded by value (the bitflag substructs are the canonical pattern). A wide substruct stays move-only.
+
+### Extract substructs only when they pay for themselves
+
+Composition is for reducing duplication or enforcing an invariant, not for cosmetic grouping. The four extant submodule structs on `DeviceInner` each earn their keep:
+
+- **`FfState`** — shared by the device, state-block save/restore, and tests; the state-block API can't be written without a typed snapshot.
+- **`CursorState`** — encapsulates WM_* subclass invariants the rest of `d3d9` shouldn't reach into.
+- **`StageBindings`** — owns the `[CachedComPtr; STAGE_COUNT]` array's refcount accounting plus per-(sampler, type_) latches; the slot-count-bounded loops live there.
+- **`ShaderBindings`** — pairs each stage's shader pointer with its constants array and `populated_rows` watermark.
+
+Before introducing a new substruct, name the rule it enforces. "These fields are accessed together in `f()`" is not a rule — it's a coincidence of one function's shape. "Same field name + type appears on ≥2 sibling structs" *is* a rule (the `PipelineRsBits` extraction collapsed 10 such fields shared between `PipelineSnapshot` and `RenderStateSnapshot`). When in doubt, leave the fields flat; the next reader can extract once the duplication is real.
+
+The split-borrow constraint matters when a substruct does land: keep clusters as *sibling fields* of `DeviceInner`, not nested under one wrapper. `dev.current_frame.scratch + dev.snapshot_cache` exercises field-level disjoint `&mut` access on the per-draw hot path; any new substruct must preserve that.
+
+## Strong types for cross-module identifiers
+
+Wrap distinct `u64`s (D3D9 object id, Metal handle, content hash, packed-bits state key) in newtypes with **private inner field**. Construction owned by the defining module via domain-specific factories — never raw-`u64` constructors. Examples: `TextureId::new_unique()`, `ProgramId::from_tokens(&[u32])`, `DepthStencilKey::from_state(...)`. For logging implement `fmt::LowerHex`. Add `.raw()` only when a concrete site (typically a thunk param at FFI) needs the `u64`. See `ids.rs`.
+
+## ABI constants have one home — never restate them locally
+
+Every constant that names a value in an external ABI is declared **once**, in a shared crate, and referenced everywhere else. There are two homes, mirroring the two ABIs the codebase straddles:
+
+- **D3D9 ABI constants** → `mtld3d-types` (`windows/types/src/`). `D3DFMT_*`, `D3DRS_*`, `D3DTSS_*`, `D3DSAMP_*`, `D3DUSAGE_*`, `D3DPOOL_*`, `D3DRTYPE_*`, `D3DSBT_*`, `D3DGETDATA_*`, `D3DDECLUSAGE_*`, the FF op/arg/compare spaces, HRESULT codes (`hresult.rs`), primitive/FVF flags (`primitive.rs`), caps bits — all live here. `device.rs` / `direct3d9.rs` are glob-exported, so a new `pub const` there needs no `lib.rs` edit; a new module does.
+- **Metal wire values** → `unix/shared/src/mtl.rs` (see ARCHITECTURE.md §"Shared wire values are typed in `unix/shared`"). Storage modes, pixel formats, compare funcs, blend factors, primitive types, usage/write-mask bitflags — declared as `#[repr(u32)]` enums or `bitflags!`, never as bare `u32`.
+
+**One principle, two homes: D3D ABI → `mtld3d-types`; Metal wire → `mtl.rs`; never restate either locally.** No function-local or module-local `const D3D*`, no bare ABI integer literal at a call site or `match` arm (`101 =>` becomes `D3DFMT_INDEX16 =>`). A local restatement is a silent-drift hazard: a local `D3DRTYPE_*` copy can drift to the wrong SDK value while the canonical constant stays fixed in its one home.
+
+Width nuance: the types-crate constants are `u32` (matching the D3D9 wire width) except where a narrower field is the natural home (`D3DDECLUSAGE_*` are `u8`). When a `u8`-keyed consumer must `match` against a `u32` constant (the FF emitter stores op/arg codes in `u8` cache-key fields), widen the scrutinee with `u32::from(x)` at the match rather than mirroring the constant — a `match` pattern can't carry an `as` cast, and a parallel `u8` mirror would reintroduce a second definition. The integration-test harness (`windows/tests`) depends only on `mtld3d-types`, so anything it needs must resolve from there, not from `mtld3d-core`.
+
+## Prefer snake_case Rust names
+
+Use snake_case for internal function names, even D3D9/COM impls. When an exported symbol must be PascalCase (e.g. `DllMain`, `Direct3DCreate9`), pin via `#[unsafe(export_name = "DllMain")]` — never `#[allow(non_snake_case)]`.
+
+## Unsafe is a last resort
+
+`unsafe` exists for FFI, COM vtable dispatch, and a small set of documented zero-cost abstractions (`PageBox`, the crumb buffer, the `ffi_boundary` newtypes, `MetalHandle`, `CachedComPtr`). Anywhere else, find a safe alternative first.
+
+### The boundary principle
+
+The canonical pattern in this codebase is **typed boundary newtypes**, not safe-fn helpers. A newtype with an `unsafe fn` constructor and safe methods type-encodes the ABI contract once — the caller writes one `unsafe { Type::new(p) }` per FFI entry, the SAFETY: comment lives at that single contract-assertion site, and downstream methods are safe because the invariant rides on the type.
+
+This mirrors the stdlib's approach. `slice::from_raw_parts`, `Box::from_raw`, `Pin::new_unchecked`, `NonNull::as_ref` are all `unsafe fn`: there's no sound way to give them a safe signature because the caller-upheld preconditions can't be checked at runtime. A "safe" wrapper that internally `unsafe`-deref's a caller-supplied pointer with a documented contract is unsound — the safe signature accepts any input, but only some inputs satisfy the documented contract. The contract assertion belongs at the call site, marked with `unsafe`, not buried behind a safe signature.
+
+### Escalation ladder
+
+Before writing `unsafe`, in order:
+
+1. Is there a safe std primitive? (`Vec`, `slice::from_ref`, `Cell`, `Box::leak`, `core::ptr::NonNull` safe methods in 2024 edition.)
+2. Is there a vetted crate that wraps the operation? (`libloading` for `dlsym`, `objc2-*` for selectors, `bytemuck` for POD reinterpret.)
+3. Can I model this as a boundary newtype — an `unsafe fn` constructor with safe methods, where the invariant is encoded in the type? (`PageBox`, `Crumb`, `InPtr<T>`, `MetalHandle<K>`, `CachedComPtr<T>`.)
+4. Only if 1–3 don't apply: `unsafe { … }` with a SAFETY: comment at the assertion site.
+
+### Mandatory SAFETY: comment
+
+Every `unsafe {}` block carries a `// SAFETY:` comment directly above it. Format:
+
+    // SAFETY: <invariant the unsafe op relies on>; <why it holds here>.
+    let q = unsafe { MetalHandle::<MTLCommandQueueKind>::new(raw) };
+
+State what invariant is being asserted ("ptr is non-null and aligned", "the wire u64 carries a previously-retained `id<MTLDevice>`") and why it's true in this context ("checked above by `is_null()`", "IDirect3DDevice9 ABI guarantees `this` is *mut Direct3DDevice9"). Bare "FFI call" or "manual layout" is not acceptable.
+
+### One operation per unsafe block
+
+Don't wrap a 16-line block in one `unsafe {}`. Each pointer deref, each transmute, each FFI call gets its own block with its own SAFETY: comment. Two reasons: (a) `rg 'SAFETY:'` returns a focused answer per operation, (b) refactoring half the block to be safe doesn't strand the comment on the other half.
+
+Acceptable exception: a tight loop where every iteration is the same unsafe op (e.g. `for slot in slots { unsafe { write_volatile(slot, …) } }`).
+
+### Canonical boundary newtypes
+
+Use these in preference to raw pointer juggling. Each lives in `mtld3d_shared` (or `mtld3d-d3d9` for PE-only types) so the same code is shared across the workspaces:
+
+**FFI pointer boundaries** (`mtld3d_shared::ffi_boundary`):
+
+- **`InPtr<'a, T>`** — borrowed input pointer. `unsafe fn opt(p)` filters null; safe `Deref` to `T`. Use at COM vtable entries (`this: *mut c_void` → `&Direct3DDevice9`) and read-only typed in-params.
+- **`InPtrMut<'a, T>`** — exclusive borrow. Same shape; `DerefMut` to `T`. Use at unix-call handler params written back to the caller.
+- **`ValueIn<'a, T: Copy>`**: by-value typed in-param read (`D3DRECT`, `D3DMATRIX`, …). `unsafe fn opt(p)`; safe `.read()` consumes self and returns `T`. One-shot convenience: `ValueIn::<T>::read_opt(p)`. The read assumes no alignment.
+- **`OutPtr<'a, T>`**: null-guarded typed out-param write. `unsafe fn opt(out)`; safe `.write(val)` consumes self. One-shot convenience: `OutPtr::write_opt(out, val)`. The write assumes no alignment.
+- **`slice_from_caller` / `slice_to_caller`**: an application's array, read (borrowed when aligned, copied otherwise) or filled (a byte copy), with no alignment assumed.
+- **`VtableThis<'a, T>`** — `IUnknown` vtable `this` cast. Crashes on null per D3D9 spec (preserves crash-on-refcount-miscount). `unsafe fn new(this)`; safe `Deref`/`DerefMut` to `T`. Used at `AddRef`/`Release`/`QueryInterface` thunks where silently filtering null would mask a refcount underflow.
+
+**Metal protocol handles** (`mtld3d_shared::mtl_handle` + `unix/unix/src/metal/handle.rs`):
+
+- **`MetalHandle<K>`** — `#[repr(transparent)]` newtype over `u64` tagged with a marker kind (`MTLDeviceKind`, `MTLTextureKind`, `NSViewKind`, …). Used end-to-end: every typed field in `unix/shared/src/params.rs`, every PE-side slot that stores a Metal protocol-object handle (`DeviceInner`, `FrameData`, `Direct3DSurface9`, `Direct3DTexture9`, `Pass`/`PassState`, `FrameSummaryContext`, `VisibilityQueryCore`, …), and every unix-side helper that crosses the boundary. The `unsafe fn new(raw)` constructor fires at four legitimate boundary shapes: (1) unix-side OUT writes wrapping `Retained::into_raw(...) as u64` once per Create*; (2) PE-side wraps that recover typed handles from u64-bound wire fields by design — `Command::param_b` / `BlitCommand::{src,dst}_handle` (heterogeneous-kind by variant), `get_or_create_texture` returns (still u64-bound for Command construction), and the visibility-buffer batch-create return; (3) tests with opaque test values; (4) nowhere else. Safe `.into_retained()` (defined unix-side, where `objc2-metal` is visible) calls `Retained::retain` on the canonical retain. `unsafe trait ReleaseRetain` at destroy sites consumes the canonical retain via `Retained::from_raw + drop`.
+
+**External COM pointers** (`windows/d3d9/src/com_ref.rs`):
+
+- **`CachedComPtr<T: ComUnknown, K: Ownership>`**: owning cached pointer with RAII refcount. `unsafe fn adopt(p)` takes a device-internal reference and `Drop` gives it back, so the application's public refcount never counts it. Use for every reference the device keeps on an external D3D9 COM object: `K = Bound` for bindings (bound RT/DS/VB/IB, textures, shaders, declaration), `K = Captured` for the objects a state block captures or records, which also keeps a `D3DPOOL_DEFAULT` object outstanding for `Reset`. Replaces inline `(*p).vtbl().add_ref(...)` / `release(...)` pairs.
+
+Other concentration examples: `PageBox`, `Crumb`, `ScratchArena`, the per-Win32-function wrappers in `cursor.rs` (`set_cursor`, `delete_object`, `create_bitmap_packed`, …).
+
+### An application's pointer promises no alignment
+
+A pointer the application passes a COM entry point carries no alignment promise: an out-struct (`D3DLOCKED_RECT`, `D3DSURFACE_DESC`, `D3DCAPS9`), an in-struct (`D3DMATRIX`, `D3DPRESENT_PARAMETERS`, a GUID), a `DWORD`, `BOOL` or interface out-slot, an array of constants, rects or vertex elements. The D3D9 runtime copies through these pointers, so a caller that keeps the struct at an odd address, in a packed record or an odd stack slot, is inside the contract. A Rust reference to that place, a typed `read` or `write` through it, or a typed slice over it is undefined behaviour in every build, and a build with debug assertions panics on it with `misaligned pointer dereference`.
+
+So application memory is reached only through the alignment-free helpers of `mtld3d_shared::ffi_boundary`: `ValueIn` reads a value, `OutPtr` writes one, `slice_from_caller` reads an array and `slice_to_caller` fills one. A getter that fills a struct field by field builds the struct as a local value and writes it once. An in/out struct is read with `ValueIn`; the fields the call reports back are written one by one with unaligned stores, so a field the application changes during the call keeps its value. A type that is not `Copy` cannot go through `ValueIn`; it is read with `core::ptr::read_unaligned`, or field by field. `InPtr`, `InPtrMut` and `VtableThis` stay for the pointers whose alignment holds by construction: a COM `this`, an interface the application passes in (an object the layer or the system made), and the unix-call params the layer builds itself.
+
+`make audit` checks the shape in the entry points under `windows/d3d9/src`. In the body of an `extern "system" fn`, a pointer parameter may not become a reference (`&*p`, `&mut *p`, `p.as_ref()`, `p.as_mut()`), be read or written through `*p`, `p.read()` or `p.write()`, or become a typed slice, and no `InPtr` or `InPtrMut` may wrap a `D3D*`, `Guid` or `LUID` type, whether named in a turbofish or in a type annotation. A byte view (`p.cast::<u8>()`) and a cast to one of the layer's own COM wrappers (`p.cast::<Direct3D…>()`) are exempt, and so is `crash.rs`, whose vectored exception handler receives pointers from the system. A helper the entry point hands the pointer to, and a local the pointer is first cast into, are beyond the check's reach and keep the rule by review.
+
+### Don't sprinkle — concentrate at three sites
+
+If you find yourself writing the same `unsafe` pattern at three call sites, that's a missing boundary newtype. Add one to the appropriate module rather than letting the unsafe spread.
+
+### `unsafe fn` only when callers must uphold a precondition
+
+`extern "system" fn` and `extern "C" fn` are safe-to-call from Rust; they coerce to `unsafe` fn pointers automatically when stored in vtable arrays. A vtable entry function does **not** need to be `unsafe fn`. Canonical pattern:
+
+    // YES: vtable thunk is `extern "system" fn`; one `unsafe` at the InPtr
+    // constructor where the ABI contract is asserted; body is safe.
+    extern "system" fn device_set_render_state(this: *mut c_void, state: u32, value: u32) -> i32 {
+        // SAFETY: vtable thunk; `this` is *mut Direct3DDevice9 per IDirect3DDevice9 ABI.
+        let Some(dev) = (unsafe { InPtr::<Direct3DDevice9>::opt(this) }) else {
+            return D3DERR_INVALIDCALL;
+        };
+        dev.set_render_state(state, value)
+    }
+
+    // NO: don't reach for raw `unsafe { &*(this as *const T) }` in new code —
+    // use `InPtr::<T>::opt` (or `VtableThis::<T>::new` for IUnknown thunks).
+
+For `AddRef`/`Release`/`QueryInterface` thunks where D3D9 spec leaves null-`this` UB, use `VtableThis::<T>::new(this)` — it crashes on null by design so a refcount miscount surfaces as a null-deref panic rather than a silent recovery.
+
+### No `unsafe_code` rustc lint
+
+This codebase deliberately does not enable the rustc `unsafe_code` lint. Every crate structurally bears unsafe (FFI extern blocks, COM dispatch, Metal handle conversion, allocator), so blanket per-crate `#![allow(unsafe_code)]` would just be noise. The enforcement is layered: clippy lints (`missing_safety_doc`, `transmute_ptr_to_ref`, `not_unsafe_ptr_arg_deref`) plus `undocumented_unsafe_blocks` and `multiple_unsafe_ops_per_block` — all enabled workspace-wide in `windows/Cargo.toml` and `unix/Cargo.toml`. Together they require every `unsafe {}` block to carry a `// SAFETY:` comment naming the invariant and to perform exactly one unsafe operation; new code that drifts fails `make check`.
+
+## Warning suppressions
+
+Default rule: **never** `#[allow(...)]`, `#[expect(...)]`, or `#[cfg_attr(..., allow(...))]`. The lint is followed. `make check` runs clippy with `clippy::nursery` and `clippy::pedantic` enabled workspace-wide, denies every warning via `build.warnings = "deny"`, and **stays clean by fixing the code, not by silencing the lint**. Every lint is treated as serious — refactor by default; reaching for `#[allow]` is the absolute last resort.
+
+The tree carries exactly **three** per-site `#[allow(clippy::...)]` attributes, plus one workspace-level `too_many_lines = "allow"`. Each is listed under "Accepted per-site exceptions" below. Adding another per-site allow needs a rationale comment that names which of the accepted exception classes applies — and the structural fix (a non-panicking `cast_unsigned`/`to_le_bytes` reinterpret, `try_from(..).expect(..)`, or a literal cross-checked by a `const` assert) clears the great majority of numeric-cast lints without one.
+
+### Standard structural fixes
+
+These handle ~95% of every clippy complaint raised in the tree. Apply the fix; do not allow.
+
+| Lint                              | Fix                                                                                                              |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `cast_possible_truncation`        | `T::try_from(v).expect("<contractual bound>")` — turns silent truncation into a loud panic at the violated bound |
+| `cast_possible_wrap`              | same; or fix the storage type at definition                                                                      |
+| `cast_sign_loss`                  | `u32::try_from(signed).expect(...)` or `signed.unsigned_abs()`                                                   |
+| `cast_precision_loss`             | use a wider float (`f64`) at the source; for D3DCOLOR-style u32→u8 unpack use `to_le_bytes` destructure; for u64→f64 use the `u64_to_f64_exact` / `usize_to_f64_exact` helpers in `tsc.rs` (hi/lo split + `mul_add`) |
+| `cast_ptr_alignment`              | `core::ptr::read_unaligned` instead of a direct pointer cast                                                     |
+| `too_many_arguments`              | introduce a `FooParams` / `FooCreateInfo` struct                                                                 |
+| `items_after_statements`          | hoist `const` / `type` / `use` to function top, or to file scope                                                 |
+| `similar_names`                   | rename one of the bindings                                                                                       |
+| `many_single_char_names`          | rename to descriptive names — or delete the dead code carrying them                                              |
+| `needless_pass_by_value`          | take `&T`; ctors that previously took owned `Info` structs take `&Info`                                          |
+| `needless_pass_by_ref_mut`        | take `&self` / `&T`                                                                                              |
+| `missing_const_for_fn`            | add `const fn` (including `const extern "system" fn`)                                                            |
+| `unnecessary_wraps`               | drop the `Option` / `Result` wrap; let callers wrap at the boundary                                              |
+| `unnecessary_box_returns`         | return `Self`; let callers `Box::new(value)` before `Box::into_raw`                                              |
+| `struct_excessive_bools`          | convert to `bitflags!` or a packed `u8` / `u16` / `u64` per §"Booleans pack"                                     |
+| `pub_underscore_fields`           | rename the field (drop the `_` prefix)                                                                           |
+| `match_same_arms`                 | restructure: `let-else` for the catch-all arm, exhaustive `match` for the rest                                   |
+| `float_cmp` (in tests)            | `.to_bits()` comparisons — `assert_eq!(f.to_bits(), v.to_bits())`                                                |
+| `doc_markdown`, `assigning_clones`, `too_long_first_doc_paragraph` | rewrite the doc / code                                                          |
+| `missing_errors_doc`, `missing_panics_doc`, `missing_safety_doc` | add the doc                                                                       |
+
+### Accepted per-site exceptions
+
+1. **`unix/unix/src/metal/macdrv.rs` `mod bounded_cast`** — `cast_possible_truncation` + `cast_sign_loss` + `cast_precision_loss`, mod-level. Three numeric-cast helpers (`f64_to_u32_saturating`, `f64_to_f32`, `i32_to_f32`) whose bounds are established by callers. The structural alternative (IEEE-754 bit-manipulation reimplementing `as`) is ~25 lines of mantissa/exponent extraction producing identical bits with zero precision benefit. Each fn doc names the bound; callers document why their input satisfies it.
+2. **`unix/unix/src/metal/command.rs` `PendingCmdBuf`** — `non_send_fields_in_send_ty`. Wraps `Retained<dyn MTLCommandBuffer>`; the three ops we use (refcount inc/dec, `waitUntilCompleted`) are Apple-documented thread-safe. Alternatives are `SendWrapper` (panics on cross-thread access) or raw `usize` + `Retained::retain` everywhere — both worse than a well-documented `unsafe impl Send` at one narrow site.
+3. **`windows/core/src/config.rs` `Mtld3dConfig`** — `struct_excessive_bools`. The config is a flat one-`bool`-per-`mtld3d.conf`-key bag; each field name mirrors a file key (`caps_all` ↔ `debug.capsAll`). Packing into `bitflags!` (the §"Booleans pack" default) would decouple the field names from the conf keys for no hot-path benefit — `Mtld3dConfig` is read once per `IDirect3D9`, never per-draw. The clarity of the 1:1 mapping outweighs the byte savings, so the bools stay flat.
+
+**Note on `as`:** even when an `as` cast is identity at compile time (e.g. `u64 as usize` on a 64-bit-only build), prefer `usize::try_from(v).expect(...)` with a one-line rationale. `as` is the smell; `try_from` keeps the bound check explicit and survives a future port to a 32-bit unix host without silent truncation.
+
+### Adding a new per-site allow
+
+Acceptable only when **all** of:
+
+1. The lint is in `clippy::nursery` or `clippy::pedantic` (never `complexity`, `correctness`, `perf`, `style`, `suspicious`, or any rustc warning).
+2. The structural fix from the table above has been attempted and produces verbose code with identical machine behaviour, or defeats a safety mechanism / breaks a binary contract / forces every caller through the same hack.
+3. A `// allow: <reason>` comment (or doc comment on the surrounding fn / mod) names which of (2) applies and why the table entry doesn't.
+
+A single `// allow:` comment may cover a contiguous run of `#[allow(...)]` attributes on the same item when the same rationale applies. Prefer the multi-lint form `#[allow(a, b, c)]` or a mod-level `#[allow(...)]` covering the helpers (see `bounded_cast`).
+
+### Workspace-level
+
+Both workspace `[lints.clippy]` blocks — `windows/Cargo.toml` and `unix/Cargo.toml`, inherited by every member via `[lints] workspace = true` — deny `nursery` + `pedantic`. The **only** workspace-level allow in the tree is `too_many_lines = "allow"`. Rationale: line count is a poor proxy for complexity. The lints that catch real complexity (`cognitive_complexity`, `cyclomatic_complexity`) stay denied; long but linear procedural functions (frame encoder, MSL codegen templates, per-opcode dispatchers, test narratives) are left intact rather than fragmented into helpers that thread the same state.
+
+Adding any other `[workspace.lints] foo = "allow"` requires the same justification as a per-site allow plus an argument that it applies uniformly across every member crate.
+
+## No silent failures — use `log_once_warn!`
+
+Every stub, unimplemented branch, default `_ =>` arm, silent early-return, and silent fallback must log. Silent fallthroughs hide real bugs behind a clean `RUST_LOG=info`.
+
+Macros live in `unix/shared/src/log_helpers.rs`, exported via `#[macro_export]`. Every crate calls them as `mtld3d_shared::log_once_warn!(target: LOG_TARGET, "…")` (or `log_once_warn_by!`, `log_once_trace_by!`, `log_once_info!`, `log_once_info_by!`). Backed by per-call-site `static AtomicBool` — fires once per process per site.
+
+When to `log_once_warn!`: COM vtable stubs returning a constant; `match` arms falling through because the input isn't handled yet; `else { return }` short-circuits dropping a draw / skipping a binding / swallowing state; FFI/Metal helpers with safe-fallback returns for unmapped values.
+
+When to `log_once_info!` instead: the D3D9 no-op IS the complete correct Metal-world behaviour — VRAM-residency hints (`PreLoad`, `Set/GetPriority`, `EvictManagedResources`), obsolete features modern drivers also ignore (`GetNPatchMode`). Info only when (a) Metal has no equivalent or the feature is obsolete on all modern drivers, (b) the returned value matches a real driver, and (c) returning it causes no visible misbehaviour.
+
+When NOT to use either: legitimate by-design no-ops (cache hits, `None`-then-`continue` in a search) — comment instead. Real error paths that should fire every time — keep `error!`.
+
+Format: `"stub IDirect3DDevice9::Foo → ReturnCode"`, `"IDirect3D<Type>9::<Method>: no Metal analog, no-op"`, `"<module>: <what happened> → <fallback>"`. One line; once-per-site means it can be descriptive.
+
+## No raw `msg_send!` — use typed `objc2-*` bindings
+
+Every Obj-C selector goes through a typed method on an `objc2-*` framework crate (`objc2-metal`, `objc2-quartz-core`, `objc2-foundation`, `objc2-core-foundation`, `objc2-core-graphics`, `objc2-app-kit`). Selector name and return type become compile errors instead of runtime `unrecognized selector` crashes, and the per-call `unsafe { … }` wrapping disappears for safe selectors.
+
+Untyped `msg_send!` is a silent-drift risk. A selector typo (`setDisplaySyncEnabld:`) compiles, ships, and fires the first time the user resizes a window. Return-type mismatches are equally undetectable until a corrupted value shows up downstream. The objc2 framework crates are already wired in `unix/Cargo.toml`, so reaching for `msg_send!` is leaving free type-checking on the table.
+
+This is one instance of the general rule in §"Unsafe is a last resort": prefer typed safe wrappers over raw unsafe. `msg_send!` is an untyped unsafe surface that already has typed alternatives.
+
+How to apply:
+
+- New selector → use the typed method from the right `objc2-*` crate. If the feature isn't enabled yet, add it to the right entry under `[workspace.dependencies]` in `unix/Cargo.toml`.
+- Need a class from an `objc2-*` framework crate not yet wired? Add it with `default-features = false` + an explicit feature list — these crates default to "everything on" (`objc2-app-kit` alone has hundreds of default features), which inflates compile time.
+- Feature dependencies are not transitive: enabling `NSView` requires `NSResponder`; methods returning `CGFloat`/`NSRect` need the `objc2-core-foundation` feature on `objc2-app-kit`. The compile error names the missing item; the crate's `Cargo.toml` `[features]` section names the gate.
+- `*mut c_void` from FFI → `Retained::retain(ptr.cast::<TypedClass>())`, then call typed methods. Pattern used throughout `macdrv.rs`.
+- Protocol inheritance (e.g. handing a `CAMetalDrawable` to `MTLCommandBuffer::presentDrawable`) uses `ProtocolObject::from_ref(&*sub_obj)` — sound because the sub-protocol trait extends the super-protocol trait. Type inference at the call site picks the target protocol.
+- `MainThreadOnly` classes (`NSScreen` / `NSView` / `NSWindow` / most of AppKit) are reached from the main thread alone, through the two dispatchers; §"AppKit work runs on the main thread" has the rule and the marker it takes.
+
+Hard rule: no new `msg_send!`, `class!`, or `sel!` callsites — they're a grep away from being banned mechanically. If a binding is genuinely missing from objc2 framework crates, declare it locally via `objc2::extern_class!` / `extern_methods!` (the same macros the framework crates use) so the surface stays typed.
+
+This is one instance of the general rule in §"Unsafe is a last resort": prefer typed safe wrappers over raw unsafe. `msg_send!` is unsafe surface that already has typed alternatives.
+
+## AppKit work runs on the main thread
+
+Every `AppKit` object the layer touches (a view, its window, the screen under it, `NSApp`, the notification center and the observers it hands back) is created, read and released on the main thread, and so is the Core Animation layer configuration that has to land in a main-thread `CATransaction`. The API, encoder and submit threads never reach one directly: main-thread-only work is dispatched through `run_on_main_thread_sync` or `run_on_main_thread_async` in `unix/unix/src/metal/macdrv.rs`, the only two doors, and the dispatched closure runs in an autorelease pool of its own, so what it autoreleases drains when it returns rather than in whatever pool the main thread's caller holds open. The synchronous door goes through Wine's `OnMainThread` where the `macdrv_functions` table publishes it, which answers winemac's queries to the waiting thread while it waits, and through `dispatch_sync` on the main queue otherwise, or when the entry returns without running the work (CrossOver's arm64 build publishes it as a stub). A thread that another thread may be waiting on takes the asynchronous door: winemac's main thread waits on Wine threads in a run-loop mode that does not drain the main queue, and the thread it waits on can be the API thread blocked on the encoder, so a synchronous hop from the encoder thread closes a cycle.
+
+Inside the dispatch, the marker is the checked `MainThreadMarker::new().expect("<function> runs on the main thread")`. The check is one `pthread_main_np` call on a path that is already a main-queue block, and an off-main use aborts with a named site instead of corrupting `AppKit`'s per-thread state. `unsafe { MainThreadMarker::new_unchecked() }` is banned by `make audit`; a property documented as readable from any thread is no exception, because the walk to the object that has the property is the part that is not.
+
+A view or a layer is resurrected from the address an attachment record holds in exactly one place: the registry helpers `retain_view` and `retain_layer` in `metal/macdrv/attachment.rs`, which check the record is still live under the registry lock and take a `MainThreadMarker`, so the contract is type-enforced where the address is turned back into an object. A new reader of a record's view or layer goes through them.
+
+## Doc comments
+
+- Use `///` for items, `//` for fn-body and inline notes.
+- Doc first paragraph stays brief (avoids `clippy::too_long_first_doc_paragraph`).
+- Identifiers in doc comments use backticks; clones into existing buffers use `clone_into` (avoids `clippy::doc_markdown` and `clippy::assigning_clones`).
+- Default to writing no comment at all. Add one when the *why* is non-obvious: a hidden constraint, a subtle invariant, a workaround for a specific behaviour, a surprise. Don't explain *what* the code does — well-named identifiers already do that.
+
+### Shape: title, blank line, body
+
+Every doc block of **two or more lines** — `///` or `//!`, on any item, including struct fields and enum variants — is shaped:
+
+1. Line 1 is a **single-line title**: one sentence, no wrap, within the 100 columns rustfmt gives code.
+2. Line 2 is an **empty doc line**.
+3. The body follows.
+
+A one-line doc comment is already a title and needs nothing. Blocks whose content is only a `# Safety` / `# Errors` / `# Panics` section still get a title line above it.
+
+The title is what rustdoc puts in the summary column of every index, and what a reader sees before deciding to keep reading. A wrapped opening sentence gives them a fragment. `make audit` enforces the shape; body prose stays hard-wrapped at the file's existing width.
+
+```rust
+/// A standalone `CreateRenderTarget` colour surface.
+///
+/// `parent_texture` is null (so it is not texture-backed) but it carries its
+/// own persistent `metal_color_handle` distinct from the backbuffer, plus its
+/// own format and dimensions.
+```
+
+## FxHash for maps, xxh3 for content
+
+Every hash map and set in both workspaces is `rustc_hash::FxHashMap` / `FxHashSet`, never std's default `HashMap` / `HashSet`. The keys here are `u64`s, handles, ids and small derived-`Hash` structs; SipHash's DoS resistance buys nothing in a renderer and costs a dozen rounds per lookup where FxHash is one multiply. Build with `FxHashMap::default()` or `with_capacity_and_hasher(n, FxBuildHasher)`. `std::collections::hash_map::Entry` is hasher-agnostic and stays.
+
+Content hashing is a different job: folding a byte buffer or a composite key into a `u64` that then *is* the identity (shader bytecode, vertex declarations, cursor pixels, the on-disk shader-cache keys). That uses `xxhash_rust::xxh3::Xxh3`: fast over buffers, real avalanche, stable across toolchains. Never `DefaultHasher` (SipHash, and std documents its algorithm as unspecified between releases) and never `FxHasher`, which spreads keys across buckets but is not an identity: a map absorbs a collision with the `Eq` compare that follows, a content hash has nothing behind it.
+
+The audit bans `HashMap`, `HashSet`, `DefaultHasher` and `RandomState` outside comments.
+
+## Dependencies
+
+- All third-party versions live in `[workspace.dependencies]` at the workspace root. Member crates use `{ workspace = true }`.
+- Both `Cargo.lock` files are committed for reproducible releases. Bump via `make upgrade` (semver-compatible) or `make upgrade-incompat` (with `cargo-edit`).
+
+## Imports
+
+No glob imports. Explicit named imports only — never `use foo::*`. Two exceptions:
+
+- A `pub use submodule::*` re-export of a crate's **own** constant-definition modules (`mtld3d-types`' `lib.rs` re-exports `device::*` / `direct3d9::*`): the glob is the crate's public API surface, and it lets a new `pub const` land in those modules without a parallel `lib.rs` edit. That is a re-export of in-crate items, not a glob *import* of another module's names into local scope.
+- `use super::*` at the top of a `#[cfg(test)]` test module file (`foo/tests.rs`): the standard Rust idiom for pulling the module-under-test's items into its unit tests. The test module is private, so nothing leaks past the crate, and the glob tracks the parent's surface without churn as items come and go.
+
+## State lives on an object, not in a static
+
+Mutable state hangs off the object that owns it: an interface or device for
+application-facing state, a `FrameEncoder` for state confined to its encoder
+thread, and native per-device records for native work. Runtime placement does
+not change ownership scope. A PE object can own the lifetime of a native record
+through an opaque handle, while Unix allocates and frees the record. Shared
+sinks retain explicit backing and teardown contracts. Do not move per-device
+state into a process-global registry merely because its worker moves to Unix.
+
+A `static` that holds mutable state is an exception, and its doc block names which of these arguments earns it:
+
+- **The caller has no object to reach.** A signal handler, the VEH, `DllMain`, an IAT hook the guest calls through its own `user32`/`kernel32` imports, an `NSNotification` observer, a Metal completion handler, a window procedure whose only key is the `HWND`. Those last two take a map keyed by what they do have (`DEVICE_INSTANCES`, `DRIVING_WINDOWS`, `ATTACHMENTS`) — a registry of per-object records, not state of its own.
+- **The resource is process-wide.** One log file, one global allocator, one `MTLDevice`, one `MTLCaptureManager`, one `NSApp` and Wine delegate, one system cursor, one 32-bit address space. A cache built on the one `MTLDevice` (pipelines, functions, null textures) is process-wide for the same reason, and says so.
+- **It outlives every object.** The kept metal views keyed by `HWND`, the page-box pool and its generation counter: a box retired by one device serves the next, and generations must not collide when addresses are reused.
+- **It is a machine fact, latched once and immutable after.** The adapter mode list, the device info, the TSC rate, the `RUST_LOG` gates.
+- **It is a per-call-site log-once latch** (§No silent failures — use `log_once_warn!`). Those carry nothing beyond "fired".
+
+What does not earn one: "the handler had no context, so I keyed a global map by an address I happen to have", "it is only a counter", "it is just a cache". A counter in a static counts every device at once — two devices sample a per-device cadence at double rate and drain each other's statistics — and a global map puts a lock on a path that would otherwise need none. Diagnostic counters are not exempt: they are read as per-device numbers.
+
+A static touched by exactly one function is declared inside that function, not at module scope. Same address stability and `'static` lifetime, with the visibility matching the actual reach. Module scope is for the load-bearing cases: `#[global_allocator]`, cross-module flags, anything `pub`.
+
+`make audit` does not count statics; the plan's Rules check does. A plan that introduces one names it and gives its argument (see `CLAUDE.md`).
+
+## Inline attributes
+
+Default `#[inline]`, not `#[inline(always)]`. Thin-LTO inlines small functions on its own; `#[inline(always)]` is reserved for cases where measurement proves it pays.
+
+## `LazyLock` over `OnceLock`
+
+`LazyLock` is the default when the initializer is a static `fn` (stable since 1.80). Reach for `OnceLock` only when the initializer needs runtime arguments.

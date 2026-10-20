@@ -1,0 +1,478 @@
+//! Several devices alive at once, each on its own window.
+//!
+//! The unix side keeps one attachment record per device, keyed by the metal
+//! view attach created, and every present and every teardown addresses its
+//! own. These tests drive two and three devices side by side through the
+//! paths that look a record up: interleaved presents past the interval at
+//! which the presenting thread asks the main thread for a display
+//! reconciliation, a teardown beside a device that keeps presenting, and an
+//! attach beside a device that is already live. The last two tests move the
+//! devices onto two threads: one where each device's wait for its own frame
+//! meets the other's submissions in the unix-side registry of in-flight
+//! command buffers, and one where two devices under `render.scale` read back
+//! at once, so each device's readback resolve has to run in a scratch texture
+//! of its own.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use mtld3d_tests::{
+    HARNESS_PROBE_REPLY, Harness, HarnessConfig, SharedDevice, SharedQuery, Texture,
+    WM_HARNESS_PROBE, assert_pixel_eq, harness_window_proc, send_message, spawn_scoped,
+    window_proc,
+};
+use mtld3d_types::{
+    D3DCREATE_HARDWARE_VERTEXPROCESSING, D3DCREATE_MULTITHREADED, D3DFMT_A8R8G8B8, D3DFVF_XYZ,
+    D3DGETDATA_FLUSH, D3DISSUE_BEGIN, D3DISSUE_END, D3DPOOL_MANAGED, D3DPRESENT_INTERVAL_IMMEDIATE,
+    D3DPT_TRIANGLELIST, D3DQUERYTYPE_OCCLUSION, D3DVERTEXTEXTURESAMPLER0,
+};
+
+use super::shaders::{PS_COLOR_PASSTHROUGH, centered_triangle, vs_fetch_to_color};
+
+/// Two devices attached at once present independently, and a teardown leaves the other alone.
+///
+/// Both devices present past the interval at which the presenting thread
+/// queues a headroom refresh on the main thread, so that walk runs on each
+/// device's own view while the other is live; each then reads back its own
+/// colour. Releasing the first device retires its record while the second
+/// keeps presenting, a third device attaches beside the live second, and the
+/// two go away in the reverse order.
+///
+/// What this cannot detect: with a process-wide record in place of the
+/// per-device one these devices still render their own frames, because the
+/// harness windows are hidden, the headroom is 1.0 everywhere and a present
+/// routes by its own layer. What it guards is the per-device lookup on every
+/// present and detach path: a present that dereferences a retired record, a
+/// detach that retires the wrong one, or a lock order that wedges between the
+/// submit thread and the main thread's reconciliation ends this test rather
+/// than passing it.
+#[test]
+fn two_live_devices_present_independently() {
+    const PRESENTS: u32 = 40;
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    const BLUE: u32 = 0xFF00_00FF;
+
+    let first = Harness::new();
+    let second = Harness::new();
+    for _ in 0..PRESENTS {
+        first.render_once(RED, |_| {});
+        second.render_once(GREEN, |_| {});
+    }
+    assert_pixel_eq(
+        first.read_pixel(1, 1),
+        RED,
+        "first device beside the second",
+    );
+    assert_pixel_eq(
+        second.read_pixel(1, 1),
+        GREEN,
+        "second device beside the first",
+    );
+
+    // The window outlives the device it served.
+    assert_eq!(
+        first.release_device(),
+        0,
+        "the first device is fully released"
+    );
+    for _ in 0..PRESENTS {
+        second.render_once(GREEN, |_| {});
+    }
+    assert_pixel_eq(
+        second.read_pixel(1, 1),
+        GREEN,
+        "second device after the first was released",
+    );
+
+    let third = Harness::new();
+    for _ in 0..PRESENTS {
+        second.render_once(GREEN, |_| {});
+        third.render_once(BLUE, |_| {});
+    }
+    assert_pixel_eq(
+        second.read_pixel(1, 1),
+        GREEN,
+        "second device beside the third",
+    );
+    assert_pixel_eq(
+        third.read_pixel(1, 1),
+        BLUE,
+        "third device attached beside the live second",
+    );
+    drop(third);
+    drop(second);
+}
+
+/// Drive one device through `FRAMES` frames, each flushed through its occlusion query.
+///
+/// `GetData(D3DGETDATA_FLUSH)` parks on the unix-side wait for the frame the
+/// `Present` before it submitted, so every frame of this loop is one wait
+/// against the registry of in-flight command buffers.
+fn present_and_flush(
+    device: &SharedDevice<'_>,
+    query: &SharedQuery<'_>,
+    frames: u32,
+) -> Vec<(&'static str, i32)> {
+    let mut results = Vec::new();
+    for _ in 0..frames {
+        results.push(("Issue(BEGIN)", query.issue(D3DISSUE_BEGIN)));
+        results.push(("Issue(END)", query.issue(D3DISSUE_END)));
+        results.push(("Present", device.present()));
+        results.push(("GetData(FLUSH)", query.data_u32(D3DGETDATA_FLUSH).0));
+    }
+    results
+}
+
+/// Two devices on two threads each wait for their own frames.
+///
+/// Each worker drives one `D3DCREATE_MULTITHREADED` device: it brackets an
+/// empty frame with an occlusion query, presents, and flushes the query,
+/// which waits for the frame it just submitted. The two devices mint the
+/// same sequence numbers, so the unix-side registry of in-flight command
+/// buffers has to tell them apart: a wait that lands on the other device's
+/// buffer ends the process under the Metal validation layer when that buffer
+/// is not yet committed, and without the layer a wait whose entry the other
+/// device's completion removed retires a frame early. Both windows are
+/// created, pumped and destroyed on this thread, so the workers never touch
+/// a window. The collision is timing-dependent, so one run guards the lookup
+/// rather than proving it.
+#[test]
+fn two_devices_on_two_threads_wait_for_their_own_frames() {
+    const FRAMES: u32 = 300;
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+
+    // `IMMEDIATE`: a hidden window is held to the pace a vsync request sets,
+    // and the collision wants the frames as dense as the threads make them.
+    let config = HarnessConfig {
+        behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
+        ..HarnessConfig::default()
+    };
+    let first = Harness::create(&config);
+    let second = Harness::create(&config);
+    let first_query = first
+        .create_query(D3DQUERYTYPE_OCCLUSION)
+        .expect("OCCLUSION query is supported");
+    let second_query = second
+        .create_query(D3DQUERYTYPE_OCCLUSION)
+        .expect("OCCLUSION query is supported");
+    let first_shared = first.shared();
+    let second_shared = second.shared();
+    let first_shared_query = first_shared.share_query(&first_query);
+    let second_shared_query = second_shared.share_query(&second_query);
+    let finished = AtomicU32::new(0);
+
+    std::thread::scope(|scope| {
+        let first_worker = spawn_scoped(scope, || {
+            let results = present_and_flush(&first_shared, &first_shared_query, FRAMES);
+            finished.fetch_add(1, Ordering::AcqRel);
+            results
+        });
+        let second_worker = spawn_scoped(scope, || {
+            let results = present_and_flush(&second_shared, &second_shared_query, FRAMES);
+            finished.fetch_add(1, Ordering::AcqRel);
+            results
+        });
+        while finished.load(Ordering::Acquire) < 2 {
+            assert!(first.pump(), "WM_QUIT on the first window");
+            assert!(second.pump(), "WM_QUIT on the second window");
+            std::thread::yield_now();
+        }
+        for worker in [first_worker, second_worker] {
+            let results = worker.join().expect("a worker thread panicked");
+            // `GetData` may answer `S_FALSE` (1) for a query the GPU has not
+            // retired; every other call answers `D3D_OK`, and no call fails.
+            for (call, hr) in &results {
+                assert!(*hr >= 0, "{call} on a worker thread failed: 0x{hr:08X}");
+            }
+        }
+    });
+
+    first.render_once(RED, |_| {});
+    second.render_once(GREEN, |_| {});
+    assert_pixel_eq(
+        first.read_pixel(1, 1),
+        RED,
+        "first device after its thread stopped",
+    );
+    assert_pixel_eq(
+        second.read_pixel(1, 1),
+        GREEN,
+        "second device after its thread stopped",
+    );
+}
+
+/// What one worker's readbacks came to.
+struct ReadbackOutcome {
+    /// Readbacks that returned a colour other than the one cleared to.
+    mismatches: u32,
+    /// The first mismatch, as `(frame, pixel)`.
+    first_wrong: Option<(u32, u32)>,
+    /// The first failing call, by name, with its hr.
+    failed: Option<(&'static str, i32)>,
+}
+
+/// Clear, present and read back the centre pixel `frames` times.
+///
+/// Stops at the first failing call; a wrong colour is counted and the loop
+/// goes on, so the count says how often the collision landed.
+fn readback_own_colour(device: &SharedDevice<'_>, colour: u32, frames: u32) -> ReadbackOutcome {
+    let mut outcome = ReadbackOutcome {
+        mismatches: 0,
+        first_wrong: None,
+        failed: None,
+    };
+    for frame in 0..frames {
+        let hr = device.clear_target(colour);
+        if hr < 0 {
+            outcome.failed = Some(("Clear", hr));
+            return outcome;
+        }
+        let hr = device.present();
+        if hr < 0 {
+            outcome.failed = Some(("Present", hr));
+            return outcome;
+        }
+        match device.read_pixel(320, 240) {
+            Ok(pixel) if pixel == colour => {}
+            Ok(pixel) => {
+                outcome.mismatches += 1;
+                outcome.first_wrong.get_or_insert((frame, pixel));
+            }
+            Err(failed) => {
+                outcome.failed = Some(failed);
+                return outcome;
+            }
+        }
+    }
+    outcome
+}
+
+/// Two scaled devices on two threads each read back their own pixels.
+///
+/// Under `render.scale` a readback resolves the render-resolution back buffer
+/// up to its reported size in a scratch texture, then blits the scratch into
+/// the caller's memory, both on the device's own queue. Two devices at one
+/// size and format asked for the scratch at once, and Metal orders command
+/// buffers within a queue only, so the other device's resolve could land
+/// between this device's resolve and its blit: each read the other's frame.
+/// The scratch is keyed by the queue now, and this drives two devices of the
+/// same geometry through the readback at once. The collision is
+/// timing-dependent, so one run guards the keying rather than proving it.
+#[test]
+fn two_scaled_devices_on_two_threads_read_back_their_own_pixels() {
+    const FRAMES: u32 = 300;
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+
+    // `IMMEDIATE` for dense frames, as in the test above.
+    let config = HarnessConfig {
+        behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
+        config_entries: "render.scale=0.5",
+        presentation_interval: D3DPRESENT_INTERVAL_IMMEDIATE,
+        ..HarnessConfig::default()
+    };
+    let first = Harness::create(&config);
+    let second = Harness::create(&config);
+    let first_shared = first.shared();
+    let second_shared = second.shared();
+    let finished = AtomicU32::new(0);
+
+    std::thread::scope(|scope| {
+        let first_worker = spawn_scoped(scope, || {
+            let results = readback_own_colour(&first_shared, RED, FRAMES);
+            finished.fetch_add(1, Ordering::AcqRel);
+            results
+        });
+        let second_worker = spawn_scoped(scope, || {
+            let results = readback_own_colour(&second_shared, GREEN, FRAMES);
+            finished.fetch_add(1, Ordering::AcqRel);
+            results
+        });
+        while finished.load(Ordering::Acquire) < 2 {
+            assert!(first.pump(), "WM_QUIT on the first window");
+            assert!(second.pump(), "WM_QUIT on the second window");
+            std::thread::yield_now();
+        }
+        for (name, worker) in [("first", first_worker), ("second", second_worker)] {
+            let outcome = worker.join().expect("a worker thread panicked");
+            assert!(
+                outcome.failed.is_none(),
+                "{name} device: {} failed on its worker thread: 0x{:08X}",
+                outcome.failed.map_or("", |(call, _)| call),
+                outcome.failed.map_or(0, |(_, hr)| hr)
+            );
+            assert_eq!(
+                outcome.mismatches,
+                0,
+                "{name} device read another device's pixels in {} of {FRAMES} readbacks, \
+                 first at frame {} reading 0x{:08X}",
+                outcome.mismatches,
+                outcome.first_wrong.map_or(0, |(frame, _)| frame),
+                outcome.first_wrong.map_or(0, |(_, pixel)| pixel)
+            );
+        }
+    });
+}
+
+/// Send the window the messages the subclass acts on, then check its own procedure still answers.
+///
+/// `WM_SETCURSOR` over the client area with no D3D cursor set and `WM_SIZE`
+/// at the window's own client size both run through the subclass and on to
+/// the procedure it forwards to; the probe is answered by the harness
+/// window's procedure alone.
+fn window_still_reaches_its_procedure(hwnd: usize, when: &str) {
+    const WM_SIZE: u32 = 0x0005;
+    const WM_SETCURSOR: u32 = 0x0020;
+    const WM_MOUSEMOVE: isize = 0x0200;
+    const HTCLIENT: isize = 1;
+    // 480 rows in the high word, 640 columns in the low one.
+    const CLIENT_SIZE: isize = (0x01E0 << 16) | 0x0280;
+
+    let _ = send_message(hwnd, WM_SETCURSOR, hwnd, (WM_MOUSEMOVE << 16) | HTCLIENT);
+    let _ = send_message(hwnd, WM_SIZE, 0, CLIENT_SIZE);
+    assert_eq!(
+        send_message(hwnd, WM_HARNESS_PROBE, 0, 0),
+        HARNESS_PROBE_REPLY,
+        "{when}: the window's own procedure receives its messages"
+    );
+}
+
+/// Two devices on one window share its subclass, and the last one out restores its procedure.
+///
+/// D3D9 allows several devices on one window. Only the first one hooks the
+/// window procedure: a second hook would take the first for the procedure it
+/// wraps and forward every message to itself until the stack ran out. With
+/// both devices alive a cursor and a resize message reach the window's own
+/// procedure, the device left behind after either release keeps receiving
+/// them, and once both are gone the window runs its own procedure again, in
+/// either release order.
+#[test]
+fn two_devices_on_one_window_share_its_subclass_in_either_release_order() {
+    for first_released_first in [true, false] {
+        let order = if first_released_first {
+            "first device released first"
+        } else {
+            "second device released first"
+        };
+        let first = Harness::new();
+        let hwnd = first.hwnd();
+        let second = Harness::create(&HarnessConfig {
+            device_window: hwnd,
+            ..HarnessConfig::default()
+        });
+        assert_ne!(
+            window_proc(hwnd),
+            harness_window_proc(),
+            "{order}: the window is subclassed while a device lives"
+        );
+        window_still_reaches_its_procedure(hwnd, &format!("{order}, both devices alive"));
+
+        if first_released_first {
+            assert_eq!(
+                first.release_device(),
+                0,
+                "the first device is fully released"
+            );
+            window_still_reaches_its_procedure(hwnd, &format!("{order}, second device left"));
+            assert_eq!(
+                second.release_device(),
+                0,
+                "the second device is fully released"
+            );
+        } else {
+            assert_eq!(
+                second.release_device(),
+                0,
+                "the second device is fully released"
+            );
+            window_still_reaches_its_procedure(hwnd, &format!("{order}, first device left"));
+            assert_eq!(
+                first.release_device(),
+                0,
+                "the first device is fully released"
+            );
+        }
+        assert_eq!(
+            window_proc(hwnd),
+            harness_window_proc(),
+            "{order}: the window runs its own procedure once no device is left"
+        );
+        assert_eq!(
+            send_message(hwnd, WM_HARNESS_PROBE, 0, 0),
+            HARNESS_PROBE_REPLY,
+            "{order}: the window's own procedure answers once no device is left"
+        );
+        // The window outlives both devices; the harness that created it destroys it.
+        drop(second);
+        drop(first);
+    }
+}
+
+/// Draw the centred triangle coloured by what vertex texture slot 0 fetches from `texture`.
+///
+/// The texture is bound at the vertex slot alone, so nothing but that slot's
+/// bind and the draw that follows can bring it to `h`'s device. Returns the
+/// pixel at the triangle's centre.
+fn vertex_fetched_colour(h: &Harness, texture: &Texture<'_>) -> u32 {
+    const BLUE: u32 = 0xFF00_00FF;
+    assert_eq!(
+        h.set_texture(D3DVERTEXTEXTURESAMPLER0, texture),
+        0,
+        "bind vertex sampler 0"
+    );
+    let vs = h.create_vertex_shader(&vs_fetch_to_color());
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+            0,
+            "draw"
+        );
+    });
+    let pixel = h.read_pixel(320, 280);
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(
+        h.clear_texture(D3DVERTEXTEXTURESAMPLER0),
+        0,
+        "unbind vertex sampler 0"
+    );
+    pixel
+}
+
+/// A texture another live device used is sampled through a vertex texture slot of this one.
+///
+/// A `D3DPOOL_MANAGED` texture follows the device it is used on. A fragment
+/// stage moves it over in the draw's stage walk, and a vertex texture slot has
+/// to as well: bound at the slot alone, the texture stayed attached to the
+/// device it came from, its levels never uploaded here, and the fetch found no
+/// storage behind its id on this device's encoder.
+#[test]
+fn a_texture_bound_only_at_a_vertex_slot_moves_to_the_device_that_samples_it() {
+    const GREEN: u32 = 0xFF00_FF00;
+    let first = Harness::new();
+    let second = Harness::new();
+    let texture = first.create_texture(2, 2, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    texture.lock_rect(0, 0).write_u32(&[GREEN; 4]);
+
+    assert_eq!(
+        vertex_fetched_colour(&first, &texture),
+        GREEN,
+        "the device that created the texture fetches it"
+    );
+    assert_eq!(
+        vertex_fetched_colour(&second, &texture),
+        GREEN,
+        "the second device fetches the texture it took over through the vertex slot"
+    );
+    assert_eq!(
+        vertex_fetched_colour(&first, &texture),
+        GREEN,
+        "and the first device fetches it again once it moves back"
+    );
+}

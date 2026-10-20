@@ -1,0 +1,176 @@
+[workspace]
+members = ["unix", "shared", "conformance", "e2e"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+version = "0.14.1"
+license = "Zlib"
+description = "Direct3D 9 translation layer for Wine on macOS, backed by Metal"
+authors = ["Alexander Theissen <alex.theissen@me.com>"]
+keywords = ["direct3d", "d3d9", "metal", "wine", "macos"]
+categories = ["graphics", "emulators", "api-bindings"]
+repository = "https://github.com/athei/mtld3d"
+homepage = "https://github.com/athei/mtld3d"
+
+[workspace.dependencies]
+bitflags = "2"
+block2 = "0.6"
+cc = "1"
+mtld3d-shared = { path = "shared" }
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+libc = "0.2"
+libloading = "0.9"
+log = "0.4"
+# `disable-encoding-assertions` turns off objc2's debug-only runtime
+# message-send verification. Under an Xcode GPU capture, Metal substitutes a
+# `CaptureMTLDevice` proxy that forwards `MTLDevice` methods dynamically rather
+# than declaring them on its class; that verification inspects the class method
+# table (which does not see dynamic forwarding) and aborts a `release`/`dev`
+# build with "method not found" before the forwarded call can run. We use only
+# generated typed bindings (no hand-rolled `msg_send!`), so the check only ever
+# produces that false positive here — disabling it lets the real, forwarded
+# value come back and makes capturable debug builds behave like production.
+objc2 = { version = "0.6", features = ["disable-encoding-assertions"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "NSApplication",
+    "NSBitmapImageRep",
+    "NSColor",
+    "NSColorSpace",
+    "NSCursor",
+    "NSEvent",
+    "NSGraphics",
+    "NSImage",
+    "NSImageRep",
+    "NSResponder",
+    "NSScreen",
+    "NSView",
+    "NSWindow",
+    "block2",
+    "objc2-core-foundation",
+    "objc2-core-graphics",
+    "objc2-quartz-core",
+] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes", "CFRunLoop"] }
+objc2-core-graphics = { version = "0.3", features = ["CGColorSpace", "CGDirectDisplay"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSDictionary",
+    "NSException",
+    "NSString",
+    "NSURL",
+    "NSProcessInfo",
+    "NSNotification",
+    "NSNull",
+    "NSOperation",
+    "block2",
+] }
+objc2-metal = { version = "0.3", features = [
+    "MTLBuffer",
+    "MTLCaptureManager",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLCommandEncoder",
+    "MTLDepthStencil",
+    "MTLDevice",
+    "MTLDrawable",
+    "MTLLibrary",
+    "MTLPixelFormat",
+    "MTLRenderCommandEncoder",
+    "MTLRenderPass",
+    "MTLRenderPipeline",
+    "MTLResource",
+    "MTLSampler",
+    "MTLTexture",
+    "MTLTypes",
+    "MTLVertexDescriptor",
+] }
+objc2-metal-fx = { version = "0.3", features = ["MTLFXSpatialScaler"] }
+objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer", "CATransaction", "objc2-metal"] }
+rustc-hash = "2"
+# The global allocator of the native dylib, with the `build_cc` configuration
+# the PE side ships (windows/Cargo.toml). Both lockfiles resolve the same
+# version, and `make upgrade` and `make upgrade-incompat` keep this one on it
+# by moving them together. The windows workspace's `snmalloc_drift` tests catch
+# a bump that changes the allocator's shape; this workspace has none.
+snmalloc-rs = { version = "0.7.6", features = ["build_cc"] }
+strum = { version = "0.28", default-features = false }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = "thin"
+# Match windows/Cargo.toml — limited debug info for post-mortem
+# symbolication of mtld3d.so crashes (e.g. NSException stack traces).
+# Function names + line tables + inline frame chain. The bytes do NOT
+# land in the dylib: cargo defaults to `split-debuginfo = "unpacked"`
+# on macOS, so the DWARF stays in the compiler's `.o` files and the
+# dylib carries only a debug map (`OSO` stabs) naming them by absolute
+# path. That map resolves on this machine until the next rebuild and
+# nowhere else, which is why the `unix` make target runs `dsymutil` to
+# gather the DWARF into a shippable `mtld3d.so.dSYM` — the Mach-O
+# counterpart of the side-by-side `.pdb` on MSVC.
+debug = 1
+
+# `release` is our dev/debug profile (the `make` build + e2e run against it),
+# so carry the debugging checks here: `debug-assertions` (every `debug_assert!`)
+# and `overflow-checks` (panic on integer wrap). `production` overrides both
+# back off below.
+debug-assertions = true
+overflow-checks = true
+
+# snmalloc-sys 0.7's build.rs reads cargo's `DEBUG` env var (set when the
+# package's debuginfo is enabled) and then compiles its C++ with `-g` and
+# reports a `Debug` build. Keep it a release build of the allocator in every
+# profile, as windows/Cargo.toml does, since dev defaults to `debug = 2`.
+# `NDEBUG` is not this override's job: production gets it for every C and C++
+# object from the Makefile (docs/CONVENTIONS.md, "Production carries no debug
+# assertions"), and `release` keeps snmalloc's checks with the rest.
+[profile.release.package.snmalloc-sys]
+debug = 0
+
+[profile.dev.package.snmalloc-sys]
+debug = 0
+
+# zstd-sys's C objects would otherwise carry `-g` for the same reason. Under
+# LTO rustc links the dylib against a filtered copy of each rlib in a temporary
+# directory it deletes after the link, so the debug map names those objects by
+# a path that no longer exists: `dsymutil` warns once per object and gathers no
+# DWARF from them. Building them without debug info leaves nothing to point at.
+# dev gets the same override so the two profiles agree, as for snmalloc-sys.
+[profile.release.package.zstd-sys]
+debug = 0
+
+[profile.dev.package.zstd-sys]
+debug = 0
+
+# Shipped builds — fat cross-crate LTO + a single codegen unit so the
+# linker can inline and DCE across the whole dylib. Inherits panic, debug,
+# opt-level, incremental from `release`, but overrides `debug-assertions` +
+# `overflow-checks` back off (release carries them for dev/test; the shipped
+# artifact must not). Activated by `PROD=1 make`.
+[profile.production]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug-assertions = false
+overflow-checks = false
+
+# Warn-level so a plain `cargo clippy` (or an editor) reports findings without
+# hard-failing; the hard gate is `make check`, which denies every warning via
+# cargo's `build.warnings = "deny"`.
+[workspace.lints.clippy]
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Stricter unsafe discipline (see docs/CONVENTIONS.md §"Unsafe is a last resort").
+missing_safety_doc = "warn"
+not_unsafe_ptr_arg_deref = "warn"
+transmute_ptr_to_ref = "warn"
+multiple_unsafe_ops_per_block = "warn"
+undocumented_unsafe_blocks = "warn"
+# Length is a poor proxy for complexity; allow long procedural functions
+# (frame encoder, MSL codegen templates, per-opcode dispatchers) where the
+# structural alternative is fragmented helpers threading the same state.
+too_many_lines = "allow"

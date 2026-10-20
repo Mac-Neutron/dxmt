@@ -1,0 +1,1552 @@
+//! `IUnknown` / `IDirect3DResource9` plumbing.
+//!
+//! Refcounts, `QueryInterface`, `GetDevice`, `GetType`, no-op methods, caps
+//! queries, and stub contracts.
+
+use core::ffi::c_void;
+
+use mtld3d_tests::{Harness, UNWRITTEN, spawn_scoped};
+use mtld3d_types::{
+    D3D_OK, D3DCLEAR_TARGET, D3DDECL_END_STREAM, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
+    D3DDECLUSAGE_POSITION, D3DERR_INVALIDCALL, D3DERR_MOREDATA, D3DERR_NOTFOUND,
+    D3DERR_UNSUPPORTEDTEXTUREFILTER, D3DFMT_A8R8G8B8, D3DFMT_D16, D3DFMT_D24S8, D3DFMT_INDEX16,
+    D3DFMT_R5G6B5, D3DFVF_XYZ, D3DGAMMARAMP, D3DMULTISAMPLE_4_SAMPLES, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DQUERYTYPE_EVENT, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DSBT_ALL,
+    D3DSGR_CALIBRATE, D3DSGR_NO_CALIBRATION, D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DTSS_CONSTANT, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_WRITEONLY, D3DVERTEXELEMENT9, E_NOINTERFACE,
+    Guid, IDirect3D9Vtbl, IID_IDIRECT3D9, IID_IDIRECT3DDEVICE9, IID_IDIRECT3DSWAPCHAIN9,
+    IID_IDIRECT3DTEXTURE9, IID_IUNKNOWN,
+};
+
+/// `GetPrivateData` as a test reads it: the hr and the size it reported.
+type GetPrivateData<'a> = &'a dyn Fn(Option<&mut [u8]>) -> (i32, u32);
+
+/// `vs_2_0 { dcl_position v0; mov oPos, v0 }` and `ps_2_0 { mov oC0, c0 }`.
+///
+/// The programs are here only to have a shader object to ask; what they
+/// compute never reaches a draw.
+const VS_PASSTHROUGH: [u32; 8] = [
+    0xFFFE_0200,
+    0x0200_001F,
+    0x8000_0000,
+    0x900F_0000,
+    0x0200_0001,
+    0xC00F_0000,
+    0x90E4_0000,
+    0x0000_FFFF,
+];
+
+const PS_WHITE: [u32; 5] = [
+    0xFFFF_0200,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0000,
+    0x0000_FFFF,
+];
+
+const POSITION_DECL: [D3DVERTEXELEMENT9; 2] = [
+    D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset: 0,
+        type_: D3DDECLTYPE_FLOAT3,
+        method: 0,
+        usage: D3DDECLUSAGE_POSITION,
+        usage_index: 0,
+    },
+    D3DVERTEXELEMENT9 {
+        stream: D3DDECL_END_STREAM,
+        offset: 0,
+        type_: D3DDECLTYPE_UNUSED,
+        method: 0,
+        usage: 0,
+        usage_index: 0,
+    },
+];
+
+/// `SetTexture` / `GetTexture` take the fragment and vertex stages and ignore every other stage.
+///
+/// A stage no sampler has is accepted and ignored: `SetTexture` returns
+/// `D3D_OK` without binding and `GetTexture` returns `D3D_OK` with a null
+/// texture, the answer Windows and Wine give.
+#[test]
+fn get_texture_accepts_all_fragment_and_vertex_slots() {
+    let h = Harness::new();
+    let texture = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    let base = texture.refcount();
+
+    for stage in [15, 257, 260] {
+        assert_eq!(
+            h.set_texture(stage, &texture),
+            D3D_OK,
+            "SetTexture({stage})"
+        );
+        assert_eq!(
+            h.texture_matches_raw_result(stage, texture.as_ptr()),
+            (D3D_OK, true),
+            "GetTexture({stage}) returns the binding"
+        );
+        assert_eq!(
+            texture.refcount(),
+            base,
+            "GetTexture({stage}) reference is released"
+        );
+    }
+
+    for stage in [16, 256, 261, u32::MAX] {
+        assert_eq!(
+            h.set_texture(stage, &texture),
+            D3D_OK,
+            "SetTexture({stage}) is accepted and ignored"
+        );
+        assert_eq!(
+            h.texture_matches_raw_result(stage, core::ptr::null_mut()),
+            (D3D_OK, true),
+            "GetTexture({stage}) answers a null texture"
+        );
+        assert_eq!(
+            texture.refcount(),
+            base,
+            "SetTexture({stage}) took no reference"
+        );
+    }
+}
+
+/// State calls with an index no state has follow the D3D9 runtimes rather than refusing it.
+///
+/// A texture-stage-state stage past the eighth clamps to the eighth, and a
+/// type past `D3DTSS_CONSTANT` (or the unnamed type 0) to `D3DTSS_CONSTANT`,
+/// on both `Set` and `Get`. A sampler state of a stage no sampler has is
+/// accepted and ignored, and reads as zero. A render state past
+/// `D3DRS_BLENDOPALPHA` up to 255 is accepted, ignored and reads as zero;
+/// above 255, and the unnamed states 1 to 6, `SetRenderState` still answers
+/// `D3D_OK` while `GetRenderState` is `INVALIDCALL`.
+#[test]
+fn out_of_range_state_indices_clamp_or_are_ignored() {
+    let h = Harness::new();
+
+    assert_eq!(
+        h.set_texture_stage_state(9, D3DTSS_CONSTANT, 0x1234_5678),
+        D3D_OK
+    );
+    assert_eq!(h.texture_stage_state(7, D3DTSS_CONSTANT), 0x1234_5678);
+    assert_eq!(
+        h.try_texture_stage_state(u32::MAX, D3DTSS_CONSTANT),
+        (D3D_OK, 0x1234_5678),
+        "a Get past the eighth stage reads the eighth"
+    );
+    assert_eq!(h.set_texture_stage_state(2, 40, 0x0BAD_F00D), D3D_OK);
+    assert_eq!(h.texture_stage_state(2, D3DTSS_CONSTANT), 0x0BAD_F00D);
+    assert_eq!(
+        h.try_texture_stage_state(2, 0),
+        (D3D_OK, 0x0BAD_F00D),
+        "type 0 reads D3DTSS_CONSTANT"
+    );
+
+    for sampler in [16, 256, 261] {
+        assert_eq!(
+            h.set_sampler_state(sampler, D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            D3D_OK,
+            "SetSamplerState({sampler}) is accepted and ignored"
+        );
+        assert_eq!(
+            h.try_sampler_state(sampler, D3DSAMP_MAGFILTER),
+            (D3D_OK, 0),
+            "GetSamplerState({sampler}) reads zero"
+        );
+    }
+    assert_eq!(
+        h.sampler_state(15, D3DSAMP_MAGFILTER),
+        D3DTEXF_POINT,
+        "the last fragment sampler keeps its default"
+    );
+
+    for state in [210, 255] {
+        assert_eq!(
+            h.set_render_state(state, 7),
+            D3D_OK,
+            "SetRenderState({state})"
+        );
+        assert_eq!(
+            h.try_render_state(state),
+            (D3D_OK, 0),
+            "GetRenderState({state}) reads zero"
+        );
+    }
+    for state in [1, 6, 256, u32::MAX] {
+        assert_eq!(
+            h.set_render_state(state, 7),
+            D3D_OK,
+            "SetRenderState({state})"
+        );
+        assert_eq!(
+            h.try_render_state(state),
+            (D3DERR_INVALIDCALL, UNWRITTEN),
+            "GetRenderState({state}) is refused"
+        );
+    }
+}
+
+/// Every child resource forwards exactly one reference to the owning device.
+///
+/// The reference is held for the child's public lifetime (the D3D9
+/// child-refcount model): creating one raises the device refcount by one,
+/// releasing it lowers it back. Guards the central `ComChild` forwarding engine
+/// against per-type imbalance.
+#[test]
+fn child_resources_balance_device_refcount() {
+    let h = Harness::new();
+    let base = h.device_refcount();
+
+    {
+        let _vb = h.create_vertex_buffer(64, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+        assert_eq!(h.device_refcount(), base + 1, "vertex buffer forwards +1");
+    }
+    assert_eq!(h.device_refcount(), base, "vertex buffer release balances");
+
+    {
+        let _ib = h.create_index_buffer(64, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+        assert_eq!(h.device_refcount(), base + 1, "index buffer forwards +1");
+    }
+    assert_eq!(h.device_refcount(), base, "index buffer release balances");
+
+    {
+        let _tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+        assert_eq!(h.device_refcount(), base + 1, "texture forwards +1");
+    }
+    assert_eq!(h.device_refcount(), base, "texture release balances");
+
+    {
+        let _tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        assert_eq!(
+            h.device_refcount(),
+            base + 1,
+            "system-memory texture forwards +1"
+        );
+    }
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "system-memory texture release balances"
+    );
+
+    {
+        let _cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+        assert_eq!(
+            h.device_refcount(),
+            base + 1,
+            "system-memory cube forwards +1"
+        );
+    }
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "system-memory cube release balances"
+    );
+
+    {
+        let _rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+        assert_eq!(h.device_refcount(), base + 1, "render target forwards +1");
+    }
+    assert_eq!(h.device_refcount(), base, "render target release balances");
+
+    {
+        let _sb = h.create_state_block(D3DSBT_ALL);
+        assert_eq!(h.device_refcount(), base + 1, "state block forwards +1");
+    }
+    assert_eq!(h.device_refcount(), base, "state block release balances");
+
+    if let Some(q) = h.create_query(D3DQUERYTYPE_EVENT) {
+        assert_eq!(h.device_refcount(), base + 1, "query forwards +1");
+        drop(q);
+        assert_eq!(h.device_refcount(), base, "query release balances");
+    }
+}
+
+/// A `D3DSBT_ALL` state block captures the bound state.
+///
+/// That includes the implicit FVF vertex declaration, which sits at public
+/// refcount 0 in the cache. Creating then releasing the block must leave the
+/// device refcount unchanged: whatever the block holds goes with it.
+/// Otherwise the device is left holding references it can never shed, and
+/// teardown never reaches a zero refcount.
+#[test]
+fn state_block_capture_balances_device_refcount() {
+    let h = Harness::new();
+    // Bind an FVF so the device has a (cached, implicit) vertex declaration for
+    // the block to capture.
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let base = h.device_refcount();
+    {
+        let _sb = h.create_state_block(D3DSBT_ALL);
+    }
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "D3DSBT_ALL capture + release leaves the device refcount balanced",
+    );
+}
+
+/// The references a state block holds never show in an object's public refcount.
+///
+/// A block keeps what it captured or recorded alive, but `Release` answers
+/// the application's own references only: a texture bound, captured by a
+/// `D3DSBT_ALL` block or recorded into a `BeginStateBlock` one and unbound
+/// again counts one reference, the application's. Capturing the implicit
+/// declaration an FVF binds, which no application reference holds, adds no
+/// device reference beyond the block's own. A captured texture the
+/// application has released stays usable: `Apply` binds it again.
+#[test]
+fn state_blocks_hold_no_public_reference_on_what_they_capture() {
+    let h = Harness::new();
+    let base = h.device_refcount();
+    let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), D3D_OK, "SetFVF");
+    assert_eq!(tex.refcount(), 1, "a binding takes no public reference");
+
+    let captured = h.create_state_block(D3DSBT_ALL);
+    assert_eq!(
+        h.device_refcount(),
+        base + 2,
+        "the texture and the block each hold the device once; the captured FVF declaration does not"
+    );
+    assert_eq!(h.clear_texture(0), D3D_OK, "SetTexture(0, NULL)");
+    assert_eq!(
+        tex.refcount(),
+        1,
+        "a D3DSBT_ALL capture takes no public reference on the texture"
+    );
+
+    assert_eq!(h.begin_state_block(), D3D_OK, "BeginStateBlock");
+    assert_eq!(h.set_texture(0, &tex), D3D_OK, "SetTexture while recording");
+    let recorded = h.end_state_block();
+    assert_eq!(
+        tex.refcount(),
+        1,
+        "a recorded SetTexture takes no public reference on the texture"
+    );
+
+    let raw = tex.as_ptr();
+    drop(tex);
+    assert_eq!(
+        h.device_refcount(),
+        base + 2,
+        "the application's last texture reference took its device reference with it"
+    );
+    assert_eq!(captured.apply(), D3D_OK, "Apply of the D3DSBT_ALL block");
+    assert!(
+        h.texture_matches_raw(0, raw),
+        "the block kept the released texture alive and binds it again"
+    );
+    assert_eq!(h.clear_texture(0), D3D_OK, "SetTexture(0, NULL)");
+    drop(captured);
+    drop(recorded);
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "releasing the blocks leaves the device refcount balanced"
+    );
+}
+
+#[test]
+fn factory_refcount_increments_and_decrements() {
+    // factory_only avoids the extra reference a device holds on its factory.
+    let h = Harness::factory_only();
+    // The factory starts at 1 (Direct3DCreate9); AddRef → 2, Release → 1.
+    assert_eq!(h.add_ref_factory(), 2, "AddRef returns the new count");
+    assert_eq!(
+        h.release_factory(),
+        1,
+        "Release returns the post-decrement count"
+    );
+}
+
+/// `AddRef` and `Release` on one `IDirect3D9` from several threads at once keep an exact count.
+///
+/// COM reference counts are free-threaded, and every device an interface
+/// created takes and gives back a reference on it from that device's own
+/// threads, under that device's lock alone. A count that loses an update
+/// leaks the interface (and with the last one the log thread) or frees it
+/// under a holder. Every thread pairs its calls, so the count has to come
+/// back to where it started. A cushion of references taken first keeps a
+/// lost decrement from freeing the interface in the middle of the run. A
+/// lost update is a race, so a regression fails this run by run with high
+/// odds rather than every time.
+#[test]
+fn factory_refcount_survives_concurrent_add_ref_and_release() {
+    const THREADS: usize = 4;
+    const PAIRS: u32 = 100_000;
+    const CUSHION: u32 = 1_000_000;
+    let h = Harness::factory_only();
+    for _ in 0..CUSHION {
+        h.add_ref_factory();
+    }
+    let factory = h.factory() as usize;
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            spawn_scoped(scope, || {
+                let interface = factory as *mut c_void;
+                // SAFETY: `interface` is the live `IDirect3D9` the harness
+                // holds, whose first word is its vtable.
+                let vtbl_ptr = unsafe { *interface.cast::<*const IDirect3D9Vtbl>() };
+                // SAFETY: the vtable of a live interface is a `'static` table.
+                let vtbl = unsafe { &*vtbl_ptr };
+                for _ in 0..PAIRS {
+                    // SAFETY: vtable thunks; each `Release` balances the
+                    // `AddRef` before it, and the cushion keeps the count up.
+                    unsafe { (vtbl.add_ref)(interface) };
+                    // SAFETY: as above.
+                    unsafe { (vtbl.release)(interface) };
+                }
+            });
+        }
+    });
+    let held = h.add_ref_factory();
+    h.release_factory();
+    // Checked before the cushion goes back: a count that came out short
+    // would let these releases free the interface the harness still holds.
+    assert_eq!(
+        held,
+        CUSHION + 2,
+        "the harness's reference, the cushion and this probe's, nothing gained or lost"
+    );
+    for _ in 0..CUSHION {
+        h.release_factory();
+    }
+}
+
+#[test]
+fn query_interface_unknown_is_rejected() {
+    let h = Harness::new();
+    assert_eq!(
+        h.device_query_interface_unknown(),
+        E_NOINTERFACE,
+        "QueryInterface for an unknown GUID returns E_NOINTERFACE",
+    );
+}
+
+/// The device answers `QueryInterface` for `IUnknown` and `IDirect3DDevice9` with itself.
+///
+/// One reference stronger. SDKs that are handed the game's device take their own typed reference
+/// through `QueryInterface(IID_IDirect3DDevice9)` and treat a failure as an
+/// unusable device.
+#[test]
+fn query_interface_identity_on_device() {
+    let h = Harness::new();
+    let base = h.device_refcount();
+    for iid in [IID_IUNKNOWN, IID_IDIRECT3DDEVICE9] {
+        let (hr, same, held) = h.device_query_interface(&iid);
+        assert_eq!(hr, D3D_OK, "QueryInterface({:#010x})", iid.data1);
+        assert!(same, "the interface is the device object itself");
+        assert_eq!(
+            held,
+            base + 1,
+            "QueryInterface hands out one counted reference"
+        );
+    }
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "releasing the QI references balances"
+    );
+}
+
+/// The factory answers for `IUnknown` and `IDirect3D9`, and for nothing else.
+#[test]
+fn query_interface_identity_on_factory() {
+    let h = Harness::factory_only();
+    for iid in [IID_IUNKNOWN, IID_IDIRECT3D9] {
+        let (hr, same, held) = h.factory_query_interface(&iid);
+        assert_eq!(hr, D3D_OK, "QueryInterface({:#010x})", iid.data1);
+        assert!(same, "the interface is the factory object itself");
+        assert_eq!(
+            held, 2,
+            "the factory's own reference plus the one QI handed out"
+        );
+    }
+    let (hr, same, held) = h.factory_query_interface(&IID_IDIRECT3DDEVICE9);
+    assert_eq!(hr, E_NOINTERFACE, "the factory is not a device");
+    assert!(!same, "nothing is handed out on a miss");
+    assert_eq!(held, 1, "a miss leaves the refcount alone");
+}
+
+/// A surface queries its texture, swapchain, or device container for the requested interface.
+///
+/// The returned interface is the actual container, carries exactly one owned
+/// reference, and an unsupported IID returns `E_NOINTERFACE` with a null output.
+#[test]
+fn surface_get_container_queries_the_actual_container() {
+    let h = Harness::new();
+
+    let texture = h.create_texture(8, 8, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    let level = texture.surface_level(0);
+    let texture_base = texture.refcount();
+    let (hr, container, held_refcount) = level.get_container(&IID_IDIRECT3DTEXTURE9);
+    assert_eq!(hr, D3D_OK, "texture-level GetContainer(Texture9)");
+    assert_eq!(container, texture.as_ptr(), "texture container identity");
+    assert_eq!(held_refcount, texture_base + 1, "texture container AddRef");
+    assert_eq!(
+        texture.refcount(),
+        texture_base,
+        "texture container Release"
+    );
+    let (hr, container, held_refcount) = level.get_container(&IID_IDIRECT3DDEVICE9);
+    assert_eq!(hr, E_NOINTERFACE, "texture-level container is not a device");
+    assert!(
+        container.is_null(),
+        "unsupported texture container IID nulls output"
+    );
+    assert_eq!(
+        held_refcount, 0,
+        "unsupported texture container IID has no reference"
+    );
+    assert_eq!(
+        texture.refcount(),
+        texture_base,
+        "unsupported IID leaves texture count alone"
+    );
+
+    let render_target = h.create_render_target(8, 8, D3DFMT_A8R8G8B8);
+    let device_base = h.device_refcount();
+    let (hr, container, held_refcount) = render_target.get_container(&IID_IDIRECT3DDEVICE9);
+    assert_eq!(hr, D3D_OK, "standalone render-target GetContainer(Device9)");
+    assert_eq!(
+        container,
+        h.device(),
+        "standalone render-target container identity"
+    );
+    assert_eq!(held_refcount, device_base + 1, "device container AddRef");
+    assert_eq!(h.device_refcount(), device_base, "device container Release");
+    let (hr, container, held_refcount) = render_target.get_container(&IID_IDIRECT3DTEXTURE9);
+    assert_eq!(
+        hr, E_NOINTERFACE,
+        "standalone render target is not a texture"
+    );
+    assert!(
+        container.is_null(),
+        "unsupported device container IID nulls output"
+    );
+    assert_eq!(
+        held_refcount, 0,
+        "unsupported device container IID has no reference"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        device_base,
+        "unsupported IID leaves device count alone"
+    );
+
+    let backbuffer = h.back_buffer(0);
+    let device_base = h.device_refcount();
+    let (hr, unknown, held_refcount) = backbuffer.get_container(&IID_IUNKNOWN);
+    assert_eq!(hr, D3D_OK, "backbuffer GetContainer(IUnknown)");
+    assert_eq!(
+        held_refcount, 1,
+        "implicit swapchain starts at refcount zero"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        device_base,
+        "IUnknown container reference is balanced"
+    );
+    let (hr, swapchain, held_refcount) = backbuffer.get_container(&IID_IDIRECT3DSWAPCHAIN9);
+    assert_eq!(hr, D3D_OK, "backbuffer GetContainer(SwapChain9)");
+    assert_eq!(swapchain, unknown, "backbuffer container identity");
+    assert_eq!(held_refcount, 1, "swapchain container AddRef");
+    assert_eq!(
+        h.device_refcount(),
+        device_base,
+        "swapchain container Release"
+    );
+    let (hr, container, held_refcount) = backbuffer.get_container(&IID_IDIRECT3DTEXTURE9);
+    assert_eq!(hr, E_NOINTERFACE, "backbuffer container is not a texture");
+    assert!(
+        container.is_null(),
+        "unsupported swapchain container IID nulls output"
+    );
+    assert_eq!(
+        held_refcount, 0,
+        "unsupported swapchain container IID has no reference"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        device_base,
+        "unsupported IID leaves swapchain count alone"
+    );
+}
+
+/// `GetDevice` names the device that created the resource, in every pool.
+///
+/// MANAGED is covered because a managed resource deliberately does not pin its
+/// device: it still came from one, and reporting otherwise would be a wrong
+/// answer rather than a missing feature. The returned reference is the
+/// caller's, so it is released here and the count is checked back to its
+/// pre-call value.
+#[test]
+fn resource_get_device_returns_the_creating_device() {
+    let h = Harness::new();
+    // The reference `GetDevice` writes belongs to the caller, so every case
+    // releases it and asserts the count is back where it started: a thunk
+    // that handed out a pointer without taking a reference fails here rather
+    // than under the application's own Release.
+    let check = |label: &str, get: &dyn Fn() -> (i32, *mut c_void)| {
+        let before = h.device_refcount();
+        let (hr, dev) = get();
+        assert_eq!(hr, D3D_OK, "{label}: GetDevice");
+        assert_eq!(dev, h.device(), "{label}: the device that created it");
+        // SAFETY: `dev` is the reference `GetDevice` just handed out.
+        let back = unsafe { h.release_device_ref(dev) };
+        assert_eq!(
+            back, before,
+            "{label}: the reference handed out is the one given back"
+        );
+    };
+
+    // MANAGED and SCRATCH are the pools that deliberately do not pin the
+    // device. A resource in one still came from a device, and answering
+    // otherwise would be a wrong answer rather than a missing feature.
+    for (pool, label) in [
+        (D3DPOOL_DEFAULT, "texture (DEFAULT)"),
+        (D3DPOOL_MANAGED, "texture (MANAGED)"),
+    ] {
+        let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, pool);
+        check(label, &|| tex.get_device());
+    }
+    // The cube and volume vtables share the 2D texture's thunk, which reads
+    // the wrapper through one type and only holds because the three share a
+    // layout. A SCRATCH cube holds no Metal texture, which is why it is worth
+    // asking separately.
+    for (pool, label) in [
+        (D3DPOOL_DEFAULT, "cube (DEFAULT)"),
+        (D3DPOOL_SCRATCH, "cube (SCRATCH)"),
+    ] {
+        let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, pool);
+        check(label, &|| cube.get_device());
+    }
+
+    let (hr, vol) = h.try_create_volume_texture([4, 4, 4], 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(hr, D3D_OK, "CreateVolumeTexture");
+    let vol = vol.expect("CreateVolumeTexture returned null");
+    check("volume texture", &|| vol.get_device());
+    // A volume level holds no device of its own; it resolves through the
+    // texture that owns it, which is the one path here that answers
+    // indirectly.
+    let (hr, volume) = vol.get_volume_level(0);
+    assert_eq!(hr, D3D_OK, "GetVolumeLevel");
+    let volume = volume.expect("GetVolumeLevel returned null");
+    check("volume", &|| volume.get_device());
+
+    let vb = h.create_vertex_buffer(64, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    check("vertex buffer", &|| vb.get_device());
+    let ib = h.create_index_buffer(64, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    check("index buffer", &|| ib.get_device());
+
+    // A surface belonging to a texture holds no device of its own: it answers
+    // through the texture, which is the object the device detaches at
+    // teardown. MANAGED is the case that matters, since its texture is not
+    // pinned by the surfaces handed out of it.
+    for (pool, label) in [
+        (D3DPOOL_DEFAULT, "texture surface (DEFAULT)"),
+        (D3DPOOL_MANAGED, "texture surface (MANAGED)"),
+    ] {
+        let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, pool);
+        let surf = tex.surface_level(0);
+        check(label, &|| surf.get_device());
+    }
+    // A standalone surface pins the device itself.
+    let rt = h.create_render_target(4, 4, D3DFMT_A8R8G8B8);
+    check("render target surface", &|| rt.get_device());
+
+    let vs = h.create_vertex_shader(&VS_PASSTHROUGH);
+    check("vertex shader", &|| vs.get_device());
+    let ps = h.create_pixel_shader(&PS_WHITE);
+    check("pixel shader", &|| ps.get_device());
+
+    let decl = h.create_vertex_declaration(&POSITION_DECL);
+    check("vertex declaration", &|| decl.get_device());
+    let sb = h.create_state_block(D3DSBT_ALL);
+    check("state block", &|| sb.get_device());
+    let query = h
+        .create_query(D3DQUERYTYPE_EVENT)
+        .expect("an event query is always available");
+    check("query", &|| query.get_device());
+}
+
+/// The shared body of the test below, run once per resource shape.
+///
+/// `base` is the device's public refcount taken before the resource was
+/// created, and `get_device` asks the created resource. Releases the
+/// harness's own device reference, so the caller must hold the resource
+/// across the call and drop it afterwards.
+fn check_holds_device_past_app_reference(
+    h: &Harness,
+    base: u32,
+    label: &str,
+    get_device: &dyn Fn() -> (i32, *mut c_void),
+) {
+    assert_eq!(
+        h.device_refcount(),
+        base + 1,
+        "{label}: the resource forwards one device reference"
+    );
+    assert_eq!(
+        h.release_device(),
+        base,
+        "{label}: the resource's reference is what the device is left holding"
+    );
+    let (hr, dev) = get_device();
+    assert_eq!(hr, D3D_OK, "{label}: GetDevice past the app reference");
+    assert_eq!(dev, h.device(), "{label}: the device that created it");
+    // SAFETY: `dev` is the reference `GetDevice` just handed out, and the
+    // resource still holds one of its own, so the device stays live.
+    let back = unsafe { h.release_device_ref(dev) };
+    assert_eq!(
+        back, base,
+        "{label}: the reference handed out is the one given back"
+    );
+}
+
+/// A system-memory resource holds its device past the application's last reference.
+///
+/// Every D3D9 resource holds one reference on the device that created it, so
+/// the device is destroyed by the last of them to go and not by the
+/// application's own `Release`. The two system-memory pools change where the
+/// pixels live, not who owns whom: a `D3DPOOL_SCRATCH` cube, which keeps no
+/// Metal texture at all, answers `GetDevice` with a live device after the
+/// application has dropped its reference, exactly as the `D3DPOOL_SYSTEMMEM`
+/// 2D texture beside it does. Each case releases the device it was created
+/// from, so each gets its own harness, and each drops its resource last: a run
+/// that reaches the end tore device and resource down in that order without
+/// faulting.
+#[test]
+fn a_system_memory_resource_holds_the_device_past_the_app_reference() {
+    {
+        let h = Harness::new();
+        let base = h.device_refcount();
+        let cube = h.create_cube_texture_owned(4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SCRATCH);
+        check_holds_device_past_app_reference(&h, base, "SCRATCH cube", &|| cube.get_device());
+    }
+    {
+        let h = Harness::new();
+        let base = h.device_refcount();
+        let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        check_holds_device_past_app_reference(&h, base, "SYSTEMMEM texture", &|| tex.get_device());
+    }
+}
+
+/// The two ways a `GetDevice` call can be malformed, neither of them fatal.
+///
+/// An out-param the thunk cannot write is the one early return that must
+/// touch nothing, and a null `this` reaches the same thunk through a vtable
+/// the caller kept after the object died. Both are answered with
+/// `INVALIDCALL`: a fault here would take the application down inside a call
+/// that cannot fail on real hardware.
+#[test]
+fn get_device_answers_a_malformed_call() {
+    let h = Harness::new();
+    let vb = h.create_vertex_buffer(64, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+
+    // SAFETY: a live buffer with no out-param to write.
+    let hr = unsafe { vb.get_device_raw(vb.as_ptr(), core::ptr::null_mut()) };
+    assert_eq!(hr, D3DERR_INVALIDCALL, "null out-param");
+
+    let mut out: *mut c_void = vb.as_ptr();
+    // SAFETY: a writable out-param, and a `this` the thunk must reject.
+    let hr = unsafe { vb.get_device_raw(core::ptr::null_mut(), &raw mut out) };
+    assert_eq!(hr, D3DERR_INVALIDCALL, "null this");
+    assert!(
+        out.is_null(),
+        "a rejected call clears the out-param rather than leaving the caller's value"
+    );
+}
+
+#[test]
+fn resource_reports_its_type() {
+    let h = Harness::new();
+    let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, 0);
+    assert_eq!(tex.resource_type(), D3DRTYPE_TEXTURE, "texture GetType");
+    // A level of that texture is a surface in its own right, so it reports
+    // `D3DRTYPE_SURFACE` rather than its container's type.
+    let level = tex.surface_level(0);
+    assert_eq!(level.resource_type(), D3DRTYPE_SURFACE, "surface GetType");
+}
+
+#[test]
+fn resource_no_op_methods_are_callable() {
+    let h = Harness::new();
+    let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, 0);
+    // PreLoad / SetPriority are managed-pool hints; on a DEFAULT-pool texture
+    // they are no-ops that must not crash. Priority stays 0 (managed-only).
+    tex.pre_load();
+    assert_eq!(
+        tex.set_priority(5),
+        0,
+        "SetPriority returns the previous priority"
+    );
+    assert_eq!(
+        tex.priority(),
+        0,
+        "GetPriority stays 0 — priority is managed-only"
+    );
+}
+
+/// `Get`/`SetPriority` round-trip for `D3DPOOL_MANAGED` resources.
+///
+/// They stay pinned at `0` for every other pool. D3D9 honours priority only for
+/// managed resources — it orders the resource manager's eviction — so
+/// `SetPriority` returns the previously stored value and `GetPriority` reads it
+/// back; non-managed pools report `0` and discard the write. Covers a texture
+/// and a vertex buffer (`buffers.rs` covers the index buffer); surfaces and
+/// render targets are always `0`.
+#[test]
+fn priority_round_trips_for_managed_resources() {
+    let h = Harness::new();
+
+    // Managed texture: stored priority round-trips, SetPriority returns the
+    // previous value.
+    let managed_tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(managed_tex.priority(), 0, "managed texture starts at 0");
+    assert_eq!(
+        managed_tex.set_priority(1),
+        0,
+        "SetPriority returns the previous priority (0)"
+    );
+    assert_eq!(managed_tex.priority(), 1, "GetPriority reads the new value");
+    assert_eq!(
+        managed_tex.set_priority(2),
+        1,
+        "SetPriority returns the previous priority (1)"
+    );
+
+    // Managed vertex buffer: same round-trip.
+    let managed_vb = h.create_vertex_buffer(256, 0, D3DFVF_XYZ, D3DPOOL_MANAGED);
+    assert_eq!(
+        managed_vb.priority(),
+        0,
+        "managed vertex buffer starts at 0"
+    );
+    assert_eq!(
+        managed_vb.set_priority(1),
+        0,
+        "SetPriority returns the previous priority (0)"
+    );
+    assert_eq!(managed_vb.priority(), 1, "GetPriority reads the new value");
+
+    // Non-managed resources never store a priority: GetPriority is 0 and
+    // SetPriority returns 0 (the discarded previous value).
+    let default_tex = h.create_texture(16, 16, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(default_tex.priority(), 0, "non-managed texture stays at 0");
+    assert_eq!(
+        default_tex.set_priority(1),
+        0,
+        "non-managed SetPriority returns 0 and discards the write"
+    );
+    assert_eq!(
+        default_tex.priority(),
+        0,
+        "non-managed GetPriority remains 0 after a write"
+    );
+}
+
+#[test]
+fn available_texture_mem_is_nonzero() {
+    let h = Harness::new();
+    assert!(
+        h.available_texture_mem() > 0,
+        "GetAvailableTextureMem reports memory"
+    );
+}
+
+/// The two standalone-surface entry points move the reported figure.
+///
+/// A `CreateRenderTarget` / `CreateDepthStencilSurface` surface owns a real
+/// `D3DPOOL_DEFAULT` Metal texture without going through the texture path, so
+/// each has to be charged at creation and refunded at release. Both are
+/// 2048x2048 at four bytes per pixel, so each is exactly 16 MiB, and the
+/// reported figure is in bytes (no rounding to whole MiB).
+#[test]
+fn available_texture_mem_tracks_standalone_surfaces() {
+    const SURFACE_BYTES: u32 = 2048 * 2048 * 4;
+
+    let h = Harness::new();
+    let base = h.available_texture_mem();
+    assert!(
+        base > 2 * SURFACE_BYTES,
+        "budget {base} leaves room for both surfaces"
+    );
+    {
+        let _rt = h.create_render_target(2048, 2048, D3DFMT_A8R8G8B8);
+        assert_eq!(
+            h.available_texture_mem(),
+            base - SURFACE_BYTES,
+            "a standalone render target costs its own bytes"
+        );
+        {
+            let _ds = h.create_depth_stencil_surface(2048, 2048, D3DFMT_D24S8);
+            assert_eq!(
+                h.available_texture_mem(),
+                base - 2 * SURFACE_BYTES,
+                "a standalone depth-stencil surface costs its own bytes"
+            );
+        }
+        assert_eq!(
+            h.available_texture_mem(),
+            base - SURFACE_BYTES,
+            "releasing the depth-stencil surface gives its bytes back"
+        );
+    }
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing the render target gives its bytes back"
+    );
+}
+
+/// A multisampled standalone surface is charged for every texture it owns.
+///
+/// `CreateRenderTarget` above one sample allocates the single-sample texture
+/// an application resolves out of plus a multisampled companion
+/// `sample_count` times its size, so the reported figure drops by
+/// `1 + sample_count` times the single-sample bytes. `CreateDepthStencilSurface`
+/// has no resolve target, so its one attachment is charged `sample_count`
+/// times. Both are 512x512 at four bytes per pixel, so the single-sample
+/// figure is exactly 1 MiB.
+#[test]
+fn available_texture_mem_charges_multisampled_surfaces() {
+    const SIZE: u32 = 512;
+    const SURFACE_BYTES: u32 = SIZE * SIZE * 4;
+
+    let h = Harness::new();
+    // Metal serves a sample count of 4 on every GPU family mtld3d runs on, so
+    // this is the device answering rather than a capability the test probes.
+    assert_eq!(
+        h.check_device_multi_sample_type(D3DFMT_A8R8G8B8, 1, D3DMULTISAMPLE_4_SAMPLES)
+            .0,
+        D3D_OK,
+        "4x colour multisampling"
+    );
+    let base = h.available_texture_mem();
+    assert!(
+        base > 16 * SURFACE_BYTES,
+        "budget {base} leaves room for the multisampled surfaces"
+    );
+    {
+        let _rt =
+            h.create_render_target_ms((SIZE, SIZE), D3DFMT_A8R8G8B8, (D3DMULTISAMPLE_4_SAMPLES, 0));
+        assert_eq!(
+            h.available_texture_mem(),
+            base - 5 * SURFACE_BYTES,
+            "a 4x render target costs its resolve target plus its companion"
+        );
+    }
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing the multisampled render target gives both back"
+    );
+    {
+        let (hr, ds) = h.create_depth_stencil_surface_ms_hr(
+            (SIZE, SIZE),
+            D3DFMT_D24S8,
+            (D3DMULTISAMPLE_4_SAMPLES, 0),
+        );
+        assert_eq!(hr, D3D_OK, "CreateDepthStencilSurface(4x)");
+        let _ds = ds.expect("multisampled depth surface");
+        assert_eq!(
+            h.available_texture_mem(),
+            base - 4 * SURFACE_BYTES,
+            "a 4x depth surface costs its one multisampled attachment"
+        );
+    }
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing the multisampled depth surface gives its bytes back"
+    );
+}
+
+/// A `D3DUSAGE_DEPTHSTENCIL` texture is charged like a colour texture.
+///
+/// `CreateTexture` with a depth format hands out a `D3DPOOL_DEFAULT` texture
+/// (a sampleable shadow map), which the texture registry charges from its mip
+/// chain's row pitches. A single 2048x2048 D24S8 level is 16 MiB in the
+/// application's own format, whatever the Metal texture behind it is.
+#[test]
+fn available_texture_mem_tracks_depth_textures() {
+    const TEXTURE_BYTES: u32 = 2048 * 2048 * 4;
+
+    let h = Harness::new();
+    let base = h.available_texture_mem();
+    assert!(
+        base > TEXTURE_BYTES,
+        "budget {base} leaves room for the depth texture"
+    );
+    {
+        let _tex = h.create_texture(
+            2048,
+            2048,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_D24S8,
+            D3DPOOL_DEFAULT,
+        );
+        assert_eq!(
+            h.available_texture_mem(),
+            base - TEXTURE_BYTES,
+            "a depth-stencil texture costs its own bytes"
+        );
+    }
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing the depth-stencil texture gives its bytes back"
+    );
+}
+
+/// A depth chain is charged on the formula a colour chain is charged on.
+///
+/// `GetAvailableTextureMem` sums a texture's per-level row pitches, and a
+/// level's pitch is the host-visible (dword-rounded) stride of its own width.
+/// At an odd width a two-byte format rounds up, so the six-level `D3DFMT_D16`
+/// chain here has to cost exactly what the `D3DFMT_R5G6B5` chain of the same
+/// shape costs rather than the tight `width * 2` a depth level once measured.
+#[test]
+fn available_texture_mem_charges_a_depth_chain_like_a_colour_chain() {
+    // 33 wide: a 16-bit row is 66 bytes tight and 68 host-visible. The six
+    // levels stride 68, 32, 16, 8, 4, 4 over heights 33, 16, 8, 4, 2, 1.
+    const WIDTH: u32 = 33;
+    const CHAIN_BYTES: u32 = 68 * 33 + 32 * 16 + 16 * 8 + 8 * 4 + 4 * 2 + 4;
+
+    let h = Harness::new();
+    let base = h.available_texture_mem();
+    assert!(base > 2 * CHAIN_BYTES, "budget {base} leaves room for both");
+
+    let colour_cost = {
+        let _tex = h.create_texture(WIDTH, WIDTH, 0, 0, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        colour_cost, CHAIN_BYTES,
+        "a colour chain costs its host-visible row pitches"
+    );
+
+    let depth_cost = {
+        let _tex = h.create_texture(
+            WIDTH,
+            WIDTH,
+            0,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_D16,
+            D3DPOOL_DEFAULT,
+        );
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        depth_cost, colour_cost,
+        "a depth chain costs what the colour chain of the same shape costs"
+    );
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing both chains gives their bytes back"
+    );
+}
+
+/// A standalone depth surface is charged like the depth texture level it matches.
+///
+/// `CreateDepthStencilSurface` and a one-level `D3DUSAGE_DEPTHSTENCIL` texture
+/// allocate the same single depth attachment, so at the same width and height
+/// they have to cost the same bytes. At an odd width a two-byte format is the
+/// case that separates the host-visible row pitch from the tight one, and a
+/// surface charged on the tight stride reads 66 bytes per row against the
+/// texture level's 68.
+#[test]
+fn available_texture_mem_charges_a_depth_surface_like_a_depth_level() {
+    // 33 wide: a 16-bit row is 66 bytes tight and 68 host-visible.
+    const WIDTH: u32 = 33;
+    const LEVEL_BYTES: u32 = 68 * 33;
+
+    let h = Harness::new();
+    let base = h.available_texture_mem();
+    assert!(base > 2 * LEVEL_BYTES, "budget {base} leaves room for both");
+
+    let surface_cost = {
+        let _ds = h.create_depth_stencil_surface(WIDTH, WIDTH, D3DFMT_D16);
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        surface_cost, LEVEL_BYTES,
+        "a standalone depth surface costs its host-visible row pitch"
+    );
+
+    let texture_cost = {
+        let _tex = h.create_texture(
+            WIDTH,
+            WIDTH,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_D16,
+            D3DPOOL_DEFAULT,
+        );
+        base - h.available_texture_mem()
+    };
+    assert_eq!(
+        texture_cost, surface_cost,
+        "a one-level depth texture costs what the standalone surface costs"
+    );
+    assert_eq!(
+        h.available_texture_mem(),
+        base,
+        "releasing both gives their bytes back"
+    );
+}
+
+#[test]
+fn evict_managed_resources_succeeds() {
+    let h = Harness::new();
+    assert_eq!(
+        h.evict_managed_resources(),
+        0,
+        "EvictManagedResources is a successful no-op"
+    );
+}
+
+#[test]
+fn validate_device_succeeds_and_clip_plane_round_trips() {
+    let h = Harness::new();
+    // ValidateDevice reports the current state as single-pass valid: Metal
+    // validates pipeline state at PSO-creation time, so every state we accept
+    // renders in one pass.
+    assert_eq!(h.validate_device_hr(), 0, "ValidateDevice → S_OK");
+    // `SetClipPlane`/`GetClipPlane` round-trip here; that the planes reach
+    // the GPU is `clip_planes.rs`'s job.
+    // An unset plane reads back zero; a set plane reads back exactly.
+    assert_eq!(
+        h.get_clip_plane(0),
+        (D3D_OK, [0.0; 4]),
+        "GetClipPlane(0) before any set → S_OK + zero"
+    );
+    let plane = [2.0f32, 8.0, 5.0, 3.0];
+    assert_eq!(h.set_clip_plane(3, plane), D3D_OK, "SetClipPlane(3) → S_OK");
+    assert_eq!(
+        h.get_clip_plane(3),
+        (D3D_OK, plane),
+        "GetClipPlane(3) returns the set coefficients"
+    );
+}
+
+/// The sentinel a failing `ValidateDevice` must leave in the pass count.
+const PASSES_SENTINEL: u32 = 0xdead_beef;
+
+#[test]
+fn validate_device_rejects_a_stage_that_disables_a_filter() {
+    let h = Harness::new();
+    let texture = h.create_texture(32, 32, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    // A stage may not disable magnification or minification. The rule holds
+    // whether or not the stage has a texture bound, and the failing call
+    // leaves the pass count untouched.
+    for bound in [false, true] {
+        let hr = if bound {
+            h.set_texture(0, &texture)
+        } else {
+            h.clear_texture(0)
+        };
+        assert_eq!(hr, D3D_OK, "SetTexture(0) bound={bound}");
+        for (mag, min) in [
+            (D3DTEXF_NONE, D3DTEXF_NONE),
+            (D3DTEXF_POINT, D3DTEXF_NONE),
+            (D3DTEXF_NONE, D3DTEXF_POINT),
+        ] {
+            assert_eq!(h.set_sampler_state(0, D3DSAMP_MAGFILTER, mag), D3D_OK);
+            assert_eq!(h.set_sampler_state(0, D3DSAMP_MINFILTER, min), D3D_OK);
+            assert_eq!(
+                h.validate_device(PASSES_SENTINEL),
+                (D3DERR_UNSUPPORTEDTEXTUREFILTER, PASSES_SENTINEL),
+                "mag {mag} min {min} bound={bound}"
+            );
+        }
+        // The D3D9 default filters validate and report their pass.
+        assert_eq!(
+            h.set_sampler_state(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_sampler_state(0, D3DSAMP_MINFILTER, D3DTEXF_POINT),
+            D3D_OK
+        );
+        assert_eq!(
+            h.validate_device(PASSES_SENTINEL),
+            (D3D_OK, 1),
+            "point mag and min bound={bound}"
+        );
+    }
+    // Linear filtering a format the device filters stays valid, mip filter
+    // included: only D3DTEXF_NONE on mag or min is the disabled-stage rule.
+    for state in [D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER] {
+        assert_eq!(h.set_sampler_state(0, state, D3DTEXF_LINEAR), D3D_OK);
+    }
+    assert_eq!(
+        h.validate_device(PASSES_SENTINEL),
+        (D3D_OK, 1),
+        "trilinear on a filterable format"
+    );
+    // Any stage answers, not just the one a texture is bound to.
+    assert_eq!(
+        h.set_sampler_state(7, D3DSAMP_MINFILTER, D3DTEXF_NONE),
+        D3D_OK
+    );
+    assert_eq!(
+        h.validate_device(PASSES_SENTINEL),
+        (D3DERR_UNSUPPORTEDTEXTUREFILTER, PASSES_SENTINEL),
+        "a disabled filter on an unbound stage"
+    );
+    assert_eq!(
+        h.set_sampler_state(7, D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        D3D_OK
+    );
+    assert_eq!(
+        h.clear_texture(0),
+        D3D_OK,
+        "unbind before the texture drops"
+    );
+}
+
+/// A ramp whose every entry is `65535 * i / 255`, what a device starts with.
+fn identity_ramp() -> D3DGAMMARAMP {
+    let mut channel = [0u16; 256];
+    for (level, index) in channel.iter_mut().zip(0..=u8::MAX) {
+        *level = u16::from(index) * 257;
+    }
+    D3DGAMMARAMP {
+        red: channel,
+        green: channel,
+        blue: channel,
+    }
+}
+
+/// A ramp that halves every level: monotonic, usable, and not identity.
+fn dimmed_ramp() -> D3DGAMMARAMP {
+    let mut ramp = identity_ramp();
+    for channel in [&mut ramp.red, &mut ramp.green, &mut ramp.blue] {
+        for level in channel.iter_mut() {
+            *level /= 2;
+        }
+    }
+    ramp
+}
+
+#[test]
+fn a_null_gamma_ramp_is_ignored() {
+    let h = Harness::new();
+    // The call returns void, so the contract is that it is ignored rather
+    // than that it answers: it must not read the pointer or crash.
+    h.set_gamma_ramp_null();
+    let kept = h.get_gamma_ramp(0);
+    assert_eq!(
+        kept.red[128], 32896,
+        "a null Set left the stored identity ramp alone"
+    );
+}
+
+#[test]
+fn the_gamma_ramp_round_trips_and_starts_at_identity() {
+    let h = Harness::new();
+    let initial = h.get_gamma_ramp(0);
+    let identity = identity_ramp();
+    assert_eq!(
+        initial.red, identity.red,
+        "GetGammaRamp before any Set answers identity, not the sentinel"
+    );
+    assert_eq!(initial.green, identity.green, "identity on green");
+    assert_eq!(initial.blue, identity.blue, "identity on blue");
+
+    let dimmed = dimmed_ramp();
+    h.set_gamma_ramp(0, D3DSGR_NO_CALIBRATION, &dimmed);
+    let read = h.get_gamma_ramp(0);
+    assert_eq!(read.red, dimmed.red, "the ramp reads back as written, red");
+    assert_eq!(read.green, dimmed.green, "green");
+    assert_eq!(read.blue, dimmed.blue, "blue");
+    // The device is windowed here, which is what the suite creates, so the
+    // ramp is stored and reported without reaching the presented frame. The
+    // frame is presented to prove the present path is unaffected either way.
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET, 0xFF20_4060, 1.0, 0),
+        D3D_OK,
+        "clear after a stored ramp"
+    );
+    assert_eq!(h.present(), D3D_OK, "present after a stored ramp");
+}
+
+#[test]
+fn an_unusable_gamma_ramp_leaves_the_stored_one_alone() {
+    let h = Harness::new();
+    let dimmed = dimmed_ramp();
+    h.set_gamma_ramp(0, D3DSGR_NO_CALIBRATION, &dimmed);
+    // Every channel decreasing end to end is the shape a game writes from
+    // uninitialised or byte-swapped memory. Applying one turns a display
+    // unreadable, so it is rejected whole and the last good ramp stands.
+    let mut inverted = identity_ramp();
+    inverted.red.reverse();
+    inverted.green.reverse();
+    inverted.blue.reverse();
+    h.set_gamma_ramp(0, D3DSGR_NO_CALIBRATION, &inverted);
+    assert_eq!(
+        h.get_gamma_ramp(0).red,
+        dimmed.red,
+        "the rejected ramp was not stored"
+    );
+}
+
+#[test]
+fn gamma_calibration_is_accepted_and_ignored() {
+    let h = Harness::new();
+    let dimmed = dimmed_ramp();
+    // D3DCAPS2_CANCALIBRATEGAMMA is not advertised, so the flag carries no
+    // obligation: the ramp is taken as given rather than rejected.
+    h.set_gamma_ramp(0, D3DSGR_CALIBRATE, &dimmed);
+    assert_eq!(
+        h.get_gamma_ramp(0).green,
+        dimmed.green,
+        "the calibrated Set stored its ramp"
+    );
+}
+
+#[test]
+fn only_the_implicit_swap_chain_carries_a_gamma_ramp() {
+    let h = Harness::new();
+    let dimmed = dimmed_ramp();
+    h.set_gamma_ramp(1, D3DSGR_NO_CALIBRATION, &dimmed);
+    let identity = identity_ramp();
+    assert_eq!(
+        h.get_gamma_ramp(0).red,
+        identity.red,
+        "a Set on swap chain 1 changed nothing"
+    );
+    // The same index answers nothing rather than writing the ramp, so the
+    // caller's buffer keeps the sentinel the harness seeded.
+    assert_eq!(
+        h.get_gamma_ramp(1).red[0],
+        0xDEAD,
+        "a Get on swap chain 1 left the buffer untouched"
+    );
+}
+
+#[test]
+fn legacy_feature_stub_contracts() {
+    // Raster/clip status and dialog-box mode remain unimplemented legacy
+    // features; pin their INVALIDCALL contracts. Texture private data is now
+    // implemented (a GUID-keyed store, like surfaces). SetPaletteEntries
+    // succeeds-and-ignores the palette per D3D9, EXCEPT that without
+    // D3DPTEXTURECAPS_ALPHAPALETTE (the default caps set) every entry's peFlags
+    // must be 0xFF — the harness passes all-zero entries, so it is INVALIDCALL.
+    let h = Harness::new();
+    let tex = h.create_texture(4, 4, 1, 0, D3DFMT_A8R8G8B8, 0);
+    assert_eq!(
+        tex.set_private_data_hr(),
+        D3D_OK,
+        "SetPrivateData stores a blob"
+    );
+    assert_eq!(
+        h.set_palette_entries_hr(),
+        D3DERR_INVALIDCALL,
+        "SetPaletteEntries rejects alpha entries without ALPHAPALETTE"
+    );
+    assert_eq!(
+        h.get_raster_status_hr(),
+        D3DERR_INVALIDCALL,
+        "GetRasterStatus stub"
+    );
+    assert_eq!(
+        h.get_clip_status_hr(),
+        D3DERR_INVALIDCALL,
+        "GetClipStatus stub"
+    );
+    assert_eq!(
+        h.set_dialog_box_mode_hr(),
+        D3DERR_INVALIDCALL,
+        "SetDialogBoxMode stub"
+    );
+}
+
+/// Assert the blob round trip on one resource.
+fn check_private_data(
+    label: &str,
+    blob: &[u8],
+    set: &dyn Fn(&[u8]) -> i32,
+    get: GetPrivateData<'_>,
+    free: &dyn Fn() -> i32,
+) {
+    assert_eq!(set(blob), D3D_OK, "{label}: SetPrivateData");
+
+    let (hr, size) = get(None);
+    assert_eq!(hr, D3D_OK, "{label}: size query");
+    assert_eq!(
+        size as usize,
+        blob.len(),
+        "{label}: the size query reports the stored length"
+    );
+
+    let mut out = vec![0u8; blob.len()];
+    let (hr, _) = get(Some(&mut out));
+    assert_eq!(hr, D3D_OK, "{label}: GetPrivateData");
+    assert_eq!(out, blob, "{label}: the blob comes back unchanged");
+
+    assert_eq!(free(), D3D_OK, "{label}: FreePrivateData");
+    assert_eq!(
+        get(None).0,
+        D3DERR_NOTFOUND,
+        "{label}: the key is unknown once freed, not merely unreadable"
+    );
+}
+
+/// Vertex and index buffers hold private data like every other resource.
+///
+/// The conformance corpus exercises private data on textures and surfaces
+/// only, so the buffers' own store is covered here: the blob survives a
+/// round-trip, the size query reports its length, and freeing it makes the
+/// key unknown again rather than leaving a stale copy behind.
+#[test]
+fn buffer_private_data_round_trips() {
+    let h = Harness::new();
+    let guid = Guid {
+        data1: 0x1234_5678,
+        data2: 0x9abc,
+        data3: 0xdef0,
+        data4: [7; 8],
+    };
+    let blob = [0xAAu8, 0xBB, 0xCC, 0xDD, 0xEE];
+
+    let vb = h.create_vertex_buffer(64, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    check_private_data(
+        "vertex buffer",
+        &blob,
+        &|b| vb.set_private_data_hr(&guid, b),
+        &|o| vb.get_private_data(&guid, o),
+        &|| vb.free_private_data_hr(&guid),
+    );
+
+    let ib = h.create_index_buffer(64, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    check_private_data(
+        "index buffer",
+        &blob,
+        &|b| ib.set_private_data_hr(&guid, b),
+        &|o| ib.get_private_data(&guid, o),
+        &|| ib.free_private_data_hr(&guid),
+    );
+}
+
+/// The `IUnknown` form of private data holds a real COM reference.
+///
+/// This is the store's one dangerous path: it `AddRef`s on store and must
+/// `Release` on overwrite, on free, and when the resource dies. A leak here
+/// keeps the pointed-at object alive forever, and a double release frees an
+/// object the application still holds. The device stands in for the
+/// application's object because its refcount is observable from a test.
+///
+/// One buffer kind is enough: both forward to the same store.
+#[test]
+fn buffer_private_data_holds_a_reference_to_a_stored_iunknown() {
+    let h = Harness::new();
+    let guid = Guid {
+        data1: 0x2222_3333,
+        data2: 0x4444,
+        data3: 0x5555,
+        data4: [1; 8],
+    };
+    let vb = h.create_vertex_buffer(64, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+
+    // An unknown key is NOTFOUND, not an empty success, even for a pure size
+    // query: an application that reads before it writes must be able to tell
+    // the two apart.
+    assert_eq!(
+        vb.get_private_data(&guid, None).0,
+        D3DERR_NOTFOUND,
+        "GetPrivateData before any Set"
+    );
+    assert_eq!(
+        vb.free_private_data_hr(&guid),
+        D3DERR_NOTFOUND,
+        "FreePrivateData before any Set"
+    );
+
+    let before = h.device_refcount();
+    assert_eq!(
+        vb.set_private_data_unknown(&guid, h.device()),
+        D3D_OK,
+        "SetPrivateData(D3DSPD_IUNKNOWN)"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        before + 1,
+        "the store took a reference of its own"
+    );
+
+    // Storing over the same key releases what was there.
+    assert_eq!(
+        vb.set_private_data_unknown(&guid, h.device()),
+        D3D_OK,
+        "SetPrivateData over an existing key"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        before + 1,
+        "the overwrite released the previous reference"
+    );
+
+    // Reading one out hands the caller a reference of its own.
+    let (hr, punk, size) = vb.get_private_data_unknown(&guid);
+    assert_eq!(hr, D3D_OK, "GetPrivateData(IUnknown)");
+    assert_eq!(punk, h.device(), "the pointer that was stored");
+    assert_eq!(
+        size as usize,
+        size_of::<*mut c_void>(),
+        "an IUnknown entry reports pointer width"
+    );
+    assert_eq!(
+        h.device_refcount(),
+        before + 2,
+        "Get takes a reference for the caller"
+    );
+    // SAFETY: `punk` is the reference `GetPrivateData` just handed out.
+    unsafe { h.release_device_ref(punk) };
+
+    assert_eq!(vb.free_private_data_hr(&guid), D3D_OK, "FreePrivateData");
+    assert_eq!(
+        h.device_refcount(),
+        before,
+        "freeing the key released the store's reference"
+    );
+}
+
+/// A buffer too small to hold the blob reports the size it needs.
+///
+/// Applications size their buffer from this call, so returning success with a
+/// truncated copy would corrupt whatever they store.
+#[test]
+fn buffer_private_data_reports_the_size_it_needs() {
+    let h = Harness::new();
+    let guid = Guid {
+        data1: 0x6666_7777,
+        data2: 0x8888,
+        data3: 0x9999,
+        data4: [2; 8],
+    };
+    let blob = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+    let vb = h.create_vertex_buffer(64, D3DUSAGE_WRITEONLY, D3DFVF_XYZ, D3DPOOL_DEFAULT);
+    assert_eq!(
+        vb.set_private_data_hr(&guid, &blob),
+        D3D_OK,
+        "SetPrivateData"
+    );
+
+    let mut small = [0u8; 4];
+    let (hr, size) = vb.get_private_data(&guid, Some(&mut small));
+    assert_eq!(hr, D3DERR_MOREDATA, "an undersized buffer is MOREDATA");
+    assert_eq!(
+        size as usize,
+        blob.len(),
+        "the call reports the size the blob needs"
+    );
+    assert_eq!(small, [0u8; 4], "a rejected read writes nothing");
+}

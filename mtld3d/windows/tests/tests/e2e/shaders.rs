@@ -1,0 +1,3050 @@
+//! Programmable pipeline: hand-assembled `vs_1_1`, `vs_2_0`, and `ps_2_0`.
+//!
+//! Bound and driven with a pixel-shader constant, verified by the rendered
+//! colour.
+
+use core::ffi::c_void;
+
+use mtld3d_tests::{
+    Harness, HarnessConfig, PosColorVertex, PosVertex, VolumeVertex, assert_pixel_approx, run_child,
+};
+use mtld3d_types::{
+    D3DCLEAR_STENCIL, D3DCLEAR_ZBUFFER, D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR,
+    D3DDECLTYPE_FLOAT4, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_BINORMAL, D3DDECLUSAGE_BLENDINDICES,
+    D3DDECLUSAGE_BLENDWEIGHT, D3DDECLUSAGE_COLOR, D3DDECLUSAGE_DEPTH, D3DDECLUSAGE_FOG,
+    D3DDECLUSAGE_NORMAL, D3DDECLUSAGE_POSITIONT, D3DDECLUSAGE_TANGENT, D3DDECLUSAGE_TEXCOORD,
+    D3DERR_INVALIDCALL, D3DFMT_D24S8, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_TEXTUREFORMAT3,
+    D3DFVF_XYZ, D3DPOOL_MANAGED, D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_ALPHABLENDENABLE,
+    D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING, D3DRS_SRGBWRITEENABLE, D3DRS_ZENABLE, D3DTA_DIFFUSE,
+    D3DTOP_SELECTARG1, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DVERTEXELEMENT9,
+};
+
+/// `vs_2_0`: `dcl_position v0; mov oPos, v0;`
+const VS_BC: [u32; 8] = [
+    0xFFFE_0200,
+    (31) | (2 << 24),
+    0x0000_0000,
+    (1 << 28) | (0xF << 16),
+    (1) | (2 << 24),
+    (4 << 28) | (0xF << 16),
+    (1 << 28) | (0xE4 << 16),
+    0x0000_FFFF,
+];
+
+/// `ps_2_0`: `mov oC0, c0;` (c0 supplied via the constant buffer).
+const PS_BC: [u32; 5] = [
+    0xFFFF_0200,
+    (1) | (2 << 24),
+    (1 << 11) | (0xF << 16),
+    (2 << 28) | (0xE4 << 16),
+    0x0000_FFFF,
+];
+
+/// `ps_3_0`: mixed-lane `p0` masks a full `mov` independently per component.
+const PS_PREDICATED_COMPONENTS: [u32; 43] = [
+    0xFFFF_0300,
+    // def c0, 0, 1, 0, 1
+    0x0500_0051,
+    0xA00F_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    // def c1, 0.5, 0.5, 0.5, 0.5
+    0x0500_0051,
+    0xA00F_0001,
+    0x3F00_0000,
+    0x3F00_0000,
+    0x3F00_0000,
+    0x3F00_0000,
+    // def c2, 1, 1, 1, 1
+    0x0500_0051,
+    0xA00F_0002,
+    0x3F80_0000,
+    0x3F80_0000,
+    0x3F80_0000,
+    0x3F80_0000,
+    // def c3, 0, 0, 0, 0
+    0x0500_0051,
+    0xA00F_0003,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    // mov r0, c3; mov r1, c0
+    0x0200_0001,
+    0x800F_0000,
+    0xA0E4_0003,
+    0x0200_0001,
+    0x800F_0001,
+    0xA0E4_0000,
+    // setp_lt p0, r1, c1
+    0x0304_005E,
+    0xB00F_1000,
+    0x80E4_0001,
+    0xA0E4_0001,
+    // (p0) mov r0, c2; mov oC0, r0
+    0x1300_0001,
+    0x800F_0000,
+    0xB0E4_1000,
+    0xA0E4_0002,
+    0x0200_0001,
+    0x800F_0800,
+    0x80E4_0000,
+    0x0000_FFFF,
+];
+
+/// `vs_1_1`: `def c0, 1, 0, 0, 0; dcl_position v0; mov oPos, v0;`
+///
+/// SM1 carries no instruction-length field, so a walker that reads one steps
+/// into this shader's immediates and takes the exponent bits of `1.0f` as a
+/// token count. The `def` is what makes this stream worth keeping: its four
+/// literal words are the ones a length-field walk misreads.
+const VS1_DEF_BC: [u32; 14] = [
+    0xFFFE_0101,
+    // def c0, 1.0, 0.0, 0.0, 0.0
+    0x0000_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    // dcl_position v0
+    0x0000_001F,
+    0x8000_0000,
+    0x900F_0000,
+    // mov oPos, v0
+    0x0000_0001,
+    0xC00F_0000,
+    0x90E4_0000,
+    0x0000_FFFF,
+];
+
+/// `vs_1_1`: `expp r0.y, c0.y; mov oPos, v0; mov oD0, r0.yyyy;`
+///
+/// Only the fractional result reaches the pixel shader. The partial destination
+/// mask and non-x replicate source also pin the operand plumbing around `expp`.
+const VS1_EXPP_FRACTION: [u32; 14] = [
+    0xFFFE_0101,
+    0x0000_001F,
+    0x8000_0000,
+    0x900F_0000,
+    0x0000_004E,
+    0x8002_0000,
+    0xA055_0000,
+    0x0000_0001,
+    0xC00F_0000,
+    0x90E4_0000,
+    0x0000_0001,
+    0xD00F_0000,
+    0x8055_0000,
+    0x0000_FFFF,
+];
+
+pub const fn centered_triangle() -> [PosVertex; 3] {
+    [
+        PosVertex {
+            x: 0.0,
+            y: 0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+        },
+    ]
+}
+
+#[test]
+fn user_shader_constant_drives_color() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+
+    // c0 = red → triangle renders red.
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+        0,
+        "SetPSConstF(red)"
+    );
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFFFF_0000,
+        "constant red via user shader"
+    );
+
+    // c0 = green → same geometry now renders green (constant rebind path).
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[0.0, 1.0, 0.0, 1.0]),
+        0,
+        "SetPSConstF(green)"
+    );
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "constant green via user shader"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+#[test]
+fn pipeline_cache_replays_before_the_first_draw_on_a_new_device() {
+    let cache = std::env::current_exe()
+        .expect("resolve test executable")
+        .parent()
+        .expect("test executable has a parent")
+        .join("mtld3d_shaders.bin");
+    remove_cache_files(&cache);
+
+    let first = Harness::with_config("shaderCache.enable=true");
+    {
+        let vs = first.create_vertex_shader(&VS_BC);
+        let ps = first.create_pixel_shader(&PS_BC);
+        assert_eq!(first.set_vertex_shader(&vs), 0, "SetVertexShader");
+        assert_eq!(first.set_pixel_shader(&ps), 0, "SetPixelShader");
+        assert_eq!(first.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+        assert_eq!(
+            first.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+            0,
+            "SetPSConstF(red)"
+        );
+        first.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "first-device draw"
+            );
+        });
+        assert_eq!(
+            first.read_pixel(320, 280),
+            0xFFFF_0000,
+            "first-device pixels"
+        );
+        assert_eq!(
+            first.set_render_state(D3DRS_COLORWRITEENABLE, 0),
+            0,
+            "disable color writes"
+        );
+        first.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "first-device no-color draw"
+            );
+        });
+        assert_eq!(
+            first.read_pixel(320, 280),
+            0xFF00_00FF,
+            "zero-mask pipeline keeps the clear"
+        );
+        assert_eq!(first.clear_vertex_shader(), 0, "unbind VS");
+        assert_eq!(first.clear_pixel_shader(), 0, "unbind PS");
+    }
+    assert_eq!(first.release_device(), 0, "release first device");
+
+    let mtld3d_core::shader_cache::CacheLoad::Current(first_records) =
+        mtld3d_core::shader_cache::load(&cache).expect("load cache after first device")
+    else {
+        panic!("first device did not leave a current cache");
+    };
+    assert_eq!(first_records.shaders.len(), 2, "one VS and one PS recorded");
+    assert_eq!(
+        first_records.pipelines.len(),
+        2,
+        "color and zero-mask primaries recorded without an attachmentless sibling"
+    );
+    {
+        let h = Harness::with_config("shaderCache.enable=true");
+        let vs = h.create_vertex_shader(&VS_BC);
+        let ps = h.create_pixel_shader(&PS_BC);
+        assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+        assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+        assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+        assert_eq!(
+            h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+            0,
+            "SetPSConstF(red)"
+        );
+        // Force the encoder through its startup barrier before taking the
+        // baseline. Prewarm compacts the append-only file before it releases
+        // that barrier, and this readback waits for the encoder to drain.
+        let _ = h.read_pixel(0, 0);
+        let before_draw = std::fs::read(&cache).expect("read compacted prewarm cache");
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "second-device draw"
+            );
+        });
+        assert_eq!(h.read_pixel(320, 280), 0xFFFF_0000, "replayed pixels");
+        assert_eq!(
+            h.set_render_state(D3DRS_COLORWRITEENABLE, 0),
+            0,
+            "disable color writes"
+        );
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "replayed no-color draw"
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 280),
+            0xFF00_00FF,
+            "replayed zero-mask pipeline keeps the clear"
+        );
+        let after_draw = std::fs::read(&cache).expect("read cache after replayed draw");
+        assert_eq!(
+            after_draw, before_draw,
+            "a prewarmed combination appends no shader or PSO record"
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_COLORWRITEENABLE, 0x0F),
+            0,
+            "restore color writes"
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_ALPHABLENDENABLE, 1),
+            0,
+            "enable alpha blending"
+        );
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0,
+                "new pipeline combination"
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 280),
+            0xFFFF_0000,
+            "new combination keeps cold-path rendering"
+        );
+        let mtld3d_core::shader_cache::CacheLoad::Current(new_records) =
+            mtld3d_core::shader_cache::load(&cache).expect("load cache after new combination")
+        else {
+            panic!("new combination did not leave a current cache");
+        };
+        assert_eq!(
+            new_records.shaders.len(),
+            2,
+            "new state reuses both shaders"
+        );
+        assert_eq!(
+            new_records.pipelines.len(),
+            3,
+            "new state appends one pipeline recipe"
+        );
+    }
+
+    remove_cache_files(&cache);
+}
+
+fn remove_cache_files(cache: &std::path::Path) {
+    remove_cache_file(cache);
+    let mut lock_name = cache.as_os_str().to_owned();
+    lock_name.push(".lock");
+    remove_cache_file(std::path::Path::new(&lock_name));
+}
+
+fn remove_cache_file(path: &std::path::Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove {}: {error}", path.display()),
+    }
+}
+
+#[test]
+fn pipeline_cache_replays_after_process_restart() {
+    const CHILD_NAME: &str = "pipeline-cache-replay.exe";
+
+    let exe = std::env::current_exe().expect("resolve test executable");
+    if exe.file_name().is_some_and(|name| name == CHILD_NAME) {
+        render_pipeline_cache_workload();
+        return;
+    }
+    let _factory = Harness::factory_only();
+    // Each child resolves the cache beside its own executable. Keep it out
+    // of the parent suite's directory so other devices can run concurrently.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock follows Unix epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "pipeline-cache-replay-{}-{stamp}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&dir).expect("create private replay directory");
+    let child = dir.join(CHILD_NAME);
+    std::fs::copy(&exe, &child).expect("copy replay executable");
+    let cache = dir.join("mtld3d_shaders.bin");
+    for phase in 0..4 {
+        let warm = phase != 0;
+        let regenerate = phase == 2;
+        if regenerate {
+            stale_cache_emitter(&cache);
+        }
+        let mut command = std::process::Command::new(&child);
+        command
+            .args([
+                "--exact",
+                "shaders::pipeline_cache_replays_after_process_restart",
+                "--nocapture",
+            ])
+            .env("RUST_LOG", "mtld3d=debug,mtld3d::dxso=trace");
+        // Nothing of the child's configuration is its own: the workload's
+        // harness pins the two keys it needs on the interface it creates, and
+        // the rest is the suite's. What it must not run under is the merged
+        // window a harness on another thread of this process holds open while
+        // it creates an interface of its own.
+        let output = run_child(&mut command, "").expect("run replay child");
+        assert!(
+            output.status.success(),
+            "replay child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let logs = dir.join("mtld3d-logs");
+        let entries: Vec<_> = std::fs::read_dir(&logs)
+            .expect("list replay logs")
+            .map(|entry| entry.expect("read replay log entry").path())
+            .collect();
+        assert_eq!(entries.len(), 1, "one process log per replay");
+        let log = std::fs::read_to_string(&entries[0]).expect("read replay log");
+        assert_eq!(
+            log.matches("encoder: live CreateRenderPipeline").count(),
+            if regenerate {
+                3
+            } else if warm {
+                0
+            } else {
+                6
+            },
+            "known PSO calls move from first use to startup: {log}"
+        );
+        if warm {
+            assert!(
+                log.contains(if regenerate {
+                    "pre-warmed 3 render pipelines, 1 no-color mappings"
+                } else {
+                    "pre-warmed 6 render pipelines, 2 no-color mappings"
+                }),
+                "all PSOs and the sibling mapping were built at startup: {log}"
+            );
+            assert!(
+                log.contains(if regenerate {
+                    "shaders:    2 pre-warmed"
+                } else {
+                    "shaders:    4 pre-warmed"
+                }),
+                "all four libraries prewarmed: {log}"
+            );
+            if regenerate {
+                assert!(
+                    log.contains("regenerated MSL for 2 retained DXSO variants"),
+                    "DXSO regenerated at startup: {log}"
+                );
+                assert_eq!(
+                    log.matches("── VS MSL prog").count(),
+                    0,
+                    "no live programmable VS emission: {log}"
+                );
+                assert_eq!(
+                    log.matches("── PS MSL prog").count(),
+                    0,
+                    "no live programmable PS emission: {log}"
+                );
+            } else {
+                assert!(
+                    !log.contains("── VS MSL") && !log.contains("── PS MSL"),
+                    "no live shader emission: {log}"
+                );
+                assert!(
+                    !log.contains("regenerated MSL"),
+                    "current MSL was reused: {log}"
+                );
+            }
+        }
+        let mtld3d_core::shader_cache::CacheLoad::Current(records) =
+            mtld3d_core::shader_cache::load(&cache).expect("load replay cache")
+        else {
+            panic!("replay did not leave a current cache");
+        };
+        assert_eq!(records.shaders.len(), 4);
+        assert_eq!(records.pipelines.len(), 6);
+        if warm && !regenerate {
+            assert!(
+                !records.needs_compaction,
+                "warm draws appended no shader or pipeline records"
+            );
+        }
+        std::fs::remove_file(&entries[0]).expect("remove checked replay log");
+    }
+    std::fs::remove_dir_all(&dir).expect("remove private replay directory");
+}
+
+// Simulate another emitter without a second build. Poisoned MSL makes accidental reuse fail.
+fn stale_cache_emitter(path: &std::path::Path) {
+    use std::hash::Hasher as _;
+
+    use mtld3d_core::shader_cache::{self, CHUNK_HEADER_LEN, CacheLoad, HEADER_LEN};
+
+    let CacheLoad::Current(mut records) = shader_cache::load(path).expect("load current cache")
+    else {
+        panic!("cache is current before emitter change");
+    };
+    let mut bytes = Vec::new();
+    shader_cache::write_header(&mut bytes);
+    assert_eq!(bytes.len(), HEADER_LEN);
+    for entry in &mut records.shaders {
+        entry.msl = "invalid obsolete MSL".into();
+        let mut chunk = Vec::new();
+        shader_cache::write_record(&mut chunk, entry);
+        let mut body = zstd::decode_all(&chunk[CHUNK_HEADER_LEN..]).expect("decode shader record");
+        body[0] ^= 1;
+        let frame = zstd::encode_all(body.as_slice(), 3).expect("encode stale shader");
+        chunk.truncate(CHUNK_HEADER_LEN);
+        chunk[12..16].copy_from_slice(
+            &u32::try_from(frame.len())
+                .expect("frame length")
+                .to_le_bytes(),
+        );
+        let mut hash = xxhash_rust::xxh3::Xxh3::new();
+        hash.write(&chunk[..16]);
+        hash.write(&frame);
+        chunk[16..24].copy_from_slice(&hash.finish().to_le_bytes());
+        chunk.extend_from_slice(&frame);
+        bytes.extend_from_slice(&chunk);
+    }
+    for recipe in &records.pipelines {
+        shader_cache::write_pipeline_record(&mut bytes, recipe);
+    }
+    // Both child processes have exited; this private cache has no active writer.
+    std::fs::write(path, bytes).expect("replace private cache with old-emitter records");
+}
+
+fn render_pipeline_cache_workload() {
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(D3DFMT_D24S8),
+        config_entries: "shaderCache.enable=true;log.dir=",
+        ..HarnessConfig::default()
+    });
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    assert_eq!(h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]), 0);
+    for (mask, expected) in [(0x0F, 0xFFFF_0000), (0, 0xFF00_00FF)] {
+        assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, mask), 0);
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0),
+                0
+            );
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0
+            );
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "cold and replayed pixels");
+    }
+    assert_eq!(h.clear_vertex_shader(), 0);
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    // An sRGB attachment normalizes the fragment variant on the encoder.
+    // Recipes must reference that effective variant, not the API snapshot.
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0);
+    let vertices = centered_triangle().map(|vertex| PosColorVertex {
+        x: vertex.x,
+        y: vertex.y,
+        z: vertex.z,
+        color: 0xFFFF_0000,
+    });
+    for (mask, expected) in [(0x0F, 0xFFFF_0000), (0, 0xFF00_00FF)] {
+        assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, mask), 0);
+        h.render_once(0xFF00_00FF, |device| {
+            assert_eq!(
+                device.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0),
+                0
+            );
+            assert_eq!(
+                device.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &vertices),
+                0
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 280),
+            expected,
+            "fixed-function replay pixels"
+        );
+    }
+}
+
+#[test]
+fn sm3_predication_preserves_false_destination_components() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_PREDICATED_COMPONENTS);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    h.render_once(0xFF00_0000, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+            0,
+            "draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        0x00FF_00FF,
+        "false p0.yw components must preserve the zero destination lanes"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+#[test]
+fn vs_1_1_expp_exposes_the_fractional_component() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS1_EXPP_FRACTION);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (input, expected, what) in [
+        (1.5, 0x8080_8080, "positive fraction"),
+        (-1.5, 0x8080_8080, "negative fraction"),
+        (2.0, 0x0000_0000, "integer"),
+    ] {
+        assert_eq!(
+            h.set_vertex_shader_constant_f(0, &[13.0, input, 17.0, 19.0]),
+            0,
+            "SetVSConstF"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+/// `vs_2_0`: `dcl_position v0; add oPos, v0, c0;`, translate by VS constant c0.
+const VS_TRANSLATE: [u32; 9] = [
+    0xFFFE_0200,
+    (31) | (2 << 24),
+    0x0000_0000,
+    (1 << 28) | (0xF << 16),
+    (2) | (3 << 24), // add: dst + 2 src tokens
+    (4 << 28) | (0xF << 16),
+    (1 << 28) | (0xE4 << 16),
+    (2 << 28) | (0xE4 << 16),
+    0x0000_FFFF,
+];
+
+#[test]
+fn vertex_shader_constant_translates_geometry() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_TRANSLATE);
+    let ps = h.create_pixel_shader(&PS_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[0.0, 1.0, 0.0, 1.0]),
+        0,
+        "PS green"
+    );
+    let tri = centered_triangle();
+
+    // c0 = 0 → triangle at the origin covers the centre.
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &[0.0, 0.0, 0.0, 0.0]),
+        0,
+        "VS c0 = 0"
+    );
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        0xFF00_FF00,
+        "centred triangle is green"
+    );
+
+    // c0 = (+2, 0) → translated off-screen, centre reverts to background.
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &[2.0, 0.0, 0.0, 0.0]),
+        0,
+        "VS c0 = +2x"
+    );
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    });
+    assert_ne!(
+        h.read_pixel(320, 240),
+        0xFF00_FF00,
+        "translated triangle left the centre"
+    );
+}
+
+#[test]
+fn float_shader_constant_setters_accept() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &[1.0, 2.0, 3.0, 4.0]),
+        0,
+        "VS const F"
+    );
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+        0,
+        "PS const F"
+    );
+}
+
+#[test]
+fn float_shader_constant_setters_reject_out_of_range() {
+    // D3D9 validates the `[start, start + count)` register window: the last
+    // in-range write succeeds, anything past the file (or a `-1` start whose
+    // unsigned value would wrap) is D3DERR_INVALIDCALL. A clamping write that
+    // silently returned S_OK lets the canonical `while (SUCCEEDED(Set(i++)))`
+    // probe loop spin forever, so this contract is load-bearing. vs_3_0
+    // exposes 256 float constants, ps_3_0 exposes 224.
+    let h = Harness::new();
+    let one = [0.0_f32; 4];
+    let four = [0.0_f32; 16];
+
+    // Vertex: c255 is the last valid register; c256 and a 4-wide window from
+    // c253 both overflow the 256-row file.
+    assert_eq!(
+        h.set_vertex_shader_constant_f(255, &one),
+        0,
+        "VS c255 in range"
+    );
+    assert_eq!(
+        h.set_vertex_shader_constant_f(256, &one),
+        D3DERR_INVALIDCALL,
+        "VS c256 past file"
+    );
+    assert_eq!(
+        h.set_vertex_shader_constant_f(253, &four),
+        D3DERR_INVALIDCALL,
+        "VS 4-wide window past c255"
+    );
+    assert_eq!(
+        h.set_vertex_shader_constant_f(u32::MAX, &one),
+        D3DERR_INVALIDCALL,
+        "VS -1 start must not wrap into range"
+    );
+
+    // Pixel: the file stops at c223 (ps_3_0), 32 registers below the vertex one.
+    assert_eq!(
+        h.set_pixel_shader_constant_f(223, &one),
+        0,
+        "PS c223 in range"
+    );
+    assert_eq!(
+        h.set_pixel_shader_constant_f(224, &one),
+        D3DERR_INVALIDCALL,
+        "PS c224 past file"
+    );
+    assert_eq!(
+        h.set_pixel_shader_constant_f(u32::MAX, &one),
+        D3DERR_INVALIDCALL,
+        "PS -1 start must not wrap into range"
+    );
+}
+
+#[test]
+fn integer_and_bool_shader_constants_round_trip() {
+    // SM2/SM3 integer/bool constant registers are stored even though the MSL
+    // emit does not consume them yet: Set succeeds and Get reads them back.
+    let h = Harness::new();
+    assert_eq!(
+        h.set_vertex_shader_constant_i(0, &[1, 2, 3, 4]),
+        0,
+        "VS const I set"
+    );
+    assert_eq!(
+        h.set_vertex_shader_constant_b(0, &[1, 0]),
+        0,
+        "VS const B set"
+    );
+    assert_eq!(
+        h.set_pixel_shader_constant_i(0, &[5, 6, 7, 8]),
+        0,
+        "PS const I set"
+    );
+    assert_eq!(
+        h.set_pixel_shader_constant_b(0, &[0, 1]),
+        0,
+        "PS const B set"
+    );
+
+    let (hr, vs_i) = h.get_vertex_shader_constant_i(0, 1);
+    assert_eq!(hr, 0, "VS const I get");
+    assert_eq!(vs_i, [1, 2, 3, 4], "VS const I round-trip");
+
+    let (hr, vs_b) = h.get_vertex_shader_constant_b(0, 2);
+    assert_eq!(hr, 0, "VS const B get");
+    assert_eq!(vs_b, [1, 0], "VS const B round-trip");
+
+    let (hr, ps_i) = h.get_pixel_shader_constant_i(0, 1);
+    assert_eq!(hr, 0, "PS const I get");
+    assert_eq!(ps_i, [5, 6, 7, 8], "PS const I round-trip");
+
+    let (hr, ps_b) = h.get_pixel_shader_constant_b(0, 2);
+    assert_eq!(hr, 0, "PS const B get");
+    assert_eq!(ps_b, [0, 1], "PS const B round-trip");
+}
+
+/// Constant calls take a zero count and refuse a window past the register file.
+///
+/// A zero count is a call that moves nothing and answers `D3D_OK` on all
+/// twelve `Set`/`Get` entry points, leaving the registers as they were. The
+/// integer and boolean files are sixteen registers deep, and a start at or
+/// past the sixteenth is `INVALIDCALL` whatever the count, where a start
+/// inside the file keeps clamping an oversized count to what remains. The
+/// float getters refuse a window that runs past the 256 vertex-shader or 224
+/// pixel-shader registers, as the float setters do.
+#[test]
+fn constant_calls_take_a_zero_count_and_refuse_a_window_past_the_file() {
+    let h = Harness::new();
+    assert_eq!(h.set_vertex_shader_constant_f(0, &[1.0, 2.0, 3.0, 4.0]), 0);
+    assert_eq!(h.set_vertex_shader_constant_i(0, &[1, 2, 3, 4]), 0);
+    assert_eq!(h.set_vertex_shader_constant_b(0, &[1]), 0);
+    assert_eq!(h.set_pixel_shader_constant_f(0, &[5.0, 6.0, 7.0, 8.0]), 0);
+    assert_eq!(h.set_pixel_shader_constant_i(0, &[5, 6, 7, 8]), 0);
+    assert_eq!(h.set_pixel_shader_constant_b(0, &[1]), 0);
+
+    let floats = [9.0_f32; 4];
+    let ints = [9_i32; 4];
+    let float_setters = [
+        Harness::set_vertex_shader_constant_f_raw
+            as unsafe fn(&Harness, u32, *const f32, u32) -> i32,
+        Harness::set_pixel_shader_constant_f_raw,
+    ];
+    for set in float_setters {
+        // SAFETY: a zero count reads no register of the array.
+        let hr = unsafe { set(&h, 0, floats.as_ptr(), 0) };
+        assert_eq!(hr, 0, "F set, count 0");
+    }
+    let int_setters = [
+        Harness::set_vertex_shader_constant_i_raw
+            as unsafe fn(&Harness, u32, *const i32, u32) -> i32,
+        Harness::set_vertex_shader_constant_b_raw,
+        Harness::set_pixel_shader_constant_i_raw,
+        Harness::set_pixel_shader_constant_b_raw,
+    ];
+    for set in int_setters {
+        // SAFETY: a zero count reads no register of the array.
+        let hr = unsafe { set(&h, 0, ints.as_ptr(), 0) };
+        assert_eq!(hr, 0, "I/B set, count 0");
+    }
+    assert_eq!(
+        h.get_vertex_shader_constant_f(0, 0).0,
+        0,
+        "VS F get, count 0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_i(0, 0).0,
+        0,
+        "VS I get, count 0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_b(0, 0).0,
+        0,
+        "VS B get, count 0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_f(0, 0).0,
+        0,
+        "PS F get, count 0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_i(0, 0).0,
+        0,
+        "PS I get, count 0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_b(0, 0).0,
+        0,
+        "PS B get, count 0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_f(0, 1),
+        (0, vec![1.0, 2.0, 3.0, 4.0]),
+        "a zero-count VS F set leaves c0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_f(0, 1),
+        (0, vec![5.0, 6.0, 7.0, 8.0]),
+        "a zero-count PS F set leaves c0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_i(0, 1),
+        (0, vec![1, 2, 3, 4]),
+        "a zero-count VS I set leaves i0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_i(0, 1),
+        (0, vec![5, 6, 7, 8]),
+        "a zero-count PS I set leaves i0"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_b(0, 1),
+        (0, vec![1]),
+        "a zero-count VS B set leaves b0"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_b(0, 1),
+        (0, vec![1]),
+        "a zero-count PS B set leaves b0"
+    );
+
+    for start in [16, 17, u32::MAX] {
+        assert_eq!(
+            h.set_vertex_shader_constant_i(start, &[1, 2, 3, 4]),
+            D3DERR_INVALIDCALL,
+            "VS I set at {start}"
+        );
+        assert_eq!(
+            h.set_vertex_shader_constant_b(start, &[1]),
+            D3DERR_INVALIDCALL,
+            "VS B set at {start}"
+        );
+        assert_eq!(
+            h.set_pixel_shader_constant_i(start, &[1, 2, 3, 4]),
+            D3DERR_INVALIDCALL,
+            "PS I set at {start}"
+        );
+        assert_eq!(
+            h.set_pixel_shader_constant_b(start, &[1]),
+            D3DERR_INVALIDCALL,
+            "PS B set at {start}"
+        );
+        assert_eq!(
+            h.set_vertex_shader_constant_i(start, &[]),
+            D3DERR_INVALIDCALL,
+            "VS I set at {start}, count 0"
+        );
+        for (label, hr) in [
+            ("VS I get", h.get_vertex_shader_constant_i(start, 1).0),
+            ("VS B get", h.get_vertex_shader_constant_b(start, 1).0),
+            ("PS I get", h.get_pixel_shader_constant_i(start, 1).0),
+            ("PS B get", h.get_pixel_shader_constant_b(start, 1).0),
+        ] {
+            assert_eq!(hr, D3DERR_INVALIDCALL, "{label} at {start}");
+        }
+    }
+    assert_eq!(
+        h.set_vertex_shader_constant_i(15, &[1, 2, 3, 4]),
+        0,
+        "i15 is the last integer register"
+    );
+    assert_eq!(
+        h.set_pixel_shader_constant_b(15, &[1]),
+        0,
+        "b15 is the last boolean register"
+    );
+
+    for (start, count) in [(255, 2), (256, 1), (257, 0), (u32::MAX, 1)] {
+        assert_eq!(
+            h.get_vertex_shader_constant_f(start, count).0,
+            D3DERR_INVALIDCALL,
+            "VS F get at {start}, count {count}"
+        );
+    }
+    for (start, count) in [(223, 2), (224, 1), (225, 0), (u32::MAX, 1)] {
+        assert_eq!(
+            h.get_pixel_shader_constant_f(start, count).0,
+            D3DERR_INVALIDCALL,
+            "PS F get at {start}, count {count}"
+        );
+    }
+    assert_eq!(
+        h.get_vertex_shader_constant_f(255, 1).0,
+        0,
+        "c255 is the last vertex-shader float register"
+    );
+    assert_eq!(
+        h.get_vertex_shader_constant_f(256, 0).0,
+        0,
+        "an empty VS F window at the end of the file"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_f(223, 1).0,
+        0,
+        "c223 is the last pixel-shader float register"
+    );
+    assert_eq!(
+        h.get_pixel_shader_constant_f(224, 0).0,
+        0,
+        "an empty PS F window at the end of the file"
+    );
+}
+
+#[test]
+fn float_shader_constants_round_trip() {
+    // GetVertexShaderConstantF / GetPixelShaderConstantF read back the values
+    // written by the matching Set. Values are exactly representable, so a copy
+    // round-trip compares bit-exact.
+    let h = Harness::new();
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &[1.0, 2.0, 3.0, 4.0]),
+        0,
+        "VS const F set"
+    );
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[0.5, 0.25, 0.0, 1.0]),
+        0,
+        "PS const F set"
+    );
+
+    let (hr, vs_f) = h.get_vertex_shader_constant_f(0, 1);
+    assert_eq!(hr, 0, "VS const F get");
+    assert_eq!(vs_f, [1.0, 2.0, 3.0, 4.0], "VS const F round-trip");
+
+    let (hr, ps_f) = h.get_pixel_shader_constant_f(0, 1);
+    assert_eq!(hr, 0, "PS const F get");
+    assert_eq!(ps_f, [0.5, 0.25, 0.0, 1.0], "PS const F round-trip");
+}
+
+/// Assert the whole `GetFunction` contract for one shader.
+fn check_get_function(label: &str, bc: &[u32], get: &dyn Fn(*mut c_void, *mut u32) -> i32) {
+    let want = u32::try_from(core::mem::size_of_val(bc)).expect("bytecode fits u32");
+
+    // Size query: a null buffer reports the byte length.
+    let mut size = 0u32;
+    assert_eq!(
+        get(core::ptr::null_mut(), &raw mut size),
+        0,
+        "{label}: size query"
+    );
+    assert_eq!(size, want, "{label}: reported size");
+
+    // Copy: the tokens come back byte for byte.
+    let mut buf = vec![0u32; bc.len()];
+    let mut size = want;
+    assert_eq!(
+        get(buf.as_mut_ptr().cast(), &raw mut size),
+        0,
+        "{label}: copy"
+    );
+    assert_eq!(buf, bc, "{label}: bytecode round-trip");
+    assert_eq!(
+        size, want,
+        "{label}: the caller's size is left as it passed it"
+    );
+
+    // A buffer one byte short is rejected rather than truncated into, and the
+    // size the caller passed in is left as it was: the size query is the only
+    // form that writes it.
+    let mut short = want - 1;
+    assert_eq!(
+        get(buf.as_mut_ptr().cast(), &raw mut short),
+        D3DERR_INVALIDCALL,
+        "{label}: undersized buffer"
+    );
+    assert_eq!(
+        short,
+        want - 1,
+        "{label}: a rejected copy leaves the caller's size as it was"
+    );
+
+    // The size slot is where the length goes in and out, so there is no call
+    // without one.
+    assert_eq!(
+        get(core::ptr::null_mut(), core::ptr::null_mut()),
+        D3DERR_INVALIDCALL,
+        "{label}: null size out-param"
+    );
+}
+
+/// `GetFunction` hands back the exact token stream the shader was created from.
+///
+/// Nothing in the conformance corpus calls it, so this test is the only thing
+/// standing between the round-trip and a regression. An app that reads its own
+/// bytecode back does not check the HRESULT first: it sizes a buffer from the
+/// query and copies into it, so a failure here surfaces as a null dereference
+/// inside the app rather than as a D3D error.
+#[test]
+fn get_function_round_trips_the_bytecode() {
+    let h = Harness::new();
+
+    for (label, bc) in [("vs_2_0", &VS_BC[..]), ("vs_1_1 with def", &VS1_DEF_BC[..])] {
+        let vs = h.create_vertex_shader(bc);
+        // SAFETY: every call passes either null or a buffer of the size it names.
+        check_get_function(label, bc, &|d, s| unsafe { vs.get_function(d, s) });
+    }
+
+    let ps = h.create_pixel_shader(&PS_BC);
+    // SAFETY: every call passes either null or a buffer of the size it names.
+    check_get_function("ps_2_0", &PS_BC, &|d, s| unsafe { ps.get_function(d, s) });
+}
+
+/// `vs_2_0`: `if b0` picks red, else green, for the diffuse output.
+///
+/// `dcl_position v0; def c0, 1,0,0,1; def c1, 0,1,0,1; mov oPos, v0;
+/// if b0 mov oD0, c0 else mov oD0, c1 endif`
+const VS_BOOL_BRANCH_BC: [u32; 30] = [
+    0xFFFE_0200,
+    0x0200_001F,
+    0x8000_0000,
+    0x900F_0000,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0500_0051,
+    0xA00F_0001,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0200_0001,
+    0xC00F_0000,
+    0x90E4_0000,
+    0x0100_0028,
+    0xE0E4_0800,
+    0x0200_0001,
+    0xD00F_0000,
+    0xA0E4_0000,
+    0x0000_002A,
+    0x0200_0001,
+    0xD00F_0000,
+    0xA0E4_0001,
+    0x0000_002B,
+    0x0000_FFFF,
+];
+
+/// `ps_2_0`: `dcl v0; mov oC0, v0;` (the interpolated diffuse).
+const PS_DIFFUSE_BC: [u32; 8] = [
+    0xFFFF_0200,
+    0x0200_001F,
+    0x8000_0000,
+    0x900F_0000,
+    0x0200_0001,
+    0x800F_0800,
+    0x90E4_0000,
+    0x0000_FFFF,
+];
+
+/// A dynamic boolean constant drives a static `if` in the vertex shader.
+///
+/// The branch's condition is `b0`, set through `SetVertexShaderConstantB`:
+/// TRUE takes the red arm, FALSE the green one, and the change reaches the
+/// draw without a shader rebind.
+#[test]
+fn bool_shader_constant_drives_static_branch() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BOOL_BRANCH_BC);
+    let ps = h.create_pixel_shader(&PS_DIFFUSE_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (value, expected, what) in [
+        (1, 0xFFFF_0000, "b0 = TRUE takes the if arm (red)"),
+        (0, 0xFF00_FF00, "b0 = FALSE takes the else arm (green)"),
+    ] {
+        assert_eq!(
+            h.set_vertex_shader_constant_b(0, &[value]),
+            0,
+            "SetVertexShaderConstantB"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+}
+
+/// `ps_3_0`: `if b0` picks red, else green, for the colour output.
+///
+/// `def c0, 1,0,0,1; def c1, 0,1,0,1; if b0 mov oC0, c0 else mov oC0, c1 endif`
+const PS_BOOL_BRANCH_BC: [u32; 24] = [
+    0xFFFF_0300,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0500_0051,
+    0xA00F_0001,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0100_0028,
+    0xE0E4_0800,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0000,
+    0x0000_002A,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0001,
+    0x0000_002B,
+    0x0000_FFFF,
+];
+
+/// A dynamic boolean constant drives a static `if` in the pixel shader.
+///
+/// The fragment twin of the vertex-shader test above: `b0` comes from
+/// `SetPixelShaderConstantB`, TRUE paints red, FALSE green, no rebind.
+#[test]
+fn bool_shader_constant_drives_static_branch_in_pixel_shader() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_BOOL_BRANCH_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (value, expected, what) in [
+        (1, 0xFFFF_0000, "b0 = TRUE takes the if arm (red)"),
+        (0, 0xFF00_FF00, "b0 = FALSE takes the else arm (green)"),
+    ] {
+        assert_eq!(
+            h.set_pixel_shader_constant_b(0, &[value]),
+            0,
+            "SetPixelShaderConstantB"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+}
+
+/// `ps_3_0`: `rep i0` adds a quarter of red per iteration.
+///
+/// `def c0, 0.25,0,0,0; def c1, 0,0,0,1; mov r0, c1; rep i0; add r0, r0, c0;
+/// endrep; mov oC0, r0`
+const PS_INT_LOOP_BC: [u32; 27] = [
+    0xFFFF_0300,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3E80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x0500_0051,
+    0xA00F_0001,
+    0x0000_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0200_0001,
+    0x800F_0000,
+    0xA0E4_0001,
+    0x0100_0026,
+    0xF0E4_0000,
+    0x0300_0002,
+    0x800F_0000,
+    0x80E4_0000,
+    0xA0E4_0000,
+    0x0000_0027,
+    0x0200_0001,
+    0x800F_0800,
+    0x80E4_0000,
+    0x0000_FFFF,
+];
+
+/// A dynamic integer constant drives a `rep` loop count in the pixel shader.
+///
+/// `i0.x` comes from `SetPixelShaderConstantI`: four iterations reach full
+/// red, zero iterations leave the black start value, no rebind in between.
+#[test]
+fn int_shader_constant_drives_loop_count_in_pixel_shader() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_INT_LOOP_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    let tri = centered_triangle();
+
+    for (count, expected, what) in [
+        (4, 0xFFFF_0000, "i0 = 4 iterations add up to full red"),
+        (
+            0,
+            0xFF00_0000,
+            "i0 = 0 iterations keep the black start value",
+        ),
+    ] {
+        assert_eq!(
+            h.set_pixel_shader_constant_i(0, &[count, 0, 0, 0]),
+            0,
+            "SetPixelShaderConstantI"
+        );
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+        });
+        assert_eq!(h.read_pixel(320, 280), expected, "{what}");
+    }
+}
+
+/// `ps_2_0`: `def c0, 1,0,0,1; mov oDepth, c0.x; mov oC0, c0;`
+const PS_DEPTH_WRITE_BC: [u32; 14] = [
+    0xFFFF_0200,
+    0x0500_0051,
+    0xA00F_0000,
+    0x3F80_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x0200_0001,
+    0x9001_0800,
+    0xA000_0000,
+    0x0200_0001,
+    0x800F_0800,
+    0xA0E4_0000,
+    0x0000_FFFF,
+];
+
+/// A pixel shader writing `oDepth` still draws when no depth buffer is bound.
+///
+/// D3D9 discards the depth write in that case; the pipeline must not fail
+/// (Metal rejects a depth output against no depth attachment), so the draw
+/// lands and the colour output shows.
+#[test]
+fn depth_writing_ps_draws_without_a_depth_buffer() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_DEPTH_WRITE_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    assert_eq!(
+        h.clear_depth_stencil_surface(),
+        0,
+        "unbind the depth buffer"
+    );
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFFFF_0000,
+        "the colour output lands although the shader writes oDepth"
+    );
+}
+
+/// `vs_3_0` fetching a texel with `texldl` and forwarding it as the color.
+///
+/// `dcl_position v0; dcl_2d s0; dcl_position o0; dcl_color0 o1;
+/// def c4, 0.5, 0.5, 0, 0; mov o0, v0; texldl r0, c4, s0; mov o1, r0;`
+/// The fetch coordinate is `c4`, the center of the texture, LOD 0 from `.w`.
+#[rustfmt::skip]
+const VS_FETCH: [u32; 27] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0500_0051, 0xA00F_0004,                           // def c4,
+    0x3F00_0000, 0x3F00_0000, 0x0000_0000, 0x0000_0000, //   0.5, 0.5, 0, 0
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0300_005F, 0x800F_0000, 0xA0E4_0004, 0xA0E4_0800, // texldl r0, c4, s0
+    0x0000_FFFF,                                        // end (o1 write below)
+];
+
+/// [`VS_FETCH`] with `mov o1, r0`: the texel sampler 0 fetches becomes the vertex colour.
+pub fn vs_fetch_to_color() -> Vec<u32> {
+    let mut tokens = VS_FETCH.to_vec();
+    let end = tokens.pop().expect("end token");
+    tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    tokens
+}
+
+/// `ps_3_0 { dcl_color0 v0; mov oC0, v0; }`, pass the VS color through.
+#[rustfmt::skip]
+pub const PS_COLOR_PASSTHROUGH: [u32; 8] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_000A, 0x900F_0000,              // dcl_color0 v0
+    0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn vertex_texture_fetch_reads_the_bound_slot() {
+    // Vertex texture fetch: a vs_3_0 declares a sampler, the game binds a
+    // texture at D3DVERTEXTEXTURESAMPLER0 (stage 257), and texldl reads it
+    // per vertex. The fetched color rides a varying to the pixel shader, so
+    // the rendered triangle proves the vertex-stage bind end to end.
+    // Support is probed exactly like a title does: the caps bit and the
+    // per-format QUERY_VERTEXTEXTURE answer.
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(
+            mtld3d_types::D3DFMT_X8R8G8B8,
+            mtld3d_types::D3DUSAGE_QUERY_VERTEXTEXTURE,
+            mtld3d_types::D3DRTYPE_TEXTURE,
+            mtld3d_types::D3DFMT_A8R8G8B8,
+        ),
+        0,
+        "vertex texture format probe answers available"
+    );
+
+    let tex = h.create_texture(2, 2, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, 0);
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        locked.write_u32(&[0xFF00_FF00; 4]); // all-green
+    }
+    assert_eq!(h.set_texture(257, &tex), 0, "bind vertex sampler 0");
+
+    let mut vs_tokens = VS_FETCH.to_vec();
+    // `mov o1, r0` before the end token.
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the texel fetched in the vertex shader colors the triangle"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(257), 0, "unbind slot");
+}
+
+#[test]
+fn reset_restores_the_vertex_sampler_state_the_draw_samples_with() {
+    // Reset puts every sampler state back to its default, the vertex samplers
+    // included, and a texture bound after it samples with those defaults.
+    // The fetch reads u = 1.25 of a 2x1 texture, red then green: the default
+    // WRAP addressing reads the red texel, a CLAMP left over from before the
+    // Reset would read the green one.
+    const RED: u32 = 0xFFFF_0000;
+    const GREEN: u32 = 0xFF00_FF00;
+    let h = Harness::new();
+    let vertex_sampler_0 = mtld3d_types::D3DVERTEXTEXTURESAMPLER0;
+    assert_eq!(
+        h.set_sampler_state(
+            vertex_sampler_0,
+            mtld3d_types::D3DSAMP_ADDRESSU,
+            mtld3d_types::D3DTADDRESS_CLAMP
+        ),
+        0,
+        "CLAMP before the Reset"
+    );
+    assert_eq!(h.reset(640, 480), 0, "same-size Reset");
+    assert_eq!(
+        h.sampler_state(vertex_sampler_0, mtld3d_types::D3DSAMP_ADDRESSU),
+        mtld3d_types::D3DTADDRESS_WRAP,
+        "Reset reports the default addressing"
+    );
+
+    let tex = h.create_texture(2, 1, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[RED, GREEN]);
+    assert_eq!(
+        h.set_texture(vertex_sampler_0, &tex),
+        0,
+        "bind vertex sampler 0"
+    );
+    let mut vs_tokens = VS_FETCH.to_vec();
+    // `def c4` x, the fetch's u.
+    vs_tokens[15] = 1.25f32.to_bits();
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        RED,
+        "the fetch at u = 1.25 wraps to the red texel"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(vertex_sampler_0), 0, "unbind slot");
+}
+
+#[test]
+fn vertex_texture_fetch_keeps_intra_frame_versions() {
+    // The upload after the left draw is ordered before the right draw. The
+    // encoder executes uploads at frame start, so it must rename the sampled
+    // Metal texture to keep the later bytes out of the earlier draw.
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, 0);
+    tex.lock_rect(0, 0).write_u32(&[0xFFFF_0000]);
+    assert_eq!(h.set_texture(257, &tex), 0, "bind vertex sampler 0");
+
+    let mut vs_tokens = VS_FETCH.to_vec();
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(-0.5)),
+            0,
+            "left draw"
+        );
+        tex.lock_rect(0, 0).write_u32(&[0xFF00_FF00]);
+        assert_eq!(d.set_texture(257, &tex), 0, "rebind vertex sampler 0");
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(0.5)),
+            0,
+            "right draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(160, 264),
+        0xFFFF_0000,
+        "the first draw keeps the texture bytes current at that draw"
+    );
+    assert_eq!(
+        h.read_pixel(480, 264),
+        0xFF00_FF00,
+        "the second draw sees the texture upload issued between the draws"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(257), 0, "unbind slot");
+}
+
+#[test]
+fn vertex_texture_fetch_uploads_managed_writes_without_rebind() {
+    vertex_texture_writes(D3DPOOL_MANAGED, 0, 0, &TextureWriteBinding::Unchanged);
+}
+
+#[test]
+fn vertex_texture_fetch_uploads_dynamic_writes_without_rebind() {
+    vertex_texture_writes(
+        mtld3d_types::D3DPOOL_DEFAULT,
+        mtld3d_types::D3DUSAGE_DYNAMIC,
+        mtld3d_types::D3DLOCK_DISCARD,
+        &TextureWriteBinding::Unchanged,
+    );
+}
+
+#[test]
+fn vertex_texture_fetch_uploads_managed_writes_with_vertex_rebind() {
+    vertex_texture_writes(D3DPOOL_MANAGED, 0, 0, &TextureWriteBinding::VertexRebind);
+}
+
+#[test]
+fn vertex_texture_fetch_uploads_dynamic_writes_with_vertex_rebind() {
+    vertex_texture_writes(
+        mtld3d_types::D3DPOOL_DEFAULT,
+        mtld3d_types::D3DUSAGE_DYNAMIC,
+        mtld3d_types::D3DLOCK_DISCARD,
+        &TextureWriteBinding::VertexRebind,
+    );
+}
+
+#[test]
+fn vertex_texture_fetch_uploads_managed_writes_with_fragment_bind() {
+    vertex_texture_writes(D3DPOOL_MANAGED, 0, 0, &TextureWriteBinding::FragmentBind);
+}
+
+#[test]
+fn vertex_texture_fetch_uploads_dynamic_writes_with_fragment_bind() {
+    vertex_texture_writes(
+        mtld3d_types::D3DPOOL_DEFAULT,
+        mtld3d_types::D3DUSAGE_DYNAMIC,
+        mtld3d_types::D3DLOCK_DISCARD,
+        &TextureWriteBinding::FragmentBind,
+    );
+}
+
+enum TextureWriteBinding {
+    Unchanged,
+    VertexRebind,
+    FragmentBind,
+}
+
+fn vertex_texture_writes(pool: u32, usage: u32, lock_flags: u32, binding: &TextureWriteBinding) {
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(
+            mtld3d_types::D3DFMT_X8R8G8B8,
+            mtld3d_types::D3DUSAGE_QUERY_VERTEXTEXTURE | usage,
+            mtld3d_types::D3DRTYPE_TEXTURE,
+            mtld3d_types::D3DFMT_A8R8G8B8,
+        ),
+        0,
+        "vertex texture format and usage are supported"
+    );
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    for slot in 0..4 {
+        let stage = mtld3d_types::D3DVERTEXTEXTURESAMPLER0 + slot;
+        let tex = h.create_texture(1, 1, 1, usage, mtld3d_types::D3DFMT_A8R8G8B8, pool);
+        tex.lock_rect(0, lock_flags).write_u32(&[0xFFFF_0000]);
+        assert_eq!(h.set_texture(stage, &tex), 0, "bind vertex sampler {slot}");
+
+        let mut vs_tokens = VS_FETCH.to_vec();
+        // Both the declaration and the texldl source name this sampler.
+        vs_tokens[6] |= slot;
+        vs_tokens[25] |= slot;
+        let end = vs_tokens.pop().expect("end token");
+        vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+        let vs = h.create_vertex_shader(&vs_tokens);
+        assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(-0.5)),
+                0,
+                "left draw"
+            );
+            // Whole-level writes keep this inside the lockable pool's contract.
+            tex.lock_rect(0, lock_flags).write_u32(&[0xFF00_FF00]);
+            match binding {
+                TextureWriteBinding::Unchanged => {}
+                TextureWriteBinding::VertexRebind => {
+                    assert_eq!(d.set_texture(stage, &tex), 0, "rebind vertex sampler");
+                }
+                TextureWriteBinding::FragmentBind => {
+                    assert_eq!(d.set_texture(0, &tex), 0, "bind fragment sampler");
+                }
+            }
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(0.5)),
+                0,
+                "right draw"
+            );
+        });
+        assert_eq!(
+            h.read_pixel(160, 264),
+            0xFFFF_0000,
+            "slot {slot}: the first draw keeps the bytes from before the write"
+        );
+        assert_eq!(
+            h.read_pixel(480, 264),
+            0xFF00_FF00,
+            "slot {slot}: the second draw sees the write with its chosen binding control"
+        );
+        assert_eq!(h.clear_texture(stage), 0, "unbind vertex sampler");
+        assert_eq!(h.clear_texture(0), 0, "unbind fragment sampler");
+        assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    }
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+#[test]
+fn vertex_texture_fetch_follows_the_bound_kind_not_the_declaration() {
+    // A vs_3_0 may declare one sampler kind and sample another: native
+    // drivers read the texture the game bound and ignore the dcl. Metal
+    // type-checks the `[[texture(n)]]` argument against the bound
+    // MTLTexture, so the emitted vertex function has to take its argument
+    // type and its coordinate width from the binding. Here the shader
+    // declares `dcl_volume s0` (sampler usage token 0xA0000000) and the game
+    // binds a plain 2D texture at D3DVERTEXTEXTURESAMPLER0. Typing from the
+    // declaration gives `texture3d<float>` sampled with a two-component
+    // coordinate, which is not valid MSL, so the whole vertex library fails
+    // to compile and the triangle never reaches the render target.
+    let h = Harness::new();
+    let tex = h.create_texture(2, 2, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, 0);
+    {
+        let mut locked = tex.lock_rect(0, 0);
+        locked.write_u32(&[0xFF00_FF00; 4]); // all-green
+    }
+    assert_eq!(h.set_texture(257, &tex), 0, "bind vertex sampler 0");
+
+    let mut vs_tokens = VS_FETCH.to_vec();
+    vs_tokens[5] = 0xA000_0000; // dcl_volume s0 in place of dcl_2d s0
+    // `mov o1, r0` before the end token.
+    let end = vs_tokens.pop().expect("end token");
+    vs_tokens.extend_from_slice(&[0x0200_0001, 0xE00F_0001, 0x80E4_0000, end]);
+    let vs = h.create_vertex_shader(&vs_tokens);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the 2D texel fetched through a volume declaration colors the triangle"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(257), 0, "unbind slot");
+}
+
+/// `ps_2_0`: `def c0, 0, 0, 1, 1; mov oC0, c0;`, opaque blue with no buffer read.
+///
+/// A `def`-declared row is translated into a shader-local literal, so this
+/// program never reads the pixel constant buffer whatever the game uploads
+/// into it.
+const PS_DEF_BLUE: [u32; 11] = [
+    0xFFFF_0200,
+    // def c0, 0.0, 0.0, 1.0, 1.0
+    0x0051 | (5 << 24),
+    0xA00F_0000,
+    0x0000_0000,
+    0x0000_0000,
+    0x3F80_0000,
+    0x3F80_0000,
+    // mov oC0, c0
+    (1) | (2 << 24),
+    0x800F_0800,
+    0xA0E4_0000,
+    0x0000_FFFF,
+];
+
+/// Triangle centred on `cx` in NDC, tall enough to cover the sample row.
+fn triangle_at(cx: f32) -> [PosVertex; 3] {
+    [
+        PosVertex {
+            x: cx,
+            y: 0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: cx + 0.25,
+            y: -0.5,
+            z: 0.5,
+        },
+        PosVertex {
+            x: cx - 0.25,
+            y: -0.5,
+            z: 0.5,
+        },
+    ]
+}
+
+/// `vs_3_0` reading `c[a0.x + 0]` from a subroutine reached through `call`.
+///
+/// `dcl_position v0; dcl_position o0; dcl_color0 o1; mov o0, v0; mova a0, c0;
+/// call l0; ret; label l0; mov o1, c[a0.x + 0]; ret;`
+/// `c0.x` carries the row index, so the row the colour comes from is known
+/// only at draw time and the whole uploaded prefix has to be bound.
+#[rustfmt::skip]
+const VS_CALL_REL_CONST: [u32; 27] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_002E, 0xB00F_0000, 0xA0E4_0000,              // mova a0, c0
+    0x0100_0019, 0xA0E4_1000,                           // call l0
+    0x0000_001C,                                        // ret
+    0x0100_001E, 0xA0E4_1000,                           // label l0
+    0x0300_0001, 0xE00F_0001, 0xA0E4_2000, 0xB000_0000, // mov o1, c[a0.x + 0]
+    0x0000_001C,                                        // ret
+    0x0000_FFFF,                                        // end
+];
+
+/// The constant prefix a draw binds covers a relative read inside a subroutine.
+///
+/// The only statically named float rows are `c0` (the index) and the rel-addr
+/// base `c0`, so a prefix sized from what the instruction stream names ends one
+/// row long. The colour lives in `c20`, reachable only because the shader
+/// reports relative addressing and the draw binds every populated row.
+#[test]
+fn relative_constant_read_inside_a_call_sees_the_uploaded_row() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_CALL_REL_CONST);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    // Rows 0..=20: row 0 is the index, rows 1..=19 are red so a read that lands
+    // short of the target row is a visibly different colour, row 20 is green.
+    let mut constants = [0.0f32; 21 * 4];
+    constants[0] = 20.0;
+    for row in 1..20 {
+        constants[row * 4] = 1.0;
+        constants[row * 4 + 3] = 1.0;
+    }
+    constants[20 * 4 + 1] = 1.0;
+    constants[20 * 4 + 3] = 1.0;
+    assert_eq!(
+        h.set_vertex_shader_constant_f(0, &constants),
+        0,
+        "SetVertexShaderConstantF"
+    );
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the row c[a0.x + 0] names must be inside the bound constant prefix"
+    );
+}
+
+/// `ps_3_0` reading `c[aL + 2]` inside a one-pass `loop` that starts `aL` at 18.
+///
+/// `defi i0, 1, 18, 1, 0; loop aL, i0; mov r0, c[aL + 2]; endloop; mov oC0, r0`
+/// The instruction stream names rows up to `c2` only; the row it reads is `c20`.
+#[rustfmt::skip]
+const PS_LOOP_REL_CONST: [u32; 19] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0500_0030, 0xF00F_0000, 1, 18, 1, 0,              // defi i0, 1, 18, 1, 0
+    0x0200_001B, 0xF0E4_0800, 0xF0E4_0000,              // loop aL, i0
+    0x0300_0001, 0x800F_0000, 0xA0E4_2002, 0xF000_0800, // mov r0, c[aL + 2]
+    0x0000_001D,                                        // endloop
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// The pixel constant prefix a draw binds covers a `c[aL + N]` read.
+///
+/// Rows 0..=19 are red, so a prefix sized from the rows the instruction stream
+/// names (three) ends long before the green row 20 the loop counter selects.
+#[test]
+fn pixel_relative_constant_read_in_a_loop_sees_the_uploaded_row() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_LOOP_REL_CONST);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let mut constants = [0.0f32; 21 * 4];
+    for row in 0..20 {
+        constants[row * 4] = 1.0;
+        constants[row * 4 + 3] = 1.0;
+    }
+    constants[20 * 4 + 1] = 1.0;
+    constants[20 * 4 + 3] = 1.0;
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &constants),
+        0,
+        "SetPixelShaderConstantF"
+    );
+
+    let tri = centered_triangle();
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "the row c[aL + 2] names must be inside the bound constant prefix"
+    );
+}
+
+#[test]
+fn defined_pixel_constant_ignores_the_constant_buffer() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let ps = h.create_pixel_shader(&PS_DEF_BLUE);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let tri = centered_triangle();
+
+    // Nothing uploaded yet: the literal is the only source of the colour.
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_00FF,
+        "def c0 colours the triangle blue"
+    );
+
+    // c0 = red in the constant buffer. The shader still reads its literal, so
+    // the colour does not move even though the row now holds something else.
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+        0,
+        "SetPSConstF(red)"
+    );
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_00FF,
+        "an upload into c0 does not reach a def-declared register"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+#[test]
+fn constant_reader_after_a_non_reader_sees_the_current_row() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_BC);
+    let reader = h.create_pixel_shader(&PS_BC);
+    let literal = h.create_pixel_shader(&PS_DEF_BLUE);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+
+    let left = triangle_at(-0.5);
+    let middle = triangle_at(0.0);
+    let right = triangle_at(0.5);
+
+    // Three draws in one pass: a buffer reader, then a program that reads no
+    // float constant while the row changes underneath it, then the reader
+    // again. The middle draw must neither bind the row nor claim it did, or
+    // the third draw dedups against a value the encoder never bound.
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]),
+        0,
+        "SetPSConstF(red)"
+    );
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.set_pixel_shader(&reader), 0, "bind reader");
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &left), 0, "left");
+        assert_eq!(
+            d.set_pixel_shader_constant_f(0, &[0.0, 1.0, 0.0, 1.0]),
+            0,
+            "SetPSConstF(green)"
+        );
+        assert_eq!(d.set_pixel_shader(&literal), 0, "bind literal");
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &middle),
+            0,
+            "middle"
+        );
+        assert_eq!(d.set_pixel_shader(&reader), 0, "rebind reader");
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &right),
+            0,
+            "right"
+        );
+    });
+
+    assert_eq!(
+        h.read_pixel(160, 264),
+        0xFFFF_0000,
+        "first reader draw is red"
+    );
+    assert_eq!(h.read_pixel(320, 264), 0xFF00_00FF, "literal draw is blue");
+    assert_eq!(
+        h.read_pixel(480, 264),
+        0xFF00_FF00,
+        "second reader draw picks up the row set between the draws"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+/// `vs_3_0`: pass the position and a three-component texcoord through.
+#[rustfmt::skip]
+const VS_TEXCOORD_PASSTHROUGH: [u32; 20] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0005, 0x900F_0001,              // dcl_texcoord0 v1
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_0005, 0xE00F_0001,              // dcl_texcoord0 o1
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE00F_0001, 0x90E4_0001,              // mov o1, v1
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0 { dcl_texcoord0 v0.xy; dcl_2d s0; texld r0, v0, s0; mov oC0, r0; }`.
+#[rustfmt::skip]
+const PS_SAMPLE_2D: [u32; 15] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9003_0000,              // dcl_texcoord0 v0.xy
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0300_0042, 0x800F_0000, 0x90E4_0000, 0xA0E4_0800, // texld r0, v0, s0
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0` sampling `s0.bbbb` into `r0.xz` after priming the other lanes.
+#[rustfmt::skip]
+const PS_SAMPLE_SWIZZLED: [u32; 24] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9003_0000,              // dcl_texcoord0 v0.xy
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x0000_0000, 0x3F80_0000, 0x0000_0000, 0x3F80_0000, //   0, 1, 0, 1
+    0x0200_0001, 0x800F_0000, 0xA0E4_0000,              // mov r0, c0
+    0x0300_0042, 0x8005_0000, 0x90E4_0000, 0xA0AA_0800, // texld r0.xz, v0, s0.bbbb
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn sampler_result_swizzle_precedes_the_destination_write_mask() {
+    let h = Harness::new();
+    let texture = h.create_texture(1, 1, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    {
+        let mut locked = texture.lock_rect(0, 0);
+        locked.write_u32(&[0x8020_4060]);
+    }
+    assert_eq!(h.set_texture(0, &texture), 0, "bind texture");
+    for (state, value) in [
+        (mtld3d_types::D3DSAMP_MINFILTER, mtld3d_types::D3DTEXF_POINT),
+        (mtld3d_types::D3DSAMP_MAGFILTER, mtld3d_types::D3DTEXF_POINT),
+        (mtld3d_types::D3DSAMP_MIPFILTER, mtld3d_types::D3DTEXF_NONE),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "SetSamplerState");
+    }
+
+    let vs = h.create_vertex_shader(&VS_TEXCOORD_PASSTHROUGH);
+    let ps = h.create_pixel_shader(&PS_SAMPLE_SWIZZLED);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+
+    let v = |x: f32, y: f32| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u: 0.5,
+        v: 0.5,
+        w: 0.0,
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    h.render_once(0xFF00_00FF, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        0xFF60_FF60,
+        "the source blue lane is replicated into the written red and blue lanes"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "unbind stage 0");
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+/// [`PS_SAMPLE_2D`] with `dcl_texcoord0 v0.xyz` and `dcl_volume s0`.
+#[rustfmt::skip]
+const PS_SAMPLE_VOLUME: [u32; 15] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9007_0000,              // dcl_texcoord0 v0.xyz
+    0x0200_001F, 0xA000_0000, 0xA00F_0800,              // dcl_volume s0
+    0x0300_0042, 0x800F_0000, 0x90E4_0000, 0xA0E4_0800, // texld r0, v0, s0
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn a_sampler_reads_the_bound_texture_kind_not_the_declared_one() {
+    // D3D9 samples the texture the application bound, whatever dimensionality
+    // the pixel shader's `dcl` names, and titles ship both mismatches: a
+    // `dcl_volume` slot carrying a 2D texture reads that texture, and a
+    // `dcl_2d` slot carrying a volume reads the volume slice the coordinate's
+    // third component selects. Binding the declared kind instead leaves the
+    // sample undefined (Metal rejects the mismatched MTLTexture) and the
+    // rendered quad reads back as the shader's zero-sample result.
+    let h = Harness::new();
+
+    let flat = h.create_texture(2, 2, 1, 0, mtld3d_types::D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    {
+        let mut locked = flat.lock_rect(0, 0);
+        locked.write_u32(&[0xFF70_7070; 4]);
+    }
+    let (hr, volume) = h.try_create_volume_texture(
+        [2, 2, 2],
+        1,
+        0,
+        mtld3d_types::D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(hr, 0, "CreateVolumeTexture");
+    let volume = volume.expect("volume texture");
+    // Slice 0 dark grey, slice 1 mid grey: the sampled slice names itself.
+    volume.write_u32(
+        0,
+        &[
+            0xFF20_2020,
+            0xFF20_2020,
+            0xFF20_2020,
+            0xFF20_2020,
+            0xFF40_4040,
+            0xFF40_4040,
+            0xFF40_4040,
+            0xFF40_4040,
+        ],
+    );
+
+    for (state, value) in [
+        (mtld3d_types::D3DSAMP_MINFILTER, mtld3d_types::D3DTEXF_POINT),
+        (mtld3d_types::D3DSAMP_MAGFILTER, mtld3d_types::D3DTEXF_POINT),
+        (mtld3d_types::D3DSAMP_MIPFILTER, mtld3d_types::D3DTEXF_NONE),
+        (
+            mtld3d_types::D3DSAMP_ADDRESSU,
+            mtld3d_types::D3DTADDRESS_CLAMP,
+        ),
+        (
+            mtld3d_types::D3DSAMP_ADDRESSV,
+            mtld3d_types::D3DTADDRESS_CLAMP,
+        ),
+        (
+            mtld3d_types::D3DSAMP_ADDRESSW,
+            mtld3d_types::D3DTADDRESS_CLAMP,
+        ),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "SetSamplerState");
+    }
+
+    let vs = h.create_vertex_shader(&VS_TEXCOORD_PASSTHROUGH);
+    let ps_2d = h.create_pixel_shader(&PS_SAMPLE_2D);
+    let ps_volume = h.create_pixel_shader(&PS_SAMPLE_VOLUME);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | (D3DFVF_TEXTUREFORMAT3 << 16)),
+        0,
+        "SetFVF"
+    );
+
+    // The coordinate names texel (0.5, 0.5) of slice 0 under point filtering:
+    // a volume of depth 2 puts its slice centres at w = 0.25 and w = 0.75.
+    let v = |x: f32, y: f32| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_FFFF,
+        u: 0.5,
+        v: 0.5,
+        w: 0.25,
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+
+    // Each case names the bound texture, the shader's declaration, and the
+    // colour the bound texture holds at the sampled point. The two mismatched
+    // rows are the ones the fix is about; the matched rows pin that reading
+    // the binding did not disturb the agreeing case.
+    for (bind_volume, ps, expected, name) in [
+        (false, &ps_2d, 0xFF70_7070u32, "2d texture, dcl_2d"),
+        (true, &ps_volume, 0xFF20_2020, "volume texture, dcl_volume"),
+        (false, &ps_volume, 0xFF70_7070, "2d texture, dcl_volume"),
+        (true, &ps_2d, 0xFF20_2020, "volume texture, dcl_2d"),
+    ] {
+        if bind_volume {
+            assert_eq!(h.set_volume_texture(0, &volume), 0, "bind volume");
+        } else {
+            assert_eq!(h.set_texture(0, &flat), 0, "bind 2d");
+        }
+        assert_eq!(h.set_pixel_shader(ps), 0, "SetPixelShader");
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                0,
+                "draw {name}"
+            );
+        });
+        assert_eq!(h.read_pixel(320, 240), expected, "{name}");
+    }
+
+    assert_eq!(h.clear_texture(0), 0, "unbind stage 0");
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+/// Both stages keep each draw's constants through submission and arena reuse.
+#[test]
+fn constant_snapshots_survive_updates_passes_and_frame_reuse() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_TRANSLATE);
+    let ps = h.create_pixel_shader(&PS_BC);
+    let depth = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    assert_eq!(h.set_depth_stencil_surface(&depth), 0);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    let tri = triangle_at(0.0);
+    for frame in 0..4 {
+        let colors = if frame % 2 == 0 {
+            [[1.0, 0.0, 0.0, 1.0], [0.0, 1.0, 0.0, 1.0]]
+        } else {
+            [[0.0, 1.0, 0.0, 1.0], [1.0, 0.0, 0.0, 1.0]]
+        };
+        h.render_once(0xFF00_00FF, |d| {
+            assert_eq!(d.set_vertex_shader_constant_f(0, &[-0.5, 0.0, 0.0, 0.0]), 0);
+            assert_eq!(d.set_pixel_shader_constant_f(0, &colors[0]), 0);
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+            assert_eq!(d.set_vertex_shader_constant_f(0, &[0.0, 0.0, 0.0, 0.0]), 0);
+            assert_eq!(d.set_pixel_shader_constant_f(0, &colors[1]), 0);
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+            // The same snapshots must bind on a fresh encoder. Draw into an
+            // untouched region so a missing bind cannot preserve correct pixels.
+            assert_eq!(d.clear_depth_stencil_surface(), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(0.5)),
+                0
+            );
+        });
+        let expected = if frame % 2 == 0 {
+            [0xFFFF_0000, 0xFF00_FF00]
+        } else {
+            [0xFF00_FF00, 0xFFFF_0000]
+        };
+        assert_eq!(h.read_pixel(160, 264), expected[0], "left frame {frame}");
+        assert_eq!(h.read_pixel(320, 264), expected[1], "middle frame {frame}");
+        assert_eq!(h.read_pixel(480, 264), expected[1], "right frame {frame}");
+        assert_eq!(h.set_depth_stencil_surface(&depth), 0);
+    }
+}
+
+/// Readback submission and FF draws cannot leave programmable bindings stale.
+#[test]
+fn constant_snapshots_survive_readback_and_fixed_function_transition() {
+    let h = Harness::new();
+    let vs = h.create_vertex_shader(&VS_TRANSLATE);
+    let ps = h.create_pixel_shader(&PS_BC);
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    let tri = triangle_at(0.0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(0xFF00_0000), 0);
+    assert_eq!(h.set_vertex_shader_constant_f(0, &[-0.5, 0.0, 0.0, 0.0]), 0);
+    assert_eq!(h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    assert_eq!(h.read_pixel(160, 264), 0xFFFF_0000, "mid-scene flush");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &triangle_at(0.5)),
+        0
+    );
+    assert_eq!(
+        h.read_pixel(320, 264),
+        0xFFFF_0000,
+        "unchanged post-flush binding"
+    );
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    assert_eq!(h.clear_vertex_shader(), 0);
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    for (index, position) in [-0.5, 0.0].into_iter().enumerate() {
+        let ff = triangle_at(position).map(|v| PosColorVertex {
+            x: v.x,
+            y: v.y,
+            z: v.z,
+            color: 0xFF00_FF00,
+        });
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &ff), 0);
+        if index == 0 {
+            // Updating programmable registers with a clean FF snapshot must
+            // leave its constants unchanged until the programmable rebind.
+            assert_eq!(h.set_vertex_shader_constant_f(0, &[0.5, 0.0, 0.0, 0.0]), 0);
+            assert_eq!(h.set_pixel_shader_constant_f(0, &[0.0, 0.0, 1.0, 1.0]), 0);
+        }
+    }
+    assert_eq!(h.set_vertex_shader(&vs), 0);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    // Rebinding consumes the programmable registers updated during FF.
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    assert_eq!(h.set_vertex_shader_constant_f(0, &[-0.5, 0.0, 0.0, 0.0]), 0);
+    assert_eq!(h.set_pixel_shader_constant_f(0, &[1.0, 0.0, 0.0, 1.0]), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+    assert_eq!(h.read_pixel(160, 264), 0xFFFF_0000, "programmable restored");
+    assert_eq!(h.read_pixel(320, 264), 0xFF00_FF00, "FF constants");
+    assert_eq!(h.read_pixel(480, 264), 0xFF00_00FF, "post-flush update");
+}
+
+/// D3D9 copies the constant array and promises nothing about its alignment.
+///
+/// A title passing a pointer that is not four-byte aligned is inside the
+/// contract, so the register file has to take it and read back the same
+/// values a correctly aligned call would have written.
+#[test]
+fn a_pixel_shader_constant_upload_takes_an_unaligned_pointer() {
+    const START: u32 = 29;
+    const BYTES: usize = size_of::<[f32; 4]>();
+
+    let h = Harness::new();
+    let want = [1.0f32, 2.0, 3.0, 4.0];
+
+    // One register's worth of payload written one byte into an f32-aligned
+    // buffer, so the pointer handed over cannot be aligned for `f32`.
+    let mut buf = [0.0f32; 5];
+    // SAFETY: `buf` is 20 bytes, so byte offset 1 is in range.
+    let dst = unsafe { buf.as_mut_ptr().cast::<u8>().add(1) };
+    // SAFETY: 16 bytes from byte offset 1 stay inside the 20, and the regions
+    // do not overlap.
+    unsafe { core::ptr::copy_nonoverlapping(want.as_ptr().cast::<u8>(), dst, BYTES) };
+    // SAFETY: one byte into a 20-byte buffer, leaving the 16 written above.
+    let unaligned = unsafe { buf.as_ptr().byte_add(1) };
+    assert_ne!(
+        unaligned as usize % align_of::<f32>(),
+        0,
+        "the test needs a pointer that is not aligned for f32",
+    );
+
+    // SAFETY: `unaligned` addresses the 16 bytes written above.
+    let hr = unsafe { h.set_pixel_shader_constant_f_raw(START, unaligned, 1) };
+    assert_eq!(hr, 0, "SetPixelShaderConstantF with an unaligned pointer");
+
+    let (hr, got) = h.get_pixel_shader_constant_f(START, 1);
+    assert_eq!(hr, 0, "GetPixelShaderConstantF");
+    assert_eq!(
+        got.as_slice(),
+        want.as_slice(),
+        "the register file holds what the unaligned call sent",
+    );
+}
+
+/// Unaligned integer/boolean uploads consume only the remaining register window.
+#[test]
+fn unaligned_integer_and_boolean_constants_clamp_before_reading() {
+    let h = Harness::new();
+    let setters = [
+        (
+            Harness::set_vertex_shader_constant_i_raw
+                as unsafe fn(&Harness, u32, *const i32, u32) -> i32,
+            Harness::get_vertex_shader_constant_i as fn(&Harness, u32, u32) -> (i32, Vec<i32>),
+            4,
+        ),
+        (
+            Harness::set_pixel_shader_constant_i_raw,
+            Harness::get_pixel_shader_constant_i,
+            4,
+        ),
+        (
+            Harness::set_vertex_shader_constant_b_raw,
+            Harness::get_vertex_shader_constant_b,
+            1,
+        ),
+        (
+            Harness::set_pixel_shader_constant_b_raw,
+            Harness::get_pixel_shader_constant_b,
+            1,
+        ),
+    ];
+    for (set, get, width) in setters {
+        for offset in 1..4 {
+            for recording in [false, true] {
+                let want = [1_i32, -7, i32::MIN, i32::MAX];
+                let mut storage = [0_i32; 5];
+                // SAFETY: offsets 1..=3 leave room for the 16-byte row.
+                let input = unsafe { storage.as_mut_ptr().byte_add(offset) };
+                // SAFETY: the separate destination holds all four initialized words.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        want.as_ptr().cast::<u8>(),
+                        input.cast::<u8>(),
+                        size_of_val(&want),
+                    );
+                }
+                if recording {
+                    assert_eq!(h.begin_state_block(), 0);
+                }
+                // SAFETY: start 15 leaves one register, whose initialized bytes
+                // remain readable and unmodified for the call despite the huge count.
+                assert_eq!(unsafe { set(&h, 15, input, u32::MAX) }, 0);
+                storage.fill(0);
+                if recording {
+                    let block = h.end_state_block();
+                    // SAFETY: the aligned storage contains one zeroed register.
+                    assert_eq!(unsafe { set(&h, 15, storage.as_ptr(), 1) }, 0);
+                    assert_eq!(block.apply(), 0);
+                }
+                let (hr, got) = get(&h, 15, 1);
+                assert_eq!(hr, 0);
+                assert_eq!(got, want[..width], "offset {offset}, recording {recording}");
+            }
+        }
+    }
+}
+
+/// Both float setters and state blocks own the values of an unaligned upload.
+#[test]
+fn unaligned_float_constants_survive_caller_overwrite() {
+    let h = Harness::new();
+    let setters = [
+        (
+            Harness::set_vertex_shader_constant_f_raw
+                as unsafe fn(&Harness, u32, *const f32, u32) -> i32,
+            Harness::get_vertex_shader_constant_f as fn(&Harness, u32, u32) -> (i32, Vec<f32>),
+            254,
+        ),
+        (
+            Harness::set_pixel_shader_constant_f_raw,
+            Harness::get_pixel_shader_constant_f,
+            222,
+        ),
+    ];
+    for (set, get, start) in setters {
+        for offset in 1..4 {
+            for recording in [false, true] {
+                let want = [
+                    1.0_f32,
+                    -0.0,
+                    f32::from_bits(0x7fc0_0123),
+                    f32::INFINITY,
+                    -3.0,
+                    0.0,
+                    f32::NEG_INFINITY,
+                    f32::from_bits(1),
+                ];
+                let mut storage = [0.0_f32; 9];
+                // SAFETY: offsets 1..=3 leave room for the two 16-byte rows.
+                let input = unsafe { storage.as_mut_ptr().byte_add(offset) };
+                // SAFETY: distinct storage has space for all initialized source bytes.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        want.as_ptr().cast::<u8>(),
+                        input.cast::<u8>(),
+                        size_of_val(&want),
+                    );
+                }
+                if recording {
+                    assert_eq!(h.begin_state_block(), 0);
+                }
+                // SAFETY: input holds the initialized two rows through this call.
+                assert_eq!(unsafe { set(&h, start, input, 2) }, 0);
+                storage.fill(0.0);
+                if recording {
+                    let block = h.end_state_block();
+                    // SAFETY: the aligned storage contains two zeroed registers.
+                    assert_eq!(unsafe { set(&h, start, storage.as_ptr(), 2) }, 0);
+                    assert_eq!(block.apply(), 0);
+                }
+                let (hr, got) = get(&h, start, 2);
+                assert_eq!(hr, 0);
+                assert_eq!(
+                    got.iter().map(|f| f.to_bits()).collect::<Vec<_>>(),
+                    want.map(f32::to_bits)
+                );
+            }
+        }
+    }
+}
+
+/// Vertex fetch retains signed RGB/Q before an explicit range conversion.
+#[test]
+fn q8w8v8u8_vertex_texture_preserves_signed_values() {
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, mtld3d_types::D3DFMT_Q8W8V8U8, D3DPOOL_MANAGED);
+    tex.lock_rect(0, 0).write_u32(&[0xf030_10e0]);
+    assert_eq!(h.set_texture(257, &tex), 0);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    for (src, expected) in [(0x80e4_0000, 0x6f5f_90b0), (0x80ff_0000, 0x6f6f_6f6f)] {
+        let mut tokens = VS_FETCH.to_vec();
+        tokens.pop();
+        tokens.extend_from_slice(&[
+            0x0500_0051,
+            0xa00f_0005,
+            0x3f00_0000,
+            0x3f00_0000,
+            0x3f00_0000,
+            0x3f00_0000,
+            0x0400_0004,
+            0xe00f_0001,
+            src,
+            0xa0e4_0005,
+            0xa0e4_0005,
+            0x0000_ffff,
+        ]);
+        let vs = h.create_vertex_shader(&tokens);
+        assert_eq!(h.set_vertex_shader(&vs), 0);
+        h.render_once(0, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0
+            );
+        });
+        mtld3d_tests::assert_pixel_approx(
+            h.read_pixel(320, 280),
+            expected,
+            1,
+            "signed vertex fetch",
+        );
+    }
+}
+
+/// Vertex fetch retains signed RGB/Q before an explicit range conversion.
+#[test]
+fn q16w16v16u16_vertex_texture_preserves_signed_values() {
+    let h = Harness::new();
+    let tex = h.create_texture(
+        1,
+        1,
+        1,
+        0,
+        mtld3d_types::D3DFMT_Q16W16V16U16,
+        D3DPOOL_MANAGED,
+    );
+    tex.lock_rect(0, 0)
+        .write(&[[-8192_i16, 4096, 12288, -4096]]);
+    assert_eq!(h.set_texture(257, &tex), 0);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    for (src, expected) in [(0x80e4_0000, 0x705f_8faf), (0x80ff_0000, 0x7070_7070)] {
+        let mut tokens = VS_FETCH.to_vec();
+        tokens.pop();
+        tokens.extend_from_slice(&[
+            0x0500_0051,
+            0xa00f_0005,
+            0x3f00_0000,
+            0x3f00_0000,
+            0x3f00_0000,
+            0x3f00_0000,
+            0x0400_0004,
+            0xe00f_0001,
+            src,
+            0xa0e4_0005,
+            0xa0e4_0005,
+            0x0000_ffff,
+        ]);
+        let vs = h.create_vertex_shader(&tokens);
+        assert_eq!(h.set_vertex_shader(&vs), 0);
+        h.render_once(0, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                0
+            );
+        });
+        mtld3d_tests::assert_pixel_approx(
+            h.read_pixel(320, 280),
+            expected,
+            1,
+            "signed vertex fetch",
+        );
+    }
+}
+
+/// Vertex fetch keeps the low two bits of each ten-bit lane and the four alpha codes.
+#[test]
+fn a2r10g10b10_vertex_texture_keeps_ten_bit_precision_and_alpha() {
+    packed10_vertex_texture(mtld3d_types::D3DFMT_A2R10G10B10);
+}
+
+/// Vertex fetch reads red from the low lane of A2B10G10R10, with the same precision and alpha.
+#[test]
+fn a2b10g10r10_vertex_texture_keeps_ten_bit_precision_and_alpha() {
+    packed10_vertex_texture(mtld3d_types::D3DFMT_A2B10G10R10);
+}
+
+/// Fetch 513, 514 and 515 from `format` in a vertex shader, amplified, then alpha alone.
+fn packed10_vertex_texture(format: u32) {
+    let h = Harness::new();
+    let tex = h.create_texture(1, 1, 1, 0, format, D3DPOOL_MANAGED);
+    assert_eq!(h.set_texture(257, &tex), 0);
+    let ps = h.create_pixel_shader(&PS_COLOR_PASSTHROUGH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0);
+    for (src, gain, offset) in [(0x80e4_0000, 255.75, -128.0), (0x80ff_0000, 1.0, 0.0)] {
+        let mut tokens = VS_FETCH.to_vec();
+        tokens.pop();
+        tokens.extend_from_slice(&[
+            0x0400_0004,
+            0xe00f_0001,
+            src,
+            0xa0e4_0000,
+            0xa0e4_0001,
+            0x0000_ffff,
+        ]);
+        let vs = h.create_vertex_shader(&tokens);
+        assert_eq!(h.set_vertex_shader(&vs), 0);
+        assert_eq!(
+            h.set_vertex_shader_constant_f(0, &[gain, gain, gain, 1.0]),
+            0
+        );
+        assert_eq!(
+            h.set_vertex_shader_constant_f(1, &[offset, offset, offset, 0.0]),
+            0
+        );
+        for alpha in 0..4 {
+            tex.lock_rect(0, 0)
+                .write_u32(&[super::packed10::packed(format, 513, 514, 515, alpha)]);
+            h.render_once(0, |d| {
+                assert_eq!(
+                    d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+                    0
+                );
+            });
+            let expected = if src == 0x80ff_0000 {
+                alpha * 85 * 0x0101_0101
+            } else {
+                ((alpha * 85) << 24) | 0x0040_80bf
+            };
+            mtld3d_tests::assert_pixel_approx(
+                h.read_pixel(320, 280),
+                expected,
+                1,
+                "packed vertex fetch",
+            );
+        }
+    }
+}
+
+/// `vs_3_0`: red diffuse in `o1`, green NORMAL0 in `o2`, blue COLOR2 in `o3`.
+#[rustfmt::skip]
+const VS3_NORMAL_AND_COLOR2: [u32; 47] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x0000_0000, 0x3F80_0000, 0x0000_0000, 0x3F80_0000, //   0, 1, 0, 1
+    0x0500_0051, 0xA00F_0001,                           // def c1,
+    0x3F80_0000, 0x0000_0000, 0x0000_0000, 0x3F80_0000, //   1, 0, 0, 1
+    0x0500_0051, 0xA00F_0002,                           // def c2,
+    0x0000_0000, 0x0000_0000, 0x3F80_0000, 0x3F80_0000, //   0, 0, 1, 1
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0200_001F, 0x8000_0003, 0xE00F_0002,              // dcl_normal0 o2
+    0x0200_001F, 0x8002_000A, 0xE00F_0003,              // dcl_color2 o3
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE00F_0001, 0xA0E4_0001,              // mov o1, c1
+    0x0200_0001, 0xE00F_0002, 0xA0E4_0000,              // mov o2, c0
+    0x0200_0001, 0xE00F_0003, 0xA0E4_0002,              // mov o3, c2
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0 { dcl_normal0 v0; mov oC0, v0; }`.
+#[rustfmt::skip]
+const PS3_READ_NORMAL: [u32; 8] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0003, 0x900F_0000,              // dcl_normal0 v0
+    0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0 { dcl_color2 v0; mov oC0, v0; }`.
+#[rustfmt::skip]
+const PS3_READ_COLOR2: [u32; 8] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8002_000A, 0x900F_0000,              // dcl_color2 v0
+    0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0
+    0x0000_FFFF,                                        // end
+];
+
+/// Draw the centered triangle with `vs` and `ps` over black and read its centre.
+fn draw_pair(h: &Harness, vs: &[u32], ps: &[u32]) -> u32 {
+    let vs = h.create_vertex_shader(vs);
+    let ps = h.create_pixel_shader(ps);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    h.render_once(0xFF00_0000, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+            0,
+            "draw"
+        );
+    });
+    let pixel = h.read_pixel(320, 280);
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    pixel
+}
+
+#[test]
+fn sm3_semantics_outside_the_fixed_set_link_by_name() {
+    let h = Harness::new();
+    assert_eq!(
+        draw_pair(&h, &VS3_NORMAL_AND_COLOR2, &PS3_READ_NORMAL),
+        0xFF00_FF00,
+        "the pixel shader's NORMAL0 is the vertex shader's NORMAL0, not its diffuse"
+    );
+    assert_eq!(
+        draw_pair(&h, &VS3_NORMAL_AND_COLOR2, &PS3_READ_COLOR2),
+        0xFF00_00FF,
+        "COLOR2 links like any other semantic"
+    );
+}
+
+/// `vs_3_0` packing TEXCOORD0 into `o1.xy` and TEXCOORD1 into `o1.zw`.
+///
+/// TEXCOORD0 carries (1, 0) and TEXCOORD1's `zw` carry (1, 1).
+#[rustfmt::skip]
+const VS3_PACKED_TEXCOORDS: [u32; 29] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x3F80_0000, 0x0000_0000, 0x3F80_0000, 0x3F80_0000, //   1, 0, 1, 1
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_0005, 0xE003_0001,              // dcl_texcoord0 o1.xy
+    0x0200_001F, 0x8001_0005, 0xE00C_0001,              // dcl_texcoord1 o1.zw
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE003_0001, 0xA0E4_0000,              // mov o1.xy, c0
+    0x0200_0001, 0xE00C_0001, 0xA0E4_0000,              // mov o1.zw, c0
+    0x0000_FFFF,                                        // end
+];
+
+/// [`VS3_PACKED_TEXCOORDS`] with TEXCOORD1 in `o2.zw` instead.
+#[rustfmt::skip]
+const VS3_SPLIT_TEXCOORDS: [u32; 29] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x3F80_0000, 0x0000_0000, 0x3F80_0000, 0x3F80_0000, //   1, 0, 1, 1
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_0005, 0xE003_0001,              // dcl_texcoord0 o1.xy
+    0x0200_001F, 0x8001_0005, 0xE00C_0002,              // dcl_texcoord1 o2.zw
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE003_0001, 0xA0E4_0000,              // mov o1.xy, c0
+    0x0200_0001, 0xE00C_0002, 0xA0E4_0000,              // mov o2.zw, c0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0` reading TEXCOORD0 from `v2.xy` and TEXCOORD1 from `v5.zw` into one colour.
+#[rustfmt::skip]
+const PS3_SPLIT_TEXCOORDS: [u32; 17] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9003_0002,              // dcl_texcoord0 v2.xy
+    0x0200_001F, 0x8001_0005, 0x900C_0005,              // dcl_texcoord1 v5.zw
+    0x0200_0001, 0x8003_0000, 0x90E4_0002,              // mov r0.xy, v2
+    0x0200_0001, 0x800C_0000, 0x90E4_0005,              // mov r0.zw, v5
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0` packing TEXCOORD0 into `v0.xy` and TEXCOORD1 into `v0.zw`.
+#[rustfmt::skip]
+const PS3_PACKED_TEXCOORDS: [u32; 11] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0005, 0x9003_0000,              // dcl_texcoord0 v0.xy
+    0x0200_001F, 0x8001_0005, 0x900C_0000,              // dcl_texcoord1 v0.zw
+    0x0200_0001, 0x800F_0800, 0x90E4_0000,              // mov oC0, v0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn sm3_packed_and_split_registers_link_by_semantic_lanes() {
+    let h = Harness::new();
+    for (vs, ps, what) in [
+        (
+            &VS3_PACKED_TEXCOORDS,
+            &PS3_SPLIT_TEXCOORDS[..],
+            "a register the vertex shader packs, read from two pixel registers",
+        ),
+        (
+            &VS3_SPLIT_TEXCOORDS,
+            &PS3_PACKED_TEXCOORDS[..],
+            "two vertex registers, read from one register the pixel shader packs",
+        ),
+    ] {
+        assert_eq!(
+            draw_pair(&h, vs, ps),
+            0xFFFF_00FF,
+            "{what}: red and green from TEXCOORD0.xy, blue and alpha from TEXCOORD1.zw"
+        );
+    }
+}
+
+/// `vs_3_0` writing a red diffuse and no semantic outside the fixed set.
+#[rustfmt::skip]
+const VS3_RED_DIFFUSE: [u32; 23] = [
+    0xFFFE_0300,                                        // vs_3_0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x3F80_0000, 0x0000_0000, 0x0000_0000, 0x3F80_0000, //   1, 0, 0, 1
+    0x0200_001F, 0x8000_0000, 0x900F_0000,              // dcl_position v0
+    0x0200_001F, 0x8000_0000, 0xE00F_0000,              // dcl_position o0
+    0x0200_001F, 0x8000_000A, 0xE00F_0001,              // dcl_color0 o1
+    0x0200_0001, 0xE00F_0000, 0x90E4_0000,              // mov o0, v0
+    0x0200_0001, 0xE00F_0001, 0xA0E4_0000,              // mov o1, c0
+    0x0000_FFFF,                                        // end
+];
+
+/// `ps_3_0 { dcl_normal0 v0; add oC0, v0, c0; }` with `c0` from the constant buffer.
+#[rustfmt::skip]
+const PS3_NORMAL_PLUS_C0: [u32; 9] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x8000_0003, 0x900F_0000,              // dcl_normal0 v0
+    0x0300_0002, 0x800F_0800, 0x90E4_0000, 0xA0E4_0000, // add oC0, v0, c0
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn an_sm3_input_no_vertex_output_supplies_reads_zero() {
+    let h = Harness::new();
+    let ps = h.create_pixel_shader(&PS3_NORMAL_PLUS_C0);
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    assert_eq!(
+        h.set_pixel_shader_constant_f(0, &[0.0, 1.0, 0.0, 1.0]),
+        0,
+        "SetPSConstF(green)"
+    );
+
+    // Fixed-function vertex processing with a red diffuse.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "LIGHTING off");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let red = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0xFFFF_0000,
+    };
+    let tri = [red(0.0, 0.5), red(0.5, -0.5), red(-0.5, -0.5)];
+    h.render_once(0xFF00_0000, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0, "draw");
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "fixed-function vertex processing outputs no NORMAL0, so it reads zero"
+    );
+
+    // A vertex shader that outputs a red diffuse and no NORMAL0.
+    let vs = h.create_vertex_shader(&VS3_RED_DIFFUSE);
+    assert_eq!(h.set_vertex_shader(&vs), 0, "SetVertexShader");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ), 0, "SetFVF");
+    h.render_once(0xFF00_0000, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle()),
+            0,
+            "draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        0xFF00_FF00,
+        "a vertex shader without NORMAL0 leaves the input at zero"
+    );
+
+    assert_eq!(h.clear_vertex_shader(), 0, "unbind VS");
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+}
+
+/// One vertex of [`PRETRANSFORMED_PASSTHROUGH_DECL`].
+#[repr(C)]
+struct PassthroughVertex {
+    position: [f32; 4],
+    float4s: [[f32; 4]; 8],
+    diffuse: u32,
+    specular: u32,
+}
+
+/// Usage of each `FLOAT4` element of [`PassthroughVertex::float4s`], in order.
+const PASSTHROUGH_USAGES: [u8; 8] = [
+    D3DDECLUSAGE_BLENDWEIGHT,
+    D3DDECLUSAGE_BLENDINDICES,
+    D3DDECLUSAGE_NORMAL,
+    D3DDECLUSAGE_FOG,
+    D3DDECLUSAGE_TEXCOORD,
+    D3DDECLUSAGE_TANGENT,
+    D3DDECLUSAGE_BINORMAL,
+    D3DDECLUSAGE_DEPTH,
+];
+
+/// The colour each element of [`PassthroughVertex::float4s`] carries, distinct per channel.
+const PASSTHROUGH_COLORS: [u32; 8] = [
+    0xFF10_2030,
+    0xFF40_5060,
+    0xFF70_8090,
+    0xFFA0_B0C0,
+    0xFF11_2233,
+    0xFF44_5566,
+    0xFF77_8899,
+    0xFFAA_BBCC,
+];
+
+const PASSTHROUGH_DIFFUSE: u32 = 0xFF12_3456;
+
+/// `ps_3_0 { dcl_<usage><index> v0; mov oC0, v0; }`
+fn ps3_echo(usage: u8, index: u8) -> [u32; 8] {
+    [
+        0xFFFF_0300,
+        0x0200_001F,
+        0x8000_0000 | (u32::from(index) << 16) | u32::from(usage),
+        0x900F_0000,
+        0x0200_0001,
+        0x800F_0800,
+        0x90E4_0000,
+        0x0000_FFFF,
+    ]
+}
+
+/// A pre-transformed draw feeds each `ps_3_0` input the declaration element of its semantic.
+///
+/// With no vertex shader, D3D9 hands a `ps_3_0` the declaration's elements
+/// by semantic: the ones the fixed-function stage carries anyway (texture
+/// coordinates, colours) and every other semantic, NORMAL, TANGENT, FOG and
+/// the rest. A semantic the declaration lacks reads zero, and the same
+/// declaration still draws its diffuse through the fixed-function pixel
+/// stage.
+#[test]
+fn a_pretransformed_draw_feeds_sm3_inputs_from_the_declaration_by_semantic() {
+    let element = |offset: u16, type_: u8, usage: u8| D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_,
+        method: 0,
+        usage,
+        usage_index: 0,
+    };
+    let mut elements = vec![element(0, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT)];
+    for (i, usage) in (0u16..).zip(PASSTHROUGH_USAGES) {
+        elements.push(element(16 + 16 * i, D3DDECLTYPE_FLOAT4, usage));
+    }
+    let mut specular = element(148, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR);
+    specular.usage_index = 1;
+    elements.extend([
+        element(144, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR),
+        specular,
+        D3DVERTEXELEMENT9 {
+            stream: D3DDECL_END_STREAM,
+            offset: 0,
+            type_: D3DDECLTYPE_UNUSED,
+            method: 0,
+            usage: 0,
+            usage_index: 0,
+        },
+    ]);
+    let float4s = PASSTHROUGH_COLORS.map(|color| {
+        let [b, g, r, _] = color.to_le_bytes();
+        let unorm = |c: u8| f32::from(c) / 255.0;
+        [unorm(r), unorm(g), unorm(b), 1.0]
+    });
+    let vertex = |x: f32, y: f32| PassthroughVertex {
+        position: [x, y, 0.5, 1.0],
+        float4s,
+        diffuse: PASSTHROUGH_DIFFUSE,
+        specular: 0xFF00_0000,
+    };
+    let quad = [
+        vertex(0.0, 0.0),
+        vertex(640.0, 0.0),
+        vertex(0.0, 480.0),
+        vertex(640.0, 480.0),
+    ];
+
+    let h = Harness::new();
+    let decl = h.create_vertex_declaration(&elements);
+    assert_eq!(h.set_vertex_declaration(&decl), 0, "SetVertexDeclaration");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "LIGHTING");
+    let draw = || {
+        h.render_once(0xFFFF_00FF, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad),
+                0,
+                "draw"
+            );
+        });
+        h.read_pixel(320, 240)
+    };
+
+    let mut cases: Vec<(u8, u8, u32)> = PASSTHROUGH_USAGES
+        .into_iter()
+        .zip(PASSTHROUGH_COLORS)
+        .map(|(usage, color)| (usage, 0, color))
+        .collect();
+    cases.extend([
+        (D3DDECLUSAGE_COLOR, 0, PASSTHROUGH_DIFFUSE),
+        // Neither is in the declaration: every lane, alpha included, reads zero.
+        (D3DDECLUSAGE_COLOR, 2, 0x0000_0000),
+        (D3DDECLUSAGE_TEXCOORD, 1, 0x0000_0000),
+    ]);
+    for (usage, index, expected) in cases {
+        let ps = h.create_pixel_shader(&ps3_echo(usage, index));
+        assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+        assert_pixel_approx(
+            draw(),
+            expected,
+            1,
+            &format!("ps_3_0 reading usage {usage} index {index}"),
+        );
+        assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    }
+
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        0,
+        "COLOROP"
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+        0,
+        "COLORARG1"
+    );
+    assert_pixel_approx(
+        draw(),
+        PASSTHROUGH_DIFFUSE,
+        1,
+        "the fixed-function pixel stage still draws the diffuse",
+    );
+}

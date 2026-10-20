@@ -1,0 +1,96 @@
+//! Unit tests for the process-pinned Metal device.
+//!
+//! The pin is what makes the process-wide Metal caches sound: they hold
+//! pipeline states, textures and buffers built on one `MTLDevice`, and Metal
+//! rejects an encode that mixes objects of two. Every Mac these tests run on
+//! has one GPU, so the assertions pin the invariant rather than reproduce the
+//! dual-GPU divergence, which needs graphics switching to observe.
+
+use mtld3d_shared::mtl::PresentDebugFlags;
+use objc2_metal::MTLDevice;
+
+use super::{DeviceCaps, create_command_queue, default_device_info, is_paravirtual_name};
+use crate::metal::handle::{IntoRetained, ReleaseRetain};
+
+/// Retires the presenter and drops the retains of one `DeviceCaps`, as the destroy thunk does.
+///
+/// The caller must be done with both handles, and no copy of either may be
+/// used afterwards.
+fn release(caps: &DeviceCaps) {
+    // SAFETY: this stands in for `destroy_command_queue`: the handle came
+    // from `create_command_queue` and nothing names it afterwards.
+    let record = unsafe { crate::metal::DeviceRecord::consume(caps.record_handle) }
+        .expect("the record of a created device");
+    crate::metal::presenter::stop_and_join(record.present());
+    // The queue's retain rides on the record, released as it drops here.
+    drop(record);
+    // SAFETY: the device handle carries the retain `create_command_queue`
+    // took for this D3D device, not the pin's own.
+    unsafe { caps.device_handle.release_retain() };
+}
+
+/// Two `create_command_queue` calls hand out one device, and the caps agree with it.
+///
+/// The second call must name the same `id<MTLDevice>` as the first, and
+/// `default_device_info`, which answers the PE side's `GetDeviceInfo`, must
+/// report that device's registry id rather than a second resolution's. The
+/// third call proves the pin keeps a retain of its own: the device is still
+/// live after both handed-out retains are dropped.
+#[test]
+fn create_command_queue_hands_out_the_pinned_device() {
+    let Some(first) = create_command_queue(None, PresentDebugFlags::empty()) else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let second = create_command_queue(None, PresentDebugFlags::empty())
+        .expect("a second queue on the pinned device");
+    assert_eq!(
+        first.device_handle.raw(),
+        second.device_handle.raw(),
+        "every D3D device gets the same MTLDevice"
+    );
+    assert_ne!(
+        first.record_handle.raw(),
+        second.record_handle.raw(),
+        "each D3D device gets its own record, and its own MTLCommandQueue with it"
+    );
+
+    let (_, registry_id, _) = default_device_info().expect("caps for the pinned device");
+    let device = first
+        .device_handle
+        .into_retained()
+        .expect("the handed-out device handle is live");
+    assert_eq!(
+        device.registryID(),
+        registry_id,
+        "the caps answer describes the device the queues were made on"
+    );
+    drop(device);
+
+    release(&first);
+    release(&second);
+
+    let third = create_command_queue(None, PresentDebugFlags::empty())
+        .expect("a queue after both devices were destroyed");
+    let device = third
+        .device_handle
+        .into_retained()
+        .expect("the pinned device outlives the handles it was handed out through");
+    assert_eq!(device.registryID(), registry_id);
+    drop(device);
+    release(&third);
+}
+
+#[test]
+fn only_the_paravirtual_device_name_takes_the_paravirtual_answers() {
+    assert!(is_paravirtual_name("Apple Paravirtual device"));
+    for real in [
+        "Apple M1",
+        "Apple M4 Max",
+        "AMD Radeon Pro 5500M",
+        "Intel(R) UHD Graphics 630",
+        "Intel(R) Iris(TM) Plus Graphics",
+    ] {
+        assert!(!is_paravirtual_name(real), "{real} is a real GPU");
+    }
+}

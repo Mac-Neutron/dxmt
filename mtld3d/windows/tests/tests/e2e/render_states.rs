@@ -1,0 +1,1555 @@
+//! Render-state *execution*: blend, colour-write masking, scissor, culling.
+//!
+//! Plus get/set round-trips and spec-default verification.
+
+use mtld3d_tests::{
+    Harness, HarnessConfig, PosColorVertex, Rgba8, Surface, Texture, TexturedVertex,
+    assert_pixel_approx,
+};
+use mtld3d_types::{
+    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DCLEAR_STENCIL, D3DCLEAR_TARGET,
+    D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_EQUAL, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DCULL_CCW,
+    D3DCULL_CW, D3DCULL_NONE, D3DFILL_SOLID, D3DFILL_WIREFRAME, D3DFMT_A8R8G8B8, D3DFVF_DIFFUSE,
+    D3DFVF_TEX1, D3DFVF_XYZ, D3DPOOL_DEFAULT, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_BLENDOP, D3DRS_COLORWRITEENABLE, D3DRS_CULLMODE, D3DRS_DEPTHBIAS, D3DRS_DESTBLEND,
+    D3DRS_FILLMODE, D3DRS_LIGHTING, D3DRS_SCISSORTESTENABLE, D3DRS_SLOPESCALEDEPTHBIAS,
+    D3DRS_SRCBLEND, D3DRS_SRGBWRITEENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC,
+    D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILREF, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MINFILTER,
+    D3DSTENCILOP_KEEP, D3DSTENCILOP_REPLACE, D3DTADDRESS_CLAMP, D3DTEXF_POINT,
+    D3DUSAGE_RENDERTARGET, render_state_defaults,
+};
+
+const BLACK: u32 = 0xFF00_0000;
+const BLUE: u32 = 0xFF00_00FF;
+const GREEN: u32 = 0xFF00_FF00;
+const RED: u32 = 0xFFFF_0000;
+const WHITE: u32 = 0xFFFF_FFFF;
+
+fn arm_diffuse(h: &Harness) {
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+}
+
+/// A full clip-space quad (two triangles) of one colour.
+fn fill_quad(color: u32) -> [PosColorVertex; 6] {
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color,
+    };
+    [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ]
+}
+
+/// A full clip-space quad at a chosen depth.
+fn quad_at_depth(color: u32, z: f32) -> [PosColorVertex; 6] {
+    let mut q = fill_quad(color);
+    for v in &mut q {
+        v.z = z;
+    }
+    q
+}
+
+const fn centered_triangle(color: u32) -> [PosColorVertex; 3] {
+    [
+        PosColorVertex {
+            x: 0.0,
+            y: 0.5,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+            color,
+        },
+    ]
+}
+
+#[test]
+fn defaults_match_spec() {
+    // A depth device so ZENABLE's "TRUE when depth present" default applies.
+    let h = Harness::with_depth();
+    let spec = render_state_defaults();
+    for state in [
+        mtld3d_types::D3DRS_ZENABLE,
+        mtld3d_types::D3DRS_ZWRITEENABLE,
+        mtld3d_types::D3DRS_ZFUNC,
+        mtld3d_types::D3DRS_FILLMODE,
+        mtld3d_types::D3DRS_CULLMODE,
+        mtld3d_types::D3DRS_SHADEMODE,
+        mtld3d_types::D3DRS_LIGHTING,
+        mtld3d_types::D3DRS_ALPHABLENDENABLE,
+        D3DRS_SRCBLEND,
+        D3DRS_DESTBLEND,
+        D3DRS_BLENDOP,
+        mtld3d_types::D3DRS_ALPHATESTENABLE,
+        mtld3d_types::D3DRS_ALPHAFUNC,
+        mtld3d_types::D3DRS_STENCILENABLE,
+        D3DRS_SCISSORTESTENABLE,
+        D3DRS_COLORWRITEENABLE,
+        mtld3d_types::D3DRS_TEXTUREFACTOR,
+        mtld3d_types::D3DRS_FOGENABLE,
+    ] {
+        assert_eq!(
+            h.render_state(state),
+            spec[state as usize],
+            "RenderState {state} default mismatch",
+        );
+    }
+}
+
+#[test]
+fn set_get_round_trip() {
+    let h = Harness::new();
+    for (state, value) in [
+        (D3DRS_CULLMODE, D3DCULL_CW),
+        (D3DRS_SRCBLEND, D3DBLEND_SRCALPHA),
+        (D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA),
+        (D3DRS_COLORWRITEENABLE, 0x0000_0007),
+        (mtld3d_types::D3DRS_STENCILREF, 0x42),
+        (mtld3d_types::D3DRS_TEXTUREFACTOR, 0x1234_5678),
+    ] {
+        assert_eq!(
+            h.set_render_state(state, value),
+            0,
+            "SetRenderState {state}"
+        );
+        assert_eq!(
+            h.render_state(state),
+            value,
+            "GetRenderState {state} round-trip"
+        );
+    }
+}
+
+/// The render states whose value has to land inside a D3D9 enum space.
+///
+/// `SetRenderState` takes a DWORD, so each of these can be handed a value the
+/// space does not contain; the layer reads the state's spec default instead.
+const ENUM_STATES: [u32; 22] = [
+    mtld3d_types::D3DRS_ZFUNC,
+    D3DRS_FILLMODE,
+    mtld3d_types::D3DRS_ALPHAFUNC,
+    D3DRS_STENCILFUNC,
+    mtld3d_types::D3DRS_CCW_STENCILFUNC,
+    D3DRS_SRCBLEND,
+    mtld3d_types::D3DRS_SRCBLENDALPHA,
+    D3DRS_DESTBLEND,
+    mtld3d_types::D3DRS_DESTBLENDALPHA,
+    D3DRS_BLENDOP,
+    mtld3d_types::D3DRS_BLENDOPALPHA,
+    D3DRS_CULLMODE,
+    mtld3d_types::D3DRS_STENCILFAIL,
+    mtld3d_types::D3DRS_STENCILZFAIL,
+    D3DRS_STENCILPASS,
+    mtld3d_types::D3DRS_CCW_STENCILFAIL,
+    mtld3d_types::D3DRS_CCW_STENCILZFAIL,
+    mtld3d_types::D3DRS_CCW_STENCILPASS,
+    D3DRS_COLORWRITEENABLE,
+    mtld3d_types::D3DRS_COLORWRITEENABLE1,
+    mtld3d_types::D3DRS_COLORWRITEENABLE2,
+    mtld3d_types::D3DRS_COLORWRITEENABLE3,
+];
+
+#[test]
+fn out_of_range_enum_states_draw_what_the_defaults_draw() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    // Alpha test on so the fixed-function variant key narrows ALPHAFUNC too;
+    // the default compare passes every fragment either way.
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_ALPHATESTENABLE, 1),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_ALPHAREF, 0), 0);
+
+    let spec = render_state_defaults();
+    for state in ENUM_STATES {
+        assert_eq!(
+            h.set_render_state(state, spec[state as usize]),
+            0,
+            "SetRenderState {state} default"
+        );
+    }
+    let quad = fill_quad(WHITE);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "in-range draw"
+        );
+    });
+    let expected = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        expected.r > 200 && expected.g > 200 && expected.b > 200,
+        "white under the defaults, got {expected:?}"
+    );
+
+    // A DWORD no D3D9 enum space contains. The call succeeds (native stores
+    // any DWORD) and reads back verbatim, and the draw that follows is the
+    // one the spec default produces.
+    for state in ENUM_STATES {
+        let poison = 0x0001_0000 | spec[state as usize];
+        assert_eq!(
+            h.set_render_state(state, poison),
+            0,
+            "SetRenderState {state} out of range"
+        );
+        assert_eq!(
+            h.render_state(state),
+            poison,
+            "GetRenderState {state} round-trip"
+        );
+    }
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "out-of-range draw"
+        );
+    });
+    assert_eq!(
+        Rgba8::from_pixel(h.read_pixel(320, 240)),
+        expected,
+        "out-of-range enum states drew a different frame"
+    );
+}
+
+#[test]
+fn alpha_blend_src_over_dest() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_BLENDOP, D3DBLENDOP_ADD), 0);
+
+    // Green at alpha 0.5 over an opaque blue background → ~(0, 128, 128).
+    let quad = fill_quad(0x8000_FF00);
+    h.render_once(BLUE, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "blend draw"
+        );
+    });
+    let px = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(px.r < 20, "red stays 0, got {px:?}");
+    assert!((110..=145).contains(&px.g), "green ~half, got {px:?}");
+    assert!((110..=145).contains(&px.b), "blue ~half, got {px:?}");
+}
+
+#[test]
+fn additive_blend_accumulates() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_ONE), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_ONE), 0);
+
+    // Opaque green added onto a dark-red background → (64, 255, 0).
+    let quad = fill_quad(0xFF00_FF00);
+    h.render_once(0xFF40_0000, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "additive draw"
+        );
+    });
+    let px = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (48..=80).contains(&px.r),
+        "red retained from dest, got {px:?}"
+    );
+    assert!(px.g > 240, "green saturated, got {px:?}");
+    assert!(px.b < 20, "blue stays 0, got {px:?}");
+}
+
+#[test]
+fn both_src_alpha_source_factors_override_the_destination_factor() {
+    // `D3DBLEND_BOTHSRCALPHA` as the source factor blends SRCALPHA over
+    // INVSRCALPHA and `D3DBLEND_BOTHINVSRCALPHA` the reverse, whatever
+    // `D3DRS_DESTBLEND` holds. Green at a quarter alpha over opaque blue.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_ZERO), 0);
+    let quad = fill_quad(0x4000_FF00);
+    for (src, green, blue) in [
+        (D3DBLEND_BOTHSRCALPHA, 0x40, 0xBF),
+        (D3DBLEND_BOTHINVSRCALPHA, 0xBF, 0x40),
+    ] {
+        assert_eq!(h.set_render_state(D3DRS_SRCBLEND, src), 0);
+        h.render_once(BLUE, |d| {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+                0,
+                "blend draw"
+            );
+        });
+        // Colour only: the destination alpha the blend leaves is not under test.
+        assert_pixel_approx(
+            h.read_pixel(320, 240) | 0xFF00_0000,
+            0xFF00_0000 | (green << 8) | blue,
+            2,
+            &format!("SRCBLEND {src}"),
+        );
+    }
+}
+
+#[test]
+fn blend_factor_restored_to_the_default_mid_pass_takes_effect() {
+    // `D3DRS_BLENDFACTOR` is per-encoder state, so a second draw in the
+    // same pass that sets it back to opaque white must blend at full
+    // weight rather than keep the first draw's factor. Red at half weight
+    // over black fills the frame, then green at full weight covers the
+    // right half: a right half that stays mixed with red is the stale
+    // factor.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let mut right_half = fill_quad(GREEN);
+    for v in &mut right_half {
+        v.x = v.x.max(0.0);
+    }
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(
+            d.set_render_state(D3DRS_SRCBLEND, mtld3d_types::D3DBLEND_BLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(D3DRS_DESTBLEND, mtld3d_types::D3DBLEND_INVBLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_BLENDFACTOR, 0x8080_8080),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(RED)),
+            0,
+            "half-weight draw"
+        );
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_BLENDFACTOR, WHITE),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right_half),
+            0,
+            "full-weight draw"
+        );
+    });
+    let left = Rgba8::from_pixel(h.read_pixel(160, 240));
+    assert!(
+        (110..=145).contains(&left.r) && left.g < 20,
+        "left half is red at half weight, got {left:?}"
+    );
+    let right = Rgba8::from_pixel(h.read_pixel(480, 240));
+    assert!(
+        right.r < 20 && right.g > 240,
+        "right half is green at full weight, got {right:?}"
+    );
+}
+
+#[test]
+fn the_default_blend_factor_blends_at_full_weight_on_a_pass_first_draw() {
+    // `D3DRS_BLENDFACTOR` is left at its default opaque white and is the
+    // source factor, with a zero destination factor: the frame's only draw
+    // must come out at full weight. A fresh Metal encoder blends with zero,
+    // so a draw that relies on the encoder's own blend colour draws nothing.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(
+            d.set_render_state(D3DRS_SRCBLEND, mtld3d_types::D3DBLEND_BLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(D3DRS_DESTBLEND, mtld3d_types::D3DBLEND_ZERO),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(GREEN)),
+            0
+        );
+    });
+    let got = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        got.r < 20 && got.g > 240,
+        "the default factor blends green at full weight, got {got:?}"
+    );
+}
+
+#[test]
+fn a_render_target_round_trip_leaves_the_next_draw_its_own_fill_mode_and_blend_factor() {
+    // A draw into the back buffer under wireframe fill and a half-weight
+    // blend factor, then another render target bound and the back buffer
+    // bound again with nothing drawn in between, then a solid draw at full
+    // weight over the right half. Both draws bind the same attachments, so
+    // their passes may run as one render pass; the second draw must still
+    // fill solid and blend at full weight rather than inherit the first
+    // draw's fill mode or factor.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let back = h.render_target(0);
+    let other = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let mut right_half = fill_quad(GREEN);
+    for v in &mut right_half {
+        v.x = v.x.max(0.0);
+    }
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(
+            d.set_render_state(D3DRS_SRCBLEND, mtld3d_types::D3DBLEND_BLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(D3DRS_DESTBLEND, mtld3d_types::D3DBLEND_INVBLENDFACTOR),
+            0
+        );
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_BLENDFACTOR, 0x8080_8080),
+            0
+        );
+        assert_eq!(d.set_render_state(D3DRS_FILLMODE, D3DFILL_WIREFRAME), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(RED)),
+            0,
+            "wireframe half-weight draw"
+        );
+        assert_eq!(d.set_render_target(0, &other), 0, "detour");
+        assert_eq!(d.set_render_target(0, &back), 0, "back again");
+        assert_eq!(d.set_render_state(D3DRS_FILLMODE, D3DFILL_SOLID), 0);
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_BLENDFACTOR, WHITE),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right_half),
+            0,
+            "solid full-weight draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(160, 240),
+        BLACK,
+        "the wireframe draw leaves the left half's interior clear"
+    );
+    let right = Rgba8::from_pixel(h.read_pixel(480, 240));
+    assert!(
+        right.r < 20 && right.g > 240,
+        "right half is filled green at full weight, got {right:?}"
+    );
+}
+
+#[test]
+fn colorwrite_mask_drops_red() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    // Enable GREEN|BLUE|ALPHA, mask out RED.
+    assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 0x0000_000E), 0);
+
+    let quad = fill_quad(0xFFFF_FFFF); // white
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "masked draw"
+        );
+    });
+    let px = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(px.r < 20, "red masked off (stays cleared 0), got {px:?}");
+    assert!(px.g > 200 && px.b > 200, "green+blue written, got {px:?}");
+}
+
+/// A render-state write of the stored value between draws leaves every draw of the frame right.
+///
+/// Three draws of one frame fill a third of the target each, placed by their
+/// vertices. The first follows a new `D3DRS_COLORWRITEENABLE`, the second a
+/// write of that same value, which marks nothing, and the third a new value
+/// written twice, so the repeat must not undo the mark of the write before
+/// it. Nothing but the mask is written between a draw and the next, so only
+/// the mark of the mask write can carry a new mask to a draw.
+#[test]
+fn same_value_render_state_writes_between_draws_leave_every_draw_right() {
+    const NO_RED: u32 = 0x0000_000E;
+    const NO_GREEN: u32 = 0x0000_000D;
+    const CYAN: u32 = 0xFF00_FFFF;
+    const MAGENTA: u32 = 0xFFFF_00FF;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    // A white quad over the full height between two clip-space x.
+    let strip = |left: f32, right: f32| {
+        fill_quad(WHITE).map(|v| PosColorVertex {
+            x: if v.x < 0.0 { left } else { right },
+            ..v
+        })
+    };
+    let strips = [strip(-1.0, -0.4), strip(-0.3, 0.3), strip(0.4, 1.0)];
+    let masks: [&[u32]; 3] = [&[NO_RED], &[NO_RED], &[NO_GREEN, NO_GREEN]];
+
+    h.render_once(BLACK, |d| {
+        for (quad, writes) in strips.iter().zip(masks) {
+            for &mask in writes {
+                assert_eq!(
+                    d.set_render_state(D3DRS_COLORWRITEENABLE, mask),
+                    0,
+                    "SetRenderState(COLORWRITEENABLE, {mask:#x})"
+                );
+            }
+            assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, quad), 0);
+        }
+    });
+    assert_eq!(
+        h.read_pixel(100, 240),
+        CYAN,
+        "the draw after the new mask drops red"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        CYAN,
+        "the draw after the same-value write still drops red"
+    );
+    assert_eq!(
+        h.read_pixel(540, 240),
+        MAGENTA,
+        "the draw after a new mask written twice drops green"
+    );
+    assert_eq!(h.read_pixel(210, 240), BLACK, "between the thirds");
+}
+
+#[test]
+fn scissor_clips_draw() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0, "clear before enabling scissor");
+    assert_eq!(h.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+    assert_eq!(
+        h.set_scissor_rect(&D3DRECT {
+            x1: 0,
+            y1: 0,
+            x2: 320,
+            y2: 240
+        }),
+        0
+    );
+    let quad = fill_quad(0xFFFF_0000); // red, full screen
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "scissored draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_eq!(h.read_pixel(160, 120), 0xFFFF_0000, "inside scissor is red");
+    assert_eq!(h.read_pixel(480, 360), BLACK, "outside scissor stays black");
+}
+
+/// Draw a full-target red quad under the scissor `rect`, on black.
+fn draw_scissored(h: &Harness, rect: D3DRECT) {
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_scissor_rect(&rect), 0, "SetScissorRect");
+        assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(RED)),
+            0,
+            "scissored draw"
+        );
+        assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 0), 0);
+    });
+}
+
+#[test]
+fn a_scissor_reaching_past_the_top_left_corner_keeps_its_far_edges() {
+    // The rect is stored as written and only its part on the target lets
+    // pixels through: (0, 0)-(160, 120) here, not a rect widened by the
+    // distance its near edges stick out.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let rect = D3DRECT {
+        x1: -160,
+        y1: -120,
+        x2: 160,
+        y2: 120,
+    };
+    draw_scissored(&h, rect);
+    let got = h.scissor_rect();
+    assert_eq!(
+        (got.x1, got.y1, got.x2, got.y2),
+        (-160, -120, 160, 120),
+        "GetScissorRect hands the rect back as written"
+    );
+    assert_eq!(h.read_pixel(100, 80), RED, "inside the scissor");
+    assert_eq!(h.read_pixel(240, 80), BLACK, "right of the far edge");
+    assert_eq!(h.read_pixel(100, 180), BLACK, "below the far edge");
+}
+
+#[test]
+fn an_unbounded_scissor_rect_scissors_nothing_away() {
+    // `SetScissorRect` takes any RECT, so an edge far past any target is a
+    // valid way to say "everything".
+    let h = Harness::new();
+    arm_diffuse(&h);
+    draw_scissored(
+        &h,
+        D3DRECT {
+            x1: 0,
+            y1: 0,
+            x2: i32::MAX,
+            y2: i32::MAX,
+        },
+    );
+    assert_eq!(h.read_pixel(10, 10), RED, "top left");
+    assert_eq!(h.read_pixel(630, 470), RED, "bottom right");
+}
+
+#[test]
+fn an_empty_scissor_rect_lets_nothing_through() {
+    // With the test on, a rect of no area (or an inverted one) scissors
+    // every pixel away, for a draw and for a `Clear` alike.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    for rect in [
+        D3DRECT {
+            x1: 100,
+            y1: 100,
+            x2: 100,
+            y2: 300,
+        },
+        D3DRECT {
+            x1: 300,
+            y1: 300,
+            x2: 100,
+            y2: 100,
+        },
+    ] {
+        draw_scissored(&h, rect);
+        assert_eq!(h.read_pixel(200, 200), BLACK, "the draw is scissored away");
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.set_scissor_rect(&rect), 0, "SetScissorRect");
+            assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 1), 0);
+            assert_eq!(d.clear_target(GREEN), 0, "scissored clear");
+            assert_eq!(d.set_render_state(D3DRS_SCISSORTESTENABLE, 0), 0);
+        });
+        assert_eq!(h.read_pixel(200, 200), BLACK, "the clear is scissored away");
+    }
+}
+
+#[test]
+fn cull_mode_discriminates_winding() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let tri = centered_triangle(GREEN);
+
+    // NONE never culls.
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        GREEN,
+        "CULL_NONE draws the triangle"
+    );
+
+    // CW and CCW must disagree — exactly one culls this winding.
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_CW), 0);
+    h.render_once(BLACK, |d| {
+        let _ = d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri);
+    });
+    let cw = h.read_pixel(320, 280);
+
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_CCW), 0);
+    h.render_once(BLACK, |d| {
+        let _ = d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri);
+    });
+    let ccw = h.read_pixel(320, 280);
+
+    assert_ne!(cw, ccw, "CW vs CCW must cull opposite windings");
+}
+
+#[test]
+fn stencil_render_states_round_trip() {
+    let h = Harness::with_depth();
+    for (state, value) in [
+        (D3DRS_STENCILENABLE, 1),
+        (D3DRS_STENCILFUNC, D3DCMP_EQUAL),
+        (D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+        (D3DRS_STENCILREF, 0x7F),
+        (D3DRS_STENCILMASK, 0x00FF),
+    ] {
+        assert_eq!(
+            h.set_render_state(state, value),
+            0,
+            "SetRenderState {state}"
+        );
+        assert_eq!(
+            h.render_state(state),
+            value,
+            "GetRenderState {state} round-trip"
+        );
+    }
+}
+
+#[test]
+fn wireframe_fill_mode_leaves_triangle_interior_clear() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let tri = centered_triangle(GREEN);
+
+    assert_eq!(h.set_render_state(D3DRS_FILLMODE, D3DFILL_SOLID), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        GREEN,
+        "solid fill covers the interior"
+    );
+
+    assert_eq!(h.set_render_state(D3DRS_FILLMODE, D3DFILL_WIREFRAME), 0);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri), 0);
+    });
+    assert_eq!(
+        h.read_pixel(320, 280),
+        BLACK,
+        "wireframe leaves the triangle interior clear"
+    );
+}
+
+#[test]
+fn stencil_test_gates_rendering() {
+    // Stamp the reference under a centred triangle, then draw a fullscreen quad
+    // that only passes where the stamp landed. The quad covers the corner too,
+    // so a corner still holding the clear colour is the proof that the stencil
+    // test rejected those fragments rather than the quad missing them.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        // The depth plane starts undefined and the depth test is on, so it is
+        // cleared along with the stencil the test is about.
+        assert_eq!(
+            d.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0),
+            0,
+            "depth and stencil clear"
+        );
+        assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_ALWAYS), 0);
+        assert_eq!(
+            d.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+            0
+        );
+        assert_eq!(d.set_render_state(D3DRS_STENCILREF, 1), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle(BLUE)),
+            0,
+            "stamp draw"
+        );
+
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(GREEN)),
+            0,
+            "gated draw"
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "inside the stamp");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "outside the stamp");
+}
+
+/// Stencil stamped before a mid-frame readback still gates the draws after it.
+///
+/// The readback ends the submission without a `Present`, so the stamp and the
+/// gated draw land in two submissions of one frame. The second one writes no
+/// stencil of its own, only tests it, so the stencil plane has to be loaded
+/// from what the first one stored rather than discarded as never written.
+#[test]
+fn stencil_stamped_before_a_mid_frame_readback_gates_the_continuation() {
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(
+            D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL,
+            BLACK,
+            1.0,
+            0
+        ),
+        0,
+        "colour, depth and stencil clear"
+    );
+    assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_STENCILFUNC, D3DCMP_ALWAYS), 0);
+    assert_eq!(
+        h.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_REPLACE),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_STENCILREF, 1), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &centered_triangle(BLUE)),
+        0,
+        "stamp draw"
+    );
+    assert_eq!(h.read_pixel(320, 240), BLUE, "the stamp is drawn");
+
+    assert_eq!(h.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+    assert_eq!(h.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(GREEN)),
+        0,
+        "gated draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.set_render_state(D3DRS_STENCILENABLE, 0), 0);
+    assert_eq!(h.read_pixel(320, 240), GREEN, "inside the stamp");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "outside the stamp");
+}
+
+#[test]
+fn additive_pass_selected_by_depth_equal_reaches_the_target() {
+    // A renderer that writes depth in one pass and adds light in a second
+    // selects the same fragments with `EQUAL`, which only holds while the
+    // second pass rasterizes the depth the first one stored. Any nudge
+    // applied to the blended pass alone makes it match nothing and vanish.
+    // Prime depth with an opaque quad, then draw the same geometry additively
+    // under `EQUAL`: the additive white saturates the primed green, so a
+    // still-green centre is the proof that the second pass was rejected.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let quad = quad_at_depth(GREEN, 0.5);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+        assert_eq!(d.set_render_state(mtld3d_types::D3DRS_ZENABLE, 1), 0);
+        assert_eq!(d.set_render_state(mtld3d_types::D3DRS_ZWRITEENABLE, 1), 0);
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_ZFUNC, D3DCMP_LESSEQUAL),
+            0
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "depth-priming pass"
+        );
+
+        assert_eq!(d.set_render_state(mtld3d_types::D3DRS_ZWRITEENABLE, 0), 0);
+        assert_eq!(
+            d.set_render_state(mtld3d_types::D3DRS_ZFUNC, D3DCMP_EQUAL),
+            0
+        );
+        assert_eq!(d.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_SRCBLEND, D3DBLEND_ONE), 0);
+        assert_eq!(d.set_render_state(D3DRS_DESTBLEND, D3DBLEND_ONE), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(WHITE, 0.5)),
+            0,
+            "additive pass"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        WHITE,
+        "the EQUAL-selected additive pass reached the target"
+    );
+}
+
+#[test]
+fn depth_bias_is_an_absolute_offset_at_every_depth() {
+    // `D3DRS_DEPTHBIAS` is added to the fragment's depth as it stands, whatever
+    // that depth is. A quad one `gap` behind a stored depth under `LESS` passes
+    // once the bias exceeds the gap and not before, and the amount it takes must
+    // not depend on where in the depth range the pair sits: a float depth buffer
+    // that scales the bias by the depth's exponent delivers half of it at 0.75
+    // and a thirty-second of it at 0.047.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let gap = 1.0_f32 / 4096.0;
+    let wins = |z0: f32, bias: f32| {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+            assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+            assert_eq!(d.set_render_state(D3DRS_DEPTHBIAS, 0), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, z0)),
+                0,
+                "stored depth"
+            );
+            assert_eq!(d.set_render_state(D3DRS_DEPTHBIAS, bias.to_bits()), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(RED, z0 + gap)),
+                0,
+                "biased quad"
+            );
+        });
+        h.read_pixel(320, 240) == RED
+    };
+    for z0 in [0.75_f32, 0.375, 0.1875, 0.046_875] {
+        assert!(
+            !wins(z0, -0.75 * gap),
+            "z0={z0}: a bias under the gap leaves the quad behind"
+        );
+        assert!(
+            wins(z0, -1.5 * gap),
+            "z0={z0}: a bias over the gap brings the quad in front"
+        );
+    }
+}
+
+#[test]
+fn slope_scaled_depth_bias_is_measured_in_reported_pixels() {
+    // `D3DRS_SLOPESCALEDEPTHBIAS` scales the depth slope per pixel of the size
+    // D3D9 reports, whatever grid the target is rasterized on. A red quad
+    // whose depth rises by `gap / 64` per pixel crosses the flat green quad at
+    // 0.5 one `gap` behind it at the centre column, so a slope factor of -51.2
+    // (an offset of 0.8 gap) leaves the crossing 12.8 pixels left of the
+    // probe and -80 (1.25 gap) moves it 16 pixels right of it. A factor
+    // applied per render pixel at `render.scale = 0.75` would offset by 4/3
+    // as much, putting the first crossing 4.3 pixels right of the probe.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let gap = 1.0_f32 / 4096.0;
+    let slope = gap / 64.0;
+    let z0 = 0.5_f32;
+    let left = slope.mul_add(-320.5, z0 + gap);
+    let right = slope.mul_add(640.0, left);
+    let v = |x: f32, y: f32, z: f32| PosColorVertex {
+        x,
+        y,
+        z,
+        color: RED,
+    };
+    let sloped = [
+        v(-1.0, 1.0, left),
+        v(1.0, 1.0, right),
+        v(-1.0, -1.0, left),
+        v(1.0, 1.0, right),
+        v(1.0, -1.0, right),
+        v(-1.0, -1.0, left),
+    ];
+    let wins = |factor: f32| {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+            assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, z0)),
+                0,
+                "stored depth"
+            );
+            assert_eq!(
+                d.set_render_state(D3DRS_SLOPESCALEDEPTHBIAS, factor.to_bits()),
+                0
+            );
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &sloped),
+                0,
+                "sloped quad"
+            );
+            assert_eq!(d.set_render_state(D3DRS_SLOPESCALEDEPTHBIAS, 0), 0);
+        });
+        h.read_pixel(320, 240) == RED
+    };
+    assert!(
+        !wins(-51.2),
+        "an offset under the gap leaves the quad behind"
+    );
+    assert!(
+        wins(-80.0),
+        "an offset over the gap brings the quad in front"
+    );
+}
+
+#[test]
+fn a_pass_that_never_uses_depth_carries_it_to_a_later_depth_test() {
+    // The scene stores depth 0.25 on the left half and 0.75 on the right. A
+    // pass on another render target keeps the depth surface bound and draws
+    // with the test on but `ALWAYS` and no depth write, so it uses no depth.
+    // A later pass on the back buffer tests a red quad at 0.5 with `LESS`: it
+    // must lose on the left and win on the right, so the unused pass may not
+    // take the scene's depth store or its own load and store with it.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let back = h.render_target(0);
+    let other = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let half = |color: u32, z: f32, right: bool| {
+        let mut q = quad_at_depth(color, z);
+        for v in &mut q {
+            v.x = if right { v.x.max(0.0) } else { v.x.min(0.0) };
+        }
+        q
+    };
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+        assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+        for (z, right) in [(0.25, false), (0.75, true)] {
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &half(GREEN, z, right)),
+                0,
+                "scene half"
+            );
+        }
+        assert_eq!(d.set_render_target(0, &other), 0, "unused pass");
+        assert_eq!(d.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+        assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(BLUE)),
+            0,
+            "always-passing draw"
+        );
+        assert_eq!(d.set_render_target(0, &back), 0, "back buffer");
+        assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(RED, 0.5)),
+            0,
+            "depth-tested draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(160, 240),
+        GREEN,
+        "0.5 loses to the stored 0.25"
+    );
+    assert_eq!(h.read_pixel(480, 240), RED, "0.5 wins over the stored 0.75");
+}
+
+#[test]
+fn depth_bias_never_clips_geometry_on_a_depth_plane() {
+    // D3D9 biases a fragment after clipping and clamps the result to the depth
+    // range, so a quad lying on the far plane under a positive bias, or on the
+    // near plane under a negative one, is still drawn. A bias added to the
+    // clip-space position alone would push either one out of the clip volume.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    for (z, bias) in [(1.0_f32, 0.1_f32), (0.0, -0.1)] {
+        h.render_once(BLACK, |d| {
+            assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+            assert_eq!(d.set_render_state(D3DRS_ZENABLE, 1), 0);
+            assert_eq!(d.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+            assert_eq!(d.set_render_state(D3DRS_DEPTHBIAS, bias.to_bits()), 0);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, z)),
+                0,
+                "biased quad on the plane"
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 240),
+            GREEN,
+            "z={z} bias={bias}: the quad survives the bias"
+        );
+    }
+}
+
+#[test]
+fn stencil_clear_leaves_depth_intact() {
+    // D3DCLEAR_STENCIL alone must not disturb the depth plane it shares on
+    // D24S8. Prime depth with a near quad, clear only stencil, then draw a
+    // farther quad: it stays rejected, so the near colour survives.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+        let near = quad_at_depth(GREEN, 0.25);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &near),
+            0,
+            "near draw"
+        );
+        assert_eq!(d.clear(D3DCLEAR_STENCIL, 0, 1.0, 0), 0, "stencil clear");
+        let far = quad_at_depth(BLUE, 0.75);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &far),
+            0,
+            "far draw"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "depth survived the stencil clear"
+    );
+}
+
+#[test]
+fn combined_depth_stencil_clear_resets_both_planes_mid_frame() {
+    // Clear(ZBUFFER | STENCIL) after a draw takes the clear-quad path, and
+    // one quad has to reset both planes. Prime depth with a near quad, clear
+    // both planes with stencil 1, then draw a farther quad gated on stencil
+    // EQUAL 1: it paints only if depth went back to 1.0 and stencil holds 1.
+    // A nearer quad gated on stencil 2 then fails the stencil test, which
+    // proves the plane holds exactly 1 rather than passing by accident.
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(GREEN, 0.25)),
+            0,
+            "near draw"
+        );
+        assert_eq!(
+            d.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 1),
+            0,
+            "combined clear"
+        );
+        assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILREF, 1), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(BLUE, 0.75)),
+            0,
+            "far draw behind the primed depth"
+        );
+        assert_eq!(d.set_render_state(D3DRS_STENCILREF, 2), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad_at_depth(RED, 0.5)),
+            0,
+            "draw with the wrong reference"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLUE,
+        "one quad reset depth to 1.0 and stencil to 1"
+    );
+}
+
+#[test]
+fn stencil_reference_is_compared_through_the_mask() {
+    // D3D9 compares (ref & mask) against (stencil & mask), and apps do set a
+    // reference wider than the 8-bit attachment, sweeping it across a pass to
+    // read stencil values back one at a time. Only the quad whose low byte
+    // matches the stored value may paint.
+    const STORED: u32 = 0x3;
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, STORED),
+            0,
+            "depth and stencil clear"
+        );
+        assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILMASK, 0xFF), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP), 0);
+        for i in 0..16u32 {
+            assert_eq!(d.set_render_state(D3DRS_STENCILREF, 0x0000_FF00 | i), 0);
+            let shade = 0xFF00_0000 | (i * 16);
+            assert_eq!(
+                d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(shade)),
+                0,
+                "painter draw {i}"
+            );
+        }
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        0xFF00_0000 | (STORED * 16),
+        "only the reference matching the stored value may paint"
+    );
+}
+
+#[test]
+fn stencil_enable_without_a_stencil_attachment_is_dropped() {
+    // A depth-only surface with D3DRS_STENCILENABLE left set from an earlier
+    // pass must not build a stencil-enabled state: Metal rejects one against a
+    // pass with no stencil attachment.
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(mtld3d_types::D3DFMT_D16),
+        ..HarnessConfig::default()
+    });
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0), 0, "depth clear");
+        assert_eq!(d.set_render_state(D3DRS_STENCILENABLE, 1), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILFUNC, D3DCMP_EQUAL), 0);
+        assert_eq!(d.set_render_state(D3DRS_STENCILREF, 0x7F), 0);
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(GREEN)),
+            0,
+            "draw with a stale stencil enable"
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the draw was not stencil-gated"
+    );
+}
+
+#[test]
+fn stencil_clear_on_a_depth_only_surface_succeeds() {
+    // D3D9 masks D3DCLEAR_STENCIL against a format with no stencil plane
+    // rather than failing the call, so a game that always passes the flag
+    // keeps working after binding a depth-only surface.
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(mtld3d_types::D3DFMT_D16),
+        ..HarnessConfig::default()
+    });
+    assert_eq!(h.clear(D3DCLEAR_STENCIL, 0, 1.0, 0x7F), 0, "stencil clear");
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, 1.0, 0x7F),
+        0,
+        "combined depth+stencil clear"
+    );
+}
+
+/// A Clear issued after a draw, before any Present, must paint the whole target.
+///
+/// Inside a pass with draws the clear becomes a full-screen quad, and that
+/// quad is drawn under whatever cull mode the previous draw left; D3D's
+/// default `CULL_CCW` used to cull it whole, so the second scene rendered over
+/// the first one's leftovers instead of the clear colour (the reason a
+/// conformance point-size probe's background came out black).
+#[test]
+fn clear_after_a_draw_in_the_same_pass_is_not_culled() {
+    let h = Harness::with_depth();
+    arm_diffuse(&h);
+    let small = centered_triangle(GREEN);
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene (first scene)");
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &small), 0);
+    assert_eq!(h.end_scene(), 0, "EndScene (first scene)");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLUE, 1.0, 0),
+        0,
+        "Clear between the scenes"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &small), 0);
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.read_pixel(320, 240), GREEN, "triangle at the centre");
+    assert_eq!(h.read_pixel(72, 64), BLUE, "background is the clear colour");
+    assert_eq!(
+        h.read_pixel(600, 400),
+        BLUE,
+        "background is the clear colour"
+    );
+}
+
+/// A full clip-space quad (two triangles) sampling a texture over 0..1 UVs.
+fn textured_fill_quad(color: u32) -> [TexturedVertex; 6] {
+    let v = |x: f32, y: f32, u: f32, vt: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color,
+        u,
+        v: vt,
+    };
+    [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ]
+}
+
+/// Copy `rt` onto the back buffer unchanged, so `read_pixel` sees its stored bytes.
+///
+/// Point-sampled with `D3DSAMP_SRGBTEXTURE` left at 0, so the texel arrives
+/// raw: whatever the sRGB-write test wrote into the target is what lands.
+fn blit_rt_to_backbuffer(h: &Harness, rt: &Texture<'_>, backbuffer: &Surface<'_>) {
+    assert_eq!(h.set_render_target(0, backbuffer), 0, "restore backbuffer");
+    assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ALPHABLENDENABLE, 0),
+        0,
+        "blend off"
+    );
+    assert_eq!(h.set_texture(0, rt), 0, "bind RT as texture");
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF TEX1"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &textured_fill_quad(WHITE)),
+        0,
+        "RT copy draw"
+    );
+}
+
+/// An sRGB-capable render target for the `D3DRS_SRGBWRITEENABLE` tests.
+fn srgb_render_target(h: &Harness) -> Texture<'_> {
+    h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    )
+}
+
+/// `D3DRS_SRGBWRITEENABLE` encodes an opaque draw's colour on write.
+///
+/// Linear 0x80 (0.502) leaves the target holding 0xBC, the value Windows
+/// produces for the same draw. Pins the encode itself, independent of where
+/// in the pipeline it happens.
+#[test]
+fn srgb_write_encodes_an_opaque_draw() {
+    let h = Harness::new();
+    let rt = srgb_render_target(&h);
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+    arm_diffuse(&h);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    assert_eq!(h.clear_target(BLACK), 0, "clear RT");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0, "sRGB on");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(0xFF80_8080)),
+        0,
+        "sRGB-write draw"
+    );
+    blit_rt_to_backbuffer(&h, &rt, &backbuffer);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_pixel_approx(
+        h.read_pixel(320, 240),
+        0xFFBC_BCBC,
+        3,
+        "linear 0x80 must be stored sRGB-encoded as ~0xBC",
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind RT texture");
+}
+
+/// `D3DRS_SRGBWRITEENABLE` blends in linear space and encodes afterwards.
+///
+/// The D3D9 order the `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises:
+/// the destination is decoded to linear, the blend runs there, and the
+/// result is encoded on write. Over a stored 0x80 (linear 0.216), white at
+/// half alpha gives linear 0.608, which encodes to ~0xCD. Encoding in the
+/// pixel shader instead blends 1.0 against the stored 0.502 in gamma space
+/// and lands on ~0xC0.
+#[test]
+fn srgb_write_blends_in_linear_then_encodes() {
+    let h = Harness::new();
+    let rt = srgb_render_target(&h);
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+    arm_diffuse(&h);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    // The destination is written with sRGB writes off, so the target holds
+    // 0x80 verbatim: the gamma-space encoding of linear 0.216.
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(h.clear_target(0xFF80_8080), 0, "clear RT mid-grey");
+
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0, "sRGB on");
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0, "blend on");
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(0x80FF_FFFF)),
+        0,
+        "half-alpha white over the mid-grey"
+    );
+    blit_rt_to_backbuffer(&h, &rt, &backbuffer);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // Alpha carries no transfer function, so it blends to 0.75 either way.
+    assert_pixel_approx(
+        h.read_pixel(320, 240),
+        0xBFCD_CDCD,
+        3,
+        "the blend must run on linear values, not on the encoded ones",
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind RT texture");
+}
+
+/// The back buffer takes the same linear blend as an offscreen target.
+///
+/// Source-engine titles blend decals, glass and particles straight onto the
+/// swap chain, so the back buffer needs the sRGB view as much as a
+/// render-target texture does. Same arithmetic as
+/// `srgb_write_blends_in_linear_then_encodes`, without the copy.
+#[test]
+fn srgb_write_blends_in_linear_on_the_backbuffer() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(h.clear_target(0xFF80_8080), 0, "clear mid-grey");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0, "sRGB on");
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0, "blend on");
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(0x80FF_FFFF)),
+        0,
+        "half-alpha white over the mid-grey"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_pixel_approx(
+        h.read_pixel(320, 240),
+        0xBFCD_CDCD,
+        3,
+        "the back buffer must blend on linear values too",
+    );
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ALPHABLENDENABLE, 0),
+        0,
+        "blend off"
+    );
+}
+
+/// A `CreateRenderTarget` surface takes the same linear blend.
+///
+/// It carries its own Metal colour texture rather than a texture's, so it
+/// needs its own sRGB view; the pixels come back through
+/// `GetRenderTargetData` while it is still the bound target.
+#[test]
+fn srgb_write_blends_in_linear_on_a_standalone_render_target() {
+    let h = Harness::new();
+    let rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let backbuffer = h.render_target(0);
+    arm_diffuse(&h);
+
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind RT");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(h.clear_target(0xFF80_8080), 0, "clear RT mid-grey");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 1), 0, "sRGB on");
+    assert_eq!(h.set_render_state(D3DRS_ALPHABLENDENABLE, 1), 0, "blend on");
+    assert_eq!(h.set_render_state(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA), 0);
+    assert_eq!(h.set_render_state(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(0x80FF_FFFF)),
+        0,
+        "half-alpha white over the mid-grey"
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_pixel_approx(
+        h.read_pixel(32, 32),
+        0xBFCD_CDCD,
+        3,
+        "a standalone render target must blend on linear values too",
+    );
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+    assert_eq!(h.set_render_state(D3DRS_SRGBWRITEENABLE, 0), 0, "sRGB off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ALPHABLENDENABLE, 0),
+        0,
+        "blend off"
+    );
+}
+
+/// A device released straight after an sRGB-write present tears down in order.
+///
+/// With `D3DRS_SRGBWRITEENABLE` set the frame names the back buffer's sRGB
+/// twin view as its colour attachment, and `Release` follows the `Present`
+/// with nothing in between, so the frame is still with the encoder or the
+/// submit thread when the teardown begins. The twin's destroy therefore waits
+/// behind the flush and the encoder's GPU-idle wait like every other implicit
+/// surface, and only then goes out ahead of the base texture the queue-destroy
+/// thunk releases. Each round takes a device of its own, and the second
+/// configuration repeats the teardown under the forced Intel storage answers,
+/// the hardware where a premature release is visible.
+///
+/// What this pins: the rounds run to completion, every call answers `D3D_OK`,
+/// the release reaches a zero refcount, and the process the suite shares is
+/// still alive afterwards, with the unix side's live-texture ledger seeing one
+/// destroy per texture (a destroy of a handle it does not hold fails a build
+/// with debug assertions). What it cannot pin: a retain taken on a released
+/// Metal object is usually silent on an Apple GPU, so a green run is not
+/// evidence that the order is right, only that this order is not visibly
+/// wrong.
+#[test]
+fn a_device_released_after_an_srgb_write_present_tears_down_cleanly() {
+    const ROUNDS: u32 = 6;
+    const FRAMES: u32 = 2;
+    const MID_GREY: u32 = 0xFF80_8080;
+
+    for entries in ["", "intel.managedMemory=true;intel.linearAlign256=true"] {
+        for round in 0..ROUNDS {
+            let h = Harness::create(&HarnessConfig {
+                config_entries: entries,
+                ..HarnessConfig::default()
+            });
+            arm_diffuse(&h);
+            assert_eq!(
+                h.set_render_state(D3DRS_SRGBWRITEENABLE, 1),
+                0,
+                "sRGB on ({entries:?} round {round})"
+            );
+            for frame in 0..FRAMES {
+                assert_eq!(
+                    h.begin_scene(),
+                    0,
+                    "BeginScene (round {round} frame {frame})"
+                );
+                assert_eq!(h.clear_target(MID_GREY), 0, "clear mid-grey");
+                assert_eq!(
+                    h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &fill_quad(WHITE)),
+                    0,
+                    "sRGB-write draw"
+                );
+                assert_eq!(h.end_scene(), 0, "EndScene");
+                assert_eq!(h.present(), 0, "Present");
+            }
+            // No readback and no wait: either would retire the frames that the
+            // release has to carry through the teardown.
+            assert_eq!(
+                h.release_device(),
+                0,
+                "the device is fully released ({entries:?} round {round})"
+            );
+        }
+    }
+}

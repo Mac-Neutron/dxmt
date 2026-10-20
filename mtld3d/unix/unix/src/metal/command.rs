@@ -1,0 +1,4057 @@
+use core::{ffi::c_void, hash::BuildHasher as _};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+use block2::RcBlock;
+use log::{debug, error, trace};
+use mtld3d_shared::{
+    BlitCommand, BlitCommandType, Command, CommandType, ExtraColorDesc, MetalHandle,
+    NullTextureKind, PassDescriptor,
+    mtl::{
+        BlockLayout, CullMode, IndexType, LoadAction, PixelFormat, PrimitiveType, SET_BYTES_MAX,
+        StoreAction, TriangleFillMode, VisibilityResultMode,
+    },
+    mtl_handle::{
+        MTLBufferKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLRenderPipelineStateKind,
+        MTLSamplerStateKind, MTLTextureKind,
+    },
+    perf::{CommandBufferRole, NanosSetTimer},
+};
+use objc2::{Message, rc::Retained, runtime::ProtocolObject};
+use objc2_foundation::{NSError, NSRange};
+use objc2_metal::{
+    MTLBlitCommandEncoder, MTLBlitOption, MTLBuffer, MTLClearColor, MTLCommandBuffer,
+    MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice,
+    MTLDrawable, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
+    MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLResource, MTLResourceOptions,
+    MTLSamplerState, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureType,
+    MTLTriangleFillMode, MTLViewport, MTLVisibilityResultMode,
+};
+use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
+use objc2_quartz_core::CAMetalDrawable;
+
+use crate::{
+    LOG_TARGET,
+    metal::{
+        depth_transfer::PlanePool,
+        handle::{BorrowRetained, IntoRetained},
+        macdrv::attachment,
+        null_texture,
+        record::DeviceRecord,
+        submission::{FrameSubmission, SubmissionOutcome, SubmitDescription},
+        texture::mtl_pixel_format,
+        transient::{SubmitStamp, UploadRing},
+        upscale::UpscaleCache,
+    },
+};
+
+pub mod diagnostics;
+
+/// `Retained<ProtocolObject<dyn MTLCommandBuffer>>` is not `Send`/`Sync` in objc2.
+///
+/// Apple does not categorically mark its APIs thread-safe. What is done with
+/// this handle away from the thread that committed it: refcount changes
+/// (`clone`, `Drop`), `waitUntilCompleted` from a waiting thread, and, from
+/// any completion handler that retires the entry, the read-only property
+/// getters `status`, `error`, and under the debug log `label`,
+/// `commandQueue`, `device` and `errorOptions`. The buffer is committed and
+/// no longer mutated by then; Apple documents a command buffer's status and
+/// completion as observable from any thread, which is what
+/// `waitUntilCompleted` and the handlers exist for. Wrap and assert.
+struct PendingCmdBuf(Retained<ProtocolObject<dyn MTLCommandBuffer>>);
+// allow: chosen narrow exception. The structural alternatives — `SendWrapper`
+// (panics on cross-thread access, but Metal's completion-handler runs on its
+// own thread) or storing as `usize` + `Retained::retain(ptr)` on every access
+// (multiplies the unsafe-block count across the file for no safety gain) —
+// both make the code worse. The `unsafe impl Send`/`Sync` here is correct per
+// Apple's documented thread-safety for the operations the doc comment above
+// lists: refcount changes, `waitUntilCompleted`, and read-only getters on a
+// committed buffer.
+// SAFETY: see the `PendingCmdBuf` doc comment above: refcount changes,
+// `waitUntilCompleted` and the read-only getters of a committed buffer are
+// the only `MTLCommandBuffer` surface touched away from its thread.
+#[allow(clippy::non_send_fields_in_send_ty)]
+unsafe impl Send for PendingCmdBuf {}
+// SAFETY: as above.
+unsafe impl Sync for PendingCmdBuf {}
+
+/// One device's in-flight `MTLCommandBuffer`s, keyed by `(counter, submit_seq)`.
+///
+/// Owned by the device's record, because the in-order argument behind
+/// `wait_for_gpu_retire` holds within one queue, which is one device, and
+/// because every device mints its own `submit_seq`: one map for the process
+/// had two live devices replacing each other's entries and waiting on each
+/// other's buffers.
+///
+/// The counter stays in the key because a device has more than one: the draw
+/// and upload `coherent_seq_ptr`s the PE side owns, and the presenter's own
+/// `present_retired`. Each has a stable address across the device's
+/// submissions and its own sequence of retirements.
+///
+/// `submit_frame` inserts before `commit()`; entries leave through
+/// [`retire_finished`], in sequence order and only once each has ended, which
+/// is also what publishes the counter; `wait_for_gpu_retire` looks up by
+/// range to do a kernel-blocked wait. The retain held here is what keeps the
+/// cmdbuf addressable after `commit()` returns ownership to Metal: Metal's
+/// queue keeps its own refcount, but we need a stable pointer to call
+/// `waitUntilCompleted` on. Every completion handler retires what has ended,
+/// so the map is bounded by the frames in flight.
+pub struct PendingCmdBufs(Mutex<BTreeMap<(u64, u64), PendingCmdBuf>>);
+
+impl Default for PendingCmdBufs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingCmdBufs {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(Mutex::new(BTreeMap::new()))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<(u64, u64), PendingCmdBuf>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The entry for the smallest seq at or past `target` on one device.
+///
+/// If the target has no successor, the latest earlier entry still needs waiting.
+/// Entries of other devices never answer: the range stays inside `device`'s
+/// half of the key space.
+fn first_pending<V>(
+    map: &BTreeMap<(u64, u64), V>,
+    device: u64,
+    target: u64,
+) -> Option<(&(u64, u64), &V)> {
+    map.range((device, target)..=(device, u64::MAX))
+        .next()
+        .or_else(|| map.range((device, 0)..=(device, target)).next_back())
+}
+
+/// Log sub-target of the presented-cadence probe.
+///
+/// Inherits `mtld3d::unix` filters by prefix; `mtld3d::unix::present=trace`
+/// turns on the per-frame rows without touching anything else.
+pub const PRESENT_LOG_TARGET: &str = "mtld3d::unix::present";
+
+/// A presented interval above this is a pause, not a hitch; it reseeds.
+const PRESENTED_MAX_INTERVAL_NS: u64 = 500_000_000;
+/// Minimum excess over the typical presented interval for a hitch, ns.
+///
+/// Applied on top of the 1.5x ratio, so jitter on a fast panel stays quiet
+/// while one dropped refresh at 120 Hz (8.3 ms to 16.6 ms) registers.
+const PRESENTED_MIN_EXCESS_NS: u64 = 3_000_000;
+
+/// Presented-cadence probe: when each frame actually reached the screen.
+///
+/// Registers a presented handler on the drawable. The handler reads
+/// `presentedTime`, the compositor's host time for the frame hitting the
+/// panel, keeps an exponential running typical interval, and logs one
+/// debug line when an interval exceeds 1.5x the typical one by at least
+/// `PRESENTED_MIN_EXCESS_NS`: the interval, the typical interval, the
+/// frame's sequence number and its `nextDrawable` wait. Together with the
+/// PE-side `frame hitch` line (Present-call cadence on the API thread) it
+/// separates a stalled game thread from a frame that was produced on time
+/// and displayed late. One block allocation per frame while the target is
+/// at debug or below; the caller skips the registration otherwise, and the
+/// line only forms on a hitch.
+fn register_presented_probe(
+    drawable: &ProtocolObject<dyn CAMetalDrawable>,
+    record: &Arc<DeviceRecord>,
+    seq: u64,
+    drawable_wait_ns: u64,
+) {
+    let record = Arc::clone(record);
+    let handler = RcBlock::new(
+        move |d_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLDrawable>>| {
+            // SAFETY: Metal invokes the block with the presented drawable;
+            // the pointer is valid for the handler's duration.
+            let d = unsafe { d_ptr.as_ref() };
+            let now_ns = super::macdrv::host_seconds_to_ns(d.presentedTime());
+            if now_ns == 0 {
+                // Never presented (drawable dropped): leave the chain alone.
+                return;
+            }
+            let presented = record.presented();
+            let last_ns = presented.swap_last(now_ns);
+            if last_ns == 0 || now_ns <= last_ns {
+                return;
+            }
+            let interval_ns = now_ns - last_ns;
+            // Per-frame timeline at trace, the presented-side twin of the
+            // PE `present:` row; `t_us` is the absolute host time so rows
+            // can be aligned across threads.
+            trace!(
+                target: PRESENT_LOG_TARGET,
+                "presented: seq={seq} interval_us={} wait_us={} t_us={}",
+                interval_ns / 1000,
+                drawable_wait_ns / 1000,
+                now_ns / 1000,
+            );
+            if interval_ns > PRESENTED_MAX_INTERVAL_NS {
+                presented.set_typical(0);
+                return;
+            }
+            let typical_ns = presented.typical();
+            let next_typical = if typical_ns == 0 {
+                interval_ns
+            } else {
+                typical_ns - typical_ns / 16 + interval_ns / 16
+            };
+            presented.set_typical(next_typical);
+            let hitch = typical_ns != 0
+                && interval_ns * 2 > typical_ns * 3
+                && interval_ns > typical_ns + PRESENTED_MIN_EXCESS_NS;
+            if hitch {
+                debug!(
+                    target: PRESENT_LOG_TARGET,
+                    "presented hitch: presented interval {} us (typical {} us) seq={seq} next_drawable_wait_us={}",
+                    interval_ns / 1000,
+                    typical_ns / 1000,
+                    drawable_wait_ns / 1000,
+                );
+            }
+        },
+    );
+    // SAFETY: objc2 typed binding; Metal copies (retains) the block on
+    // registration, so the stack `handler` may drop when this returns.
+    unsafe { drawable.addPresentedHandler(RcBlock::as_ptr(&handler)) };
+}
+
+/// Wait for a submitted sequence, or the latest earlier work if that sequence is missing.
+///
+/// The wait targets the registered buffer for the smallest in-flight seq
+/// at or beyond the target on this device, falling back to its latest earlier
+/// buffer, and waits for every registered buffer of the counter up to that
+/// one, each by itself: Metal documents the order one queue executes its
+/// buffers in, not the order they complete in, so one buffer's completion is
+/// never taken to stand for another's. The counter is then published by
+/// [`retire_finished`], so it names only buffers that ended; a missing target
+/// is not evidence of GPU retirement.
+///
+/// Publishing by hand is also why this has to inspect the status: a command
+/// buffer the GPU killed is finished, so the publication is right, but
+/// recording it as retired and nothing else would hide the abort from the
+/// PE-side upload recovery that the completion handlers feed.
+/// `failed_submit_seq_ptr` gets the same `fetch_max` they do.
+///
+/// A non-zero `upload_coherent_seq_ptr` extends the wait to the upload
+/// buffers up to the same sequence, waited for the same way, and then
+/// publishes that sequence on the upload counter once no upload buffer at or
+/// below it is registered (see [`publish_upload_through`]).
+pub fn wait_for_gpu_retire(
+    pending: &PendingCmdBufs,
+    target_seq: u64,
+    coherent_seq_ptr: u64,
+    upload_coherent_seq_ptr: u64,
+    failed_submit_seq_ptr: u64,
+) {
+    if coherent_seq_ptr == 0 || target_seq == 0 {
+        return;
+    }
+    // SAFETY: PE-side `Arc<AtomicU64>::as_ptr()` was handed across; the Arc
+    // outlives every in-flight command buffer that references it (device
+    // teardown drains pending cmdbufs before dropping the Arc).
+    let atomic = unsafe { &*(coherent_seq_ptr as *const AtomicU64) };
+    let through = if atomic.load(Ordering::Acquire) >= target_seq {
+        target_seq
+    } else {
+        let found =
+            first_pending(&pending.lock(), coherent_seq_ptr, target_seq).map(|(&(_, seq), _)| seq);
+        let Some(through) = found else {
+            // No registered draw work remains, so the draw counter already
+            // stands for every draw buffer committed; the upload leg below
+            // runs up to that value. A CPU submission failure drains both
+            // counters before publishing its missing seq.
+            let through = atomic.load(Ordering::Acquire);
+            wait_for_uploads(
+                pending,
+                upload_coherent_seq_ptr,
+                through,
+                failed_submit_seq_ptr,
+            );
+            return;
+        };
+        mtld3d_shared::crumb!("gpuretirebeg", target_seq, atomic.load(Ordering::Acquire));
+        wait_registered(
+            pending,
+            coherent_seq_ptr,
+            through,
+            failed_submit_seq_ptr,
+            "retirement-wait",
+        );
+        mtld3d_shared::crumb!("gpuretireend", target_seq);
+        through
+    };
+    wait_for_uploads(
+        pending,
+        upload_coherent_seq_ptr,
+        through,
+        failed_submit_seq_ptr,
+    );
+}
+
+/// The upload leg of a retirement wait: every upload buffer up to `through`, then the counter.
+fn wait_for_uploads(pending: &PendingCmdBufs, counter: u64, through: u64, failed: u64) {
+    if counter == 0 || through == 0 {
+        return;
+    }
+    wait_registered(pending, counter, through, failed, "upload-retirement-wait");
+    publish_upload_through(pending, counter, through);
+}
+
+/// Publish `through` on the upload counter once no upload buffer at or below it is registered.
+///
+/// The caller has seen every draw buffer up to `through` end or the draw
+/// counter reach it, so every submission up to `through` committed. A
+/// submission's upload buffer registers before its draw buffer, on the one
+/// thread that registers either, so every upload buffer up to `through` has
+/// registered too; none left in the map means each of them ended. Submissions
+/// in that range that had no upload buffer are then covered, which the
+/// submit-time publication skips while an earlier upload buffer is in flight.
+/// Without this a retention gate on both counters would stay at that earlier
+/// upload's sequence after a wait that proved everything up to `through`.
+fn publish_upload_through(pending: &PendingCmdBufs, counter: u64, through: u64) {
+    let map = pending.lock();
+    if map
+        .range((counter, 0)..=(counter, through))
+        .next()
+        .is_none()
+    {
+        advance_counter(counter, through);
+    }
+}
+
+/// Wait for every registered buffer of `counter` up to `through`, each by itself, then retire them.
+///
+/// The lock is dropped before the waits: a completion handler takes the same
+/// map and would deadlock if it were held across the kernel sleep. What the
+/// counter publishes is left to [`retire_finished`], so only buffers that
+/// ended are named, whatever order Metal reported them in.
+fn wait_registered(
+    pending: &PendingCmdBufs,
+    counter: u64,
+    through: u64,
+    failed_submit_seq_ptr: u64,
+    site: &str,
+) {
+    let waited: Vec<(u64, Retained<ProtocolObject<dyn MTLCommandBuffer>>)> = pending
+        .lock()
+        .range((counter, 0)..=(counter, through))
+        .map(|(&(_, seq), cb)| (seq, cb.0.clone()))
+        .collect();
+    for (seq, cb) in &waited {
+        cb.waitUntilCompleted();
+        if cb.status() == MTLCommandBufferStatus::Error {
+            let (code, desc) = command_buffer_error(cb.error().as_deref());
+            mtld3d_shared::crumb!("gpuretirecberr", *seq);
+            mtld3d_shared::log_once_warn_by!(
+                target: LOG_TARGET,
+                key: code,
+                "{site}: command buffer for frame seq={seq} failed on the GPU (code {code}: \
+                 {desc}); everything it carried was discarded",
+            );
+        }
+    }
+    retire_finished(pending, counter, failed_submit_seq_ptr, site);
+}
+
+/// Whether a command buffer ran to its end, as opposed to being released uncommitted.
+///
+/// Metal runs the completed handlers of a buffer released without a commit
+/// too, and that buffer never executed; nothing it would have published is
+/// true.
+pub fn ended(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> bool {
+    matches!(
+        cb.status(),
+        MTLCommandBufferStatus::Completed | MTLCommandBufferStatus::Error
+    )
+}
+
+/// Retire the ended buffers of `counter` from the oldest, up to the first still running.
+///
+/// A counter's value is the highest sequence up to which every registered
+/// buffer of that counter has ended, each observed by its own status, so a
+/// gate reading it never infers one buffer's completion from another's. Each
+/// retired buffer records its abort before the counter moves past it (both
+/// stores `Release`), and leaves the map after that, so an empty range means
+/// everything registered is published. Any completion handler of the counter
+/// and any wait may run this.
+///
+/// This is the one place a completion handler writes PE memory, and it does
+/// so only for an entry it still finds in the map, holding the map's lock from
+/// that check to the removal. Once the counter passes the device's last entry
+/// the PE side may free the counters; a second retirer, a late handler of an
+/// entry another one already retired, then finds the entry gone and writes
+/// nothing.
+///
+/// The diagnostics of what was retired are logged after the lock is released.
+pub fn retire_finished(
+    pending: &PendingCmdBufs,
+    counter: u64,
+    failed_submit_seq_ptr: u64,
+    site: &str,
+) {
+    let mut retired = Vec::new();
+    {
+        let mut map = pending.lock();
+        while let Some((&key, entry)) = map.range((counter, 0)..=(counter, u64::MAX)).next() {
+            if !ended(&entry.0) {
+                break;
+            }
+            record_failed_submit(&entry.0, key.1, failed_submit_seq_ptr);
+            advance_counter(counter, key.1);
+            if let Some(entry) = map.remove(&key) {
+                retired.push((key.1, entry.0));
+            }
+        }
+    }
+    for (seq, cb) in &retired {
+        let status = cb.status();
+        diagnostics::completion(cb, status, Some(*seq), site);
+        if status == MTLCommandBufferStatus::Error {
+            diagnostics::failure(cb, Some(*seq), site, cb.error().as_deref());
+        }
+    }
+}
+
+/// `fetch_max` an aborted command buffer's seq into the PE-side failed-submit counter.
+///
+/// Nothing for a buffer that completed normally. A `failed_submit_seq_ptr`
+/// of 0 (a frame stamped before the atomic was wired) records nothing.
+fn record_failed_submit(
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    seq: u64,
+    failed_submit_seq_ptr: u64,
+) {
+    if cb.status() == MTLCommandBufferStatus::Error && failed_submit_seq_ptr != 0 {
+        // SAFETY: the PE side allocated an `Arc<AtomicU64>` and passed its
+        // pointer. The Arc is kept alive for the device's lifetime, and all
+        // command buffers that reference it are drained on device teardown
+        // before the Arc drops.
+        let atomic = unsafe { &*(failed_submit_seq_ptr as *const AtomicU64) };
+        atomic.fetch_max(seq, Ordering::Release);
+    }
+}
+
+/// Preserve the driver description shared by frame and readback failure diagnostics.
+pub fn command_buffer_error(error: Option<&NSError>) -> (u64, String) {
+    error.map_or_else(
+        || (0, String::new()),
+        |e| {
+            (
+                e.code().unsigned_abs() as u64,
+                e.localizedDescription().to_string(),
+            )
+        },
+    )
+}
+
+// SubmitFrame breadcrumb probes via `mtld3d_shared::crumb!()`. Each
+// probe fires *before* the Metal/objc operation it precedes, so on a
+// crash the most-recent trail entry uniquely identifies the next call
+// site — used to localise `unix_call(SubmitFrame) → status=0xc0000005`
+// SIGSEGVs (Wine's unix-call shim translates a unix-side SIGSEGV into
+// that PE status, so the PE error log never names the actual crash
+// site). When `cfg(mtld3d_crumb)` is off the probes compile to nothing.
+
+/// Origin of a copy the trace probes and the debug records bracket.
+///
+/// Used as the bracket label in trace probes (`blit[frame-leading/3]: …`,
+/// `blit[pass2/0]: …`) and as the site of a `texture-copy` record.
+/// `Display` formats only when the record or the trace macro fires, so the
+/// empty-args case allocates nothing.
+#[derive(Clone, Copy)]
+enum BlitSite {
+    FrameLeading,
+    Pass(usize),
+    /// A depth transfer, which encodes outside `encode_leading_blits`.
+    DepthTransfer,
+}
+
+impl core::fmt::Display for BlitSite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::FrameLeading => f.write_str("frame-leading"),
+            Self::Pass(idx) => write!(f, "pass{idx}"),
+            Self::DepthTransfer => f.write_str("depth-transfer"),
+        }
+    }
+}
+
+/// Offset alignment of an oversized inline vertex stream in the upload ring.
+///
+/// Metal's strictest buffer-offset rule, a constant-address-space binding on
+/// macOS; the padding is small next to a payload past `SET_BYTES_MAX`.
+const RING_VERTEX_ALIGN: usize = 256;
+/// Offset alignment of an inline index list in the upload ring.
+///
+/// An index buffer offset must be a multiple of the index size; 16 covers
+/// both index types with room to spare.
+const RING_INDEX_ALIGN: usize = 16;
+
+/// What one command buffer's encode carries besides the command buffer itself.
+///
+/// The device is fetched once per submission rather than per command, and
+/// `stamp` names the command buffer the device's reusable buffers are stamped
+/// with, the upload or the render one.
+struct EncodeContext<'a> {
+    device: &'a ProtocolObject<dyn MTLDevice>,
+    stamp: SubmitStamp,
+    ring: &'a mut UploadRing,
+    planes: &'a mut PlanePool,
+}
+
+/// Processes a frame into its command buffers and commits them.
+///
+/// Encodes each `PassDescriptor` as a distinct `MTLRenderCommandEncoder`
+/// with its own attachments and load actions, settles the pending present
+/// against this frame's writes, commits, and hands the presenter what it
+/// needs to show the frame once a drawable is available.
+pub fn submit_frame(record: &Arc<DeviceRecord>, frame: &FrameSubmission<'_>) -> SubmissionOutcome {
+    submit_frame_with(record, frame, |outcome| {
+        encode_frame(record, frame, outcome)
+    })
+}
+
+/// Keep CPU encoding failures inside the same retirement boundary as GPU failures.
+fn submit_frame_with(
+    record: &DeviceRecord,
+    frame: &FrameSubmission<'_>,
+    encode: impl FnOnce(&mut SubmissionOutcome) -> bool,
+) -> SubmissionOutcome {
+    let mut outcome = SubmissionOutcome::new();
+    outcome.success = encode(&mut outcome);
+    if !outcome.success {
+        retire_failed_submit(record, frame.description);
+    }
+    outcome
+}
+
+/// Retire every committed buffer before publishing a failed CPU submission as finished.
+///
+/// The registered buffers of both counters are waited for one by one, since
+/// they are the buffers that read PE pages through `bytesNoCopy` wrappers,
+/// which a retaining buffer keeps as objects but not as memory. The buffers
+/// the queue carries without registering, creation-time clears and snapshot
+/// copies, read only textures they retain. So what the PE side stamped with
+/// this frame's sequence can be recycled once it is published, even though no
+/// command buffer of the frame itself ran.
+fn retire_failed_submit(record: &DeviceRecord, params: &SubmitDescription) {
+    // SubmitFrame is serialized per device. Nothing can insert a later buffer
+    // for either counter while this call drains the failed frame's work.
+    for counter in [
+        params.draw_retirement.address(),
+        params.upload_retirement.address(),
+    ] {
+        if counter != 0 {
+            wait_registered(
+                record.pending(),
+                counter,
+                params.submit_seq,
+                params.failed_submission.address(),
+                "cpu-cleanup",
+            );
+        }
+    }
+    // Recovery can inspect failed_seq before retirement and abandon retries.
+    // Publish the CPU failure only after its committed work is no longer live.
+    params.failed_submission.publish(params.submit_seq);
+    params.upload_retirement.publish(params.submit_seq);
+    params.draw_retirement.publish(params.submit_seq);
+    record.present().frame_signal().retired();
+}
+
+/// Publish a submission without an upload buffer on the upload counter.
+///
+/// The upload counter says every upload buffer up to its value retired. A
+/// submission that has none moves it only when no upload buffer is in flight,
+/// which the in-flight map shows: [`retire_finished`] publishes a buffer
+/// before it takes it out of the map, and only this submitting thread
+/// registers one. With one in flight the counter stays, and a later
+/// submission publishes past it. That keeps a gate on both counters moving
+/// through frames that upload nothing.
+fn publish_idle_upload(pending: &PendingCmdBufs, counter: u64, seq: u64) {
+    if counter == 0 || seq == 0 {
+        return;
+    }
+    let map = pending.lock();
+    if map
+        .range((counter, 0)..=(counter, u64::MAX))
+        .next()
+        .is_none()
+    {
+        advance_counter(counter, seq);
+    }
+}
+
+/// Publish a sequence into one of the stable PE-side retirement counters.
+pub fn advance_counter(pointer: u64, seq: u64) {
+    if pointer != 0 {
+        // SAFETY: SubmitFrame carries stable PE AtomicU64 pointers kept live
+        // through this call and every registered command buffer's completion.
+        let counter = unsafe { &*(pointer as *const AtomicU64) };
+        counter.fetch_max(seq, Ordering::Release);
+    }
+}
+
+fn encode_frame(
+    record: &Arc<DeviceRecord>,
+    frame: &FrameSubmission<'_>,
+    outcome: &mut SubmissionOutcome,
+) -> bool {
+    let params = frame.description;
+    // First, so a submission that fails below still reports what finished.
+    record.gpu_time().drain(&mut outcome.timings.gpu);
+    let queue_handle = record.queue();
+    mtld3d_shared::crumb!("submit:enter", queue_handle.raw(), frame.passes.len());
+    mtld3d_shared::crumb!("submit:queueret", queue_handle.raw());
+    let Some(queue) = queue_handle.into_retained() else {
+        error!(target: LOG_TARGET, "submit_frame: queue retain failed (handle={queue_handle:#x})");
+        return false;
+    };
+
+    mtld3d_shared::crumb!("submit:cmdbuf");
+    let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
+        error!(target: LOG_TARGET, "submit_frame: commandBuffer() returned nil");
+        return false;
+    };
+    {
+        let label =
+            objc2_foundation::NSString::from_str(&format!("mtld3d-frame-{:#x}", params.submit_seq));
+        cmd_buf.setLabel(Some(&label));
+    }
+
+    if params.upload_pass_count > frame.passes.len() {
+        error!(target: LOG_TARGET, "submit_frame: invalid upload prefix");
+        return false;
+    }
+    let blits = frame.blits;
+    let passes = frame.passes;
+    let upload_pass_count = params.upload_pass_count;
+    let device = queue.device();
+    let stamp = SubmitStamp::new(params);
+    // A submission whose buffers can never be seen to retire uses a ring of
+    // its own, dropped with this frame; the command buffers keep what they
+    // reference alive until they complete.
+    let (mut shared_ring, mut shared_planes);
+    let (mut own_ring, mut own_planes);
+    let (ring, planes): (&mut UploadRing, &mut PlanePool) = if stamp.persistent() {
+        shared_ring = record.upload_ring();
+        shared_planes = record.depth_planes();
+        (&mut shared_ring, &mut shared_planes)
+    } else {
+        own_ring = UploadRing::default();
+        own_planes = PlanePool::default();
+        (&mut own_ring, &mut own_planes)
+    };
+    let mut ctx = EncodeContext {
+        device: &device,
+        stamp: stamp.upload(),
+        ring,
+        planes,
+    };
+    let mut upload_cb = None;
+    let draw_pass_start = if params.upload_retirement.address() != 0 {
+        if !blits.is_empty() || upload_pass_count != 0 {
+            let Some(cb) = encode_upload_cmd_buf(
+                record,
+                &queue,
+                blits,
+                &passes[..upload_pass_count],
+                params,
+                outcome,
+                &mut ctx,
+            ) else {
+                return false;
+            };
+            upload_cb = Some(cb);
+        }
+        upload_pass_count
+    } else {
+        ctx.stamp = SubmitStamp::new(params);
+        if !blits.is_empty() {
+            let encoded = {
+                let _blits = NanosSetTimer::start(&raw mut outcome.timings.leading_blits_ns);
+                encode_leading_blits(
+                    &cmd_buf,
+                    blits,
+                    params.blit_commands_need_encoder,
+                    BlitSite::FrameLeading,
+                    &mut ctx,
+                )
+            };
+            if !encoded {
+                return false;
+            }
+        }
+        0
+    };
+    ctx.stamp = stamp;
+    // The upload buffer's passes already set `passes_ns`; the draw passes add to it.
+    let mut draw_passes_ns: u64 = 0;
+    {
+        let _passes = NanosSetTimer::start(&raw mut draw_passes_ns);
+        for (pass_idx, pass) in passes.iter().enumerate().skip(draw_pass_start) {
+            if !encode_pass(&cmd_buf, pass, pass_idx, &mut ctx) {
+                return false;
+            }
+        }
+    }
+    outcome.timings.passes_ns = outcome.timings.passes_ns.saturating_add(draw_passes_ns);
+    ctx.ring.end_submission(&ctx.stamp);
+    ctx.planes.end_submission(&ctx.stamp);
+
+    // Presentation: what the presenter needs once this frame's render work
+    // has committed. The layer and the back buffer are retained here from the
+    // addresses the PE side keeps valid until it has drained the submit thread
+    // and waited for presentation to go idle, which every path that retires
+    // them does first; the packet owns the retains from here on.
+    let mut packet = if params.present_layer.is_null() {
+        None
+    } else {
+        mtld3d_shared::crumb!("submit:layerret", params.present_layer.raw());
+        let layer = crate::metal::handle::IntoRetainedLayer::into_retained(params.present_layer);
+        mtld3d_shared::crumb!("submit:texret", params.present_texture.raw());
+        let texture = params.present_texture.into_retained();
+        if let (Some(layer), Some(texture)) = (layer, texture) {
+            let view = usize::try_from(params.present_view.raw())
+                .expect("a 64-bit host addresses every view pointer");
+            Some(super::presenter::PresentPacket::new(
+                params.submit_seq,
+                texture,
+                layer,
+                view,
+            ))
+        } else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "submit_frame: the layer or the back buffer could not be retained; the \
+                 frame is not presented",
+            );
+            None
+        }
+    };
+    // Everything is encoded and nothing has committed: settle what the
+    // pending present reads before this frame's render work can overwrite it.
+    super::presenter::resolve_present_conflict(record.present(), &queue, outcome, packet.is_some());
+
+    super::upscale::retire_evicted(&cmd_buf, record.upscale());
+
+    // The frame-latency signal learns of the submission before its draw
+    // buffer commits, so a draw counter that reaches this sequence finds it
+    // noted; a present that will wait for the display carries the mark that
+    // holds the frame unfinished until it is shown.
+    let pacing = packet.as_ref().and_then(|_| {
+        super::presenter::pacing(
+            attachment::find(
+                usize::try_from(params.present_view.raw())
+                    .expect("a 64-bit host addresses every view pointer"),
+            )
+            .as_deref(),
+        )
+    });
+    let mark = record
+        .present()
+        .frame_signal()
+        .note_submission(params.submit_seq, pacing);
+    if let Some(packet) = packet.as_mut() {
+        packet.set_mark(mark);
+    }
+
+    // Spans the frame buffer's handler install and both commits.
+    let commit = NanosSetTimer::start(&raw mut outcome.timings.commit_ns);
+    install_frame_handler(&cmd_buf, record, params);
+
+    // The upload buffer goes first on the queue, so the render work that
+    // samples its uploads runs after them; both register for the retirement
+    // waits at their commit, never before, so a submission that fails midway
+    // leaves nothing registered that never commits.
+    if let Some(upload_cb) = upload_cb {
+        mtld3d_shared::crumb!("submit:upcommit");
+        commit_registered(
+            record.pending(),
+            &upload_cb,
+            params.upload_retirement.address(),
+            params.submit_seq,
+        );
+    } else {
+        publish_idle_upload(
+            record.pending(),
+            params.upload_retirement.address(),
+            params.submit_seq,
+        );
+    }
+    mtld3d_shared::crumb!("submit:commit");
+    commit_registered(
+        record.pending(),
+        &cmd_buf,
+        params.draw_retirement.address(),
+        params.submit_seq,
+    );
+    drop(commit);
+    if let Some(packet) = packet {
+        mtld3d_shared::crumb!("submit:push", params.submit_seq);
+        outcome.drawable_wait_ns = super::presenter::push(record.present(), packet);
+    }
+    mtld3d_shared::crumb!("submit:done");
+    true
+}
+
+/// A frame's present as the presenter encodes it.
+///
+/// Everything the route selection reads besides the command buffer and the
+/// drawable: the queue the upscale caches are keyed by, the device's
+/// attachment record, the texture to present and the frame's identity.
+pub struct PresentEncode<'a> {
+    /// The device presenting, for its cadence probe.
+    pub record: &'a Arc<DeviceRecord>,
+    pub attachment: Option<&'a Arc<attachment::Attachment>>,
+    pub source: &'a ProtocolObject<dyn MTLTexture>,
+    pub seq: u64,
+    /// The `nextDrawable` wait of this present, for the cadence probe.
+    pub drawable_wait_ns: u64,
+}
+
+/// Encode the present of `args.source` into `drawable` and queue its presentation.
+///
+/// One of two routes (`present_route`) with their fallbacks, then the
+/// throttled `presentDrawable`. Every route writes the framebuffer-only
+/// drawable through a render pass, and a frame no pass could encode
+/// presents a cleared drawable. Runs on the presenter thread under its
+/// state's lock; reads the attachment record's atomics and touches no
+/// `AppKit` object. Returns whether the present waits for the display, i.e.
+/// carries a minimum duration (vsync, a divided interval or the frame cap).
+pub fn encode_present(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    drawable: &ProtocolObject<dyn CAMetalDrawable>,
+    args: &PresentEncode<'_>,
+) -> bool {
+    let attachment = args.attachment;
+    let drawable_texture = drawable.texture();
+
+    // HDR present: when the layer is configured for EDR
+    // (RGBA16Float + an extended-linear colorspace + wantsEDR),
+    // the drawable expects *linear* float values, so the HDR
+    // pass decodes the game's gamma-encoded BGRA8 backbuffer
+    // rather than copying it.
+    //
+    // Feed the *live* dynamic headroom directly into the
+    // shader, with no bootstrap and no latch. When `current >
+    // 1.0` the panel is in EDR mode and the BT.2446 curve
+    // boosts the midtones to fill that range. When `current ==
+    // 1.0` the panel has no EDR headroom right now — either
+    // macOS hasn't promoted the screen yet (early frames) or
+    // brightness/thermal state physically rules it out for the
+    // session. In that case the shader short-circuits to a
+    // sRGB→linear pass-through (see `hdr_present.rs`), which
+    // writes correct SDR-equivalent values into the
+    // ExtendedLinear layer instead of crushing the image with
+    // an over-headroom BT.2446 boost. macOS global-scales
+    // content that exceeds the current EDR ceiling
+    // (multiplies every pixel by `current_max /
+    // requested_peak`), so any peak > current is a guaranteed
+    // visible regression — the OS clamps and dims the entire
+    // image. Following the live ceiling avoids that entirely.
+    // The back buffer is the grid we rasterized on; the drawable is
+    // the layer's own surface. Whatever the two sizes are, present
+    // resolves them here — nothing downstream can, since the
+    // compositor sees only a finished drawable.
+    let device = cmd_buf.device();
+    let geometry = PresentGeometry {
+        src: (args.source.width(), args.source.height()),
+        dst: (drawable_texture.width(), drawable_texture.height()),
+    };
+    // An enlargement the geometry has not settled on yet takes the
+    // shader rather than building a scaler for a size that is about
+    // to change again. See `SETTLED_PRESENTS`. The streak is the
+    // record's, so two devices at different geometries settle apart.
+    let settled = attachment.is_some_and(|att| att.present_settled(geometry));
+    let route = match present_route(
+        geometry.src,
+        geometry.dst,
+        super::upscale::is_available(&device),
+    ) {
+        PresentRoute::Upscale if !settled => PresentRoute::Shader,
+        route => route,
+    };
+    // Reads what the main thread last published and queues the next
+    // refresh when due. Deriving it here would mean walking
+    // NSView.window on this thread, which is what crashes inside
+    // AppKit while the main thread rebuilds window and screen state.
+    // Polled every present, not only under HDR: the refresh it queues
+    // is also what reconciles the layer with the display the window is
+    // on, and a session that started SDR has to notice a panel with
+    // headroom appearing under it.
+    let current = attachment.map_or(1.0, attachment::current_headroom);
+    // The pointer check rides the present cadence so a system tool
+    // taking the pointer is noticed without a wakeup of its own.
+    super::macdrv::poll_from_present();
+    // The layer follows that display, so its pixel format can change
+    // between two presents. Take the route from the drawable we are
+    // about to write rather than from a latch read a moment earlier: a
+    // float drawable must run the HDR pass whatever the latch says,
+    // and a BGRA8 drawable must not, because the HDR pipelines declare
+    // a float colour attachment.
+    let hdr = drawable_texture.pixelFormat() == MTLPixelFormat::RGBA16Float;
+    // The guest's gamma ramp, as the layer carries it right now. One atomic
+    // load per present when no ramp is set, which is every session that does
+    // not touch `SetGammaRamp`, and it leaves every route below as it was.
+    let gamma_layer = attachment
+        .filter(|att| att.gamma_active())
+        .map_or(0, |att| att.layer());
+
+    let presented = if hdr {
+        match route {
+            PresentRoute::Upscale => encode_hdr_present_upscaled(
+                cmd_buf,
+                args.record.upscale(),
+                args.source,
+                &drawable_texture,
+                current,
+                gamma_layer,
+            ),
+            // The tone-map pass samples through `filter::linear`, so
+            // one encode covers both an exact present and a
+            // minification.
+            PresentRoute::Shader => encode_hdr_present(
+                cmd_buf,
+                args.source,
+                &drawable_texture,
+                current,
+                gamma_layer,
+            ),
+        }
+    } else {
+        match route {
+            // A scaler Metal declines after `is_available` said yes
+            // still has to write every drawable pixel, so it falls
+            // through to the stretch.
+            //
+            // `MetalFX` enlarges the source it is given into its
+            // intermediate, and the exact copy only carries that onto the
+            // drawable, so a ramp rides neither: the ramp goes into a
+            // scratch at render resolution first and the scaler enlarges
+            // the ramped frame. That keeps `render.scale` working while a
+            // ramp is set, at one extra pass over the render grid.
+            PresentRoute::Upscale => {
+                encode_sdr_upscaled(
+                    cmd_buf,
+                    args.record.upscale(),
+                    args.source,
+                    &drawable_texture,
+                    gamma_layer,
+                ) || encode_present_copy(cmd_buf, args.source, &drawable_texture, gamma_layer)
+            }
+            // Exact at matching extents, a filtered stretch otherwise.
+            PresentRoute::Shader => {
+                encode_present_copy(cmd_buf, args.source, &drawable_texture, gamma_layer)
+            }
+        }
+    };
+    if !presented {
+        // The drawable is framebuffer-only, so no blit can write it, and a
+        // drawable presented with nothing written reads as noise (magenta on
+        // the float layer). A defined black frame is the only fallback left.
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: no present pass could be encoded for {}x{} → {}x{} {:?}; presenting a \
+             cleared drawable instead",
+            geometry.src.0, geometry.src.1, geometry.dst.0, geometry.dst.1,
+            drawable_texture.pixelFormat(),
+        );
+        clear_drawable(cmd_buf, &drawable_texture);
+    }
+
+    mtld3d_shared::crumb!("submit:present", args.drawable_wait_ns);
+    // Throttle presents to `1/panel_max_hz` when the guest asked
+    // for vsync (PE-side `D3DPRESENT_INTERVAL_*` mapping). On a
+    // ProMotion panel the system adapts the panel rate to whatever
+    // sub-max cadence we sustain under the cap, so fractional
+    // production rates display at their actual rate. `0.0` means
+    // free-run (D3DPRESENT_INTERVAL_IMMEDIATE) — drop the throttle.
+    let drawable_obj = ProtocolObject::from_ref(drawable);
+    let min_duration = attachment.map_or(0.0, |att| att.min_present_duration_sec());
+    if min_duration > 0.0 {
+        cmd_buf.presentDrawable_afterMinimumDuration(drawable_obj, min_duration);
+    } else {
+        cmd_buf.presentDrawable(drawable_obj);
+    }
+    // Debug and trace output only, so the per-frame block allocation
+    // and handler registration are skipped when the target is off.
+    if log::log_enabled!(target: PRESENT_LOG_TARGET, log::Level::Debug) {
+        // One line per drawable presented, which is what a test counts to
+        // know its presents reached `nextDrawable` rather than being skipped.
+        debug!(
+            target: PRESENT_LOG_TARGET,
+            "present: drawable acquired on window {:#x} for seq={}",
+            attachment.map_or(0, |att| att.hwnd()),
+            args.seq,
+        );
+        register_presented_probe(drawable, args.record, args.seq, args.drawable_wait_ns);
+    }
+    min_duration > 0.0
+}
+
+/// Register `cb` for the retirement waits under `counter`, then commit it.
+///
+/// Registration and commit are one step so that nothing registered ever
+/// stays uncommitted, which would hang a wait on it. A zero counter or
+/// sequence (a frame stamped before its counters were wired) commits
+/// without registering, as its completion handler was not installed either.
+pub fn commit_registered(
+    pending: &PendingCmdBufs,
+    cb: &ProtocolObject<dyn MTLCommandBuffer>,
+    counter: u64,
+    seq: u64,
+) {
+    if counter != 0 && seq > 0 {
+        register_pending(pending, counter, seq, cb.retain());
+    }
+    cb.commit();
+}
+
+/// Put `cb` into the in-flight map under `(counter, seq)`.
+///
+/// The retain is what keeps the buffer addressable for a wait after
+/// `commit()` hands ownership to Metal.
+fn register_pending(
+    pending: &PendingCmdBufs,
+    counter: u64,
+    seq: u64,
+    cb: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+) {
+    pending.lock().insert((counter, seq), PendingCmdBuf(cb));
+}
+
+/// Retire the render buffer from its completion handler: record an abort, publish in order.
+///
+/// The block runs on a Metal-internal dispatch thread and holds the record,
+/// whose in-flight map it retires from. A buffer released uncommitted, on a
+/// failed encode, runs the handler too and returns at once: it never ran, so
+/// it neither records nor publishes. Otherwise the counter moves only through
+/// [`retire_finished`], over the buffers that have ended. The entry is keyed
+/// by this device (its `coherent_seq_ptr`) as well as the seq, so another
+/// device's frame at the same seq is a different entry. A frame without a
+/// sequence or counter gets no handler.
+fn install_frame_handler(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    record: &Arc<DeviceRecord>,
+    params: &SubmitDescription,
+) {
+    if params.draw_retirement.address() == 0 || params.submit_seq == 0 {
+        return;
+    }
+    let counter = params.draw_retirement;
+    let retiring = Arc::clone(record);
+    let seq = params.submit_seq;
+    let failed_seq = params.failed_submission;
+    let handler = RcBlock::new(
+        move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            // SAFETY: Metal invokes the block with the buffer it ended; the
+            // pointer is valid for the handler's duration.
+            let cb = unsafe { cb_ptr.as_ref() };
+            if !ended(cb) {
+                return;
+            }
+            retiring.gpu_time().record(CommandBufferRole::Frame, cb);
+            // Tripwire: a command buffer the GPU rejected discards every
+            // encode it carried, but a queued `presentDrawable` still fires,
+            // so the drawable reaches the screen with undefined contents
+            // (magenta on the RGBA16Float HDR layer). What this buys is that
+            // the otherwise silent one-frame flash leaves a log line naming
+            // the actual GPU error, once per error code.
+            // Logged from the buffer alone: recording the failure writes PE
+            // memory, which `retire_finished` does for an entry it still holds.
+            if cb.status() == MTLCommandBufferStatus::Error {
+                let (code, desc) = command_buffer_error(cb.error().as_deref());
+                mtld3d_shared::crumb!("submit:cberr", seq);
+                mtld3d_shared::log_once_warn_by!(
+                    target: LOG_TARGET,
+                    key: code,
+                    "submit_frame: command buffer for frame seq={seq} failed on the GPU \
+                     (code {code}: {desc}); its rendering was discarded, so a queued \
+                     present showed undefined memory",
+                );
+            }
+            retire_finished(
+                retiring.pending(),
+                counter.address(),
+                failed_seq.address(),
+                "frame-retire",
+            );
+            retiring.present().frame_signal().retired();
+            mtld3d_shared::crumb!("submit:retire", seq);
+        },
+    );
+    // SAFETY: objc2 typed binding; Metal copies the block on registration, so
+    // the local `handler` may drop when this returns.
+    unsafe { cmd_buf.addCompletedHandler(RcBlock::as_ptr(&handler)) };
+}
+
+/// Encode the frame-leading (texture-upload) blits into a dedicated command buffer.
+///
+/// Handed back uncommitted: the caller commits it ahead of the draw CB once
+/// the pending present is settled, through `commit_registered`, which is
+/// also where it enters the retirement map. Its completion handler
+/// `fetch_max`es `submit_seq` into the PE-side `upload_coherent_seq`
+/// atomic, so the next frame's contended texture `LockRect` can observe
+/// the upload as retired and write in place instead of renaming +
+/// memcpying. Because Metal's queue is in-order and this CB is committed
+/// before the draw CB, the uploads still finish before any same-frame
+/// draw samples them.
+///
+/// Registered under the upload counter's address, so a draw buffer at the
+/// same sequence has a distinct key. CPU failure can leave this buffer
+/// committed without a draw buffer, and must wait for it and its handler
+/// before releasing the PE backing or either callback sink.
+/// Render uploads and their interleaved blits share this buffer, so its
+/// retirement covers every staging read. `None` on creation or encoding failure.
+fn encode_upload_cmd_buf(
+    record: &Arc<DeviceRecord>,
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+    blits: &[BlitCommand],
+    passes: &[PassDescriptor],
+    params: &SubmitDescription,
+    outcome: &mut SubmissionOutcome,
+    ctx: &mut EncodeContext<'_>,
+) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+    let submit_seq = params.submit_seq;
+    let upload_counter = params.upload_retirement;
+    mtld3d_shared::crumb!("submit:upcmdbuf");
+    let Some(upload_cb) = diagnostics::command_buffer(queue) else {
+        error!(target: LOG_TARGET, "submit_frame: upload commandBuffer() returned nil");
+        return None;
+    };
+    {
+        let label = objc2_foundation::NSString::from_str(&format!("mtld3d-upload-{submit_seq:#x}"));
+        upload_cb.setLabel(Some(&label));
+    }
+    if !blits.is_empty() {
+        let encoded = {
+            let _blits = NanosSetTimer::start(&raw mut outcome.timings.leading_blits_ns);
+            encode_leading_blits(
+                &upload_cb,
+                blits,
+                params.blit_commands_need_encoder,
+                BlitSite::FrameLeading,
+                ctx,
+            )
+        };
+        if !encoded {
+            return None;
+        }
+    }
+    {
+        let _passes = NanosSetTimer::start(&raw mut outcome.timings.passes_ns);
+        for (pass_idx, pass) in passes.iter().enumerate() {
+            if !encode_pass(&upload_cb, pass, pass_idx, ctx) {
+                return None;
+            }
+        }
+    }
+    if submit_seq > 0 {
+        let seq = submit_seq;
+        let failed_seq = params.failed_submission;
+        // As the render buffer's handler: the record outlives the block.
+        let retiring = Arc::clone(record);
+        let handler = RcBlock::new(
+            move |cb_ptr: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+                // This buffer carries every upload pass and blit, so an
+                // abort loses texture uploads and `Staged` VB/IB dirty-range
+                // copies. Nothing
+                // in the API stream ever re-announces them, so the loss is
+                // permanent unless the PE side replays it: record the seq
+                // before the retirement bump (both `Release`, so a reader
+                // that sees the retirement sees the failure) and let the
+                // encoder's upload-recovery queues re-issue. A buffer
+                // released uncommitted never ran and returns at once.
+                //
+                // SAFETY: Metal invokes the block with the buffer it ended;
+                // the pointer is valid for the handler's duration.
+                let cb = unsafe { cb_ptr.as_ref() };
+                if !ended(cb) {
+                    return;
+                }
+                retiring.gpu_time().record(CommandBufferRole::Upload, cb);
+                // Logged from the buffer alone; see the render buffer's handler.
+                if cb.status() == MTLCommandBufferStatus::Error {
+                    let (code, desc) = command_buffer_error(cb.error().as_deref());
+                    mtld3d_shared::crumb!("submit:upcberr", seq);
+                    mtld3d_shared::log_once_warn_by!(
+                        target: LOG_TARGET,
+                        key: code,
+                        "submit_frame: upload command buffer for frame seq={seq} failed on \
+                         the GPU (code {code}: {desc}); every texture and VB/IB upload it \
+                         carried was discarded and will be re-issued",
+                    );
+                }
+                retire_finished(
+                    retiring.pending(),
+                    upload_counter.address(),
+                    failed_seq.address(),
+                    "upload-retire",
+                );
+                mtld3d_shared::crumb!("submit:upretire", seq);
+            },
+        );
+        // SAFETY: objc2 typed binding; Metal copies the block on
+        // `addCompletedHandler`, so the local `handler` may drop after.
+        unsafe { upload_cb.addCompletedHandler(RcBlock::as_ptr(&handler)) };
+    }
+    Some(upload_cb)
+}
+
+/// How present resolves the back buffer onto the drawable.
+///
+/// The drawable is framebuffer-only, so both arms write it through a render
+/// pass; no blit reaches it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PresentRoute {
+    /// The drawable is larger in both axes and this GPU has `MetalFX`.
+    ///
+    /// An edge-aware upscale, materially sharper than a bilinear magnify.
+    Upscale,
+    /// Any other geometry, matching extents included.
+    ///
+    /// The present shader: a bit-exact copy at matching extents and a
+    /// filtered stretch otherwise, the only route that covers every drawable
+    /// pixel at any ratio.
+    Shader,
+}
+
+/// One present's source and destination extents.
+///
+/// Only ever compared, never measured against, so the axes stay in the
+/// tuples the Metal texture accessors hand back.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct PresentGeometry {
+    pub src: (usize, usize),
+    pub dst: (usize, usize),
+}
+
+/// One attachment's running count of consecutive presents at one geometry.
+///
+/// The state behind [`geometry_settled`], owned by the attachment record so
+/// that two devices presenting at different geometries each settle on their
+/// own. Only the presenter advances it, from the one thread that presents
+/// that device's frames; the mutex is for the shared record, not for
+/// contention.
+pub struct GeometryStreak(Mutex<Option<(PresentGeometry, u32)>>);
+
+impl GeometryStreak {
+    /// A streak that has seen no present yet.
+    pub const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    /// Advance the count for `geometry`, and say whether it has settled.
+    pub fn settled(&self, geometry: PresentGeometry) -> bool {
+        self.0
+            .lock()
+            .is_ok_and(|mut seen| geometry_settled(&mut seen, geometry))
+    }
+}
+
+impl Default for GeometryStreak {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Consecutive presents at one geometry before `MetalFX` is worth building.
+///
+/// The drawable follows the layer every present, while the back buffer only
+/// follows the guest's `WM_SIZE`, so a window being dragged larger produces a
+/// *different* enlargement on almost every frame. Each one would be a fresh
+/// `newSpatialScalerWithDevice`, an expensive create that the scaler cache
+/// then keeps for the life of the process: a hitch per frame of the drag, and
+/// a leak that outlives it. Waiting for the geometry to hold still spends a
+/// scaler only on sizes the game settled on.
+///
+/// **Transience, not ratio, is the discriminator.** The tempting alternative
+/// is to skip the scaler for enlargements too small to see, but the two cases
+/// overlap: a live drag was measured producing ratios up to `1.004`
+/// (`2474x1546 → 2484x1552`) while `render.scale = 0.99` asks for `1.0098`.
+/// No threshold separates those without being a coincidence.
+///
+/// Half a second is long enough that a pause mid-drag rarely reaches it, and
+/// short enough to be invisible: the frames before it present through the
+/// shader's bilinear stretch, and they are frames right after a resize, a
+/// `Reset`, or device creation, which are about to change again anyway.
+const SETTLED_PRESENTS: u32 = 30;
+
+/// Advance the settle counter for `geometry`, and say whether it has settled.
+///
+/// A change of geometry restarts the count, so "settled" means
+/// [`SETTLED_PRESENTS`] presents in a row at the same pair rather than that
+/// many presents in total. `seen` is the caller's state so this stays a pure
+/// function of it.
+fn geometry_settled(seen: &mut Option<(PresentGeometry, u32)>, geometry: PresentGeometry) -> bool {
+    match seen {
+        Some((last, streak)) if *last == geometry => {
+            *streak = streak.saturating_add(1);
+            *streak >= SETTLED_PRESENTS
+        }
+        _ => {
+            *seen = Some((geometry, 1));
+            SETTLED_PRESENTS <= 1
+        }
+    }
+}
+
+/// Pick the present route for one frame's geometry.
+///
+/// `MTLFXSpatialScaler` only enlarges, so anything else is the shader's,
+/// matching extents included, where the shader is an exact copy. A drawable
+/// larger in one axis and smaller in the other is a stretch, not an upscale:
+/// the scaler rejects that pair.
+///
+/// Whether an enlargement is *worth* a scaler is a separate question, and
+/// deliberately not asked here: see [`SETTLED_PRESENTS`].
+const fn present_route(
+    src: (usize, usize),
+    dst: (usize, usize),
+    metalfx_available: bool,
+) -> PresentRoute {
+    let enlarges = src.0 <= dst.0 && src.1 <= dst.1 && (src.0 < dst.0 || src.1 < dst.1);
+    if metalfx_available && enlarges {
+        PresentRoute::Upscale
+    } else {
+        PresentRoute::Shader
+    }
+}
+
+/// The sampler state a bind command names, or the default sampler for handle 0.
+///
+/// Handle 0 is a sampler state the device declined to create. The draw still
+/// samples through that slot, and Metal requires a sampler behind every
+/// `[[sampler(n)]]` the fragment function declares, so the default sampler
+/// stands in: the draw filters differently from what the game asked, which
+/// is the state the creation failure already warned about, instead of
+/// running with an unbound argument.
+///
+/// # Safety
+///
+/// A non-zero `handle` is borrowed rather than retained, so the caller
+/// carries [`BorrowRetained`]'s obligation: the canonical retain the handle
+/// stands for must outlive `'a`. The default-sampler branch asserts nothing,
+/// its object living for the process.
+unsafe fn sampler_or_default<'a>(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    handle: u64,
+) -> Option<&'a ProtocolObject<dyn MTLSamplerState>> {
+    if handle != 0 {
+        // SAFETY: a non-zero bind handle is a previously-retained
+        // MTLSamplerState address.
+        let handle = unsafe { MetalHandle::<MTLSamplerStateKind>::new(handle) };
+        // SAFETY: the caller's assertion carries through unchanged.
+        return unsafe { handle.borrow_retained() };
+    }
+    mtld3d_shared::log_once_warn!(
+        target: LOG_TARGET,
+        "sampler: a draw names a sampler state the device did not create; \
+         binding the default sampler in its place"
+    );
+    null_texture::default_sampler(&cmd_buf.device())
+}
+
+/// Clear the drawable to opaque black with an empty render pass.
+///
+/// Reached only when a shader route failed to encode, which for a
+/// process-lifetime pipeline means it will fail every frame. Black is not a
+/// correct frame, but it is a defined one.
+fn clear_drawable(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+) {
+    clear_texture(cmd_buf, drawable, 1.0, "mtld3d-present-clear");
+}
+
+/// One empty render pass that clears `texture` to black at `alpha`.
+fn clear_texture(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    alpha: f64,
+    label: &str,
+) -> bool {
+    let pass_desc = MTLRenderPassDescriptor::new();
+    // SAFETY: `colorAttachments()` returns a non-null descriptor array;
+    // subscript 0 is always valid.
+    let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
+    color0.setTexture(Some(texture));
+    color0.setLoadAction(MTLLoadAction::Clear);
+    color0.setClearColor(MTLClearColor {
+        red: 0.0,
+        green: 0.0,
+        blue: 0.0,
+        alpha,
+    });
+    color0.setStoreAction(MTLStoreAction::Store);
+    let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) else {
+        mtld3d_shared::log_once_warn!(target: LOG_TARGET, "{label}: clear encoder allocation failed");
+        return false;
+    };
+    let label = objc2_foundation::NSString::from_str(label);
+    enc.setLabel(Some(&label));
+    enc.endEncoding();
+    true
+}
+
+/// HDR present of a `render.scale`-d frame: tone-map at render size, then upscale.
+///
+/// The two operations do not commute in the obvious direction. The drawable is
+/// `RGBA16Float` and the tone map has to produce it, so `MTLFXSpatialScaler`
+/// cannot be the last step *on the back buffer* — but it can be the last step
+/// on the tone map's output. Running the present pass into a scratch texture
+/// the size of the back buffer and handing that to the scaler in
+/// `ColorProcessingMode::HDR` gets both: the frame is tone-mapped, and it is
+/// enlarged by the same edge-aware upscaler SDR gets rather than by the present
+/// shader's own bilinear sample.
+///
+/// `HDR` is the mode built for exactly this input — extended-range linear
+/// values past `1.0`, which is what the present shader emits (`1.0` = SDR paper
+/// white). `MetalFX` applies its own reversible tone map internally to work in
+/// `[0, 1]`.
+///
+/// Keeping the scratch at *render* resolution rather than drawable resolution
+/// is what makes this cheap: the ICtCp/PQ math runs over fewer pixels than it
+/// does at scale 1.0, and `MetalFX` replaces a full-resolution shader pass.
+///
+/// Preflight prepares the scaler and its output before the tone-map pass,
+/// avoiding that work when preparation fails. Any failure falls back to
+/// tone-mapping the original source directly onto the drawable. Returns
+/// `false` only when neither route could encode the frame. The capability
+/// check precedes scratch allocation so an unsupported GPU allocates none.
+fn encode_hdr_present_upscaled(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    upscale: &UpscaleCache,
+    src: &ProtocolObject<dyn MTLTexture>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+    peak: f32,
+    gamma_layer: usize,
+) -> bool {
+    encode_hdr_present_upscaled_with(
+        cmd_buf,
+        upscale,
+        src,
+        drawable,
+        peak,
+        gamma_layer,
+        |scratch| {
+            super::upscale::encode(
+                cmd_buf,
+                &cmd_buf.device(),
+                upscale,
+                scratch,
+                drawable,
+                MTLFXSpatialScalerColorProcessingMode::HDR,
+            )
+        },
+    )
+}
+
+/// SDR upscale with the guest's gamma ramp applied before the scaler.
+///
+/// `MetalFX` enlarges the source it is given, and the exact copy that carries
+/// its output onto the drawable transforms nothing, so the ramp has to be in
+/// that source: the present shader writes a ramped copy of the render
+/// grid into a `BGRA8` scratch and the scaler enlarges that. Without a ramp
+/// there is nothing to insert and the scaler reads the game's own texture, the
+/// route this had before.
+///
+/// `false` when the scratch, the ramped copy or the scaler is unavailable; the
+/// caller then falls back to the shader stretch, which writes every drawable
+/// pixel either way.
+fn encode_sdr_upscaled(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    upscale: &UpscaleCache,
+    src: &ProtocolObject<dyn MTLTexture>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+    gamma_layer: usize,
+) -> bool {
+    let device = cmd_buf.device();
+    let scale = |source: &ProtocolObject<dyn MTLTexture>| {
+        super::upscale::encode(
+            cmd_buf,
+            &device,
+            upscale,
+            source,
+            drawable,
+            MTLFXSpatialScalerColorProcessingMode::Perceptual,
+        )
+    };
+    if gamma_layer == 0 {
+        return scale(src);
+    }
+    let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
+    let height = u32::try_from(src.height()).unwrap_or(u32::MAX);
+    let Some(scratch) =
+        super::upscale::scratch_target(&device, upscale, width, height, PixelFormat::Bgra8Unorm)
+    else {
+        return false;
+    };
+    encode_present_copy(cmd_buf, src, &scratch, gamma_layer) && scale(&scratch)
+}
+
+fn encode_hdr_present_upscaled_with(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    upscale: &UpscaleCache,
+    src: &ProtocolObject<dyn MTLTexture>,
+    drawable: &ProtocolObject<dyn MTLTexture>,
+    peak: f32,
+    gamma_layer: usize,
+    scale: impl FnOnce(&ProtocolObject<dyn MTLTexture>) -> bool,
+) -> bool {
+    let device = cmd_buf.device();
+    let width = u32::try_from(src.width()).unwrap_or(u32::MAX);
+    let height = u32::try_from(src.height()).unwrap_or(u32::MAX);
+    // The scratch and the scaler are this queue's alone: another device
+    // presenting at the same render size tone-maps and upscales through its
+    // own.
+    let scratch = if super::upscale::is_available(&device) {
+        super::upscale::scratch_target(&device, upscale, width, height, PixelFormat::Rgba16Float)
+    } else {
+        None
+    };
+    let Some(scratch) = scratch.filter(|scratch| {
+        super::upscale::can_scale(
+            &device,
+            upscale,
+            scratch,
+            drawable,
+            MTLFXSpatialScalerColorProcessingMode::HDR,
+        )
+    }) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: no MetalFX HDR upscale for {width}x{height} — the frame is stretched by \
+             the present shader instead and will look softer"
+        );
+        return encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer);
+    };
+
+    (encode_hdr_present(cmd_buf, src, &scratch, peak, gamma_layer) && scale(&scratch))
+        || encode_hdr_present(cmd_buf, src, drawable, peak, gamma_layer)
+}
+
+/// HDR present pass: the game's `BGRA8` backbuffer onto an `RGBA16Float` surface.
+///
+/// Rendered via a fullscreen triangle that sRGB-decodes each sample and
+/// multiplies by the EDR boost factor.
+///
+/// `dst` is the drawable at the default scale, and the render-resolution
+/// scratch [`encode_hdr_present_upscaled`] hands to `MetalFX` otherwise. Both
+/// are `RGBA16Float`, which is what the present pipelines are built against.
+///
+/// Returns `false` if the pipeline or render encoder is unavailable; the
+/// caller then clears the drawable.
+fn encode_hdr_present(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    peak: f32,
+    gamma_layer: usize,
+) -> bool {
+    let device = cmd_buf.device();
+    let Some(resources) = super::present::ensure_resources(&device) else {
+        return false;
+    };
+    // Pick the pass-through pipeline when the panel reports no EDR
+    // headroom this frame, BT.2446 otherwise. The two pipelines share
+    // the vertex stage and the sRGB EOTF; pass-through skips the
+    // BT.2446 math and requires no uniforms. See `present.rs` for
+    // the per-pipeline rationale.
+    // A gamma ramp replaces the stage with its twin, which looks each channel
+    // up in the layer's table before the sRGB decode. The twins are compiled
+    // on first use, so a session without a ramp pays nothing for them; a
+    // compile that fails presents without the ramp rather than dropping the
+    // frame.
+    let stage = if peak <= 1.0 {
+        super::present::GammaStage::Passthrough
+    } else {
+        super::present::GammaStage::Bt2446
+    };
+    let ramp = if gamma_layer == 0 {
+        None
+    } else {
+        super::present::ensure_gamma_pipeline(&device, stage)
+    };
+    let (plain, uniforms) = if peak <= 1.0 {
+        (resources.passthrough, None)
+    } else {
+        // Fragment uniform block consumed by the BT.2446 pipeline, 16 bytes;
+        // MSL alignment for `constant T&` requires 16-byte alignment, and a
+        // stack array of four f32 is naturally aligned and fits. Computed once
+        // per frame on the CPU rather than in every fragment.
+        (resources.bt2446, Some(super::present::hdr_uniforms(peak)))
+    };
+    encode_present_pass(
+        cmd_buf,
+        src,
+        dst,
+        &PresentStage {
+            plain,
+            ramp,
+            uniforms,
+            gamma_layer,
+        },
+    )
+}
+
+/// SDR present pass: the game's back buffer onto a same-format drawable.
+///
+/// The route for every SDR geometry `MetalFX` does not serve: matching
+/// extents, a minification, a mixed-axis change, or a GPU with no `MetalFX`
+/// at all. The fragment stage is a plain sample, and at matching extents every
+/// fragment lands on its own texel centre, so the pass is a bit-exact copy
+/// there and a filtered stretch everywhere else.
+///
+/// Returns `false` (with an error at the call site of `ensure_resources`)
+/// if pipeline creation failed.
+fn encode_present_copy(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    gamma_layer: usize,
+) -> bool {
+    let device = cmd_buf.device();
+    let Some(resources) = super::present::ensure_resources(&device) else {
+        return false;
+    };
+    let ramp = if gamma_layer == 0 {
+        None
+    } else {
+        super::present::ensure_gamma_pipeline(&device, super::present::GammaStage::Copy)
+    };
+    encode_present_pass(
+        cmd_buf,
+        src,
+        dst,
+        &PresentStage {
+            plain: resources.copy,
+            ramp,
+            uniforms: None,
+            gamma_layer,
+        },
+    )
+}
+
+/// One present pass's fragment stage, with and without the guest's gamma ramp.
+struct PresentStage {
+    /// The pipeline without a ramp.
+    plain: u64,
+    /// Its gamma-ramp twin, `None` when no ramp is set or its compile failed.
+    ramp: Option<u64>,
+    /// The `BT.2446` block at fragment slot 0; `None` for the stages with none.
+    uniforms: Option<[f32; 4]>,
+    /// Layer whose gamma table `ramp` reads.
+    gamma_layer: usize,
+}
+
+/// Encode one present pass: a fullscreen triangle sampling `src` across `dst`.
+///
+/// Shared by every shader-driven route. A ramp pass that cannot be encoded
+/// (its table went away, or no encoder) is encoded again without the ramp,
+/// so the frame still reaches the drawable, which no blit can write.
+fn encode_present_pass(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    stage: &PresentStage,
+) -> bool {
+    // The fullscreen triangle covers every pixel, so nothing is loaded.
+    let pass = |pipeline_handle, gamma_layer| {
+        encode_fullscreen_pass(
+            cmd_buf,
+            src,
+            dst,
+            &FullscreenPass {
+                pipeline_handle,
+                uniforms: stage.uniforms,
+                load_action: MTLLoadAction::DontCare,
+                label: "mtld3d-present-pass",
+                gamma_layer,
+            },
+        )
+    };
+    stage.ramp.is_some_and(|ramp| pass(ramp, stage.gamma_layer)) || pass(stage.plain, 0)
+}
+
+/// Copy `src` onto `dst` of the same extent and format, texel for texel, through a render pass.
+///
+/// For a destination no blit can write, such as a framebuffer-only drawable.
+/// The nearest-texel readback pipeline built for `dst`'s format samples each
+/// texel centre, so the copy is exact for every format it is built for, the
+/// float ones included. Returns `false`, logged once, when the format has no
+/// such pipeline or the pass cannot be encoded.
+pub fn encode_exact_copy(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+) -> bool {
+    let mtl_format = dst.pixelFormat();
+    let Some(format) = super::texture::wire_pixel_format(mtl_format) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "exact copy: {mtl_format:?} is not a format mtld3d creates; the copy is not encoded"
+        );
+        return false;
+    };
+    let Some(pipeline) = super::present::ensure_readback_pipeline(&cmd_buf.device(), format, true)
+    else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "exact copy: no {format:?} copy pipeline; the copy is not encoded"
+        );
+        return false;
+    };
+    encode_fullscreen_pass(
+        cmd_buf,
+        src,
+        dst,
+        &FullscreenPass {
+            pipeline_handle: pipeline,
+            uniforms: None,
+            load_action: MTLLoadAction::DontCare,
+            label: "mtld3d-exact-copy",
+            gamma_layer: 0,
+        },
+    )
+}
+
+/// Encode the software cursor's sprite pass: `src` (the sprite) onto `dst` (the overlay drawable).
+///
+/// The same fullscreen triangle as present, against a drawable sized to the
+/// sprite, so every fragment lands on its texel. The target is cleared to
+/// transparent first: the cursor pipelines write premultiplied colour and
+/// alpha and the overlay window shows whatever the pass did not cover.
+pub fn encode_cursor_pass(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    pipeline_handle: u64,
+    uniforms: Option<[f32; 4]>,
+    gamma_layer: usize,
+) -> bool {
+    encode_fullscreen_pass(
+        cmd_buf,
+        src,
+        dst,
+        &FullscreenPass {
+            pipeline_handle,
+            uniforms,
+            load_action: MTLLoadAction::Clear,
+            label: "mtld3d-cursor-pass",
+            gamma_layer,
+        },
+    )
+}
+
+/// What one fullscreen pass does, beside the two textures it reads and writes.
+struct FullscreenPass<'a> {
+    pipeline_handle: u64,
+    /// The `BT.2446` block at fragment slot 0; `None` for the stages with none.
+    uniforms: Option<[f32; 4]>,
+    load_action: MTLLoadAction,
+    label: &'a str,
+    /// Layer whose gamma table the fragment stage reads, `0` for none.
+    ///
+    /// Set only for a gamma pipeline, which indexes the table
+    /// unconditionally, so the two travel together.
+    gamma_layer: usize,
+}
+
+/// One fullscreen-triangle pass sampling `src` across `dst` with `pass.pipeline_handle`.
+///
+/// `MTLLoadAction::Clear` clears to transparent black.
+fn encode_fullscreen_pass(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    dst: &ProtocolObject<dyn MTLTexture>,
+    pass: &FullscreenPass,
+) -> bool {
+    let FullscreenPass {
+        pipeline_handle,
+        uniforms,
+        load_action,
+        label,
+        gamma_layer,
+    } = *pass;
+    // SAFETY: pipeline_handle is a previously-retained MTLRenderPipelineState address.
+    let Some(pipeline) =
+        (unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(pipeline_handle) })
+            .into_retained()
+    else {
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: rustc_hash::FxBuildHasher.hash_one(label),
+            "{label}: no pipeline state to encode with; the pass is skipped"
+        );
+        return false;
+    };
+
+    let pass_desc = MTLRenderPassDescriptor::new();
+    // SAFETY: `colorAttachments()` returns a non-null descriptor array;
+    // subscript 0 is always valid.
+    let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
+    color0.setTexture(Some(dst));
+    color0.setLoadAction(load_action);
+    color0.setClearColor(MTLClearColor {
+        red: 0.0,
+        green: 0.0,
+        blue: 0.0,
+        alpha: 0.0,
+    });
+    color0.setStoreAction(MTLStoreAction::Store);
+
+    let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) else {
+        mtld3d_shared::log_once_warn_by!(
+            target: LOG_TARGET,
+            key: rustc_hash::FxBuildHasher.hash_one(label),
+            "{label}: the render encoder could not be created; the pass is skipped"
+        );
+        return false;
+    };
+    let label = objc2_foundation::NSString::from_str(label);
+    enc.setLabel(Some(&label));
+    enc.setRenderPipelineState(&pipeline);
+    // SAFETY: objc2 typed binding; `src` is a retained `MTLTexture` live
+    // for the call.
+    unsafe {
+        enc.setFragmentTexture_atIndex(Some(src), 0);
+    }
+    if let Some(uniforms) = uniforms {
+        // SAFETY: `&uniforms` is a fresh stack reference; the raw pointer is
+        // non-null by construction.
+        let uniforms_ptr = unsafe {
+            core::ptr::NonNull::new_unchecked(
+                core::ptr::from_ref(&uniforms).cast::<c_void>().cast_mut(),
+            )
+        };
+        // SAFETY: objc2 typed binding; `uniforms_ptr` borrows the stack
+        // slot for the duration of this call, and the encoder copies before
+        // returning.
+        unsafe {
+            enc.setFragmentBytes_length_atIndex(uniforms_ptr, core::mem::size_of_val(&uniforms), 0);
+        }
+    }
+    // A gamma pipeline indexes the layer's table unconditionally, so a table
+    // that is gone by the time the pass encodes has to end the pass rather
+    // than draw through a pipeline with an unbound argument. The caller
+    // resolved the pipeline from the same flag the table is published under,
+    // so this is the teardown race and nothing else.
+    if gamma_layer != 0 && !super::gamma::bind(&enc, gamma_layer) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: layer {gamma_layer:#x} lost its gamma table between the route and the \
+             pass; the frame is presented without the ramp"
+        );
+        enc.endEncoding();
+        return false;
+    }
+    // SAFETY: objc2 typed binding; pipeline is bound above; no buffer args.
+    unsafe {
+        enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+    }
+    enc.endEncoding();
+    true
+}
+
+/// Pixel formats Apple lists as valid arguments to `blit.generateMipmapsForTexture`.
+///
+/// Color-renderable and color-filterable. Compressed (BC*) and
+/// depth/stencil formats are excluded by Metal at runtime; PE-side
+/// `device_create_texture` already drops the autogen flag for
+/// `fmt.is_compressed()`, so this guard is defensive against future
+/// format additions. The packed 16-bit formats are both on the Apple family,
+/// the only one that has them; a device without them backs those D3D formats
+/// with `BGRA8Unorm`.
+const fn pixel_format_supports_mipgen(fmt: MTLPixelFormat) -> bool {
+    matches!(
+        fmt,
+        MTLPixelFormat::A8Unorm
+            | MTLPixelFormat::B5G6R5Unorm
+            | MTLPixelFormat::BGR5A1Unorm
+            | MTLPixelFormat::ABGR4Unorm
+            | MTLPixelFormat::R8Unorm
+            | MTLPixelFormat::R8Snorm
+            | MTLPixelFormat::R16Unorm
+            | MTLPixelFormat::R16Snorm
+            | MTLPixelFormat::R16Float
+            | MTLPixelFormat::R32Float
+            | MTLPixelFormat::RG8Unorm
+            | MTLPixelFormat::RG8Snorm
+            | MTLPixelFormat::RG16Unorm
+            | MTLPixelFormat::RG16Snorm
+            | MTLPixelFormat::RG16Float
+            | MTLPixelFormat::RG32Float
+            | MTLPixelFormat::RGBA8Unorm
+            | MTLPixelFormat::RGBA8Unorm_sRGB
+            | MTLPixelFormat::RGBA8Snorm
+            | MTLPixelFormat::BGRA8Unorm
+            | MTLPixelFormat::BGRA8Unorm_sRGB
+            | MTLPixelFormat::RGBA16Unorm
+            | MTLPixelFormat::RGBA16Snorm
+            | MTLPixelFormat::RGBA16Float
+            | MTLPixelFormat::RGBA32Float
+            | MTLPixelFormat::RGB10A2Unorm
+    )
+}
+
+/// Why Metal would refuse a texture-to-texture blit.
+///
+/// `copyFromTexture:` validates every one of these itself: under
+/// `MTL_DEBUG_LAYER` a violation aborts the process, and without the layer
+/// the copy is undefined. The blit encoder tests them first and skips the
+/// copy, so a caller that sends a mismatched pair loses one copy rather than
+/// the process.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CopyRejectReason {
+    /// The pixel formats are neither equal nor a linear/sRGB twin pair.
+    FormatMismatch,
+    /// The sample counts differ, which a blit copy cannot resolve.
+    SampleCountMismatch,
+    /// The source texture has no such mip level.
+    SourceLevelMissing,
+    /// The destination texture has no such mip level.
+    DestinationLevelMissing,
+    /// The region leaves the addressed source mip level.
+    SourceRegionOutOfBounds,
+    /// The region leaves the addressed destination mip level.
+    DestinationRegionOutOfBounds,
+    /// The source buffer is shorter than the rows and slices the copy reads.
+    SourceBufferTooShort,
+    /// The destination buffer is shorter than the rows and slices the copy writes.
+    DestinationBufferTooShort,
+}
+
+impl CopyRejectReason {
+    /// Stable `u64` key so `log_once_warn_by!` fires once per reason.
+    ///
+    /// Keying on the discriminant keeps the reasons distinct instead of
+    /// collapsing every later rejection into the first one seen.
+    const fn key(self) -> u64 {
+        self as u64
+    }
+
+    /// Per-destination key so the warn fires once per reason and destination.
+    ///
+    /// A texture upload that this rejects is one texture's pixels, and a
+    /// single key for the whole process names the first texture to hit the
+    /// reason and hides every other one. Metal object addresses are at least
+    /// 8-byte aligned and the discriminant is under 8, so the low bits carry
+    /// it without ever colliding with another destination.
+    const fn key_at(self, destination: u64) -> u64 {
+        destination ^ (self as u64)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::FormatMismatch => "source and destination pixel formats are incompatible",
+            Self::SampleCountMismatch => "source and destination sample counts differ",
+            Self::SourceLevelMissing => "the source has no such mip level",
+            Self::DestinationLevelMissing => "the destination has no such mip level",
+            Self::SourceRegionOutOfBounds => "the region leaves the source mip level",
+            Self::DestinationRegionOutOfBounds => "the region leaves the destination mip level",
+            Self::SourceBufferTooShort => "the source buffer is shorter than the copy reads",
+            Self::DestinationBufferTooShort => {
+                "the destination buffer is shorter than the copy writes"
+            }
+        }
+    }
+}
+
+/// The texture end of a blit copy, as the live `MTLTexture` describes it.
+///
+/// `width`, `height` and `depth` are the base level's, `level` the mip level
+/// the copy addresses and `levels` the texture's level count, so the
+/// addressed extent is derived here rather than passed in alongside them.
+struct CopyEndpoint {
+    pixel_format: MTLPixelFormat,
+    sample_count: usize,
+    width: usize,
+    height: usize,
+    /// Slice count of the base level: one outside a volume texture.
+    depth: usize,
+    level: usize,
+    levels: usize,
+    origin_x: usize,
+    origin_y: usize,
+}
+
+impl CopyEndpoint {
+    /// Extent of the addressed mip level, or `None` when it does not exist.
+    const fn level_extent(&self) -> Option<(usize, usize)> {
+        if self.level >= self.levels {
+            return None;
+        }
+        let w = self.width >> self.level;
+        let h = self.height >> self.level;
+        Some((if w == 0 { 1 } else { w }, if h == 0 { 1 } else { h }))
+    }
+
+    /// Slices in the addressed mip level, or `None` when it does not exist.
+    const fn level_depth(&self) -> Option<usize> {
+        if self.level >= self.levels {
+            return None;
+        }
+        let d = self.depth >> self.level;
+        Some(if d == 0 { 1 } else { d })
+    }
+}
+
+impl core::fmt::Display for CopyEndpoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "{:?} samples={} level={}/{} origin={},{} size={}x{}x{}",
+            self.pixel_format,
+            self.sample_count,
+            self.level,
+            self.levels,
+            self.origin_x,
+            self.origin_y,
+            self.width,
+            self.height,
+            self.depth
+        )
+    }
+}
+
+/// The sRGB-encoded twin of a pixel format the wire enum covers.
+fn srgb_twin_of(format: MTLPixelFormat) -> Option<MTLPixelFormat> {
+    let raw = u32::try_from(format.0).ok()?;
+    Some(mtl_pixel_format(PixelFormat::from_repr(raw)?.srgb_twin()?))
+}
+
+/// Whether `copyFromTexture:` accepts a copy between these two pixel formats.
+///
+/// Equal formats always. A linear format and its sRGB twin are the one
+/// unequal pair Metal accepts, being two encodings of one base format, and
+/// mtld3d creates an sRGB view next to every colour texture that has one.
+fn pixel_formats_copy_compatible(src: MTLPixelFormat, dst: MTLPixelFormat) -> bool {
+    if src == dst {
+        return true;
+    }
+    if srgb_twin_of(src) == Some(dst) {
+        return true;
+    }
+    srgb_twin_of(dst) == Some(src)
+}
+
+/// Whether a region placed at `origin` stays inside `extent`.
+const fn region_fits(
+    origin: (usize, usize),
+    region: (usize, usize),
+    extent: (usize, usize),
+) -> bool {
+    match (
+        origin.0.checked_add(region.0),
+        origin.1.checked_add(region.1),
+    ) {
+        (Some(right), Some(bottom)) => right <= extent.0 && bottom <= extent.1,
+        _ => false,
+    }
+}
+
+/// Reject a texture-to-texture copy `copyFromTexture:` would not accept.
+///
+/// `None` means the pair is copyable. One region serves both ends because a
+/// blit copy cannot resize, so it is bounds-checked against each of them.
+fn copy_texture_reject(
+    src: &CopyEndpoint,
+    dst: &CopyEndpoint,
+    region_w: usize,
+    region_h: usize,
+    region_depth: usize,
+) -> Option<CopyRejectReason> {
+    if !pixel_formats_copy_compatible(src.pixel_format, dst.pixel_format) {
+        return Some(CopyRejectReason::FormatMismatch);
+    }
+    if src.sample_count != dst.sample_count {
+        return Some(CopyRejectReason::SampleCountMismatch);
+    }
+    let Some(src_extent) = src.level_extent() else {
+        return Some(CopyRejectReason::SourceLevelMissing);
+    };
+    let Some(dst_extent) = dst.level_extent() else {
+        return Some(CopyRejectReason::DestinationLevelMissing);
+    };
+    let region = (region_w, region_h);
+    if !region_fits((src.origin_x, src.origin_y), region, src_extent)
+        || region_depth > src.level_depth().expect("source level checked above")
+    {
+        return Some(CopyRejectReason::SourceRegionOutOfBounds);
+    }
+    if !region_fits((dst.origin_x, dst.origin_y), region, dst_extent)
+        || region_depth > dst.level_depth().expect("destination level checked above")
+    {
+        return Some(CopyRejectReason::DestinationRegionOutOfBounds);
+    }
+    None
+}
+
+/// The buffer end of a blit copy between an `MTLBuffer` and an `MTLTexture`.
+///
+/// `offset` is where the first row starts, `bytes_per_row` the stride between
+/// rows of blocks and `bytes_per_image` the stride between slices, all as the
+/// copy was encoded; `length` is the live `MTLBuffer`'s own length.
+struct CopyBufferEndpoint {
+    length: usize,
+    offset: usize,
+    bytes_per_row: usize,
+    bytes_per_image: usize,
+}
+
+impl core::fmt::Display for CopyBufferEndpoint {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "len={} offset={} bytesPerRow={} bytesPerImage={}",
+            self.length, self.offset, self.bytes_per_row, self.bytes_per_image
+        )
+    }
+}
+
+/// The region a buffer/texture copy transfers, in texture pixels.
+///
+/// `depth` is the slice count the copy walks: one for a 2D texture, the box
+/// depth for a volume.
+struct CopyRegion {
+    width: usize,
+    height: usize,
+    depth: usize,
+}
+
+impl core::fmt::Display for CopyRegion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}x{}x{}", self.width, self.height, self.depth)
+    }
+}
+
+/// Block layout of a live texture's pixel format.
+///
+/// Every format an mtld3d texture can carry is on the wire, so the fallback
+/// is unreachable; it sizes a copy as one byte per pixel, which keeps the
+/// bounds check permissive rather than refusing a copy it cannot measure.
+fn copy_block_layout(format: MTLPixelFormat) -> BlockLayout {
+    let Some(wire) = u32::try_from(format.0)
+        .ok()
+        .and_then(PixelFormat::from_repr)
+    else {
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: format.0 as u64,
+            "copy guard: pixel format {format:?} is not on the mtld3d wire, \
+             sizing its blocks as one byte per pixel"
+        );
+        return BlockLayout::unmapped();
+    };
+    wire.block_layout()
+}
+
+/// Whether the region placed at the endpoint's origin stays inside its level.
+///
+/// The level extent is rounded up to the block grid first: a compressed level
+/// narrower than one block still addresses a whole block, so a copy covering
+/// it names the block extent and not the level's. On an uncompressed format
+/// the rounding is the identity.
+fn level_holds_region(
+    texture: &CopyEndpoint,
+    region: &CopyRegion,
+    extent: (usize, usize),
+    block: BlockLayout,
+) -> bool {
+    let block_w = usize::try_from(block.width()).expect("block extent fits usize");
+    let block_h = usize::try_from(block.height()).expect("block extent fits usize");
+    let bounds = (
+        extent.0.next_multiple_of(block_w),
+        extent.1.next_multiple_of(block_h),
+    );
+    region_fits(
+        (texture.origin_x, texture.origin_y),
+        (region.width, region.height),
+        bounds,
+    ) && texture.level_depth().is_some_and(|d| region.depth <= d)
+}
+
+/// Byte offset, exclusive, the copy stops at in the buffer.
+///
+/// The strides cover every row but the last one of the last slice, which is
+/// only as long as the region's own blocks: that is where the copy stops, not
+/// at the end of a padded row. `None` when the arithmetic overflows, which is
+/// itself a reason to refuse the copy.
+fn buffer_copy_end(
+    buffer: &CopyBufferEndpoint,
+    region: &CopyRegion,
+    block: BlockLayout,
+) -> Option<usize> {
+    let block_w = usize::try_from(block.width()).ok()?;
+    let block_h = usize::try_from(block.height()).ok()?;
+    let block_bytes = usize::try_from(block.bytes()).ok()?;
+    let rows = region.height.div_ceil(block_h);
+    let cols = region.width.div_ceil(block_w);
+    if rows == 0 || cols == 0 || region.depth == 0 {
+        return Some(buffer.offset);
+    }
+    let last_row = cols.checked_mul(block_bytes)?;
+    let slice = buffer
+        .bytes_per_row
+        .checked_mul(rows - 1)?
+        .checked_add(last_row)?;
+    let span = buffer
+        .bytes_per_image
+        .checked_mul(region.depth - 1)?
+        .checked_add(slice)?;
+    buffer.offset.checked_add(span)
+}
+
+/// Whether the buffer holds every byte a copy of `region` touches.
+fn buffer_holds_region(
+    buffer: &CopyBufferEndpoint,
+    region: &CopyRegion,
+    block: BlockLayout,
+) -> bool {
+    buffer_copy_end(buffer, region, block).is_some_and(|end| end <= buffer.length)
+}
+
+/// Reject a buffer-to-texture copy `copyFromBuffer:` would not accept.
+///
+/// `None` means the upload is safe to encode. `block` is the destination
+/// format's, since the region and the source rows are both laid out in it.
+fn copy_buffer_to_texture_reject(
+    src: &CopyBufferEndpoint,
+    dst: &CopyEndpoint,
+    region: &CopyRegion,
+    block: BlockLayout,
+) -> Option<CopyRejectReason> {
+    let Some(extent) = dst.level_extent() else {
+        return Some(CopyRejectReason::DestinationLevelMissing);
+    };
+    if !level_holds_region(dst, region, extent, block) {
+        return Some(CopyRejectReason::DestinationRegionOutOfBounds);
+    }
+    if !buffer_holds_region(src, region, block) {
+        return Some(CopyRejectReason::SourceBufferTooShort);
+    }
+    None
+}
+
+/// Reject a texture-to-buffer copy `copyFromTexture:toBuffer:` would not accept.
+///
+/// The mirror of `copy_buffer_to_texture_reject`: the same two bounds with
+/// the roles of the two ends swapped.
+fn copy_texture_to_buffer_reject(
+    src: &CopyEndpoint,
+    dst: &CopyBufferEndpoint,
+    region: &CopyRegion,
+    block: BlockLayout,
+) -> Option<CopyRejectReason> {
+    let Some(extent) = src.level_extent() else {
+        return Some(CopyRejectReason::SourceLevelMissing);
+    };
+    if !level_holds_region(src, region, extent, block) {
+        return Some(CopyRejectReason::SourceRegionOutOfBounds);
+    }
+    if !buffer_holds_region(dst, region, block) {
+        return Some(CopyRejectReason::DestinationBufferTooShort);
+    }
+    None
+}
+
+/// Replay the frame's leading blit commands inside a single `MTLBlitCommandEncoder`.
+///
+/// Runs before any render pass. Preserves ordering between
+/// `CopyTextureToTexture` (preserve) and `CopyBufferToTexture` (sub-rect
+/// upload) the PE side emits — preserve blits targeting a given texture
+/// must precede any sub-rect upload blits targeting that same texture.
+fn encode_leading_blits(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    blits: &[BlitCommand],
+    needs_encoder: bool,
+    site: BlitSite,
+    ctx: &mut EncodeContext<'_>,
+) -> bool {
+    let to_usize =
+        |v: u64| usize::try_from(v).expect("PE wire u64 fits unix host usize (unix is 64-bit)");
+    mtld3d_shared::crumb!("blit:enter", blits.len() as u64, u64::from(needs_encoder),);
+    // `needs_encoder` is set on the PE side whenever an encoder-bound
+    // command (CopyBuffer/Texture variants) was emitted. Without it
+    // we'd have to scan the blit list to know whether to create the
+    // blit encoder; the PE side already knows, so just trust the flag.
+    // Pure-notify frames skip encoder creation entirely.
+    let mut blit = if needs_encoder {
+        if let Some(b) = cmd_buf.blitCommandEncoder() {
+            let label =
+                objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{site}"));
+            b.setLabel(Some(&label));
+            Some(b)
+        } else {
+            error!(
+                target: LOG_TARGET,
+                "encode_leading_blits: blitCommandEncoder() returned nil (count={})",
+                blits.len(),
+            );
+            return false;
+        }
+    } else {
+        None
+    };
+
+    for (i, cmd) in blits.iter().enumerate() {
+        mtld3d_shared::crumb!("blit:cmd", u64::from(cmd.cmd), i as u64);
+        match BlitCommandType::from_repr(cmd.cmd) {
+            Some(BlitCommandType::TransferDepth) => {
+                if let Some(encoder) = blit.take() {
+                    encoder.endEncoding();
+                }
+                if !super::depth_transfer::encode(cmd_buf, cmd, ctx.planes, &ctx.stamp) {
+                    return false;
+                }
+                if i + 1 < blits.len() {
+                    let Some(encoder) = cmd_buf.blitCommandEncoder() else {
+                        error!(target: LOG_TARGET, "depth transfer: following blit encoder failed");
+                        return false;
+                    };
+                    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+                        "mtld3d-depth-transfer-following-blits",
+                    )));
+                    blit = Some(encoder);
+                }
+            }
+            Some(BlitCommandType::NotifyBufferDidModifyRange) => {
+                // CPU-side flag-set on `MTLBuffer`, not an encoder
+                // call. Safe to interleave with open encoder commands;
+                // also safe outside any encoder.
+                // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
+                let src_buffer_handle =
+                    unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
+                // SAFETY: the canonical retain outlives this borrow. Every
+                // resource a blit of this prefix names is destroyed either
+                // through `pending_resource_retention`, stamped with the
+                // submit seq of the frame whose commands still name it and
+                // popped only once `coherent_seq` has reached that seq, or
+                // through `free_stage_upload_transients`, which gates on the
+                // lower of `coherent_seq` and `upload_coherent_seq`. Both
+                // counters advance from a command-buffer completion handler,
+                // and the prefix runs before this frame's buffers are even
+                // committed.
+                let Some(buffer) = (unsafe { src_buffer_handle.borrow_retained() }) else {
+                    error!(
+                        target: LOG_TARGET,
+                        "encode_leading_blits: notify buffer handle is null",
+                    );
+                    continue;
+                };
+                mtld3d_shared::crumb!("blit:modifyrange", cmd.src_handle);
+                buffer.didModifyRange(NSRange {
+                    location: to_usize(cmd.src_offset),
+                    length: to_usize(cmd.byte_size),
+                });
+            }
+            Some(
+                kind @ (BlitCommandType::CopyBufferToTexture
+                | BlitCommandType::CopyBufferToDepth
+                | BlitCommandType::CopyBufferToStencil),
+            ) => {
+                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
+                let src_buffer_handle =
+                    unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
+                // SAFETY: as the notify arm above, the seq-gated destroy paths
+                // cannot free a resource this prefix names before the command
+                // buffer it encodes into has retired.
+                let Some(buffer) = (unsafe { src_buffer_handle.borrow_retained() }) else {
+                    error!(
+                        target: LOG_TARGET,
+                        "encode_leading_blits: upload source buffer handle is null",
+                    );
+                    if kind != BlitCommandType::CopyBufferToTexture {
+                        blit.endEncoding();
+                        return false;
+                    }
+                    continue;
+                };
+                // SAFETY: cmd.dst_handle is a previously-retained MTLTexture address.
+                let dst_texture_handle =
+                    unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) };
+                // SAFETY: as the source buffer above, and as
+                // `SetFragmentTexture`: a texture leaves through the same
+                // seq-gated retention queue, and the implicit surfaces that
+                // skip it are destroyed behind a drain of the submit thread
+                // and a GPU-idle wait.
+                let Some(texture) = (unsafe { dst_texture_handle.borrow_retained() }) else {
+                    error!(
+                        target: LOG_TARGET,
+                        "encode_leading_blits: upload destination texture handle is null",
+                    );
+                    if kind != BlitCommandType::CopyBufferToTexture {
+                        blit.endEncoding();
+                        return false;
+                    }
+                    continue;
+                };
+                let region = CopyRegion {
+                    width: cmd.region_w as usize,
+                    height: cmd.region_h as usize,
+                    depth: cmd.depth as usize,
+                };
+                let source = CopyBufferEndpoint {
+                    length: buffer.length(),
+                    offset: to_usize(cmd.src_offset),
+                    bytes_per_row: to_usize(cmd.bytes_per_row),
+                    bytes_per_image: cmd.bytes_per_image as usize,
+                };
+                let destination = CopyEndpoint {
+                    pixel_format: texture.pixelFormat(),
+                    sample_count: texture.sampleCount(),
+                    width: texture.width(),
+                    height: texture.height(),
+                    depth: texture.depth(),
+                    level: cmd.mip_level as usize,
+                    levels: texture.mipmapLevelCount(),
+                    origin_x: cmd.origin_x as usize,
+                    origin_y: cmd.origin_y as usize,
+                };
+                let (block, options) = match kind {
+                    BlitCommandType::CopyBufferToDepth
+                        if matches!(
+                            destination.pixel_format,
+                            MTLPixelFormat::Depth32Float | MTLPixelFormat::Depth32Float_Stencil8
+                        ) =>
+                    {
+                        (
+                            PixelFormat::R32Float.block_layout(),
+                            if destination.pixel_format == MTLPixelFormat::Depth32Float_Stencil8 {
+                                MTLBlitOption::DepthFromDepthStencil
+                            } else {
+                                MTLBlitOption::empty()
+                            },
+                        )
+                    }
+                    BlitCommandType::CopyBufferToStencil
+                        if destination.pixel_format == MTLPixelFormat::Depth32Float_Stencil8 =>
+                    {
+                        (
+                            PixelFormat::R8Unorm.block_layout(),
+                            MTLBlitOption::StencilFromDepthStencil,
+                        )
+                    }
+                    BlitCommandType::CopyBufferToTexture => (
+                        copy_block_layout(destination.pixel_format),
+                        MTLBlitOption::empty(),
+                    ),
+                    _ => {
+                        error!(target: LOG_TARGET, "depth upload: incompatible plane and destination format");
+                        blit.endEncoding();
+                        return false;
+                    }
+                };
+                if let Some(reason) =
+                    copy_buffer_to_texture_reject(&source, &destination, &region, block)
+                {
+                    let reason_text = reason.as_str();
+                    let src_handle = cmd.src_handle;
+                    let dst_handle = cmd.dst_handle;
+                    mtld3d_shared::log_once_warn_by!(
+                        target: crate::LOG_TARGET,
+                        key: reason.key_at(dst_handle),
+                        "encode_leading_blits: {reason_text}, upload skipped. \
+                         src handle={src_handle:#x} {source}, \
+                         dst handle={dst_handle:#x} {destination}, \
+                         region {region}"
+                    );
+                    if kind != BlitCommandType::CopyBufferToTexture {
+                        blit.endEncoding();
+                        return false;
+                    }
+                    continue;
+                }
+                mtld3d_shared::crumb!("blit:buf2tex", cmd.src_handle, cmd.dst_handle);
+                // `depth` is the slice count (1 for a 2D texture, >1 for a
+                // volume/3D texture) and `bytes_per_image` the per-slice byte
+                // stride. For the 2D hot path the PE side passes `depth == 1`
+                // and `bytes_per_image == bytes_per_row * region_h`, exactly
+                // the values this call computed implicitly before the fields
+                // existed — so the 2D copy is byte-identical.
+                // SAFETY: objc2 typed binding; the encoder retains `buffer`
+                // and `texture` into the command buffer's resource set; the
+                // geometry cleared `copy_buffer_to_texture_reject` above.
+                unsafe {
+                    blit.copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
+                        buffer,
+                        to_usize(cmd.src_offset),
+                        to_usize(cmd.bytes_per_row),
+                        cmd.bytes_per_image as usize,
+                        MTLSize {
+                            width: cmd.region_w as usize,
+                            height: cmd.region_h as usize,
+                            depth: cmd.depth as usize,
+                        },
+                        texture,
+                        to_usize(cmd.dst_offset),
+                        cmd.mip_level as usize,
+                        MTLOrigin {
+                            x: cmd.origin_x as usize,
+                            y: cmd.origin_y as usize,
+                            z: 0,
+                        },
+                        options,
+                    );
+                }
+            }
+            Some(BlitCommandType::CopyTextureToTexture) => {
+                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                // SAFETY: cmd.src_handle is a previously-retained MTLTexture address.
+                let src_texture_handle =
+                    unsafe { MetalHandle::<MTLTextureKind>::new(cmd.src_handle) };
+                // SAFETY: as the upload arm above, a texture this prefix names
+                // outlives the command buffer the copy is encoded into.
+                let Some(src) = (unsafe { src_texture_handle.borrow_retained() }) else {
+                    error!(
+                        target: LOG_TARGET,
+                        "encode_leading_blits: copy source texture handle is null",
+                    );
+                    continue;
+                };
+                // SAFETY: cmd.dst_handle is a previously-retained MTLTexture address.
+                let dst_texture_handle =
+                    unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) };
+                // SAFETY: as the copy source above.
+                let Some(dst) = (unsafe { dst_texture_handle.borrow_retained() }) else {
+                    error!(
+                        target: LOG_TARGET,
+                        "encode_leading_blits: copy destination texture handle is null",
+                    );
+                    continue;
+                };
+                // Source origin lives in `origin_x`/`origin_y`;
+                // destination origin is packed into `dst_offset` as
+                // `(dst_y as u64) << 32 | dst_x as u64`, and the cube
+                // face at each end in `src_slice` / `dst_slice`. A
+                // full-mip preserve leaves all of these 0.
+                let dst_x = (cmd.dst_offset & 0xFFFF_FFFF) as usize;
+                let dst_y = ((cmd.dst_offset >> 32) & 0xFFFF_FFFF) as usize;
+                let src_endpoint = CopyEndpoint {
+                    pixel_format: src.pixelFormat(),
+                    sample_count: src.sampleCount(),
+                    width: src.width(),
+                    height: src.height(),
+                    depth: src.depth(),
+                    level: cmd.mip_level as usize,
+                    levels: src.mipmapLevelCount(),
+                    origin_x: cmd.origin_x as usize,
+                    origin_y: cmd.origin_y as usize,
+                };
+                let dst_endpoint = CopyEndpoint {
+                    pixel_format: dst.pixelFormat(),
+                    sample_count: dst.sampleCount(),
+                    width: dst.width(),
+                    height: dst.height(),
+                    depth: dst.depth(),
+                    level: cmd.dst_mip_level as usize,
+                    levels: dst.mipmapLevelCount(),
+                    origin_x: dst_x,
+                    origin_y: dst_y,
+                };
+                let region_w = cmd.region_w;
+                let region_h = cmd.region_h;
+                // Zero retains the single-slice wire form of 2D and cube copies.
+                let region_depth = cmd.depth.max(1);
+                if let Some(reason) = copy_texture_reject(
+                    &src_endpoint,
+                    &dst_endpoint,
+                    region_w as usize,
+                    region_h as usize,
+                    region_depth as usize,
+                ) {
+                    let reason_text = reason.as_str();
+                    let src_handle = cmd.src_handle;
+                    let dst_handle = cmd.dst_handle;
+                    mtld3d_shared::log_once_warn_by!(
+                        target: crate::LOG_TARGET,
+                        key: reason.key(),
+                        "encode_leading_blits: {reason_text}, copy skipped. \
+                         src handle={src_handle:#x} {src_endpoint}, \
+                         dst handle={dst_handle:#x} {dst_endpoint}, \
+                         region {region_w}x{region_h}x{region_depth}"
+                    );
+                    continue;
+                }
+                diagnostics::texture_copy(
+                    cmd_buf,
+                    site,
+                    i,
+                    &diagnostics::TextureCopy {
+                        texture: src,
+                        endpoint: &src_endpoint,
+                        slice: cmd.src_slice as usize,
+                    },
+                    &diagnostics::TextureCopy {
+                        texture: dst,
+                        endpoint: &dst_endpoint,
+                        slice: cmd.dst_slice as usize,
+                    },
+                    &CopyRegion {
+                        width: region_w as usize,
+                        height: region_h as usize,
+                        depth: region_depth as usize,
+                    },
+                );
+                mtld3d_shared::crumb!("blit:tex2tex", cmd.src_handle, cmd.dst_handle);
+                // SAFETY: objc2 typed binding; the encoder retains `src`/`dst`
+                // into the command buffer's resource set; the region fits both
+                // live mip extents, including depth, as checked above. Array
+                // slices come from the PE-side command's texture subresource.
+                unsafe {
+                    blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
+                        src,
+                        cmd.src_slice as usize,
+                        cmd.mip_level as usize,
+                        MTLOrigin {
+                            x: cmd.origin_x as usize,
+                            y: cmd.origin_y as usize,
+                            z: 0,
+                        },
+                        MTLSize {
+                            width: cmd.region_w as usize,
+                            height: cmd.region_h as usize,
+                            depth: region_depth as usize,
+                        },
+                        dst,
+                        cmd.dst_slice as usize,
+                        cmd.dst_mip_level as usize,
+                        MTLOrigin { x: dst_x, y: dst_y, z: 0 },
+                    );
+                }
+            }
+            Some(BlitCommandType::CopyBufferToBuffer) => {
+                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                // SAFETY: cmd.src_handle is a previously-retained MTLBuffer address.
+                let src_buffer_handle =
+                    unsafe { MetalHandle::<MTLBufferKind>::new(cmd.src_handle) };
+                // SAFETY: as the notify arm above.
+                let Some(src) = (unsafe { src_buffer_handle.borrow_retained() }) else {
+                    error!(
+                        target: LOG_TARGET,
+                        "encode_leading_blits: copy source buffer handle is null",
+                    );
+                    continue;
+                };
+                // SAFETY: cmd.dst_handle is a previously-retained MTLBuffer address.
+                let dst_buffer_handle =
+                    unsafe { MetalHandle::<MTLBufferKind>::new(cmd.dst_handle) };
+                // SAFETY: as the copy source above.
+                let Some(dst) = (unsafe { dst_buffer_handle.borrow_retained() }) else {
+                    error!(
+                        target: LOG_TARGET,
+                        "encode_leading_blits: copy destination buffer handle is null",
+                    );
+                    continue;
+                };
+                mtld3d_shared::crumb!("blit:buf2buf", cmd.src_handle, cmd.dst_handle);
+                // SAFETY: objc2 typed binding; the encoder retains `src`/`dst`
+                // into the command buffer's resource set; sizes are PE-side
+                // bounded.
+                unsafe {
+                    blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        src,
+                        to_usize(cmd.src_offset),
+                        dst,
+                        to_usize(cmd.dst_offset),
+                        to_usize(cmd.byte_size),
+                    );
+                }
+            }
+            Some(BlitCommandType::GenerateMipmaps) => {
+                let blit = blit.as_ref().expect("non-notify command requires encoder");
+                // SAFETY: cmd.dst_handle is a previously-retained MTLTexture address.
+                let dst_texture_handle =
+                    unsafe { MetalHandle::<MTLTextureKind>::new(cmd.dst_handle) };
+                // SAFETY: as the copy arms above.
+                let Some(texture) = (unsafe { dst_texture_handle.borrow_retained() }) else {
+                    error!(
+                        target: LOG_TARGET,
+                        "encode_leading_blits: mipgen texture handle is null",
+                    );
+                    continue;
+                };
+                if texture.mipmapLevelCount() <= 1 {
+                    continue;
+                }
+                if !pixel_format_supports_mipgen(texture.pixelFormat()) {
+                    mtld3d_shared::log_once_warn_by!(
+                        target: crate::LOG_TARGET,
+                        key: texture.pixelFormat().0 as u64,
+                        "encode_leading_blits: pixel format {:?} not supported by Metal generateMipmaps — skipped",
+                        texture.pixelFormat()
+                    );
+                    continue;
+                }
+                mtld3d_shared::crumb!("blit:mipgen", cmd.dst_handle);
+                blit.generateMipmapsForTexture(texture);
+            }
+            None => {
+                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                    "encode_leading_blits: unknown BlitCommandType {t} → skipped", t = cmd.cmd
+                );
+            }
+        }
+    }
+
+    if let Some(blit) = blit {
+        mtld3d_shared::crumb!("blit:endenc");
+        blit.endEncoding();
+    }
+    true
+}
+
+fn encode_pass(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    pass: &PassDescriptor,
+    pass_idx: usize,
+    ctx: &mut EncodeContext<'_>,
+) -> bool {
+    let to_usize =
+        |v: u64| usize::try_from(v).expect("PE wire u64 fits unix host usize (unix is 64-bit)");
+    let to_u32 =
+        |v: u64| u32::try_from(v).expect("PE wire u64 low-half fits u32 by packing contract");
+    mtld3d_shared::crumb!("pass:enter", pass_idx as u64, pass.command_count);
+    // Leading blits order uploads before their dependent upload pass,
+    // or a surface copy between the application's render passes. A
+    // notification-only list needs no MTLBlitCommandEncoder.
+    if pass.leading_blits_ptr != 0 && pass.leading_blits_count > 0 {
+        // SAFETY: PE supplied `leading_blits_ptr` as a `[BlitCommand; n]`
+        // valid for the call duration per the PassDescriptor wire contract.
+        let blits = unsafe {
+            core::slice::from_raw_parts(
+                pass.leading_blits_ptr as *const BlitCommand,
+                pass.leading_blits_count as usize,
+            )
+        };
+        if !encode_leading_blits(
+            cmd_buf,
+            blits,
+            pass.leading_blits_need_encoder(),
+            BlitSite::Pass(pass_idx),
+            ctx,
+        ) {
+            return false;
+        }
+    }
+
+    // Blit-only trailing pass: synthesised by the PE side when a
+    // StretchRect lands after the last draw of the frame. The leading
+    // blits have already run above; there's nothing else to do.
+    if pass.color_texture.is_null() && pass.depth_texture.is_null() && pass.command_count == 0 {
+        mtld3d_shared::crumb!("pass:blitonly", pass_idx as u64);
+        return true;
+    }
+
+    // Render-pass dimensions, captured from the bound attachment textures.
+    // Metal requires every `setScissorRect:` to satisfy `x+width ≤ passW` and
+    // `y+height ≤ passH` (the pass extent is the minimum over its attachments).
+    // A D3D9 app can leave a larger viewport/scissor set when it switches to a
+    // smaller render target, so we clamp the scissor to these below — exceeding
+    // them is a hard validation error with the debug layer and out-of-bounds
+    // (heap-corrupting) behaviour without it.
+    let mut rt_width = usize::MAX;
+    let mut rt_height = usize::MAX;
+    let rp_desc = MTLRenderPassDescriptor::new();
+    // Color attachment is optional — Rule G on the PE side strips the
+    // color attachment from clear-only passes whose color is wasted
+    // (cascade depth-clear sub-passes where the cascade color is just
+    // a placeholder). `color_texture == 0` here means "depth-only
+    // render pass", which Metal accepts as long as the depth (or
+    // stencil) attachment is set.
+    if !pass.color_texture.is_null() {
+        mtld3d_shared::crumb!("pass:colorret", pass.color_texture.raw());
+        let Some(texture) = pass.color_texture.into_retained() else {
+            error!(target: LOG_TARGET, "encode_pass: color texture retain failed (handle={:#x})", pass.color_texture);
+            return false;
+        };
+        rt_width = rt_width.min(texture.width());
+        rt_height = rt_height.min(texture.height());
+        // SAFETY: `colorAttachments()` returns a non-null descriptor array;
+        // subscript 0 is always valid.
+        let color0 = unsafe { rp_desc.colorAttachments().objectAtIndexedSubscript(0) };
+        color0.setTexture(Some(&texture));
+        // A 3D texture addresses its slices through `depthPlane`; `slice`
+        // stays 0 there and selects the array/cube face everywhere else.
+        // The PE side packs both into one subresource field because the
+        // texture's own type is what decides which one Metal wants.
+        if texture.textureType() == objc2_metal::MTLTextureType::Type3D {
+            color0.setDepthPlane(pass.color_slice() as usize);
+        } else {
+            color0.setSlice(pass.color_slice() as usize);
+        }
+        color0.setLevel(pass.color_level() as usize);
+        rt_width = rt_width.min((texture.width() >> pass.color_level()).max(1));
+        rt_height = rt_height.min((texture.height() >> pass.color_level()).max(1));
+        if !pass.color_resolve_texture.is_null() {
+            mtld3d_shared::crumb!("pass:colorres", pass.color_resolve_texture.raw());
+            let Some(resolve) = pass.color_resolve_texture.into_retained() else {
+                error!(target: LOG_TARGET, "encode_pass: colour resolve texture retain failed (handle={:#x})", pass.color_resolve_texture);
+                return false;
+            };
+            color0.setResolveTexture(Some(&resolve));
+            // The resolve target is the same D3D9 surface without
+            // multisampling, so it takes the attachment's own subresource.
+            color0.setResolveSlice(pass.color_slice() as usize);
+            color0.setResolveLevel(pass.color_level() as usize);
+        }
+        color0.setStoreAction(map_store_action(pass.color_store_action));
+        match pass.color_load_action {
+            LoadAction::Clear => {
+                color0.setLoadAction(MTLLoadAction::Clear);
+                color0.setClearColor(objc2_metal::MTLClearColor {
+                    red: f64::from(f32::from_bits(pass.clear_r)),
+                    green: f64::from(f32::from_bits(pass.clear_g)),
+                    blue: f64::from(f32::from_bits(pass.clear_b)),
+                    alpha: f64::from(f32::from_bits(pass.clear_a)),
+                });
+            }
+            LoadAction::Load => color0.setLoadAction(MTLLoadAction::Load),
+            LoadAction::DontCare => color0.setLoadAction(MTLLoadAction::DontCare),
+        }
+    } else if pass.depth_texture.is_null() && !pass.extra_color.iter().any(ExtraColorDesc::is_bound)
+    {
+        // No color AND no depth attachment with a non-zero command
+        // count would be an empty render encoder targeting nothing —
+        // shouldn't happen, but bail rather than ask Metal to build a
+        // pass descriptor with no attachments.
+        error!(
+            target: LOG_TARGET,
+            "encode_pass[{pass_idx}]: color=0 + depth=0 with cmds={} — skipping",
+            pass.command_count,
+        );
+        return true;
+    }
+
+    // Render targets 1..3. Same slice/level/load/store handling as attachment
+    // 0; the clear colour is the shared one. A stripped slot is simply unbound.
+    for (i, extra) in pass.extra_color.iter().enumerate() {
+        if !extra.is_bound() {
+            continue;
+        }
+        mtld3d_shared::crumb!("pass:extraret", extra.texture.raw());
+        let Some(texture) = extra.texture.into_retained() else {
+            error!(target: LOG_TARGET, "encode_pass: color texture {} retain failed (handle={:#x})", i + 1, extra.texture);
+            return false;
+        };
+        // SAFETY: `colorAttachments()` returns a non-null descriptor array;
+        // subscripts 1..=3 are within Metal's colour attachment count.
+        let color = unsafe { rp_desc.colorAttachments().objectAtIndexedSubscript(i + 1) };
+        color.setTexture(Some(&texture));
+        color.setSlice(extra.slice() as usize);
+        color.setLevel(extra.level() as usize);
+        rt_width = rt_width.min((texture.width() >> extra.level()).max(1));
+        rt_height = rt_height.min((texture.height() >> extra.level()).max(1));
+        if !extra.resolve_texture.is_null() {
+            let Some(resolve) = extra.resolve_texture.into_retained() else {
+                error!(target: LOG_TARGET, "encode_pass: colour {} resolve texture retain failed (handle={:#x})", i + 1, extra.resolve_texture);
+                return false;
+            };
+            color.setResolveTexture(Some(&resolve));
+            color.setResolveSlice(extra.slice() as usize);
+            color.setResolveLevel(extra.level() as usize);
+        }
+        color.setStoreAction(map_store_action(extra.store_action));
+        match extra.load_action {
+            LoadAction::Clear => {
+                color.setLoadAction(MTLLoadAction::Clear);
+                color.setClearColor(objc2_metal::MTLClearColor {
+                    red: f64::from(f32::from_bits(pass.clear_r)),
+                    green: f64::from(f32::from_bits(pass.clear_g)),
+                    blue: f64::from(f32::from_bits(pass.clear_b)),
+                    alpha: f64::from(f32::from_bits(pass.clear_a)),
+                });
+            }
+            LoadAction::Load => color.setLoadAction(MTLLoadAction::Load),
+            LoadAction::DontCare => color.setLoadAction(MTLLoadAction::DontCare),
+        }
+    }
+
+    if !pass.depth_texture.is_null() {
+        mtld3d_shared::crumb!("pass:depthret", pass.depth_texture.raw());
+        let depth_tex = pass.depth_texture.into_retained();
+        if depth_tex.is_none() {
+            error!(
+                target: LOG_TARGET,
+                "encode_pass: depth texture retain failed (handle={:#x})",
+                pass.depth_texture,
+            );
+        }
+        if let Some(depth_tex) = depth_tex {
+            let level = pass.depth_level();
+            rt_width = rt_width.min((depth_tex.width() >> level).max(1));
+            rt_height = rt_height.min((depth_tex.height() >> level).max(1));
+            let depth_attach = rp_desc.depthAttachment();
+            depth_attach.setTexture(Some(&depth_tex));
+            depth_attach.setLevel(level as usize);
+            depth_attach.setStoreAction(map_store_action(pass.depth_store_action));
+            match pass.depth_load_action {
+                LoadAction::Clear => {
+                    depth_attach.setLoadAction(MTLLoadAction::Clear);
+                    depth_attach.setClearDepth(f64::from(f32::from_bits(pass.depth_clear_value)));
+                }
+                LoadAction::Load => depth_attach.setLoadAction(MTLLoadAction::Load),
+                LoadAction::DontCare => depth_attach.setLoadAction(MTLLoadAction::DontCare),
+            }
+
+            let fmt = depth_tex.pixelFormat();
+            if fmt == MTLPixelFormat::Depth32Float_Stencil8 {
+                let stencil_attach = rp_desc.stencilAttachment();
+                stencil_attach.setTexture(Some(&depth_tex));
+                stencil_attach.setLevel(level as usize);
+                // The two planes of a `Depth32Float_Stencil8` texture take
+                // independent load and store actions: Metal validates each
+                // attachment descriptor on its own, so discarding one plane
+                // while the other is loaded or kept is a legal pass.
+                stencil_attach.setStoreAction(map_store_action(pass.stencil_store_action));
+                match pass.stencil_load_action {
+                    LoadAction::Clear => {
+                        stencil_attach.setLoadAction(MTLLoadAction::Clear);
+                        stencil_attach.setClearStencil(pass.stencil_clear_value);
+                    }
+                    LoadAction::Load => stencil_attach.setLoadAction(MTLLoadAction::Load),
+                    LoadAction::DontCare => {
+                        stencil_attach.setLoadAction(MTLLoadAction::DontCare);
+                    }
+                }
+            }
+        }
+    }
+
+    if !pass.visibility_result_buffer.is_null() {
+        mtld3d_shared::crumb!("pass:visret", pass.visibility_result_buffer.raw());
+        let vis_buf = pass.visibility_result_buffer.into_retained();
+        match vis_buf {
+            Some(buf) => rp_desc.setVisibilityResultBuffer(Some(&buf)),
+            None => error!(
+                target: LOG_TARGET,
+                "encode_pass: visibility result buffer retain failed (handle={:#x})",
+                pass.visibility_result_buffer,
+            ),
+        }
+    }
+
+    diagnostics::render_pass(cmd_buf, &rp_desc, pass_idx, pass.command_count);
+    mtld3d_shared::crumb!("pass:rendenc", pass_idx as u64);
+    let Some(encoder) = cmd_buf.renderCommandEncoderWithDescriptor(&rp_desc) else {
+        error!(
+            target: LOG_TARGET,
+            "encode_pass: renderCommandEncoderWithDescriptor returned nil (color={:#x}, depth={:#x}, load={:?}, cmds={})",
+            pass.color_texture,
+            pass.depth_texture,
+            pass.color_load_action,
+            pass.command_count,
+        );
+        return false;
+    };
+    {
+        let label = objc2_foundation::NSString::from_str(&format!("mtld3d-pass-{pass_idx}"));
+        encoder.setLabel(Some(&label));
+    }
+
+    if pass.commands_ptr != 0 && pass.command_count > 0 {
+        // SAFETY: PE supplied `commands_ptr` as a `[Command; command_count]`
+        // valid for the call duration per the PassDescriptor wire contract.
+        let commands = unsafe {
+            core::slice::from_raw_parts(
+                pass.commands_ptr as *const Command,
+                pass.command_count as usize,
+            )
+        };
+
+        // Frame-dump debug groups open around a draw. A push whose draw the
+        // PE side then dropped never gets its pop, so the depth is tracked
+        // here and any group still open is closed before `endEncoding`.
+        let mut debug_group_depth: u32 = 0;
+        for (i, cmd) in commands.iter().enumerate() {
+            mtld3d_shared::crumb!("pass:cmd", u64::from(cmd.cmd), i as u64);
+            match CommandType::from_repr(cmd.cmd) {
+                Some(CommandType::PushDebugGroup) => {
+                    let label =
+                        objc2_foundation::NSString::from_str(&format!("draw {}", cmd.param_a));
+                    encoder.pushDebugGroup(&label);
+                    debug_group_depth += 1;
+                }
+                Some(CommandType::PopDebugGroup) => {
+                    if debug_group_depth > 0 {
+                        encoder.popDebugGroup();
+                        debug_group_depth -= 1;
+                    }
+                }
+                Some(CommandType::SetRenderPipelineState) => {
+                    // SAFETY: cmd.param_b is a previously-retained MTLRenderPipelineState address.
+                    let handle =
+                        unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(cmd.param_b) };
+                    // SAFETY: the canonical retain outlives this borrow. A
+                    // pipeline state is a PE-side `pipeline_cache` entry, and
+                    // that cache never evicts: the only destroy is the
+                    // encoder's shutdown, which drains the submit thread and
+                    // waits for GPU idle before it issues one, so no replay
+                    // naming a pipeline is encoding when it runs.
+                    let Some(pipeline) = (unsafe { handle.borrow_retained() }) else {
+                        continue;
+                    };
+                    encoder.setRenderPipelineState(pipeline);
+                }
+                Some(CommandType::SetViewport) => {
+                    let height =
+                        u32::try_from(cmd.param_b & 0xFFFF_FFFF).expect("masked to 32 bits");
+                    let min_z_bits = u32::try_from(cmd.param_b >> 32).expect("u64 >> 32 fits u32");
+                    let min_z = f32::from_bits(min_z_bits);
+                    let vp_x = u32::try_from(cmd.param_c & 0xFFFF_FFFF).expect("masked to 32 bits");
+                    let max_z_bits = u32::try_from(cmd.param_c >> 32).expect("u64 >> 32 fits u32");
+                    let max_z = f32::from_bits(max_z_bits);
+                    let vp_y = u32::try_from(cmd.param_d).expect("viewport y packed as u32");
+                    let viewport = MTLViewport {
+                        originX: f64::from(vp_x),
+                        originY: f64::from(vp_y),
+                        width: f64::from(cmd.param_a),
+                        height: f64::from(height),
+                        znear: f64::from(min_z),
+                        zfar: f64::from(max_z),
+                    };
+                    encoder.setViewport(viewport);
+                }
+                Some(CommandType::SetVertexBytes) => {
+                    let ptr = core::ptr::NonNull::new(cmd.param_b as *mut c_void);
+                    if let Some(ptr) = ptr {
+                        let length = to_usize(cmd.param_c);
+                        if length > SET_BYTES_MAX {
+                            // `setVertexBytes` caps at 4 KiB; a UP draw with a
+                            // larger inline vertex payload rides the upload
+                            // ring instead.
+                            // SAFETY: `ptr` is non-null (checked) and the PE
+                            // scratch arena holds `length` readable bytes for
+                            // the duration of the call.
+                            let bytes = unsafe {
+                                core::slice::from_raw_parts(ptr.as_ptr().cast::<u8>(), length)
+                            };
+                            let Some(slice) =
+                                ctx.ring
+                                    .write(ctx.device, &ctx.stamp, bytes, RING_VERTEX_ALIGN)
+                            else {
+                                mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                                    "SetVertexBytes: upload ring chunk allocation failed ({length} B); bind skipped"
+                                );
+                                continue;
+                            };
+                            // SAFETY: objc2 typed binding; the encoder retains
+                            // the ring chunk into the command buffer's resource
+                            // set, and the payload lies at `offset`.
+                            unsafe {
+                                encoder.setVertexBuffer_offset_atIndex(
+                                    Some(slice.buffer),
+                                    slice.offset,
+                                    cmd.param_a as usize,
+                                );
+                            }
+                            continue;
+                        }
+                        // SAFETY: objc2 typed binding; `ptr` is non-null per
+                        // the `Some` branch and `length` matches the PE-side
+                        // buffer; encoder copies bytes synchronously.
+                        unsafe {
+                            encoder.setVertexBytes_length_atIndex(
+                                ptr,
+                                length,
+                                cmd.param_a as usize,
+                            );
+                        }
+                    }
+                }
+                Some(CommandType::DrawPrimitives) => {
+                    let prim_type = mtl_primitive_type_or_fallback(cmd.param_a, "DrawPrimitives");
+                    // SAFETY: objc2 typed binding; pipeline and resources
+                    // already bound by prior commands in the same pass.
+                    unsafe {
+                        encoder.drawPrimitives_vertexStart_vertexCount(
+                            prim_type,
+                            to_usize(cmd.param_b),
+                            to_usize(cmd.param_c),
+                        );
+                    }
+                }
+                Some(CommandType::SetDepthStencilState) => {
+                    // SAFETY: cmd.param_b is a previously-retained MTLDepthStencilState address.
+                    let handle =
+                        unsafe { MetalHandle::<MTLDepthStencilStateKind>::new(cmd.param_b) };
+                    // SAFETY: as `SetRenderPipelineState` above: the
+                    // `depth_stencil_cache` entry behind this handle is
+                    // destroyed only by the encoder's shutdown, behind the
+                    // submit-thread drain and the GPU-idle wait.
+                    let Some(state) = (unsafe { handle.borrow_retained() }) else {
+                        continue;
+                    };
+                    encoder.setDepthStencilState(Some(state));
+                }
+                Some(CommandType::SetCullMode) => {
+                    let mode = match CullMode::from_repr(cmd.param_a) {
+                        Some(CullMode::None) => MTLCullMode::None,
+                        Some(CullMode::Front) => MTLCullMode::Front,
+                        Some(CullMode::Back) => MTLCullMode::Back,
+                        None => {
+                            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                                "SetCullMode: raw={} unmapped → MTLCullMode::None",
+                                cmd.param_a
+                            );
+                            MTLCullMode::None
+                        }
+                    };
+                    encoder.setCullMode(mode);
+                }
+                Some(CommandType::SetTriangleFillMode) => {
+                    let mode = match TriangleFillMode::from_repr(cmd.param_a) {
+                        Some(TriangleFillMode::Fill) => MTLTriangleFillMode::Fill,
+                        Some(TriangleFillMode::Lines) => MTLTriangleFillMode::Lines,
+                        None => {
+                            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                                "SetTriangleFillMode: raw={} unmapped → MTLTriangleFillMode::Fill",
+                                cmd.param_a);
+                            MTLTriangleFillMode::Fill
+                        }
+                    };
+                    encoder.setTriangleFillMode(mode);
+                }
+                Some(CommandType::SetDepthBias) => {
+                    // Passed straight through; the PE side sends the
+                    // slope term here and applies the constant one in
+                    // the vertex shader. D3D9 has no clamp analog, so
+                    // hardcode 0.0.
+                    let depth_bias = f32::from_bits(cmd.param_a);
+                    let slope_scale = f32::from_bits(to_u32(cmd.param_b));
+                    encoder.setDepthBias_slopeScale_clamp(depth_bias, slope_scale, 0.0);
+                }
+                Some(CommandType::SetFragmentTexture) => {
+                    // SAFETY: cmd.param_b is a previously-retained MTLTexture address.
+                    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(cmd.param_b) };
+                    // SAFETY: the canonical retain outlives this borrow. A
+                    // texture the PE side gives up is parked on
+                    // `pending_resource_retention` stamped with the submit seq
+                    // of the frame whose commands still name it, exactly as a
+                    // buffer is, and the drain pops it only once `coherent_seq`
+                    // has reached that seq. The implicit surfaces skip that
+                    // queue, and each is destroyed behind a
+                    // `flush_current_frame_blocking` plus the encoder `Reset`
+                    // that drains the submit thread and waits for GPU idle.
+                    // The one destroy without that wait takes the back
+                    // buffer's sRGB twin at device destroy, and that handle
+                    // serves only as a pass attachment, which is converted
+                    // through the retained path.
+                    let Some(tex) = (unsafe { handle.borrow_retained() }) else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // texture into the command buffer's resource set.
+                    unsafe {
+                        encoder.setFragmentTexture_atIndex(Some(tex), cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetVertexTexture) => {
+                    // SAFETY: cmd.param_b is a previously-retained MTLTexture address.
+                    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(cmd.param_b) };
+                    // SAFETY: as `SetFragmentTexture` above, the seq-gated
+                    // retention drain cannot free the texture before the
+                    // command buffer this replay encodes into has retired.
+                    let Some(tex) = (unsafe { handle.borrow_retained() }) else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // texture into the command buffer's resource set.
+                    unsafe {
+                        encoder.setVertexTexture_atIndex(Some(tex), cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetVertexSamplerState) => {
+                    // SAFETY: the canonical retain outlives this borrow. A
+                    // sampler state lives in the PE side's `sampler_cache`,
+                    // which never evicts: the only destroy is the encoder's
+                    // shutdown, which drains the submit thread and waits for
+                    // GPU idle before it issues one.
+                    let Some(sampler) = (unsafe { sampler_or_default(cmd_buf, cmd.param_b) })
+                    else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // sampler into the command buffer's resource set.
+                    unsafe {
+                        encoder.setVertexSamplerState_atIndex(Some(sampler), cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetFragmentSamplerState) => {
+                    // SAFETY: as `SetVertexSamplerState` above, the
+                    // `sampler_cache` entry behind a non-zero handle outlives
+                    // every replay that names it.
+                    let Some(sampler) = (unsafe { sampler_or_default(cmd_buf, cmd.param_b) })
+                    else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // sampler into the command buffer's resource set.
+                    unsafe {
+                        encoder
+                            .setFragmentSamplerState_atIndex(Some(sampler), cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetFragmentNullTexture) => {
+                    let Some(kind) = NullTextureKind::from_repr(to_u32(cmd.param_b)) else {
+                        mtld3d_shared::log_once_warn!(
+                            target: LOG_TARGET,
+                            "null texture: unknown kind {}; leaving the slot unbound",
+                            cmd.param_b,
+                        );
+                        continue;
+                    };
+                    let device = cmd_buf.device();
+                    let Some(null) = null_texture::ensure(&device) else {
+                        continue;
+                    };
+                    // SAFETY: the handle came from `null_texture::create`'s
+                    // `Retained::into_raw`, alive for the process lifetime.
+                    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(null.texture(kind)) };
+                    // SAFETY: that retain is never taken back, so it outlives
+                    // the borrow: the set is cached in a `OnceLock` and leaks
+                    // for the process.
+                    let Some(tex) = (unsafe { handle.borrow_retained() }) else {
+                        continue;
+                    };
+                    let Some(sampler) = null_texture::default_sampler(&device) else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; the encoder retains both
+                    // into the command buffer's resource set.
+                    unsafe {
+                        encoder.setFragmentTexture_atIndex(Some(tex), cmd.param_a as usize);
+                    }
+                    // SAFETY: objc2 typed binding; as the texture above.
+                    unsafe {
+                        encoder
+                            .setFragmentSamplerState_atIndex(Some(sampler), cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetVertexNullTexture) => {
+                    let Some(kind) = NullTextureKind::from_repr(to_u32(cmd.param_b)) else {
+                        mtld3d_shared::log_once_warn!(
+                            target: LOG_TARGET,
+                            "null texture: unknown kind {}; leaving the vertex slot unbound",
+                            cmd.param_b,
+                        );
+                        continue;
+                    };
+                    let device = cmd_buf.device();
+                    let Some(null) = null_texture::ensure(&device) else {
+                        continue;
+                    };
+                    // SAFETY: the handle came from `null_texture::create`'s
+                    // `Retained::into_raw`, alive for the process lifetime.
+                    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(null.texture(kind)) };
+                    // SAFETY: as the fragment arm above, the null set leaks for
+                    // the process, so its retain outlives the borrow.
+                    let Some(tex) = (unsafe { handle.borrow_retained() }) else {
+                        continue;
+                    };
+                    let Some(sampler) = null_texture::default_sampler(&device) else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; the encoder retains both
+                    // into the command buffer's resource set.
+                    unsafe {
+                        encoder.setVertexTexture_atIndex(Some(tex), cmd.param_a as usize);
+                    }
+                    // SAFETY: objc2 typed binding; as the texture above.
+                    unsafe {
+                        encoder.setVertexSamplerState_atIndex(Some(sampler), cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetVertexBytesAt) => {
+                    let ptr = cmd.param_b as *const core::ffi::c_void;
+                    if ptr.is_null() {
+                        continue;
+                    }
+                    let length = to_usize(cmd.param_c);
+                    // SAFETY: non-null branch above guarantees `ptr` is non-null.
+                    let nn = unsafe { core::ptr::NonNull::new_unchecked(ptr.cast_mut()) };
+                    // SAFETY: objc2 typed binding; encoder copies bytes synchronously.
+                    unsafe {
+                        encoder.setVertexBytes_length_atIndex(nn, length, cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetFragmentBytesAt) => {
+                    let ptr = cmd.param_b as *const core::ffi::c_void;
+                    if ptr.is_null() {
+                        continue;
+                    }
+                    let length = to_usize(cmd.param_c);
+                    // SAFETY: non-null branch above guarantees `ptr` is non-null.
+                    let nn = unsafe { core::ptr::NonNull::new_unchecked(ptr.cast_mut()) };
+                    // SAFETY: objc2 typed binding; encoder copies bytes synchronously.
+                    unsafe {
+                        encoder.setFragmentBytes_length_atIndex(nn, length, cmd.param_a as usize);
+                    }
+                }
+                Some(CommandType::SetScissorRect) => {
+                    let req_width = (cmd.param_c >> 32) as usize;
+                    let req_height = (cmd.param_c & 0xFFFF_FFFF) as usize;
+                    // Clamp to the render-pass extent: a stale viewport/scissor
+                    // from a larger render target would otherwise exceed the
+                    // bound attachment (Metal validation error / OOB without the
+                    // debug layer). Origin past the edge collapses the rect to
+                    // empty rather than wrapping negative.
+                    let x = (cmd.param_a as usize).min(rt_width);
+                    let y = to_usize(cmd.param_b).min(rt_height);
+                    let rect = MTLScissorRect {
+                        x,
+                        y,
+                        width: req_width.min(rt_width - x),
+                        height: req_height.min(rt_height - y),
+                    };
+                    encoder.setScissorRect(rect);
+                }
+                Some(CommandType::SetVertexBuffer) => {
+                    // SAFETY: cmd.param_b is a previously-retained MTLBuffer address.
+                    let handle = unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) };
+                    // SAFETY: the canonical retain outlives this borrow. A
+                    // buffer wrapper the PE side gives up is parked on
+                    // `pending_resource_retention` stamped with the submit seq
+                    // of the frame whose commands still name it, and
+                    // `drain_retired_resource_retention` pops an entry only
+                    // once `coherent_seq` has reached that seq. This frame's
+                    // seq reaches `coherent_seq` from the completion handler
+                    // registered below, which Metal cannot run before the
+                    // command buffer this replay encodes into is committed.
+                    let Some(buffer) = (unsafe { handle.borrow_retained() }) else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // buffer into the command buffer's resource set.
+                    unsafe {
+                        encoder.setVertexBuffer_offset_atIndex(
+                            Some(buffer),
+                            to_usize(cmd.param_c),
+                            cmd.param_a as usize,
+                        );
+                    }
+                }
+                Some(CommandType::SetFragmentBuffer) => {
+                    // SAFETY: cmd.param_b is a previously-retained MTLBuffer address.
+                    let handle = unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) };
+                    // SAFETY: as `SetVertexBuffer` above, the seq-gated
+                    // retention drain cannot free the wrapper before the
+                    // command buffer this replay encodes into has retired.
+                    let Some(buffer) = (unsafe { handle.borrow_retained() }) else {
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // buffer into the command buffer's resource set.
+                    unsafe {
+                        encoder.setFragmentBuffer_offset_atIndex(
+                            Some(buffer),
+                            to_usize(cmd.param_c),
+                            cmd.param_a as usize,
+                        );
+                    }
+                }
+                Some(CommandType::DrawIndexedPrimitives) => {
+                    let prim_type =
+                        mtl_primitive_type_or_fallback(cmd.param_a, "DrawIndexedPrimitives");
+                    // SAFETY: cmd.param_b is a previously-retained MTLBuffer address.
+                    let handle = unsafe { MetalHandle::<MTLBufferKind>::new(cmd.param_b) };
+                    // SAFETY: the canonical retain outlives this borrow, by the
+                    // argument `SetVertexBuffer` states. That the borrow spans
+                    // the draw rather than a bind changes nothing: the draw goes
+                    // into the command buffer this replay encodes, and nothing
+                    // advances `coherent_seq` to this frame's seq before that
+                    // buffer has been committed and has completed.
+                    let Some(index_buffer) = (unsafe { handle.borrow_retained() }) else {
+                        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                            "DrawIndexedPrimitives: null index buffer handle, draw skipped"
+                        );
+                        continue;
+                    };
+                    let (index_count, index_type_raw, instance_count) =
+                        Command::unpack_indexed_draw_counts(cmd.param_d);
+                    let index_type = match IndexType::from_repr(index_type_raw) {
+                        Some(IndexType::UInt16) => MTLIndexType::UInt16,
+                        Some(IndexType::UInt32) => MTLIndexType::UInt32,
+                        None => {
+                            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                                "DrawIndexedPrimitives: MTLIndexType raw={index_type_raw} unmapped → UInt16"
+                            );
+                            MTLIndexType::UInt16
+                        }
+                    };
+                    // param_c packs (index_buffer_offset << 32) | (base_vertex as u32).
+                    // Low-half extraction must mask explicitly — `to_u32` would
+                    // panic on any non-zero offset. The sign of base_vertex is
+                    // recovered via the u32→i32 bitcast then widened to isize.
+                    let offset = (cmd.param_c >> 32) as usize;
+                    let base_vertex_u32 =
+                        u32::try_from(cmd.param_c & 0xFFFF_FFFF).expect("masked to 32 bits");
+                    let base_vertex = isize::try_from(base_vertex_u32.cast_signed())
+                        .expect("i32 fits isize on 64-bit unix");
+                    // SAFETY: objc2 typed binding; the encoder retains the
+                    // index buffer into the command buffer's resource set; the
+                    // counts and offset come from the PE-side packed
+                    // `param_c`/`param_d` per the wire contract.
+                    unsafe {
+                        encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
+                            prim_type,
+                            to_usize(u64::from(index_count)),
+                            index_type,
+                            index_buffer,
+                            offset,
+                            to_usize(u64::from(instance_count.max(1))),
+                            base_vertex,
+                            0,
+                        );
+                    }
+                }
+                Some(CommandType::DrawIndexedPrimitivesUp) => {
+                    let prim_type =
+                        mtl_primitive_type_or_fallback(cmd.param_a, "DrawIndexedPrimitivesUp");
+                    let Some(ptr) = core::ptr::NonNull::new(cmd.param_b as *mut c_void) else {
+                        continue;
+                    };
+                    let byte_len = to_usize(cmd.param_c);
+                    let (index_count, index_type_raw, instance_count) =
+                        Command::unpack_indexed_draw_counts(cmd.param_d);
+                    let index_type = match IndexType::from_repr(index_type_raw) {
+                        Some(IndexType::UInt16) => MTLIndexType::UInt16,
+                        Some(IndexType::UInt32) => MTLIndexType::UInt32,
+                        None => {
+                            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                                "DrawIndexedPrimitivesUp: MTLIndexType raw={index_type_raw} unmapped → UInt16"
+                            );
+                            MTLIndexType::UInt16
+                        }
+                    };
+                    // Metal has no inline-index draw, so copy the scratch index
+                    // bytes into the upload ring.
+                    // SAFETY: `ptr` is non-null (checked) and the PE scratch arena
+                    // holds `byte_len` readable index bytes for the duration of
+                    // the call.
+                    let bytes =
+                        unsafe { core::slice::from_raw_parts(ptr.as_ptr().cast::<u8>(), byte_len) };
+                    let Some(slice) =
+                        ctx.ring
+                            .write(ctx.device, &ctx.stamp, bytes, RING_INDEX_ALIGN)
+                    else {
+                        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                            "DrawIndexedPrimitivesUp: upload ring chunk allocation failed ({byte_len} B); draw skipped"
+                        );
+                        continue;
+                    };
+                    // SAFETY: objc2 typed binding; the encoder retains the ring
+                    // chunk into the command buffer's resource set; inline UP
+                    // indices are absolute (base vertex 0).
+                    unsafe {
+                        encoder.drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
+                            prim_type,
+                            to_usize(u64::from(index_count)),
+                            index_type,
+                            slice.buffer,
+                            slice.offset,
+                            to_usize(u64::from(instance_count.max(1))),
+                            0,
+                            0,
+                        );
+                    }
+                }
+                Some(CommandType::SetVisibilityResultMode) => {
+                    let mode_raw = cmd.param_a;
+                    let mode = match VisibilityResultMode::from_repr(mode_raw) {
+                        Some(VisibilityResultMode::Disabled) => MTLVisibilityResultMode::Disabled,
+                        Some(VisibilityResultMode::Boolean) => MTLVisibilityResultMode::Boolean,
+                        Some(VisibilityResultMode::Counting) => MTLVisibilityResultMode::Counting,
+                        None => {
+                            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+                                "SetVisibilityResultMode: raw={mode_raw} unmapped → Disabled"
+                            );
+                            MTLVisibilityResultMode::Disabled
+                        }
+                    };
+                    encoder.setVisibilityResultMode_offset(mode, to_usize(cmd.param_b));
+                }
+                Some(CommandType::SetBlendColor) => {
+                    let red = f32::from_bits(cmd.param_a);
+                    let green = f32::from_bits(to_u32(cmd.param_b));
+                    let blue = f32::from_bits(to_u32(cmd.param_c));
+                    let alpha = f32::from_bits(to_u32(cmd.param_d));
+                    encoder.setBlendColorRed_green_blue_alpha(red, green, blue, alpha);
+                }
+                Some(CommandType::SetStencilReference) => {
+                    encoder.setStencilReferenceValue(cmd.param_a);
+                }
+                None => {
+                    mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "unknown command type {t}", t = cmd.cmd);
+                }
+            }
+        }
+        for _ in 0..debug_group_depth {
+            encoder.popDebugGroup();
+        }
+    }
+
+    mtld3d_shared::crumb!("pass:endenc", pass_idx as u64);
+    encoder.endEncoding();
+    true
+}
+
+/// Translate a wire `StoreAction` to the corresponding `MTLStoreAction`.
+const fn map_store_action(s: StoreAction) -> MTLStoreAction {
+    match s {
+        StoreAction::Store => MTLStoreAction::Store,
+        StoreAction::DontCare => MTLStoreAction::DontCare,
+        StoreAction::MultisampleResolve => MTLStoreAction::MultisampleResolve,
+        StoreAction::StoreAndMultisampleResolve => MTLStoreAction::StoreAndMultisampleResolve,
+    }
+}
+
+/// Decode a wire `PrimitiveType` u32 into `MTLPrimitiveType`.
+///
+/// Fallback is `Triangle` so an unmapped code doesn't drop the draw
+/// silently — the warn fires once per call site, and the pipeline still
+/// renders something visible that makes the miswiring obvious.
+fn mtl_primitive_type_or_fallback(raw: u32, site: &str) -> MTLPrimitiveType {
+    match PrimitiveType::from_repr(raw) {
+        Some(PrimitiveType::Point) => MTLPrimitiveType::Point,
+        Some(PrimitiveType::Line) => MTLPrimitiveType::Line,
+        Some(PrimitiveType::LineStrip) => MTLPrimitiveType::LineStrip,
+        Some(PrimitiveType::Triangle) => MTLPrimitiveType::Triangle,
+        Some(PrimitiveType::TriangleStrip) => MTLPrimitiveType::TriangleStrip,
+        None => {
+            mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET, "{site}: MTLPrimitiveType raw={raw} unmapped → Triangle");
+            MTLPrimitiveType::Triangle
+        }
+    }
+}
+
+/// Arguments for `blit_texture_to_buffer`.
+///
+/// Grouped so the function's argument list stays under the clippy
+/// threshold.
+pub struct BlitArgs<'a> {
+    pub planes: mtld3d_shared::mtl::ReadbackPlanes,
+    pub stencil_bytes_per_row: u32,
+    pub stencil_offset: u64,
+    /// The device reading back.
+    ///
+    /// Its queue orders the resolve, and its scratch target is what the
+    /// resolve renders into.
+    pub record: &'a Arc<DeviceRecord>,
+    pub device_handle: MetalHandle<MTLDeviceKind>,
+    pub tex_handle: MetalHandle<MTLTextureKind>,
+    pub dst_ptr: u64,
+    pub dst_len: u64,
+    pub mip_level: u32,
+    /// Source array slice: a cube face index, zero for every other texture.
+    pub slice: u32,
+    pub origin_x: u32,
+    pub origin_y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_per_row: u32,
+    /// Full logical width the sub-rect coordinates are measured in.
+    ///
+    /// See `BlitTextureToBufferParams::source_width`. Differs from the source
+    /// texture's own width only under a non-default `render.scale`.
+    pub source_width: u32,
+    /// Full logical height the sub-rect coordinates are measured in.
+    pub source_height: u32,
+    /// Block height of the source format.
+    ///
+    /// See `BlitTextureToBufferParams::block_height`. `bytes_per_row` is the
+    /// stride of one block row, so the slice size counts block rows.
+    pub block_height: u32,
+}
+
+/// Resolve a render-resolution source level up to the size the caller's coordinates assume.
+///
+/// `source_width` / `source_height` are the logical extent of level 0; the
+/// level read is `level` of `slice`, and its logical extent follows Metal's
+/// own mip rule. Returns `Some(resolved)` when a resolve happened, a one-level
+/// texture holding that level at its logical size, and `None` to read the
+/// source as-is, which is both the default-scale path and the fallback if the
+/// resolve could not be encoded. At the default scale the source already
+/// holds what the caller asked for; after a declined resolve it does not, and
+/// the copy guard below refuses the read rather than letting it run off the
+/// end of the texture.
+fn resolve_readback_source(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    upscale: &UpscaleCache,
+    device: &ProtocolObject<dyn MTLDevice>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    (level, slice): (u32, u32),
+    source_width: u32,
+    source_height: u32,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+    let level_extent = |full: u32| (full >> level).max(1);
+    let (out_w, out_h) = (level_extent(source_width), level_extent(source_height));
+    let mip_extent = |full: usize| (full >> level).max(1);
+    let (tex_w, tex_h) = (mip_extent(texture.width()), mip_extent(texture.height()));
+    if tex_w == out_w as usize && tex_h == out_h as usize {
+        return None;
+    }
+    let resolved = encode_readback_resolve(
+        cmd_buf,
+        upscale,
+        device,
+        texture,
+        (level, slice),
+        out_w,
+        out_h,
+    );
+    if resolved.is_none() {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback: could not resolve a {tex_w}x{tex_h} level up to {out_w}x{out_h}; the \
+             caller gets render-resolution pixels"
+        );
+    }
+    resolved
+}
+
+/// Resample level `level` of slice `slice` of `src` to `out_w` x `out_h` for a CPU readback.
+///
+/// `GetRenderTargetData`, a back-buffer `LockRect` and `GetDC` all owe the game
+/// pixels at the resolution D3D9 reports, but under `render.scale` the back
+/// buffer, and every render target created at its size, is rasterized
+/// smaller. A fullscreen copy pass resamples the level into a scratch texture
+/// of its logical size and the source's own format, encoded onto `cmd_buf`
+/// ahead of the caller's blit encoder so the resolve and the readback are one
+/// command buffer and one wait.
+///
+/// A copy pass rather than the `MTLFXSpatialScaler` the display path runs: the
+/// scaler writes an opaque alpha and takes a handful of 8- and 16-bit formats,
+/// while a game reading a target back is owed the alpha it drew in whatever
+/// format it chose. The pass carries all four channels of any colour format,
+/// and reproduces the source exactly wherever the source is flat, which is
+/// where a readback is compared against a known colour. The single-precision
+/// float formats snap to the nearest texel instead of filtering, so they read
+/// the same on a GPU that cannot filter them.
+///
+/// Returns `None` for a format no render pass writes (compressed, depth) and
+/// when the scratch or the pipeline is unavailable, leaving the caller to read
+/// `src` directly.
+fn encode_readback_resolve(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    upscale: &UpscaleCache,
+    device: &ProtocolObject<dyn MTLDevice>,
+    src: &ProtocolObject<dyn MTLTexture>,
+    (level, slice): (u32, u32),
+    out_w: u32,
+    out_h: u32,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let mtl_format = src.pixelFormat();
+    let Some(format) = super::texture::wire_pixel_format(mtl_format) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback resolve: {mtl_format:?} is not a format mtld3d creates; readback reads \
+             the render-resolution level instead"
+        );
+        return None;
+    };
+    if !super::texture::is_resolvable_color_format(format) {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback resolve: {format:?} is not a colour render format; readback reads the \
+             render-resolution level instead"
+        );
+        return None;
+    }
+    // The scratch is this queue's alone. The resolve and the caller's blit
+    // are ordered on this queue only, so a shared scratch would let another
+    // device's resolve land between them.
+    let Some(target) = super::upscale::scratch_target(device, upscale, out_w, out_h, format) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback resolve target {out_w}x{out_h} {format:?} could not be created; readback \
+             reads the render-resolution level instead and will be the wrong size"
+        );
+        return None;
+    };
+    let nearest = matches!(
+        format,
+        PixelFormat::R32Float | PixelFormat::Rg32Float | PixelFormat::Rgba32Float
+    );
+    let Some(pipeline) = super::present::ensure_readback_pipeline(device, format, nearest) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback resolve: no {format:?} copy pipeline; readback reads the render-resolution \
+             level instead and will be the wrong size"
+        );
+        return None;
+    };
+    // The copy pass samples level 0 of slice 0 of whatever it is handed, so any
+    // other level or slice goes in through a one-level, one-slice view.
+    let view;
+    let source = if level == 0 && slice == 0 {
+        src
+    } else {
+        let create = || {
+            // SAFETY: objc2 typed binding; `src` is retained for the call, the
+            // format is its own, and the ranges name one level and one slice it
+            // holds (the caller's `level` / `slice` were validated on the PE side
+            // against the resource they came from).
+            unsafe {
+                src.newTextureViewWithPixelFormat_textureType_levels_slices(
+                    mtl_format,
+                    MTLTextureType::Type2D,
+                    NSRange::new(level as usize, 1),
+                    NSRange::new(slice as usize, 1),
+                )
+            }
+        };
+        let Some(level_view) = create().or_else(|| {
+            super::texture::retry_refused_create(
+                &src.device(),
+                "mtld3d-readback-resolve",
+                "level view",
+                create,
+            )
+        }) else {
+            mtld3d_shared::log_once_warn!(
+                target: LOG_TARGET,
+                "readback resolve: no view of level {level} slice {slice}; readback reads the \
+                 render-resolution level instead and will be the wrong size"
+            );
+            return None;
+        };
+        view = level_view;
+        &*view
+    };
+    encode_fullscreen_pass(
+        cmd_buf,
+        source,
+        &target,
+        &FullscreenPass {
+            pipeline_handle: pipeline,
+            uniforms: None,
+            load_action: MTLLoadAction::DontCare,
+            label: "mtld3d-readback-resolve",
+            // A readback reads the game's own pixels. The gamma ramp is the
+            // display's transfer function, so it belongs to the presented
+            // frame alone and never to what `GetRenderTargetData` hands back.
+            gamma_layer: 0,
+        },
+    )
+    .then_some(target)
+    .or_else(|| {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "readback resolve: the copy pass failed to encode; readback reads the \
+             render-resolution level instead and will be the wrong size"
+        );
+        None
+    })
+}
+
+/// Synchronous texture→buffer readback into PE-addressable memory.
+///
+/// Wraps the caller's page-aligned `dst_ptr / dst_len` via
+/// `newBufferWithBytesNoCopy:length:options:deallocator:` (Managed), blits
+/// the source texture sub-rect at `mip_level` into it at `bytes_per_row`
+/// stride, commits, and waits for completion. Only a true return guarantees
+/// the caller's memory holds the requested pixels. Metal orders this command
+/// buffer after every previously committed buffer on the same `queue_handle`.
+/// A failed readback may have written part of the destination.
+pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
+    use core::{ffi::c_void, ptr::NonNull};
+
+    let to_usize =
+        |v: u64| usize::try_from(v).expect("PE wire u64 fits unix host usize (unix is 64-bit)");
+    let BlitArgs {
+        planes,
+        stencil_bytes_per_row,
+        stencil_offset,
+        record,
+        device_handle,
+        tex_handle,
+        dst_ptr,
+        dst_len,
+        mip_level,
+        slice,
+        origin_x,
+        origin_y,
+        width,
+        height,
+        bytes_per_row,
+        source_width,
+        source_height,
+        block_height,
+    } = *args;
+
+    if dst_ptr == 0 || dst_len == 0 || width == 0 || height == 0 {
+        error!(target: LOG_TARGET, "blit_texture_to_buffer: invalid args");
+        return false;
+    }
+    let Some(queue) = record.queue().into_retained() else {
+        error!(target: LOG_TARGET, "blit_texture_to_buffer: queue retain failed");
+        return false;
+    };
+    let Some(device) = device_handle.into_retained() else {
+        error!(target: LOG_TARGET, "blit_texture_to_buffer: device retain failed");
+        return false;
+    };
+    let Some(texture) = tex_handle.into_retained() else {
+        error!(target: LOG_TARGET, "blit_texture_to_buffer: texture retain failed");
+        return false;
+    };
+
+    let Some(ptr) = NonNull::new(dst_ptr as *mut c_void) else {
+        error!(target: LOG_TARGET, "blit_texture_to_buffer: null dst_ptr");
+        return false;
+    };
+    // Managed + `synchronizeResource:` so the GPU→CPU readback works on
+    // non-UMA Macs (Intel/AMD): the blit writes into VRAM, then the
+    // synchronize copies VRAM back to the wrapped PE pages before the
+    // CPU read on `waitUntilCompleted` return. On UMA the storage mode
+    // collapses to Shared semantics and synchronize is a no-op, so
+    // there's no Apple-Silicon overhead.
+    // SAFETY: `ptr` is the PE-supplied dst pointer (non-null by the check
+    // above); `dst_len` matches its allocation; deallocator is None so the
+    // PE allocation is never freed by Metal.
+    let Some(dst_buffer) = (unsafe {
+        device.newBufferWithBytesNoCopy_length_options_deallocator(
+            ptr,
+            to_usize(dst_len),
+            MTLResourceOptions::StorageModeManaged,
+            None,
+        )
+    }) else {
+        error!(target: LOG_TARGET, "blit_texture_to_buffer: newBufferWithBytesNoCopy failed");
+        return false;
+    };
+    {
+        let label = objc2_foundation::NSString::from_str("mtld3d-readback");
+        dst_buffer.setLabel(Some(&label));
+    }
+
+    let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
+        error!(target: LOG_TARGET, "blit_texture_to_buffer: commandBuffer() nil");
+        return false;
+    };
+    {
+        let label = objc2_foundation::NSString::from_str("mtld3d-readback");
+        cmd_buf.setLabel(Some(&label));
+    }
+    // Under `render.scale` the source is rasterized smaller than the resolution
+    // the caller's coordinates are in, so resolve it up first, on this same
+    // command buffer and ahead of the blit encoder: the resolve opens a render
+    // pass of its own and Metal allows one encoder at a time. Sizes match at
+    // the default scale and this is skipped.
+    let source = resolve_readback_source(
+        &cmd_buf,
+        record.upscale(),
+        &device,
+        &texture,
+        (mip_level, slice),
+        source_width,
+        source_height,
+    );
+    // A resolved level is a one-level, one-slice texture of its own.
+    let (mip_level, slice) = if source.is_some() {
+        (0, 0)
+    } else {
+        (mip_level, slice)
+    };
+    let texture = source.as_deref().unwrap_or(&*texture);
+
+    let bytes_per_image = (bytes_per_row as usize) * (height as usize);
+    let region = CopyRegion {
+        width: width as usize,
+        height: height as usize,
+        depth: 1,
+    };
+    let src_endpoint = CopyEndpoint {
+        pixel_format: texture.pixelFormat(),
+        sample_count: texture.sampleCount(),
+        width: texture.width(),
+        height: texture.height(),
+        depth: texture.depth(),
+        level: mip_level as usize,
+        levels: texture.mipmapLevelCount(),
+        origin_x: origin_x as usize,
+        origin_y: origin_y as usize,
+    };
+    let destination = CopyBufferEndpoint {
+        length: dst_buffer.length(),
+        offset: 0,
+        bytes_per_row: bytes_per_row as usize,
+        bytes_per_image,
+    };
+    let (block, options) = match planes {
+        mtld3d_shared::mtl::ReadbackPlanes::Color => (
+            copy_block_layout(src_endpoint.pixel_format),
+            MTLBlitOption::empty(),
+        ),
+        mtld3d_shared::mtl::ReadbackPlanes::Depth
+        | mtld3d_shared::mtl::ReadbackPlanes::DepthStencil => {
+            if !matches!(
+                src_endpoint.pixel_format,
+                MTLPixelFormat::Depth32Float | MTLPixelFormat::Depth32Float_Stencil8
+            ) {
+                error!(target: LOG_TARGET, "depth readback: source is not a depth format");
+                return false;
+            }
+            (
+                PixelFormat::R32Float.block_layout(),
+                if src_endpoint.pixel_format == MTLPixelFormat::Depth32Float_Stencil8 {
+                    MTLBlitOption::DepthFromDepthStencil
+                } else {
+                    MTLBlitOption::empty()
+                },
+            )
+        }
+    };
+    let stencil_destination = CopyBufferEndpoint {
+        length: dst_buffer.length(),
+        offset: to_usize(stencil_offset),
+        bytes_per_row: stencil_bytes_per_row as usize,
+        bytes_per_image: 0,
+    };
+    if planes == mtld3d_shared::mtl::ReadbackPlanes::DepthStencil
+        && (src_endpoint.pixel_format != MTLPixelFormat::Depth32Float_Stencil8
+            || stencil_destination.offset < destination.bytes_per_row * region.height
+            || copy_texture_to_buffer_reject(
+                &src_endpoint,
+                &stencil_destination,
+                &region,
+                PixelFormat::R8Unorm.block_layout(),
+            )
+            .is_some())
+    {
+        error!(target: LOG_TARGET, "depth readback: invalid stencil destination");
+        return false;
+    }
+    // Checked before the encoder exists so a rejection leaves no encoder to
+    // close. A declined `MetalFX` resolve lands here: the caller asked for
+    // more pixels than the render-resolution source holds.
+    if let Some(reason) = copy_texture_to_buffer_reject(&src_endpoint, &destination, &region, block)
+    {
+        let reason_text = reason.as_str();
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: reason.key(),
+            "blit_texture_to_buffer: {reason_text}, readback skipped. \
+             src {src_endpoint}, dst {destination}, region {region}"
+        );
+        return false;
+    }
+
+    let Some(blit) = cmd_buf.blitCommandEncoder() else {
+        error!(target: LOG_TARGET, "blit_texture_to_buffer: blitCommandEncoder() nil");
+        return false;
+    };
+    {
+        let label = objc2_foundation::NSString::from_str("mtld3d-readback-blit");
+        blit.setLabel(Some(&label));
+    }
+
+    // `height` is in pixels but `bytes_per_row` strides one block row, so the
+    // slice size counts block rows. The two agree only for an uncompressed
+    // format, where the block height is 1.
+    let bytes_per_image =
+        mtld3d_shared::blit_geometry::bytes_per_image(bytes_per_row, height, block_height) as usize;
+    diagnostics::readback(
+        &cmd_buf,
+        &diagnostics::TextureCopy {
+            texture,
+            endpoint: &src_endpoint,
+            slice: slice as usize,
+        },
+        &dst_buffer,
+        &CopyBufferEndpoint {
+            bytes_per_image,
+            ..destination
+        },
+        &region,
+        (dst_ptr, dst_len),
+    );
+    // SAFETY: objc2 typed binding; `texture`/`dst_buffer` are retained Metal
+    // objects live for the call; the geometry cleared
+    // `copy_texture_to_buffer_reject` above.
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+            texture,
+            slice as usize,
+            mip_level as usize,
+            MTLOrigin {
+                x: origin_x as usize,
+                y: origin_y as usize,
+                z: 0,
+            },
+            MTLSize {
+                width: width as usize,
+                height: height as usize,
+                depth: 1,
+            },
+            &dst_buffer,
+            0,
+            bytes_per_row as usize,
+            bytes_per_image,
+            options,
+        );
+    }
+    if planes == mtld3d_shared::mtl::ReadbackPlanes::DepthStencil {
+        // SAFETY: the stencil format and byte region were validated before encoding;
+        // the retained buffer and texture outlive this synchronous submission.
+        unsafe {
+            blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
+                texture, slice as usize, mip_level as usize,
+                MTLOrigin { x: origin_x as usize, y: origin_y as usize, z: 0 },
+                MTLSize { width: width as usize, height: height as usize, depth: 1 },
+                &dst_buffer, to_usize(stencil_offset), stencil_bytes_per_row as usize, 0,
+                MTLBlitOption::StencilFromDepthStencil,
+            );
+        }
+    }
+    blit.synchronizeResource(ProtocolObject::from_ref(&*dst_buffer));
+
+    blit.endEncoding();
+    cmd_buf.commit();
+    cmd_buf.waitUntilCompleted();
+    let status = cmd_buf.status();
+    diagnostics::completion(&cmd_buf, status, None, "readback-wait");
+    // The wrapper owns no pages; the caller keeps the destination allocation.
+    readback_completed(status, || {
+        let error = cmd_buf.error();
+        diagnostics::failure(&cmd_buf, None, "readback-wait", error.as_deref());
+        error
+    })
+}
+
+/// Accept a readback only after Metal reports successful completion.
+fn readback_completed(
+    status: MTLCommandBufferStatus,
+    error: impl FnOnce() -> Option<Retained<NSError>>,
+) -> bool {
+    if status == MTLCommandBufferStatus::Completed {
+        return true;
+    }
+    let (code, desc) = command_buffer_error(error().as_deref());
+    error!(
+        target: LOG_TARGET,
+        "blit_texture_to_buffer: command buffer did not complete successfully \
+         (status {status:?}, code {code}: {desc}); readback failed"
+    );
+    false
+}
+
+#[cfg(test)]
+mod tests;

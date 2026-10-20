@@ -1,0 +1,2451 @@
+//! RAII wrappers over the D3D9 COM resources a test creates.
+//!
+//! Each owns one reference and releases it on `Drop`; each borrows the
+//! [`Harness`](crate::Harness) for `'h` so a resource can never outlive its
+//! device. All `unsafe` vtable dispatch for resources lives here, so test
+//! files stay `unsafe`-free.
+
+use core::{ffi::c_void, marker::PhantomData};
+
+use mtld3d_types::{
+    D3D_OK, D3DBOX, D3DDISPLAYMODEEX, D3DINDEXBUFFER_DESC, D3DLOCKED_BOX, D3DLOCKED_RECT,
+    D3DPRESENT_PARAMETERS, D3DPRESENTSTATS, D3DSURFACE_DESC, D3DVERTEXBUFFER_DESC, D3DVOLUME_DESC,
+    Guid, IDirect3DCubeTexture9Vtbl, IDirect3DIndexBuffer9Vtbl, IDirect3DPixelShader9Vtbl,
+    IDirect3DQuery9Vtbl, IDirect3DStateBlock9Vtbl, IDirect3DSurface9Vtbl,
+    IDirect3DSwapChain9ExVtbl, IDirect3DSwapChain9Vtbl, IDirect3DTexture9Vtbl,
+    IDirect3DVertexBuffer9Vtbl, IDirect3DVertexDeclaration9Vtbl, IDirect3DVertexShader9Vtbl,
+    IDirect3DVolume9Vtbl, IDirect3DVolumeTexture9Vtbl, IID_IDIRECT3DSWAPCHAIN9EX,
+};
+
+use crate::{
+    check::{expect_created, expect_ok},
+    vtbl::deref_vtbl,
+};
+
+/// The byte a guarded `GetPresentStats` buffer starts filled with.
+pub const PRESENT_STATS_GUARD: u8 = 0xAA;
+
+/// The bytes a guarded `GetPresentStats` buffer holds, more than any `D3DPRESENTSTATS` layout.
+pub const PRESENT_STATS_PROBE_BYTES: usize = 40;
+
+#[repr(C)]
+struct IUnknownHeadVtbl {
+    _query_interface: unsafe extern "system" fn(*mut c_void, *const Guid, *mut *mut c_void) -> i32,
+    add_ref: unsafe extern "system" fn(*mut c_void) -> u32,
+    release: unsafe extern "system" fn(*mut c_void) -> u32,
+}
+
+// ── Private data ──
+
+/// `SetPrivateData(guid, blob, len, 0)` through a resource's own thunk.
+fn set_private_data(
+    set: unsafe extern "system" fn(*mut c_void, *const Guid, *const c_void, u32, u32) -> i32,
+    this: *mut c_void,
+    guid: &Guid,
+    blob: &[u8],
+) -> i32 {
+    let len = u32::try_from(blob.len()).expect("blob fits u32");
+    // SAFETY: vtable thunk; `blob` is readable for `len`.
+    unsafe {
+        set(
+            this,
+            &raw const *guid,
+            blob.as_ptr().cast::<c_void>(),
+            len,
+            0,
+        )
+    }
+}
+
+/// `GetPrivateData(guid, out, &mut size)`; a null `out` asks for the size alone.
+fn get_private_data(
+    get: unsafe extern "system" fn(*mut c_void, *const Guid, *mut c_void, *mut u32) -> i32,
+    this: *mut c_void,
+    guid: &Guid,
+    out: Option<&mut [u8]>,
+) -> (i32, u32) {
+    let (ptr, mut size) = out.map_or((core::ptr::null_mut(), 0), |b| {
+        let len = u32::try_from(b.len()).expect("buffer fits u32");
+        (b.as_mut_ptr().cast::<c_void>(), len)
+    });
+    // SAFETY: vtable thunk; `ptr` is null or writable for `size` bytes.
+    let hr = unsafe { get(this, &raw const *guid, ptr, &raw mut size) };
+    (hr, size)
+}
+
+/// One owned `IDirect3DSwapChain9` reference.
+pub struct SwapChain<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl SwapChain<'_> {
+    /// Acquire the swapchain's first backbuffer.
+    ///
+    /// # Panics
+    /// Panics if `GetBackBuffer` fails.
+    #[must_use]
+    pub fn back_buffer(&self) -> Surface<'_> {
+        let mut surface = core::ptr::null_mut();
+        // SAFETY: live swapchain, first mono buffer, and writable output.
+        let hr = unsafe { (self.vtbl().get_back_buffer)(self.ptr, 0, 0, &raw mut surface) };
+        expect_created(hr, surface, "SwapChain::GetBackBuffer");
+        Surface::from_raw(surface)
+    }
+
+    /// Adopt the reference returned by a successful swapchain creation or query.
+    ///
+    /// # Safety
+    /// `ptr` is a live swapchain owning one reference; its device outlives `'h`.
+    pub const unsafe fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DSwapChain9Vtbl {
+        // SAFETY: the wrapper owns a live swapchain reference until Drop.
+        unsafe { deref_vtbl::<IDirect3DSwapChain9Vtbl>(self.ptr) }
+    }
+
+    /// Read the front buffer, or probe a null destination with `None`.
+    pub fn front_buffer_data(&self, dst: Option<&Surface<'_>>) -> i32 {
+        let ptr = dst.map_or(core::ptr::null_mut(), Surface::as_ptr);
+        // SAFETY: live swapchain and a live destination or explicit null probe.
+        unsafe { (self.vtbl().get_front_buffer_data)(self.ptr, ptr) }
+    }
+
+    /// `GetPresentParameters`, returning the hr and what the swapchain wrote.
+    #[must_use]
+    pub fn present_parameters(&self) -> (i32, D3DPRESENT_PARAMETERS) {
+        let mut pp = D3DPRESENT_PARAMETERS {
+            back_buffer_width: 0,
+            back_buffer_height: 0,
+            back_buffer_format: 0,
+            back_buffer_count: 0,
+            multi_sample_type: 0,
+            multi_sample_quality: 0,
+            swap_effect: 0,
+            device_window: 0,
+            windowed: 0,
+            enable_auto_depth_stencil: 0,
+            auto_depth_stencil_format: 0,
+            flags: 0,
+            full_screen_refresh_rate_in_hz: 0,
+            presentation_interval: 0,
+        };
+        // SAFETY: live swapchain; `pp` is writable for one `D3DPRESENT_PARAMETERS`.
+        let hr = unsafe {
+            (self.vtbl().get_present_parameters)(self.ptr, (&raw mut pp).cast::<c_void>())
+        };
+        (hr, pp)
+    }
+
+    /// Probe the readback thunk's null-this rejection with a valid destination.
+    #[must_use]
+    pub fn front_buffer_data_null_this(&self, dst: &Surface<'_>) -> i32 {
+        // SAFETY: the thunk accepts null this as a rejected API call; dst is live.
+        unsafe { (self.vtbl().get_front_buffer_data)(core::ptr::null_mut(), dst.as_ptr()) }
+    }
+
+    /// `QueryInterface` for `iid`: the hr and whether it handed back this swap chain.
+    ///
+    /// The reference a successful query takes is released again.
+    #[must_use]
+    pub fn query_interface(&self, iid: &Guid) -> (i32, bool) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: live swapchain; `iid` and `out` are valid for the call.
+        let hr = unsafe { (self.vtbl().query_interface)(self.ptr, iid, &raw mut out) };
+        if out.is_null() {
+            return (hr, false);
+        }
+        let same = out == self.ptr;
+        // SAFETY: releases the reference the query handed out; the wrapper's own keeps it live.
+        unsafe { (self.vtbl().release)(out) };
+        (hr, same)
+    }
+
+    /// The swap chain's `IDirect3DSwapChain9Ex` table.
+    ///
+    /// # Panics
+    /// Panics unless the swap chain answers `IID_IDirect3DSwapChain9Ex` as
+    /// itself, which only an extended device's swap chain does.
+    fn ex_vtbl(&self) -> &'static IDirect3DSwapChain9ExVtbl {
+        assert_eq!(
+            self.query_interface(&IID_IDIRECT3DSWAPCHAIN9EX),
+            (D3D_OK, true),
+            "the extended swap chain calls need an extended swap chain"
+        );
+        // SAFETY: checked above: the object answers `IID_IDirect3DSwapChain9Ex`
+        // as itself, so its vtable is the extended one.
+        unsafe { deref_vtbl::<IDirect3DSwapChain9ExVtbl>(self.ptr) }
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetLastPresentCount`: hr and the count written.
+    #[must_use]
+    pub fn last_present_count(&self) -> (i32, u32) {
+        let mut count = u32::MAX;
+        // SAFETY: extended vtable thunk; `count` is writable.
+        let hr = unsafe { (self.ex_vtbl().get_last_present_count)(self.ptr, &raw mut count) };
+        (hr, count)
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetPresentStats`: hr and the statistics written.
+    #[must_use]
+    pub fn present_stats(&self) -> (i32, D3DPRESENTSTATS) {
+        let mut stats = D3DPRESENTSTATS {
+            present_count: u32::MAX,
+            present_refresh_count: u32::MAX,
+            sync_refresh_count: u32::MAX,
+            pad: [u32::MAX; mtld3d_types::D3DPRESENTSTATS_PAD_WORDS],
+            sync_qpc_time: [u32::MAX; 2],
+            sync_gpu_time: [u32::MAX; 2],
+        };
+        // SAFETY: extended vtable thunk; `stats` is writable.
+        let hr = unsafe { (self.ex_vtbl().get_present_stats)(self.ptr, &raw mut stats) };
+        (hr, stats)
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetPresentStats` into a guarded buffer: hr and every byte of it.
+    ///
+    /// The buffer is wider than any layout of `D3DPRESENTSTATS` and starts
+    /// filled with [`PRESENT_STATS_GUARD`], so the bytes show both what the
+    /// call wrote and whether it wrote past the caller's struct.
+    #[must_use]
+    pub fn present_stats_guarded(&self) -> (i32, [u8; PRESENT_STATS_PROBE_BYTES]) {
+        let mut buffer = GuardedPresentStats {
+            bytes: [PRESENT_STATS_GUARD; PRESENT_STATS_PROBE_BYTES],
+        };
+        // SAFETY: extended vtable thunk; `buffer` is writable for more bytes
+        // than any `D3DPRESENTSTATS` layout and aligned for one.
+        let hr = unsafe {
+            (self.ex_vtbl().get_present_stats)(
+                self.ptr,
+                (&raw mut buffer).cast::<D3DPRESENTSTATS>(),
+            )
+        };
+        (hr, buffer.bytes)
+    }
+
+    /// `IDirect3DSwapChain9Ex::GetDisplayModeEx` with `mode.Size = size`.
+    #[must_use]
+    pub fn display_mode_ex(&self, size: u32) -> (i32, D3DDISPLAYMODEEX, u32) {
+        let mut mode = D3DDISPLAYMODEEX {
+            size,
+            width: 0,
+            height: 0,
+            refresh_rate: 0,
+            format: 0,
+            scan_line_ordering: 0,
+        };
+        let mut rotation = 0u32;
+        // SAFETY: extended vtable thunk; `mode` and `rotation` are writable.
+        let hr = unsafe {
+            (self.ex_vtbl().get_display_mode_ex)(
+                self.ptr,
+                (&raw mut mode).cast::<c_void>(),
+                &raw mut rotation,
+            )
+        };
+        (hr, mode, rotation)
+    }
+}
+
+impl Drop for SwapChain<'_> {
+    fn drop(&mut self) {
+        // SAFETY: balances the reference adopted by this wrapper.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Volume texture ──
+
+/// An `IDirect3DVolumeTexture9`.
+pub struct VolumeTexture<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl VolumeTexture<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DVolumeTexture9Vtbl {
+        // SAFETY: `self.ptr` is a live volume texture for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DVolumeTexture9Vtbl>(self.ptr) }
+    }
+
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    /// Mip-chain length.
+    #[must_use]
+    pub fn level_count(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_level_count)(self.ptr) }
+    }
+
+    /// `SetLOD`, returning the previous LOD.
+    #[must_use]
+    pub fn set_lod(&self, lod: u32) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().set_lod)(self.ptr, lod) }
+    }
+
+    /// Describe mip `level`. Returns `(hr, desc)`.
+    #[must_use]
+    pub fn level_desc(&self, level: u32) -> (i32, D3DVOLUME_DESC) {
+        let mut desc = D3DVOLUME_DESC {
+            format: 0,
+            resource_type: 0,
+            usage: 0,
+            pool: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut desc` is writable.
+        let hr = unsafe {
+            (self.vtbl().get_level_desc)(self.ptr, level, (&raw mut desc).cast::<c_void>())
+        };
+        (hr, desc)
+    }
+
+    /// `LockBox` over the whole of mip `level`. Returns the hr and whether `pBits` came back null.
+    ///
+    /// The struct is seeded with a garbage pointer first, so a rejected lock
+    /// that leaves it untouched reads as non-null.
+    #[must_use]
+    pub fn lock_box_probe(&self, level: u32, flags: u32) -> (i32, bool) {
+        self.lock_box_region_probe(level, None, flags)
+    }
+
+    /// Probe a whole or partial volume lock, including rejected box geometry.
+    #[must_use]
+    pub fn lock_box_region_probe(
+        &self,
+        level: u32,
+        region: Option<&D3DBOX>,
+        flags: u32,
+    ) -> (i32, bool) {
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::without_provenance_mut(0xdead_beef),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // the optional box is live through the call, null locks the whole level.
+        let hr = unsafe {
+            (self.vtbl().lock_box)(
+                self.ptr,
+                level,
+                &raw mut locked,
+                region.map_or(core::ptr::null(), |b| core::ptr::from_ref(b).cast()),
+                flags,
+            )
+        };
+        (hr, locked.bits.is_null())
+    }
+
+    /// `UnlockBox` for mip `level`. Returns the hr.
+    #[must_use]
+    pub fn unlock_box(&self, level: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().unlock_box)(self.ptr, level) }
+    }
+
+    /// Fill mip `level` of a 32-bit-per-texel volume through `LockBox` / `UnlockBox`.
+    ///
+    /// `texels` is the whole level, tightly packed slice by slice, row by
+    /// row; the write honours the row and slice pitches the lock reports.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u32(&self, level: u32, texels: &[u32]) {
+        self.write_texels(level, None, 0, texels);
+    }
+
+    /// [`Self::write_u32`] through a `LockBox` that passes `flags`.
+    ///
+    /// For a test of what the lock flags change, such as a write through a
+    /// `D3DLOCK_READONLY` lock, which the application promised not to make, or
+    /// one under `D3DLOCK_NO_DIRTY_UPDATE`, which records no dirty region.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u32_with_flags(&self, level: u32, flags: u32, texels: &[u32]) {
+        self.write_texels(level, None, flags, texels);
+    }
+
+    /// `AddDirtyBox(null)`: flag the whole volume dirty. Returns the hr.
+    #[must_use]
+    pub fn add_dirty_box(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live, a null box names the whole
+        // volume.
+        unsafe { (self.vtbl().add_dirty_box)(self.ptr, core::ptr::null()) }
+    }
+
+    /// [`Self::write_u32`] for 16-bit-per-texel formats (R5G6B5, A4R4G4B4, ...).
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u16(&self, level: u32, texels: &[u16]) {
+        self.write_texels(level, None, 0, texels);
+    }
+
+    /// Fill an eight-byte signed four-lane mip, honoring row and slice pitches.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or the slice does not fill the mip.
+    pub fn write_i16x4(&self, level: u32, texels: &[[i16; 4]]) {
+        self.write_texels(level, None, 0, texels);
+    }
+
+    /// Read an eight-byte signed four-lane mip and return its reported pitches.
+    ///
+    /// # Panics
+    /// Panics if the format, description or lock is invalid.
+    #[must_use]
+    pub fn read_i16x4(&self, level: u32) -> (i32, i32, Vec<[i16; 4]>) {
+        let (hr, desc) = self.level_desc(level);
+        expect_ok(hr, "VolumeTexture GetLevelDesc");
+        assert_eq!(desc.format, mtld3d_types::D3DFMT_Q16W16V16U16);
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: the live volume owns the level, the output is writable,
+        // and a null box requests the complete level.
+        expect_ok(
+            unsafe {
+                (self.vtbl().lock_box)(
+                    self.ptr,
+                    level,
+                    &raw mut locked,
+                    core::ptr::null(),
+                    mtld3d_types::D3DLOCK_READONLY,
+                )
+            },
+            "VolumeTexture LockBox",
+        );
+        assert!(!locked.bits.is_null());
+        let row = usize::try_from(locked.row_pitch).expect("positive row pitch");
+        let slice = usize::try_from(locked.slice_pitch).expect("positive slice pitch");
+        let width = desc.width as usize;
+        let height = desc.height as usize;
+        let depth = desc.depth as usize;
+        assert!(row >= width * 8 && slice >= row * height);
+        let mut texels = Vec::with_capacity(width * height * depth);
+        for z in 0..depth {
+            for y in 0..height {
+                for x in 0..width {
+                    // SAFETY: the format has eight-byte texels and the
+                    // validated row/slice bounds keep this read in the locked
+                    // level. All i16 bit patterns are valid; no alignment is
+                    // assumed and the copied value outlives the lock.
+                    let texel =
+                        unsafe { locked.bits.cast::<u8>().add(z * slice + y * row + x * 8) };
+                    // SAFETY: `texel` points to one validated eight-byte texel
+                    // in the live lock; read_unaligned copies all four lanes.
+                    texels.push(unsafe { texel.cast::<[i16; 4]>().read_unaligned() });
+                }
+            }
+        }
+        expect_ok(self.unlock_box(level), "VolumeTexture UnlockBox");
+        (locked.row_pitch, locked.slice_pitch, texels)
+    }
+
+    /// Fill a signed four-lane box, preserving texels outside it.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or the slice does not fill the box.
+    pub fn write_box_i16x4(&self, level: u32, region: &D3DBOX, texels: &[[i16; 4]]) {
+        self.write_texels(level, Some(region), 0, texels);
+    }
+
+    /// Fill a box of a 32-bit-per-texel volume, preserving texels outside it.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` does not fill the box exactly.
+    pub fn write_box_u32(&self, level: u32, region: &D3DBOX, texels: &[u32]) {
+        self.write_texels(level, Some(region), 0, texels);
+    }
+
+    /// Write raw DXT blocks into a volume box, honoring both returned pitches.
+    ///
+    /// # Panics
+    /// Panics for an unsupported format, invalid box, size or failed lock.
+    pub fn write_blocks(&self, level: u32, region: Option<&D3DBOX>, blocks: &[u8]) {
+        self.transfer_blocks(level, region, Some(blocks));
+    }
+
+    /// Read a complete DXT mip's raw blocks and return row and slice pitches.
+    ///
+    /// # Panics
+    /// Panics for an unsupported format or failed description/lock.
+    #[must_use]
+    pub fn read_blocks(&self, level: u32) -> (i32, i32, Vec<u8>) {
+        self.transfer_blocks(level, None, None)
+    }
+
+    /// Lock a level or a box of it and copy whole block rows in or out.
+    ///
+    /// Rows step by the returned row pitch and slices by the slice pitch, so a
+    /// pitch wider than the blocks of a row is honoured in both directions.
+    fn transfer_blocks(
+        &self,
+        level: u32,
+        region: Option<&D3DBOX>,
+        input: Option<&[u8]>,
+    ) -> (i32, i32, Vec<u8>) {
+        let (hr, desc) = self.level_desc(level);
+        expect_ok(hr, "compressed volume GetLevelDesc");
+        let block_bytes = match desc.format {
+            mtld3d_types::D3DFMT_DXT1 => 8,
+            mtld3d_types::D3DFMT_DXT2
+            | mtld3d_types::D3DFMT_DXT3
+            | mtld3d_types::D3DFMT_DXT4
+            | mtld3d_types::D3DFMT_DXT5 => 16,
+            other => panic!("not a supported compressed volume format {other:#x}"),
+        };
+        let (width, height, depth) = region.map_or((desc.width, desc.height, desc.depth), |b| {
+            assert!(b.left < b.right && b.top < b.bottom && b.front < b.back);
+            assert!(b.right <= desc.width && b.bottom <= desc.height && b.back <= desc.depth);
+            assert!(b.left.is_multiple_of(4) && b.top.is_multiple_of(4));
+            assert!(b.right.is_multiple_of(4) || b.right == desc.width);
+            assert!(b.bottom.is_multiple_of(4) || b.bottom == desc.height);
+            (b.right - b.left, b.bottom - b.top, b.back - b.front)
+        });
+        let row_bytes = width.div_ceil(4) as usize * block_bytes;
+        let rows = height.div_ceil(4) as usize;
+        let depth = depth as usize;
+        let len = row_bytes * rows * depth;
+        if let Some(bytes) = input {
+            assert_eq!(bytes.len(), len);
+        }
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        let flags = if input.is_none() {
+            mtld3d_types::D3DLOCK_READONLY
+        } else {
+            0
+        };
+        // SAFETY: the live volume owns this subresource; the validated box
+        // and writable lock result remain live throughout the COM call.
+        let hr = unsafe {
+            (self.vtbl().lock_box)(
+                self.ptr,
+                level,
+                &raw mut locked,
+                region.map_or(core::ptr::null(), |b| core::ptr::from_ref(b).cast()),
+                flags,
+            )
+        };
+        expect_ok(hr, "compressed volume LockBox");
+        assert!(!locked.bits.is_null());
+        let row_pitch = usize::try_from(locked.row_pitch).expect("positive row pitch");
+        let slice_pitch = usize::try_from(locked.slice_pitch).expect("positive slice pitch");
+        assert!(row_pitch >= row_bytes);
+        assert!(slice_pitch >= row_pitch * rows);
+        let mut output = if input.is_none() {
+            vec![0; len]
+        } else {
+            Vec::new()
+        };
+        for z in 0..depth {
+            for y in 0..rows {
+                let offset = (z * rows + y) * row_bytes;
+                // SAFETY: the block-aligned region is in bounds, and the
+                // reported pitches cover each complete row of blocks.
+                let mapped = unsafe {
+                    locked
+                        .bits
+                        .cast::<u8>()
+                        .add(z * slice_pitch + y * row_pitch)
+                };
+                if let Some(bytes) = input {
+                    // SAFETY: the input length was checked; the destination
+                    // is this row of the exclusive writable volume lock.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(bytes[offset..].as_ptr(), mapped, row_bytes);
+                    };
+                } else {
+                    // SAFETY: the output owns len bytes; this initialized
+                    // locked row is copied before the lock is released.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            mapped,
+                            output[offset..].as_mut_ptr(),
+                            row_bytes,
+                        );
+                    };
+                }
+            }
+        }
+        expect_ok(self.unlock_box(level), "compressed volume UnlockBox");
+        (locked.row_pitch, locked.slice_pitch, output)
+    }
+
+    fn write_texels<T: Copy>(&self, level: u32, region: Option<&D3DBOX>, flags: u32, texels: &[T]) {
+        let (hr, desc) = self.level_desc(level);
+        expect_ok(hr, "VolumeTexture GetLevelDesc");
+        let (width, height, depth) = region.map_or((desc.width, desc.height, desc.depth), |b| {
+            assert!(b.left < b.right && b.top < b.bottom && b.front < b.back);
+            assert!(b.right <= desc.width && b.bottom <= desc.height && b.back <= desc.depth);
+            (b.right - b.left, b.bottom - b.top, b.back - b.front)
+        });
+        let (width, height, depth) = (width as usize, height as usize, depth as usize);
+        assert_eq!(
+            texels.len(),
+            width * height * depth,
+            "requested box of texels"
+        );
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // the optional box is borrowed through this call.
+        let hr = unsafe {
+            (self.vtbl().lock_box)(
+                self.ptr,
+                level,
+                &raw mut locked,
+                region.map_or(core::ptr::null(), |b| core::ptr::from_ref(b).cast()),
+                flags,
+            )
+        };
+        expect_ok(hr, "VolumeTexture LockBox");
+        assert!(!locked.bits.is_null(), "LockBox handed out a pointer");
+        let row_pitch = usize::try_from(locked.row_pitch).expect("row pitch is positive");
+        let slice_pitch = usize::try_from(locked.slice_pitch).expect("slice pitch is positive");
+        for z in 0..depth {
+            for y in 0..height {
+                let row = &texels[(z * height + y) * width..][..width];
+                // SAFETY: `LockBox` mapped `slice_pitch * depth` writable bytes
+                // at `bits`, so the row start lands inside its own slice.
+                let dst = unsafe {
+                    locked
+                        .bits
+                        .cast::<u8>()
+                        .add(z * slice_pitch + y * row_pitch)
+                };
+                // SAFETY: `width * size_of::<T>()` bytes from the row start
+                // never exceed `row_pitch`, so the copy stays inside the
+                // mapping.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        row.as_ptr().cast::<u8>(),
+                        dst,
+                        width * core::mem::size_of::<T>(),
+                    );
+                }
+            }
+        }
+        expect_ok(self.unlock_box(level), "VolumeTexture UnlockBox");
+    }
+
+    /// `GetVolumeLevel`, handing back the sub-resource it wrote.
+    #[must_use]
+    pub fn get_volume_level(&self, level: u32) -> (i32, Option<Volume<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_volume_level)(self.ptr, level, &raw mut out) };
+        (hr, (!out.is_null()).then(|| Volume::from_raw(out)))
+    }
+}
+
+impl Drop for VolumeTexture<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Volume ──
+
+/// An `IDirect3DVolume9`, a level of a volume texture.
+pub struct Volume<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl Volume<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DVolume9Vtbl {
+        // SAFETY: `self.ptr` is a live volume for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DVolume9Vtbl>(self.ptr) }
+    }
+
+    /// The raw COM `this` pointer (for asserting sub-resource identity).
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    /// `SetPrivateData(guid, blob, len, 0)`.
+    #[must_use]
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
+    }
+
+    /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
+    ///
+    /// A null `out` asks for the size alone.
+    #[must_use]
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
+    }
+
+    /// `FreePrivateData(guid)`.
+    #[must_use]
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
+    #[must_use]
+    pub fn desc(&self) -> (i32, D3DVOLUME_DESC) {
+        let mut desc = D3DVOLUME_DESC {
+            format: 0,
+            resource_type: 0,
+            usage: 0,
+            pool: 0,
+            width: 0,
+            height: 0,
+            depth: 0,
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut desc` is writable.
+        let hr = unsafe { (self.vtbl().get_desc)(self.ptr, &raw mut desc) };
+        (hr, desc)
+    }
+
+    /// Fill the level through `IDirect3DVolume9::LockBox` / `UnlockBox`.
+    ///
+    /// `texels` is the whole level, tightly packed slice by slice, row by
+    /// row; the write honours the row and slice pitches the lock reports.
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u32(&self, texels: &[u32]) {
+        self.write_texels(texels);
+    }
+
+    /// [`Self::write_u32`] for 16-bit-per-texel formats (R5G6B5, A4R4G4B4, ...).
+    ///
+    /// # Panics
+    /// Panics if the lock fails or `texels` is not exactly one level's worth.
+    pub fn write_u16(&self, texels: &[u16]) {
+        self.write_texels(texels);
+    }
+
+    fn write_texels<T: Copy>(&self, texels: &[T]) {
+        let (hr, desc) = self.desc();
+        expect_ok(hr, "Volume GetDesc");
+        let (width, height, depth) = (
+            desc.width as usize,
+            desc.height as usize,
+            desc.depth as usize,
+        );
+        assert_eq!(texels.len(), width * height * depth, "one level of texels");
+        let mut locked = D3DLOCKED_BOX {
+            row_pitch: 0,
+            slice_pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // a null box locks the whole level.
+        let hr = unsafe { (self.vtbl().lock_box)(self.ptr, &raw mut locked, core::ptr::null(), 0) };
+        expect_ok(hr, "Volume LockBox");
+        assert!(!locked.bits.is_null(), "LockBox handed out a pointer");
+        let row_pitch = usize::try_from(locked.row_pitch).expect("row pitch is positive");
+        let slice_pitch = usize::try_from(locked.slice_pitch).expect("slice pitch is positive");
+        for z in 0..depth {
+            for y in 0..height {
+                let row = &texels[(z * height + y) * width..][..width];
+                // SAFETY: `LockBox` mapped `slice_pitch * depth` writable bytes
+                // at `bits`, so the row start lands inside its own slice.
+                let dst = unsafe {
+                    locked
+                        .bits
+                        .cast::<u8>()
+                        .add(z * slice_pitch + y * row_pitch)
+                };
+                // SAFETY: `width * size_of::<T>()` bytes from the row start
+                // never exceed `row_pitch`, so the copy stays inside the
+                // mapping.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        row.as_ptr().cast::<u8>(),
+                        dst,
+                        width * core::mem::size_of::<T>(),
+                    );
+                }
+            }
+        }
+        // SAFETY: vtable thunk; `self.ptr` is live and the level is locked.
+        let hr = unsafe { (self.vtbl().unlock_box)(self.ptr) };
+        expect_ok(hr, "Volume UnlockBox");
+    }
+}
+
+impl Drop for Volume<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Texture ──
+
+/// An `IDirect3DTexture9`.
+pub struct Texture<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl<'h> Texture<'h> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// The raw COM `this` pointer (for binding via `Harness::set_texture`).
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DTexture9Vtbl {
+        // SAFETY: `self.ptr` is a live texture for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DTexture9Vtbl>(self.ptr) }
+    }
+
+    /// Lock the whole of mip `level`. The returned guard unlocks on drop.
+    #[must_use]
+    pub fn lock_rect(&self, level: u32, flags: u32) -> LockedRect<'_> {
+        self.lock_inner(level, core::ptr::null(), flags)
+    }
+
+    /// Lock a sub-rectangle of mip `level`.
+    ///
+    /// `rect` is a `D3DRECT`-style `[left, top, right, bottom]`.
+    #[must_use]
+    pub fn lock_rect_partial(&self, level: u32, rect: &[i32; 4], flags: u32) -> LockedRect<'_> {
+        self.lock_inner(level, rect.as_ptr().cast::<c_void>(), flags)
+    }
+
+    /// `LockRect` over the whole of mip `level`. Returns the hr and whether `pBits` came back null.
+    ///
+    /// The struct is seeded with a garbage pointer first, so a rejected lock
+    /// that leaves it untouched reads as non-null. For a test that expects the
+    /// lock to fail; a successful one leaves the level mapped until
+    /// [`Self::unlock_rect`].
+    #[must_use]
+    pub fn lock_rect_probe(&self, level: u32, flags: u32) -> (i32, bool) {
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::without_provenance_mut(0xdead_beef),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // a null rect locks the whole level.
+        let hr = unsafe {
+            (self.vtbl().lock_rect)(self.ptr, level, &raw mut locked, core::ptr::null(), flags)
+        };
+        (hr, locked.bits.is_null())
+    }
+
+    fn lock_inner(&self, level: u32, rect: *const c_void, flags: u32) -> LockedRect<'_> {
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut locked` is writable.
+        let hr = unsafe { (self.vtbl().lock_rect)(self.ptr, level, &raw mut locked, rect, flags) };
+        expect_ok(hr, "Texture LockRect");
+        LockedRect {
+            owner: LockOwner::Texture {
+                this: self.ptr,
+                level,
+            },
+            pitch: locked.pitch,
+            bits: locked.bits,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Get mip `level` as a [`Surface`] (`AddRef`'d; released on drop).
+    ///
+    /// # Panics
+    /// Panics if the call fails.
+    #[must_use]
+    pub fn surface_level(&self, level: u32) -> Surface<'h> {
+        let mut surface: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut surface` is writable.
+        let hr = unsafe { (self.vtbl().get_surface_level)(self.ptr, level, &raw mut surface) };
+        expect_created(hr, surface, "GetSurfaceLevel");
+        Surface::from_raw(surface)
+    }
+
+    /// Mip-chain length.
+    #[must_use]
+    pub fn level_count(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_level_count)(self.ptr) }
+    }
+
+    /// Describe mip `level`. Returns `(hr, desc)`.
+    #[must_use]
+    pub fn level_desc(&self, level: u32) -> (i32, D3DSURFACE_DESC) {
+        let mut desc = zeroed_surface_desc();
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut desc` is writable.
+        let hr = unsafe { (self.vtbl().get_level_desc)(self.ptr, level, &raw mut desc) };
+        (hr, desc)
+    }
+
+    /// `SetLOD` — returns the previous LOD.
+    #[must_use]
+    pub fn set_lod(&self, lod: u32) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().set_lod)(self.ptr, lod) }
+    }
+
+    /// Current LOD.
+    #[must_use]
+    pub fn lod(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_lod)(self.ptr) }
+    }
+
+    /// `SetAutoGenFilterType` — returns the hr.
+    #[must_use]
+    pub fn set_auto_gen_filter_type(&self, filter: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().set_auto_gen_filter_type)(self.ptr, filter) }
+    }
+
+    /// Request generation of the runtime-owned mip chain.
+    pub fn generate_mip_sub_levels(&self) {
+        // SAFETY: `self.ptr` is a live texture for the wrapper's lifetime.
+        unsafe { (self.vtbl().generate_mip_sub_levels)(self.ptr) };
+    }
+
+    /// `GetAutoGenFilterType`.
+    #[must_use]
+    pub fn auto_gen_filter_type(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_auto_gen_filter_type)(self.ptr) }
+    }
+
+    /// `UnlockRect` for mip `level`. Returns the hr.
+    #[must_use]
+    pub fn unlock_rect(&self, level: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().unlock_rect)(self.ptr, level) }
+    }
+
+    /// `AddDirtyRect(null)` — flag the whole texture dirty. Returns the hr.
+    #[must_use]
+    pub fn add_dirty_rect(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live, null rect = whole surface.
+        unsafe { (self.vtbl().add_dirty_rect)(self.ptr, core::ptr::null()) }
+    }
+
+    /// `AddDirtyRect` over one sub-rectangle. Returns the hr.
+    ///
+    /// `rect` is a `D3DRECT`-style `[left, top, right, bottom]`.
+    #[must_use]
+    pub fn add_dirty_rect_partial(&self, rect: &[i32; 4]) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live and `rect` is four `LONG`s,
+        // the `RECT` layout the call reads.
+        unsafe { (self.vtbl().add_dirty_rect)(self.ptr, rect.as_ptr().cast::<c_void>()) }
+    }
+
+    /// `GetType` (`D3DRTYPE_*`).
+    #[must_use]
+    pub fn resource_type(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_type)(self.ptr) }
+    }
+
+    /// `SetPrivateData` — store a small blob under a test GUID. Returns the hr.
+    #[must_use]
+    pub fn set_private_data_hr(&self) -> i32 {
+        let guid = mtld3d_types::Guid {
+            data1: 1,
+            data2: 2,
+            data3: 3,
+            data4: [4; 8],
+        };
+        let data = [0u8; 4];
+        // SAFETY: vtable thunk; `&guid` and `data` are read-only for the call.
+        unsafe {
+            (self.vtbl().set_private_data)(
+                self.ptr,
+                &raw const guid,
+                data.as_ptr().cast::<c_void>(),
+                4,
+                0,
+            )
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// `PreLoad` — a no-op that must not crash.
+    pub fn pre_load(&self) {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().pre_load)(self.ptr) };
+    }
+
+    /// `SetPriority` — returns the previous priority.
+    #[must_use]
+    pub fn set_priority(&self, priority: u32) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().set_priority)(self.ptr, priority) }
+    }
+
+    /// `GetPriority`.
+    #[must_use]
+    pub fn priority(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_priority)(self.ptr) }
+    }
+
+    /// Current public refcount, read through a balanced `AddRef`/`Release` pair.
+    ///
+    /// `AddRef` answers the count it just produced, so the standing count is one
+    /// less. A sub-resource forwards its own references here, which is what makes
+    /// this the count a `GetSurfaceLevel` test watches.
+    #[must_use]
+    pub fn refcount(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        let bumped = unsafe { (self.vtbl().add_ref)(self.ptr) };
+        // SAFETY: balances the AddRef above; this wrapper keeps its own reference.
+        unsafe { (self.vtbl().release)(self.ptr) };
+        bumped - 1
+    }
+}
+
+impl Drop for Texture<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Cube texture ──
+
+/// An `IDirect3DCubeTexture9`.
+pub struct CubeTexture<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl CubeTexture<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// The raw COM pointer used for base-texture binding.
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DCubeTexture9Vtbl {
+        // SAFETY: `self.ptr` is a live cube texture for the wrapper lifetime.
+        unsafe { deref_vtbl::<IDirect3DCubeTexture9Vtbl>(self.ptr) }
+    }
+
+    /// `SetAutoGenFilterType` for this cube texture.
+    #[must_use]
+    pub fn set_auto_gen_filter_type(&self, filter: u32) -> i32 {
+        // SAFETY: the wrapper owns a live cube texture.
+        unsafe { (self.vtbl().set_auto_gen_filter_type)(self.ptr, filter) }
+    }
+
+    /// `GetAutoGenFilterType` for this cube texture.
+    #[must_use]
+    pub fn auto_gen_filter_type(&self) -> u32 {
+        // SAFETY: the wrapper owns a live cube texture.
+        unsafe { (self.vtbl().get_auto_gen_filter_type)(self.ptr) }
+    }
+
+    /// Request mip generation for this cube texture.
+    pub fn generate_mip_sub_levels(&self) {
+        // SAFETY: the wrapper owns a live cube texture.
+        unsafe { (self.vtbl().generate_mip_sub_levels)(self.ptr) };
+    }
+
+    /// `AddDirtyRect(face, null)`: flag the whole face dirty. Returns the hr.
+    #[must_use]
+    pub fn add_dirty_rect(&self, face: u32) -> i32 {
+        // SAFETY: the wrapper owns a live cube texture; a null rect names the
+        // whole face.
+        unsafe { (self.vtbl().add_dirty_rect)(self.ptr, face, core::ptr::null()) }
+    }
+
+    /// Lock one cube face and mip level.
+    ///
+    /// # Panics
+    /// Panics if `LockRect` fails.
+    #[must_use]
+    pub fn lock_rect(&self, face: u32, level: u32, flags: u32) -> LockedRect<'_> {
+        self.lock_inner(face, level, core::ptr::null(), flags)
+    }
+
+    /// Lock a sub-rectangle of one cube face and mip level.
+    ///
+    /// `rect` is a `D3DRECT`-style `[left, top, right, bottom]`.
+    ///
+    /// # Panics
+    /// Panics if `LockRect` fails.
+    #[must_use]
+    pub fn lock_rect_partial(
+        &self,
+        face: u32,
+        level: u32,
+        rect: &[i32; 4],
+        flags: u32,
+    ) -> LockedRect<'_> {
+        self.lock_inner(face, level, rect.as_ptr().cast::<c_void>(), flags)
+    }
+
+    fn lock_inner(&self, face: u32, level: u32, rect: *const c_void, flags: u32) -> LockedRect<'_> {
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: live cube texture, writable lock out-param, and `rect` is
+        // null or points at a caller-owned `[i32; 4]` in D3DRECT layout.
+        let hr =
+            unsafe { (self.vtbl().lock_rect)(self.ptr, face, level, &raw mut locked, rect, flags) };
+        expect_ok(hr, "CubeTexture LockRect");
+        LockedRect {
+            owner: LockOwner::Cube {
+                this: self.ptr,
+                face,
+                level,
+            },
+            pitch: locked.pitch,
+            bits: locked.bits,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `UnlockRect` of one cube face and mip level, returning the hr.
+    ///
+    /// For a lock taken through another object that maps the same
+    /// subresource, such as the face's own surface.
+    #[must_use]
+    pub fn unlock_rect(&self, face: u32, level: u32) -> i32 {
+        // SAFETY: live cube texture; face and level are forwarded as given.
+        unsafe { (self.vtbl().unlock_rect)(self.ptr, face, level) }
+    }
+
+    /// Get a parent-backed face surface.
+    ///
+    /// # Panics
+    /// Panics if `GetCubeMapSurface` fails.
+    #[must_use]
+    pub fn surface(&self, face: u32, level: u32) -> Surface<'_> {
+        let mut surface = core::ptr::null_mut();
+        // SAFETY: live cube texture and writable surface out-param.
+        let hr =
+            unsafe { (self.vtbl().get_cube_map_surface)(self.ptr, face, level, &raw mut surface) };
+        expect_created(hr, surface, "GetCubeMapSurface");
+        Surface::from_raw(surface)
+    }
+
+    /// `GetCubeMapSurface` returning `(hr, this)` for error-path tests.
+    ///
+    /// The unchecked form of [`Self::surface`]: a caller that expects a
+    /// rejection reads both the hr and the untouched out-param, and a caller
+    /// that gets a surface owns the reference it was handed.
+    #[must_use]
+    pub fn try_surface(&self, face: u32, level: u32) -> (i32, *mut c_void) {
+        let mut surface = core::ptr::null_mut();
+        // SAFETY: live cube texture and writable surface out-param.
+        let hr =
+            unsafe { (self.vtbl().get_cube_map_surface)(self.ptr, face, level, &raw mut surface) };
+        (hr, surface)
+    }
+
+    /// Mip-chain length.
+    #[must_use]
+    pub fn level_count(&self) -> u32 {
+        // SAFETY: live cube texture.
+        unsafe { (self.vtbl().get_level_count)(self.ptr) }
+    }
+}
+
+impl Drop for CubeTexture<'_> {
+    fn drop(&mut self) {
+        // SAFETY: live cube texture and this wrapper owns one reference.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Surface ──
+
+/// An `IDirect3DSurface9`.
+pub struct Surface<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl Surface<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// The raw COM `this` pointer (for `SetRenderTarget` etc.).
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DSurface9Vtbl {
+        // SAFETY: `self.ptr` is a live surface for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DSurface9Vtbl>(self.ptr) }
+    }
+
+    /// `GetContainer(iid)`, with any returned reference released before return.
+    ///
+    /// Returns the `HRESULT`, the interface pointer as an identity token, and
+    /// its public refcount while the reference from `GetContainer` was held.
+    /// A failed call returns a null pointer and zero count.
+    ///
+    /// # Panics
+    /// Panics if a successful call leaves the output slot untouched.
+    #[must_use]
+    pub fn get_container(&self, iid: &Guid) -> (i32, *mut c_void, u32) {
+        let sentinel = core::ptr::without_provenance_mut(0xdead_beef);
+        let mut out: *mut c_void = sentinel;
+        // SAFETY: vtable thunk; `iid` is read-only and `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_container)(self.ptr, iid, &raw mut out) };
+        if hr != D3D_OK || out.is_null() {
+            return (hr, out, 0);
+        }
+        assert_ne!(
+            out, sentinel,
+            "successful GetContainer left output untouched"
+        );
+        // SAFETY: a successful `GetContainer` returns a live COM interface.
+        let vtbl = unsafe { deref_vtbl::<IUnknownHeadVtbl>(out) };
+        // SAFETY: `out` remains live through its `GetContainer` reference.
+        unsafe { (vtbl.add_ref)(out) };
+        // SAFETY: balances the probe `AddRef`; the `GetContainer` reference remains.
+        let held_refcount = unsafe { (vtbl.release)(out) };
+        // SAFETY: releases the reference returned by `GetContainer`.
+        unsafe { (vtbl.release)(out) };
+        (hr, out, held_refcount)
+    }
+
+    /// Lock the whole surface. The returned guard unlocks on drop.
+    #[must_use]
+    pub fn lock_rect(&self, flags: u32) -> LockedRect<'_> {
+        self.lock_rect_inner(None, flags)
+    }
+
+    /// Lock a surface rectangle. The returned guard unlocks on drop.
+    #[must_use]
+    pub fn lock_rect_partial(&self, rect: &[i32; 4], flags: u32) -> LockedRect<'_> {
+        self.lock_rect_inner(Some(rect), flags)
+    }
+
+    fn lock_rect_inner(&self, rect: Option<&[i32; 4]>, flags: u32) -> LockedRect<'_> {
+        let rect = rect.map_or(core::ptr::null(), |r| core::ptr::from_ref(r).cast());
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::null_mut(),
+        };
+        // SAFETY: live surface, writable output, and a null or live input rect.
+        let hr = unsafe { (self.vtbl().lock_rect)(self.ptr, &raw mut locked, rect, flags) };
+        expect_ok(hr, "Surface LockRect");
+        LockedRect {
+            owner: LockOwner::Surface { this: self.ptr },
+            pitch: locked.pitch,
+            bits: locked.bits,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `LockRect` over the whole surface. Returns the hr and whether `pBits` came back null.
+    ///
+    /// The struct is seeded with a garbage pointer first, so a rejected lock
+    /// that leaves it untouched reads as non-null. For a test that expects the
+    /// lock to fail; a successful one leaves the surface mapped until
+    /// [`Self::unlock_rect`].
+    #[must_use]
+    pub fn lock_rect_probe(&self, flags: u32) -> (i32, bool) {
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::without_provenance_mut(0xdead_beef),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // a null rect locks the whole surface.
+        let hr =
+            unsafe { (self.vtbl().lock_rect)(self.ptr, &raw mut locked, core::ptr::null(), flags) };
+        (hr, locked.bits.is_null())
+    }
+
+    /// `LockRect` over `rect`. Returns the hr and whether `pBits` came back null.
+    ///
+    /// The rect form of [`Self::lock_rect_probe`], with the same garbage seed:
+    /// for a test that expects the rect to be refused. A successful one leaves
+    /// the surface mapped until [`Self::unlock_rect`].
+    #[must_use]
+    pub fn lock_rect_partial_probe(&self, rect: &[i32; 4], flags: u32) -> (i32, bool) {
+        let mut locked = D3DLOCKED_RECT {
+            pitch: 0,
+            bits: core::ptr::without_provenance_mut(0xdead_beef),
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live, `&mut locked` is writable,
+        // and `rect` is a live four-`i32` RECT for the duration of the call.
+        let hr = unsafe {
+            (self.vtbl().lock_rect)(
+                self.ptr,
+                &raw mut locked,
+                core::ptr::from_ref(rect).cast(),
+                flags,
+            )
+        };
+        (hr, locked.bits.is_null())
+    }
+
+    /// `UnlockRect`. Returns the hr.
+    #[must_use]
+    pub fn unlock_rect(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().unlock_rect)(self.ptr) }
+    }
+
+    /// `GetType` (`D3DRTYPE_*`).
+    #[must_use]
+    pub fn resource_type(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_type)(self.ptr) }
+    }
+
+    /// Describe the surface. Returns `(hr, desc)`.
+    #[must_use]
+    pub fn desc(&self) -> (i32, D3DSURFACE_DESC) {
+        let mut desc = zeroed_surface_desc();
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut desc` is writable.
+        let hr = unsafe { (self.vtbl().get_desc)(self.ptr, &raw mut desc) };
+        (hr, desc)
+    }
+
+    /// Call `GetDC` with the out slot pre-seeded to `sentinel`.
+    ///
+    /// Returns `(hr, out)`: on a rejected call the out slot must be left
+    /// untouched, so `out == sentinel` proves the implementation did not write
+    /// through it.
+    #[must_use]
+    pub fn get_dc(&self, sentinel: *mut c_void) -> (i32, *mut c_void) {
+        let mut out = sentinel;
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_dc)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// `ReleaseDC` on this surface with the `HDC` another surface's `GetDC` returned.
+    ///
+    /// Returns the hr. The guard keeps its DC: a refused call leaves it held
+    /// for its own surface's `ReleaseDC`.
+    #[must_use]
+    pub fn release_dc_of(&self, dc: &SurfaceDc<'_>) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live and the handle is one a
+        // live guard holds, passed through for the implementation to check.
+        unsafe { (self.vtbl().release_dc)(self.ptr, dc.hdc) }
+    }
+
+    /// `GetDC`, asserting success and returning a guard over the memory DC.
+    ///
+    /// The guard reads and writes pixels through GDI and releases the DC on
+    /// request; use [`Self::get_dc`] instead to observe the raw hr.
+    ///
+    /// # Panics
+    /// Panics if the call fails or hands back a null `HDC`.
+    #[must_use]
+    pub fn dc(&self) -> SurfaceDc<'_> {
+        let (hr, hdc) = self.get_dc(core::ptr::null_mut());
+        expect_ok(hr, "Surface GetDC");
+        assert!(!hdc.is_null(), "GetDC returned a null HDC");
+        SurfaceDc {
+            surface: self.ptr,
+            hdc,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Give up this wrapper's reference without releasing it.
+    ///
+    /// For a test that hands a surface's last reference to the device (a bound
+    /// render target) and then reads the object back through a non-owning view.
+    #[must_use]
+    pub const fn into_raw(self) -> *mut c_void {
+        let ptr = self.ptr;
+        core::mem::forget(self);
+        ptr
+    }
+
+    /// `SetPrivateData(guid, blob, len, 0)`.
+    #[must_use]
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
+    }
+
+    /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
+    ///
+    /// A null `out` asks for the size alone.
+    #[must_use]
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
+    }
+
+    /// `FreePrivateData(guid)`.
+    #[must_use]
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
+    /// `SetPrivateData(guid, punk, sizeof(ptr), D3DSPD_IUNKNOWN)`.
+    ///
+    /// The runtime holds a reference on `punk` until the key is overwritten,
+    /// freed, or the surface dies; for an implicit surface that is the
+    /// device's destruction.
+    ///
+    /// # Safety
+    /// `punk` is a live COM object that stays live until the runtime releases
+    /// the reference it takes here.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub unsafe fn set_private_data_unknown(&self, guid: &Guid, punk: *mut c_void) -> i32 {
+        let size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; for `D3DSPD_IUNKNOWN` the data pointer *is*
+        // the interface pointer, live per the contract above.
+        unsafe {
+            (self.vtbl().set_private_data)(
+                self.ptr,
+                &raw const *guid,
+                punk.cast_const(),
+                size,
+                mtld3d_types::D3DSPD_IUNKNOWN,
+            )
+        }
+    }
+}
+
+impl Drop for Surface<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+/// A held `IDirect3DSurface9::GetDC` memory DC.
+///
+/// Reads and writes pixels through GDI, which is how a test observes the
+/// surface exactly as a game's GDI drawing does. [`Self::release`] hands back
+/// the `ReleaseDC` hr; a dropped guard leaves the DC held, which the next
+/// `LockRect` / `GetDC` on the surface then rejects.
+pub struct SurfaceDc<'a> {
+    surface: *mut c_void,
+    hdc: *mut c_void,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl SurfaceDc<'_> {
+    /// Read one pixel as a `COLORREF` (`0x00BBGGRR`).
+    #[must_use]
+    pub fn get_pixel(&self, x: i32, y: i32) -> u32 {
+        crate::win32::dc_get_pixel(self.hdc.addr(), x, y)
+    }
+
+    /// Paint one pixel; `color` is a `COLORREF` (`0x00BBGGRR`).
+    ///
+    /// Returns the colour GDI stored, which for a DIB of a lower-precision
+    /// format is the nearest representable one.
+    #[must_use]
+    pub fn set_pixel(&self, x: i32, y: i32, color: u32) -> u32 {
+        crate::win32::dc_set_pixel(self.hdc.addr(), x, y, color)
+    }
+
+    /// Paint a `side` x `side` block of `color` (a `COLORREF`), origin at the top left.
+    ///
+    /// A block rather than a lone pixel: under a `render.scale` the write-back
+    /// is a downscale and the read-back an upscale, and only an interior pixel
+    /// comes through a resample pair unchanged.
+    ///
+    /// # Panics
+    /// Panics if GDI stores any pixel as a colour other than `color`.
+    pub fn fill_block(&self, side: i32, color: u32) {
+        for y in 0..side {
+            for x in 0..side {
+                assert_eq!(
+                    self.set_pixel(x, y, color),
+                    color,
+                    "SetPixel into the DC stores the colour it was handed",
+                );
+            }
+        }
+    }
+
+    /// `ReleaseDC`, returning the hr.
+    #[must_use]
+    pub fn release(self) -> i32 {
+        // SAFETY: `self.surface` is the live surface the DC was taken from.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DSurface9Vtbl>(self.surface) };
+        // SAFETY: vtable thunk; `self.hdc` is the handle the surface's own
+        // `GetDC` returned and has not been released yet.
+        unsafe { (vtbl.release_dc)(self.surface, self.hdc) }
+    }
+}
+
+// ── Vertex / index buffers ──
+
+/// An `IDirect3DVertexBuffer9`.
+pub struct VertexBuffer<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl VertexBuffer<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// `GetDevice` through this buffer's vtable, on a caller-chosen `this`.
+    ///
+    /// A null `this` and a null out-param are contract cases: the thunk
+    /// answers rather than faulting, which a wrapper method cannot express.
+    ///
+    /// # Safety
+    /// `this` is null or a live vertex buffer; `device` is null or a writable
+    /// `*mut c_void` slot.
+    #[must_use]
+    pub unsafe fn get_device_raw(&self, this: *mut c_void, device: *mut *mut c_void) -> i32 {
+        // SAFETY: vtable thunk; the caller states what `this` and `device` are.
+        unsafe { (self.vtbl().get_device)(this, device) }
+    }
+
+    /// `SetPrivateData(guid, blob, len, 0)`.
+    #[must_use]
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
+    }
+
+    /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
+    ///
+    /// A null `out` asks for the size alone.
+    #[must_use]
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
+    }
+
+    /// `FreePrivateData(guid)`.
+    #[must_use]
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
+    /// `SetPrivateData(guid, punk, sizeof(ptr), D3DSPD_IUNKNOWN)`.
+    ///
+    /// The runtime holds a reference on `punk` until the key is overwritten,
+    /// freed, or the resource dies.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub fn set_private_data_unknown(&self, guid: &Guid, punk: *mut c_void) -> i32 {
+        let size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; for `D3DSPD_IUNKNOWN` the data pointer *is*
+        // the interface pointer, and `punk` is a live COM object.
+        unsafe {
+            (self.vtbl().set_private_data)(
+                self.ptr,
+                &raw const *guid,
+                punk.cast_const(),
+                size,
+                mtld3d_types::D3DSPD_IUNKNOWN,
+            )
+        }
+    }
+
+    /// `GetPrivateData` for a stored `IUnknown`.
+    ///
+    /// Returns the hr, the pointer it wrote, and the size it reported.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    ///
+    /// # Panics
+    /// Never in practice: only if a pointer does not fit `u32`.
+    #[must_use]
+    pub fn get_private_data_unknown(&self, guid: &Guid) -> (i32, *mut c_void, u32) {
+        let mut punk: *mut c_void = core::ptr::null_mut();
+        let mut size = u32::try_from(size_of::<*mut c_void>()).expect("pointer size fits u32");
+        // SAFETY: vtable thunk; `&mut punk` is a writable pointer slot of the
+        // width `size` names.
+        let hr = unsafe {
+            (self.vtbl().get_private_data)(
+                self.ptr,
+                &raw const *guid,
+                (&raw mut punk).cast::<c_void>(),
+                &raw mut size,
+            )
+        };
+        (hr, punk, size)
+    }
+
+    /// The raw COM `this` pointer (for `SetStreamSource`).
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DVertexBuffer9Vtbl {
+        // SAFETY: `self.ptr` is a live vertex buffer for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DVertexBuffer9Vtbl>(self.ptr) }
+    }
+
+    /// Lock `[offset, offset+size)` bytes (`size == 0` locks the whole buffer).
+    ///
+    /// The returned guard unlocks on drop.
+    #[must_use]
+    pub fn lock(&self, offset: u32, size: u32, flags: u32) -> BufferLock<'_> {
+        let mut bits: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut bits` is writable.
+        let hr = unsafe { (self.vtbl().lock)(self.ptr, offset, size, &raw mut bits, flags) };
+        expect_ok(hr, "VertexBuffer Lock");
+        // SAFETY: the unlock thunk has a stable ABI; copied out so the guard
+        // need not reborrow the vtable.
+        let unlock = self.vtbl().unlock;
+        BufferLock {
+            this: self.ptr,
+            bits,
+            unlock,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `SetPriority` — returns the previous priority.
+    #[must_use]
+    pub fn set_priority(&self, priority: u32) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().set_priority)(self.ptr, priority) }
+    }
+
+    /// `GetPriority`.
+    #[must_use]
+    pub fn priority(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_priority)(self.ptr) }
+    }
+
+    /// Describe the buffer. Returns `(hr, desc)`.
+    #[must_use]
+    pub fn desc(&self) -> (i32, D3DVERTEXBUFFER_DESC) {
+        let mut desc = D3DVERTEXBUFFER_DESC {
+            format: 0,
+            resource_type: 0,
+            usage: 0,
+            pool: 0,
+            size: 0,
+            fvf: 0,
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut desc` is writable.
+        let hr = unsafe { (self.vtbl().get_desc)(self.ptr, &raw mut desc) };
+        (hr, desc)
+    }
+}
+
+impl Drop for VertexBuffer<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+/// An `IDirect3DIndexBuffer9`.
+pub struct IndexBuffer<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl IndexBuffer<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// `SetPrivateData(guid, blob, len, 0)`.
+    #[must_use]
+    pub fn set_private_data_hr(&self, guid: &Guid, blob: &[u8]) -> i32 {
+        set_private_data(self.vtbl().set_private_data, self.ptr, guid, blob)
+    }
+
+    /// `GetPrivateData(guid, out, &mut size)`, returning the hr and the size.
+    ///
+    /// A null `out` asks for the size alone.
+    #[must_use]
+    pub fn get_private_data(&self, guid: &Guid, out: Option<&mut [u8]>) -> (i32, u32) {
+        get_private_data(self.vtbl().get_private_data, self.ptr, guid, out)
+    }
+
+    /// `FreePrivateData(guid)`.
+    #[must_use]
+    pub fn free_private_data_hr(&self, guid: &Guid) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().free_private_data)(self.ptr, &raw const *guid) }
+    }
+
+    /// The raw COM `this` pointer (for `SetIndices`).
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DIndexBuffer9Vtbl {
+        // SAFETY: `self.ptr` is a live index buffer for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DIndexBuffer9Vtbl>(self.ptr) }
+    }
+
+    /// `SetPriority`, returning the previous priority.
+    #[must_use]
+    pub fn set_priority(&self, priority: u32) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().set_priority)(self.ptr, priority) }
+    }
+
+    /// `GetPriority`.
+    #[must_use]
+    pub fn priority(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_priority)(self.ptr) }
+    }
+
+    /// Lock `[offset, offset+size)` bytes (`size == 0` locks the whole buffer).
+    #[must_use]
+    pub fn lock(&self, offset: u32, size: u32, flags: u32) -> BufferLock<'_> {
+        let mut bits: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut bits` is writable.
+        let hr = unsafe { (self.vtbl().lock)(self.ptr, offset, size, &raw mut bits, flags) };
+        expect_ok(hr, "IndexBuffer Lock");
+        // SAFETY: the unlock thunk has a stable ABI; copied out for the guard.
+        let unlock = self.vtbl().unlock;
+        BufferLock {
+            this: self.ptr,
+            bits,
+            unlock,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Describe the buffer. Returns `(hr, desc)`.
+    #[must_use]
+    pub fn desc(&self) -> (i32, D3DINDEXBUFFER_DESC) {
+        let mut desc = D3DINDEXBUFFER_DESC {
+            format: 0,
+            resource_type: 0,
+            usage: 0,
+            pool: 0,
+            size: 0,
+        };
+        // SAFETY: vtable thunk; `self.ptr` is live and `&mut desc` is writable.
+        let hr = unsafe { (self.vtbl().get_desc)(self.ptr, &raw mut desc) };
+        (hr, desc)
+    }
+}
+
+impl Drop for IndexBuffer<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Shaders ──
+
+/// An `IDirect3DVertexShader9`.
+pub struct VertexShader<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl VertexShader<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: `self.ptr` is a live vertex shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DVertexShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (vtbl.get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// The raw COM `this` pointer (for `SetVertexShader`).
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    /// `GetFunction(data, &mut size)`.
+    ///
+    /// Both out-params pass through as given, so a test can exercise the size
+    /// query and the error paths rather than only the happy one.
+    ///
+    /// # Safety
+    /// `data` is either null or points to at least `*size` writable bytes;
+    /// `size` is either null or a writable `u32`. Both nulls are contract
+    /// cases a test may pass deliberately.
+    pub unsafe fn get_function(&self, data: *mut c_void, size: *mut u32) -> i32 {
+        // SAFETY: `self.ptr` is a live vertex shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DVertexShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `data`/`size` are the caller's out-params.
+        unsafe { (vtbl.get_function)(self.ptr, data, size) }
+    }
+}
+
+impl Drop for VertexShader<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is a live vertex shader; this is its last use.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DVertexShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `self.ptr` is the matching live shader.
+        unsafe { (vtbl.release)(self.ptr) };
+    }
+}
+
+/// An `IDirect3DPixelShader9`.
+pub struct PixelShader<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl PixelShader<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: `self.ptr` is a live pixel shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DPixelShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (vtbl.get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// The raw COM `this` pointer (for `SetPixelShader`).
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    /// `GetFunction(data, &mut size)`.
+    ///
+    /// Both out-params pass through as given, so a test can exercise the size
+    /// query and the error paths rather than only the happy one.
+    ///
+    /// # Safety
+    /// `data` is either null or points to at least `*size` writable bytes;
+    /// `size` is either null or a writable `u32`. Both nulls are contract
+    /// cases a test may pass deliberately.
+    pub unsafe fn get_function(&self, data: *mut c_void, size: *mut u32) -> i32 {
+        // SAFETY: `self.ptr` is a live pixel shader.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DPixelShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `data`/`size` are the caller's out-params.
+        unsafe { (vtbl.get_function)(self.ptr, data, size) }
+    }
+}
+
+impl Drop for PixelShader<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is a live pixel shader; this is its last use.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DPixelShader9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `self.ptr` is the matching live shader.
+        unsafe { (vtbl.release)(self.ptr) };
+    }
+}
+
+// ── State block ──
+
+/// An `IDirect3DStateBlock9`.
+pub struct StateBlock<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl StateBlock<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DStateBlock9Vtbl {
+        // SAFETY: `self.ptr` is a live state block for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DStateBlock9Vtbl>(self.ptr) }
+    }
+
+    /// Re-snapshot the device's current state into this block. Returns the hr.
+    #[must_use]
+    pub fn capture(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().capture)(self.ptr) }
+    }
+
+    /// Replay the captured state onto the device. Returns the hr.
+    #[must_use]
+    pub fn apply(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().apply)(self.ptr) }
+    }
+}
+
+impl Drop for StateBlock<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Query ──
+
+/// An `IDirect3DQuery9`.
+pub struct Query<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl Query<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.vtbl().get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// The raw `IDirect3DQuery9*`.
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    fn vtbl(&self) -> &'static IDirect3DQuery9Vtbl {
+        // SAFETY: `self.ptr` is a live query for the wrapper's lifetime.
+        unsafe { deref_vtbl::<IDirect3DQuery9Vtbl>(self.ptr) }
+    }
+
+    /// `GetType` (`D3DQUERYTYPE_*`).
+    #[must_use]
+    pub fn query_type(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_type)(self.ptr) }
+    }
+
+    /// Byte size of the result `GetData` writes.
+    #[must_use]
+    pub fn data_size(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().get_data_size)(self.ptr) }
+    }
+
+    /// `Issue` (`D3DISSUE_END` / `D3DISSUE_BEGIN`). Returns the hr.
+    #[must_use]
+    pub fn issue(&self, flags: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.ptr` is live.
+        unsafe { (self.vtbl().issue)(self.ptr, flags) }
+    }
+
+    /// `GetData` into a caller-sized buffer.
+    ///
+    /// `data_u32` always asks for four bytes, so it cannot see what a short
+    /// or oversized read does to the bytes around the result.
+    ///
+    /// # Panics
+    /// Panics if the buffer length does not fit in a `u32`.
+    #[must_use]
+    pub fn data_bytes(&self, buf: &mut [u8], flags: u32) -> i32 {
+        let size = u32::try_from(buf.len()).expect("query read size fits u32");
+        // SAFETY: vtable thunk; `buf` is writable for `size` bytes.
+        unsafe { (self.vtbl().get_data)(self.ptr, buf.as_mut_ptr().cast::<c_void>(), size, flags) }
+    }
+
+    /// Read a 4-byte result. Returns `(hr, value)`.
+    #[must_use]
+    pub fn data_u32(&self, flags: u32) -> (i32, u32) {
+        let mut value = 0u32;
+        // SAFETY: vtable thunk; `&mut value` covers the 4-byte EVENT/OCCLUSION result.
+        let hr = unsafe {
+            (self.vtbl().get_data)(self.ptr, (&raw mut value).cast::<c_void>(), 4, flags)
+        };
+        (hr, value)
+    }
+
+    /// Poll query status without requesting its result. Returns the hr.
+    #[must_use]
+    pub fn status(&self, flags: u32) -> i32 {
+        // SAFETY: vtable thunk; a null output pointer is valid with a zero size.
+        unsafe { (self.vtbl().get_data)(self.ptr, core::ptr::null_mut(), 0, flags) }
+    }
+}
+
+impl Drop for Query<'_> {
+    fn drop(&mut self) {
+        // SAFETY: vtable thunk; `self.ptr` is live and this is its last use.
+        unsafe { (self.vtbl().release)(self.ptr) };
+    }
+}
+
+// ── Vertex declaration ──
+
+/// An `IDirect3DVertexDeclaration9`.
+pub struct VertexDeclaration<'h> {
+    ptr: *mut c_void,
+    _marker: PhantomData<&'h ()>,
+}
+
+impl VertexDeclaration<'_> {
+    pub const fn from_raw(ptr: *mut c_void) -> Self {
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
+    /// `GetDevice`, returning the hr and the device it wrote.
+    ///
+    /// The pointer carries a reference of its own; the caller releases it.
+    #[must_use]
+    pub fn get_device(&self) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: `self.ptr` is a live vertex declaration.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DVertexDeclaration9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (vtbl.get_device)(self.ptr, &raw mut out) };
+        (hr, out)
+    }
+
+    /// The raw COM `this` pointer (for `SetVertexDeclaration`).
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+}
+
+impl Drop for VertexDeclaration<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `self.ptr` is a live vertex declaration; this is its last use.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DVertexDeclaration9Vtbl>(self.ptr) };
+        // SAFETY: vtable thunk; `self.ptr` is the matching live declaration.
+        unsafe { (vtbl.release)(self.ptr) };
+    }
+}
+
+// ── Lock guards ──
+
+enum LockOwner {
+    Texture {
+        this: *mut c_void,
+        level: u32,
+    },
+    Cube {
+        this: *mut c_void,
+        face: u32,
+        level: u32,
+    },
+    Surface {
+        this: *mut c_void,
+    },
+}
+
+/// A held texture/surface lock. Exposes the mapped span and unlocks on drop.
+pub struct LockedRect<'a> {
+    owner: LockOwner,
+    pitch: i32,
+    bits: *mut c_void,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl LockedRect<'_> {
+    /// Row pitch in bytes.
+    #[must_use]
+    pub const fn pitch(&self) -> i32 {
+        self.pitch
+    }
+
+    /// Raw pointer to the mapped span.
+    ///
+    /// For tests that fill multiple rows honouring [`Self::pitch`] (the row
+    /// stride may exceed `width * bpp`).
+    #[must_use]
+    pub const fn bits_ptr(&self) -> *mut u8 {
+        self.bits.cast::<u8>()
+    }
+
+    /// Copy `data` into the mapped span as contiguous `u32` pixels.
+    ///
+    /// # Panics
+    /// The caller must ensure `data` fits within the locked region.
+    pub const fn write_u32(&mut self, data: &[u32]) {
+        // SAFETY: `bits` maps at least `data.len()` u32s of the locked region
+        // (caller's contract); the &mut borrow makes the write exclusive.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.bits.cast::<u32>(), data.len());
+        }
+    }
+
+    /// Write a `w`x`h` block of `u32` pixels at the mapped span's origin, row by row.
+    ///
+    /// Each row starts [`Self::pitch`] bytes after the previous one. For a
+    /// lock whose row stride exceeds `w * 4`: a sub-rect lock, or a whole-level
+    /// lock a test writes only part of. `texels` is the block, tightly packed
+    /// row by row.
+    ///
+    /// # Panics
+    /// Panics if `texels` is not exactly `w * h` pixels. The caller must ensure
+    /// the block fits within the locked region.
+    pub fn write_u32_rect(&mut self, w: usize, h: usize, texels: &[u32]) {
+        assert_eq!(texels.len(), w * h, "one block of texels");
+        let pitch = usize::try_from(self.pitch).expect("positive pitch");
+        for (y, row) in texels.chunks_exact(w).enumerate() {
+            // SAFETY: the lock maps `h` rows at `bits` with `pitch` row stride
+            // (caller's contract), so row `y` starts inside the mapping.
+            let dst = unsafe { self.bits.cast::<u8>().add(y * pitch) };
+            // SAFETY: the row holds at least `w` u32s (caller's contract) and
+            // the &mut borrow makes the write exclusive.
+            unsafe { core::ptr::copy_nonoverlapping(row.as_ptr().cast::<u8>(), dst, w * 4) };
+        }
+    }
+
+    /// Write `rows` rows of `row_bytes` bytes each at the mapped span's origin, row by row.
+    ///
+    /// The byte form of [`Self::write_u32_rect`], for block-compressed
+    /// formats: a row is one row of blocks and [`Self::pitch`] the block-row
+    /// stride. `bytes` is the block, tightly packed row by row.
+    ///
+    /// # Panics
+    /// Panics if `bytes` is not exactly `row_bytes * rows` long. The caller
+    /// must ensure the block fits within the locked region.
+    pub fn write_u8_rect(&mut self, row_bytes: usize, rows: usize, bytes: &[u8]) {
+        assert_eq!(bytes.len(), row_bytes * rows, "one block of bytes");
+        let pitch = usize::try_from(self.pitch).expect("positive pitch");
+        for (y, row) in bytes.chunks_exact(row_bytes).enumerate() {
+            // SAFETY: the lock maps `rows` rows at `bits` with `pitch` row
+            // stride (caller's contract), so row `y` starts inside the mapping.
+            let dst = unsafe { self.bits.cast::<u8>().add(y * pitch) };
+            // SAFETY: the row holds at least `row_bytes` bytes (caller's
+            // contract) and the &mut borrow makes the write exclusive.
+            unsafe { core::ptr::copy_nonoverlapping(row.as_ptr(), dst, row_bytes) };
+        }
+    }
+
+    /// Copy `data` into the mapped span at offset 0 — for sub-32-bit and compressed formats.
+    ///
+    /// `data` is any `Copy` POD: `u8`/`u16`/`u32` pixels or block bytes.
+    ///
+    /// # Panics
+    /// The caller must ensure `data` fits within the locked region.
+    pub const fn write<T: Copy>(&mut self, data: &[T]) {
+        // SAFETY: `bits` maps at least `size_of_val(data)` bytes of the locked
+        // region (caller's contract); the &mut borrow makes the write exclusive.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.bits.cast::<T>(), data.len());
+        }
+    }
+
+    /// View the first `count` `u32` pixels of the mapped span.
+    #[must_use]
+    pub const fn as_u32(&self, count: usize) -> &[u32] {
+        // SAFETY: `bits` is valid for `count` u32s within the locked region
+        // (caller's contract) and lives until this guard drops.
+        unsafe { core::slice::from_raw_parts(self.bits.cast::<u32>(), count) }
+    }
+
+    /// View the first `count` bytes of the mapped span.
+    ///
+    /// For the single-byte formats (`L8`, `A8`), where one texel is one byte.
+    #[must_use]
+    pub const fn as_u8(&self, count: usize) -> &[u8] {
+        // SAFETY: `bits` is valid for `count` bytes within the locked region
+        // (caller's contract) and lives until this guard drops.
+        unsafe { core::slice::from_raw_parts(self.bits.cast::<u8>(), count) }
+    }
+
+    /// View the first `count` `u16` lanes of the mapped span.
+    ///
+    /// For the 16-bit-per-channel formats, where one texel spans several
+    /// lanes (a half-float RGBA texel is four of them).
+    #[must_use]
+    pub const fn as_u16(&self, count: usize) -> &[u16] {
+        // SAFETY: `bits` is valid for `count` u16s within the locked region
+        // (caller's contract) and lives until this guard drops.
+        unsafe { core::slice::from_raw_parts(self.bits.cast::<u16>(), count) }
+    }
+
+    /// Unlock now and return the `UnlockRect` hr, which the drop would discard.
+    #[must_use]
+    pub fn unlock(self) -> i32 {
+        let hr = self.unlock_rect();
+        core::mem::forget(self);
+        hr
+    }
+
+    fn unlock_rect(&self) -> i32 {
+        match self.owner {
+            LockOwner::Texture { this, level } => {
+                // SAFETY: `this` is the live texture this guard locked.
+                let vtbl = unsafe { deref_vtbl::<IDirect3DTexture9Vtbl>(this) };
+                // SAFETY: vtable thunk; `this` is the matching live texture.
+                unsafe { (vtbl.unlock_rect)(this, level) }
+            }
+            LockOwner::Cube { this, face, level } => {
+                // SAFETY: `this` is the live cube texture this guard locked.
+                let vtbl = unsafe { deref_vtbl::<IDirect3DCubeTexture9Vtbl>(this) };
+                // SAFETY: vtable thunk; face and level match the lock.
+                unsafe { (vtbl.unlock_rect)(this, face, level) }
+            }
+            LockOwner::Surface { this } => {
+                // SAFETY: `this` is the live surface this guard locked.
+                let vtbl = unsafe { deref_vtbl::<IDirect3DSurface9Vtbl>(this) };
+                // SAFETY: vtable thunk; `this` is the matching live surface.
+                unsafe { (vtbl.unlock_rect)(this) }
+            }
+        }
+    }
+}
+
+impl Drop for LockedRect<'_> {
+    fn drop(&mut self) {
+        self.unlock_rect();
+    }
+}
+
+/// A held vertex/index-buffer lock. Exposes the mapped span and unlocks on drop.
+pub struct BufferLock<'a> {
+    this: *mut c_void,
+    bits: *mut c_void,
+    unlock: unsafe extern "system" fn(*mut c_void) -> i32,
+    _marker: PhantomData<&'a ()>,
+}
+
+impl BufferLock<'_> {
+    /// Copy `data` (any `Copy` POD) into the mapped span at byte offset 0.
+    ///
+    /// # Panics
+    /// The caller must ensure `data` fits within the locked region.
+    pub const fn write<T: Copy>(&mut self, data: &[T]) {
+        // SAFETY: `bits` maps at least `size_of_val(data)` bytes of the locked
+        // region (caller's contract); the &mut borrow makes the write exclusive.
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), self.bits.cast::<T>(), data.len());
+        }
+    }
+
+    /// Read `count` `Copy` POD values from the mapped span at byte offset 0.
+    ///
+    /// # Panics
+    /// The caller must ensure `count` values fit within the locked region.
+    #[must_use]
+    pub fn read<T: Copy>(&self, count: usize) -> Vec<T> {
+        let mut out = Vec::with_capacity(count);
+        // SAFETY: `bits` maps at least `count * size_of::<T>()` bytes of the
+        // locked region (caller's contract); `out` has `count` capacity and the
+        // values are `Copy` POD, so the bytes are a valid `T` sequence.
+        unsafe { core::ptr::copy_nonoverlapping(self.bits.cast::<T>(), out.as_mut_ptr(), count) };
+        // SAFETY: the copy above initialised `count` elements.
+        unsafe { out.set_len(count) };
+        out
+    }
+
+    /// Unlock now and return the `Unlock` hr, which the drop would discard.
+    #[must_use]
+    pub fn unlock(self) -> i32 {
+        // SAFETY: `self.unlock` is this buffer's unlock thunk and `self.this` is
+        // the live buffer it came from; forgetting the guard keeps the drop from
+        // unlocking a second time.
+        let hr = unsafe { (self.unlock)(self.this) };
+        core::mem::forget(self);
+        hr
+    }
+}
+
+impl Drop for BufferLock<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `self.unlock` is this buffer's unlock thunk and `self.this` is
+        // the live buffer it came from.
+        unsafe { (self.unlock)(self.this) };
+    }
+}
+
+const fn zeroed_surface_desc() -> D3DSURFACE_DESC {
+    D3DSURFACE_DESC {
+        format: 0,
+        resource_type: 0,
+        usage: 0,
+        pool: 0,
+        multi_sample_type: 0,
+        multi_sample_quality: 0,
+        width: 0,
+        height: 0,
+    }
+}
+
+/// A `GetPresentStats` destination with room past the struct, aligned as the struct is.
+#[repr(C, align(8))]
+struct GuardedPresentStats {
+    bytes: [u8; PRESENT_STATS_PROBE_BYTES],
+}

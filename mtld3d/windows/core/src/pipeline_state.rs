@@ -1,0 +1,794 @@
+//! Single source of truth for D3D9 → Metal pipeline-state translation.
+//!
+//! Two functions consume the same input (`PipelineSnapshot`) and produce
+//! the two outputs that must stay in lockstep — the pipeline-cache
+//! `PipelineKey` and the native `PipelineDescription`. Anything
+//! that can change the Metal pipeline **must** appear in both. Per-field
+//! unit tests below assert the static invariant: "mutating one snapshot
+//! field produces a different key". If the audit claims a D3D state is
+//! Consumed but that value isn't keyed, the cache collides and draws
+//! silently get the wrong pipeline — e.g. a `D3DRS_BLENDOP` that is consumed on
+//! the unix side but absent from the key would collapse every blend op onto a
+//! single cached pipeline.
+
+use mtld3d_shared::{
+    MetalHandle, VertexAttrDesc, VertexBufferLayoutDesc,
+    mtl::{BlendFactor, BlendOperation, ColorWriteMask, PixelFormat, VertexStepFunction},
+    mtl_handle::MTLFunctionKind,
+};
+use mtld3d_types::{
+    D3DBLEND_BOTHINVSRCALPHA, D3DBLEND_BOTHSRCALPHA, D3DBLEND_INVSRCALPHA, D3DBLEND_ONE,
+    D3DBLEND_SRCALPHA, D3DBLEND_ZERO, D3DBLENDOP_ADD, D3DBLENDOP_MAX, D3DBLENDOP_MIN, MAX_STREAMS,
+};
+
+use crate::{
+    convert::{
+        d3d_to_metal_blend, d3d_to_metal_blend_op, d3d_to_metal_blend_rt, d3d_to_metal_write_mask,
+    },
+    ids::VertexAttrsHash,
+};
+
+bitflags::bitflags! {
+    /// Boolean RS bits that affect pipeline identity.
+    ///
+    /// Shared between `PipelineSnapshot` (the pipeline cache key) and the
+    /// d3d9 layer's `RenderStateSnapshot` (per-draw RS capture). Packed
+    /// into a u8; bits encode boolean pipeline controls derived from D3D9 RS.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    #[repr(transparent)]
+    pub struct PipelineRsFlags: u8 {
+        const BLEND_ENABLE = 1 << 0;
+        const SEPARATE_ALPHA_BLEND = 1 << 1;
+        /// ATOC plus alpha test or the A2M latch; effective only on MSAA targets.
+        const ALPHA_TO_COVERAGE = 1 << 2;
+    }
+}
+
+bitflags::bitflags! {
+    /// Booleans on `PipelineSnapshot` that aren't part of `PipelineRsBits`.
+    ///
+    /// Attachment shape — depth/stencil presence on the bound RT, and
+    /// whether the pipeline declares a color attachment. Packed into
+    /// a u8 instead of three separate `bool` fields.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct PipelineAttachFlags: u8 {
+        /// Bound RT has a depth attachment.
+        const HAS_DEPTH = 1 << 0;
+        /// Bound RT's depth attachment also carries stencil.
+        const HAS_STENCIL = 1 << 1;
+        /// Pipeline declares a color attachment.
+        ///
+        /// False for cascade caster passes where every draw has
+        /// `color_write_mask == 0` so the pass runs depth-only.
+        const HAS_COLOR_OUTPUT = 1 << 2;
+        /// Bound color RT's D3D format has a real alpha channel.
+        ///
+        /// Drives the destination-alpha blend-factor clamp: when clear
+        /// (e.g. X8R8G8B8, which shares `Bgra8Unorm` with A8R8G8B8)
+        /// `D3DBLEND_DESTALPHA` / `INVDESTALPHA` resolve to One / Zero
+        /// instead of sampling the physically-stored X byte. Set from
+        /// `map_d3d_format(fmt).has_alpha()` for the bound RT.
+        const COLOR_HAS_ALPHA = 1 << 3;
+    }
+}
+
+/// Pipeline-identity-affecting render-state bits.
+///
+/// Shared between `PipelineSnapshot` (cache key) and the d3d9 layer's
+/// `RenderStateSnapshot` (per-draw capture). Carries only the RS that
+/// gets baked into the compiled `MTLRenderPipelineState` — blend
+/// state, color-write mask, alpha-to-coverage. NOT included: depth state
+/// (`MTLDepthStencilState` is a separate cache), cull / scissor /
+/// blend-factor / depth-bias (per-encoder runtime state set via Metal
+/// command API).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(C)]
+pub struct PipelineRsBits {
+    pub flags: PipelineRsFlags,
+    /// `D3DRS_SRCBLEND` (raw D3DBLEND value, fits u8: 1..=19).
+    pub src_blend: u8,
+    /// `D3DRS_DESTBLEND` (raw D3DBLEND value).
+    pub dst_blend: u8,
+    /// `D3DRS_BLENDOP` (raw D3DBLENDOP value, 1..=5).
+    pub blend_op: u8,
+    /// `D3DRS_SRCBLENDALPHA`.
+    ///
+    /// Only active when `flags.contains(SEPARATE_ALPHA_BLEND)`; otherwise
+    /// alpha mirrors `src_blend` per D3D9 spec.
+    pub src_blend_alpha: u8,
+    /// `D3DRS_DESTBLENDALPHA`. Same activation rule.
+    pub dst_blend_alpha: u8,
+    /// `D3DRS_BLENDOPALPHA`. Same activation rule.
+    pub blend_op_alpha: u8,
+    /// `D3DRS_COLORWRITEENABLE` (4 D3DCOLORWRITEENABLE_* bits).
+    pub color_write_mask: u8,
+    /// `D3DRS_COLORWRITEENABLE1..3`, the write masks of render targets 1..3.
+    ///
+    /// Index `i` holds the mask for target `i + 1`. Only consulted for
+    /// targets present in the pass; an absent target contributes a zero
+    /// mask to the key so single-target draws never fragment the cache on
+    /// these states.
+    pub color_write_mask_ext: [u8; 3],
+}
+
+/// Colour attachments 1..3 of the render pass a draw lands in.
+///
+/// Render target 0 stays on [`PipelineSnapshot`] itself; this carries the
+/// extra simultaneous render targets. `present_mask` bit `i` (0..3) says slot
+/// `i + 1` is bound in the pass, `formats[i]` is its Metal format (ignored
+/// when absent) and `has_alpha_mask` bit `i` mirrors `COLOR_HAS_ALPHA` for it.
+/// `Copy` because the encoder copies it out of the pass state once per draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExtraColorAttachments {
+    pub formats: [PixelFormat; 3],
+    pub present_mask: u8,
+    pub has_alpha_mask: u8,
+}
+
+impl ExtraColorAttachments {
+    /// No extra attachment: the single-render-target shape.
+    pub const NONE: Self = Self {
+        formats: [PixelFormat::Bgra8Unorm; 3],
+        present_mask: 0,
+        has_alpha_mask: 0,
+    };
+
+    #[inline]
+    #[must_use]
+    pub const fn is_present(&self, extra_index: usize) -> bool {
+        self.present_mask & (1 << extra_index) != 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn has_alpha(&self, extra_index: usize) -> bool {
+        self.has_alpha_mask & (1 << extra_index) != 0
+    }
+}
+
+impl Default for ExtraColorAttachments {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl PipelineRsBits {
+    #[inline]
+    #[must_use]
+    pub const fn blend_enable(&self) -> bool {
+        self.flags.contains(PipelineRsFlags::BLEND_ENABLE)
+    }
+    #[inline]
+    #[must_use]
+    pub const fn alpha_to_coverage(&self, sample_count: u8) -> bool {
+        sample_count > 1 && self.flags.contains(PipelineRsFlags::ALPHA_TO_COVERAGE)
+    }
+    #[inline]
+    #[must_use]
+    pub const fn separate_alpha_blend_enable(&self) -> bool {
+        self.flags.contains(PipelineRsFlags::SEPARATE_ALPHA_BLEND)
+    }
+
+    /// Effective Metal write mask of extra target `extra_index` (slot `extra_index + 1`).
+    ///
+    /// Empty when the target is absent from the pass or the pixel shader,
+    /// whose `oCn` outputs `ps_color_out_mask` lists, does not write it;
+    /// otherwise the D3D9 `COLORWRITEENABLEn` mask.
+    #[must_use]
+    pub fn extra_write_mask(
+        &self,
+        extra: &ExtraColorAttachments,
+        ps_color_out_mask: u8,
+        extra_index: usize,
+    ) -> ColorWriteMask {
+        let written = ps_color_out_mask & (1 << (extra_index + 1)) != 0;
+        if extra.is_present(extra_index) && written {
+            d3d_to_metal_write_mask(u32::from(self.color_write_mask_ext[extra_index]))
+        } else {
+            ColorWriteMask::empty()
+        }
+    }
+
+    /// `true` when render target 0 receives a write under these states.
+    ///
+    /// The write mask must be non-zero and the pixel shader, whose `oCn`
+    /// outputs `ps_color_out_mask` lists, must write `oC0`.
+    #[must_use]
+    pub const fn writes_rt0(&self, ps_color_out_mask: u8) -> bool {
+        self.color_write_mask != 0 && ps_color_out_mask & 1 != 0
+    }
+
+    /// `true` when no colour target of the pass receives a write under these states.
+    ///
+    /// Render target 0 by its D3D9 mask, targets 1..3 by their effective
+    /// mask (present, written by the shader, non-zero `COLORWRITEENABLEn`).
+    #[must_use]
+    pub fn writes_no_color(&self, extra: &ExtraColorAttachments, ps_color_out_mask: u8) -> bool {
+        self.color_write_mask == 0
+            && (0..3).all(|i| {
+                self.extra_write_mask(extra, ps_color_out_mask, i)
+                    .is_empty()
+            })
+    }
+}
+
+/// Input describing one draw's pipeline state.
+///
+/// Raw-D3D (where a translation helper exists) plus pre-translated
+/// (where the value is already Metal-shaped). All future pipeline-keyed
+/// state gets a field here.
+///
+/// Not `Copy`: at 48 B this is wide enough that accidental whole-struct
+/// reads should be compile errors. `emit_draw` builds one snapshot per
+/// draw and passes it by reference to `get_or_create_pipeline`, which
+/// hands it with the draw's attribute list to `key_from_snapshot`.
+/// `Clone` stays for the rare explicit duplication path (currently just
+/// the no-color twin in `get_or_create_pipeline`).
+///
+/// `PartialEq`/`Eq` back the encoder's single-entry resolve memo: comparing
+/// two snapshots is cheaper than rebuilding the [`PipelineKey`] (its
+/// D3D→Metal translations + the cache probe), and equality implies an
+/// identical key, so the memo can return the cached handle directly. The
+/// key is a pure function of the snapshot and the attribute list, and the
+/// list is a function of the declaration (`vdecl_hash`), the vertex shader
+/// it was resolved against, whose identity `vs_fn` carries, for a draw
+/// with an attribute past its stream's stride, the `stream_layouts` that
+/// placed it (`streams::remap_crossing_attributes`), and, for a draw with a
+/// stream offset off a four-byte boundary, the remainders that moved its
+/// attributes, which such a draw folds into `vdecl_hash`
+/// (`streams::CrossingFetch::snapshot_vdecl_hash`).
+#[derive(Clone)]
+pub struct PipelineSnapshot {
+    pub vs_fn: MetalHandle<MTLFunctionKind>,
+    pub ps_fn: MetalHandle<MTLFunctionKind>,
+    /// Declaration identity: the FVF code, or the declaration's element hash.
+    ///
+    /// A draw that binds a stream offset off a four-byte boundary carries
+    /// the hash with its offsets' remainders folded in. Not keyed: the key
+    /// hashes the resolved attribute list instead, since the vertex
+    /// descriptor is built from it and `stream_layouts` alone, so two
+    /// declarations that resolve alike share a pipeline. The resolve memo,
+    /// the persisted recipe and the build diagnostics read it.
+    pub vdecl_hash: u64,
+    /// Vertex buffer layout per Metal vertex buffer slot.
+    ///
+    /// Slot `n` is D3D9 stream `n`, except the slots a draw with an attribute
+    /// past its stream's stride gives that attribute
+    /// (`streams::CrossingFetch`). Canonical: a stream the draw does not read is
+    /// [`StreamLayout::UNUSED`], so two draws that differ only in streams
+    /// neither reads share a pipeline.
+    pub stream_layouts: [StreamLayout; MAX_STREAMS as usize],
+    pub color_format: PixelFormat,
+    /// Attachment-shape flags: `HAS_DEPTH`, `HAS_STENCIL`, `HAS_COLOR_OUTPUT`.
+    ///
+    /// Packed instead of three bool fields.
+    pub attach: PipelineAttachFlags,
+    /// Blend, color-write and alpha-to-coverage RS.
+    ///
+    /// The subset of D3D9 RS that affects `MTLRenderPipelineState`
+    /// identity. d3d9 layer's `RenderStateSnapshot` carries an identical
+    /// `PipelineRsBits` substruct so per-draw construction is one field
+    /// copy.
+    pub rs: PipelineRsBits,
+    /// Render targets 1..3 bound in the pass.
+    pub extra: ExtraColorAttachments,
+    /// Bit `i` set ⇒ the bound pixel shader writes `oCi`.
+    ///
+    /// An extra target the shader never writes gets an empty write mask so
+    /// its contents survive the draw (Metal leaves an unwritten colour
+    /// output undefined). Fixed-function and SM1 shaders report bit 0.
+    pub ps_color_out_mask: u8,
+    /// Multisample count of the render pass this draw lands in, 1 for none.
+    ///
+    /// Metal requires the pipeline's `rasterSampleCount` to equal the sample
+    /// count of the pass's attachment textures, so two draws that differ only
+    /// in the target they are bound to still need distinct pipelines. `u8`
+    /// because D3D9 caps the enum at 16 samples.
+    pub sample_count: u8,
+}
+
+// Written out rather than derived because the memo compares a snapshot on
+// every draw: the derived compare tests the sixteen stream layouts field by
+// field, a branch each, while `same_layouts` folds them into one reduction.
+// The destructuring names every field, so a new field fails to compile here.
+impl PartialEq for PipelineSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        let Self {
+            vs_fn,
+            ps_fn,
+            vdecl_hash,
+            stream_layouts,
+            color_format,
+            attach,
+            rs,
+            extra,
+            ps_color_out_mask,
+            sample_count,
+        } = self;
+        *vs_fn == other.vs_fn
+            && *ps_fn == other.ps_fn
+            && *vdecl_hash == other.vdecl_hash
+            && *color_format == other.color_format
+            && *attach == other.attach
+            && *rs == other.rs
+            && *extra == other.extra
+            && *ps_color_out_mask == other.ps_color_out_mask
+            && *sample_count == other.sample_count
+            && same_layouts(stream_layouts, &other.stream_layouts)
+    }
+}
+
+impl Eq for PipelineSnapshot {}
+
+impl PipelineSnapshot {
+    /// Effective Metal write mask of extra target `extra_index` (slot `extra_index + 1`).
+    ///
+    /// Empty when the target is absent from the pass or the shader does not
+    /// write it; otherwise the D3D9 `COLORWRITEENABLEn` mask.
+    fn extra_write_mask(&self, extra_index: usize) -> ColorWriteMask {
+        self.rs
+            .extra_write_mask(&self.extra, self.ps_color_out_mask, extra_index)
+    }
+
+    /// `true` when no colour target of the pass receives a write from this draw.
+    ///
+    /// See [`PipelineRsBits::writes_no_color`]. Rule H builds the no-colour
+    /// pipeline twin for such draws.
+    #[must_use]
+    pub fn writes_no_color(&self) -> bool {
+        self.rs.writes_no_color(&self.extra, self.ps_color_out_mask)
+    }
+
+    /// Turn this into the snapshot of the same draw in a pass without colour attachments.
+    ///
+    /// Clears `HAS_COLOR_OUTPUT` and the extra targets, the only fields a
+    /// pass without colour attachments changes.
+    pub fn remove_color_output(&mut self) {
+        self.attach.remove(PipelineAttachFlags::HAS_COLOR_OUTPUT);
+        self.extra = ExtraColorAttachments::NONE;
+    }
+
+    /// Metal format keyed for extra target `extra_index`, normalised when absent.
+    const fn extra_format(&self, extra_index: usize) -> PixelFormat {
+        if self.extra.is_present(extra_index) {
+            self.extra.formats[extra_index]
+        } else {
+            ExtraColorAttachments::NONE.formats[extra_index]
+        }
+    }
+
+    /// Blend factors for extra target `extra_index`, with its own alpha clamp.
+    ///
+    /// `(src, dst, src_alpha, dst_alpha)`; the blend ops are shared with
+    /// target 0 (D3D9 has one blend state).
+    fn extra_blend_factors(
+        &self,
+        blend: &EffectiveBlend,
+        extra_index: usize,
+    ) -> (BlendFactor, BlendFactor, BlendFactor, BlendFactor) {
+        let has_alpha = self.extra.is_present(extra_index) && self.extra.has_alpha(extra_index);
+        (
+            d3d_to_metal_blend_rt(blend.src, has_alpha),
+            d3d_to_metal_blend_rt(blend.dst, has_alpha),
+            d3d_to_metal_blend_rt(blend.src_alpha, has_alpha),
+            d3d_to_metal_blend_rt(blend.dst_alpha, has_alpha),
+        )
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn has_depth(&self) -> bool {
+        self.attach.contains(PipelineAttachFlags::HAS_DEPTH)
+    }
+    #[inline]
+    #[must_use]
+    pub const fn has_stencil(&self) -> bool {
+        self.attach.contains(PipelineAttachFlags::HAS_STENCIL)
+    }
+    #[inline]
+    #[must_use]
+    pub const fn has_color_output(&self) -> bool {
+        self.attach.contains(PipelineAttachFlags::HAS_COLOR_OUTPUT)
+    }
+    /// Whether the bound colour RT's D3D format carries a real alpha channel.
+    ///
+    /// Feeds [`d3d_to_metal_blend_rt`] so destination-alpha blend factors
+    /// clamp on alpha-less targets (X8R8G8B8). The key holds its effect through
+    /// target 0's remapped factors, or holds the bit itself when an extra
+    /// target blends (see [`key_from_snapshot`]), so X8 and A8 pipelines key
+    /// apart.
+    #[inline]
+    #[must_use]
+    pub const fn color_has_alpha(&self) -> bool {
+        self.attach.contains(PipelineAttachFlags::COLOR_HAS_ALPHA)
+    }
+}
+
+/// Cache key.
+///
+/// Opaque outside this module — the only consumer is the pipeline cache's
+/// `HashMap<PipelineKey, u64>`, which uses the derived `Hash + Eq` on the
+/// struct as a whole. Keeping fields private makes the per-field invariant
+/// test (below) the sole contract between this module and every D3D9 state
+/// that influences pipeline identity.
+///
+/// In memory only: the persisted pipeline recipe stores the
+/// [`PipelineSnapshot`] and prewarm derives the key again, so the fields
+/// below can be normalised without a cache schema change. Two snapshots that
+/// build the same Metal pipeline share one key: no blend, mask or colour
+/// format without a colour output, and the factors of a `MIN` or `MAX`
+/// equation, which Metal ignores, read as `ONE`. Every attachment's blend
+/// factors are a function of the key.
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub struct PipelineKey {
+    vs_fn: MetalHandle<MTLFunctionKind>,
+    ps_fn: MetalHandle<MTLFunctionKind>,
+    vertex_attrs_hash: VertexAttrsHash,
+    stream_layouts: [StreamLayout; MAX_STREAMS as usize],
+    /// `BLEND_ENABLE` and `ALPHA_TO_COVERAGE` as the pipeline applies them.
+    ///
+    /// `SEPARATE_ALPHA_BLEND` stays clear: the alpha factors and operation
+    /// below already carry its effect.
+    flags: PipelineRsFlags,
+    /// `HAS_DEPTH`, `HAS_STENCIL`, `HAS_COLOR_OUTPUT`, and `COLOR_HAS_ALPHA` under MRT blending.
+    ///
+    /// Without an extra target blending, `COLOR_HAS_ALPHA` reaches Metal only
+    /// through target 0's destination-alpha factors, which the key then holds
+    /// after the clamp, so it stays clear. See [`key_from_snapshot`] for the
+    /// MRT case.
+    attach: PipelineAttachFlags,
+    src_blend: BlendFactor,
+    dst_blend: BlendFactor,
+    blend_op: BlendOperation,
+    src_blend_alpha: BlendFactor,
+    dst_blend_alpha: BlendFactor,
+    blend_op_alpha: BlendOperation,
+    color_write_mask: ColorWriteMask,
+    color_format: PixelFormat,
+    /// Render targets 1..3: presence, format, effective write mask, alpha clamp.
+    ///
+    /// The alpha bit stands in for the per-target blend factors: each target
+    /// clamps the shared unclamped factors by its own bit, and the key holds
+    /// the unclamped factors whenever an extra target blends, so keying the
+    /// bit keys the factors. It is zero while blending is off, when no factor
+    /// reaches Metal.
+    extra_present_mask: u8,
+    extra_has_alpha_mask: u8,
+    extra_formats: [PixelFormat; 3],
+    extra_write_masks: [ColorWriteMask; 3],
+    sample_count: u8,
+}
+
+/// Per-draw thunk-params builder input.
+///
+/// Adds the slice reference the wire-format struct needs
+/// (`vertex_attrs_ptr` + count).
+///
+/// Separated from `PipelineSnapshot` so the snapshot can be borrowed
+/// through this wrapper without dragging the lifetime of
+/// `vertex_attrs` into the underlying type.
+pub struct PipelineBuildInputs<'a> {
+    pub snapshot: &'a PipelineSnapshot,
+    pub vertex_attrs: &'a [VertexAttrDesc],
+    /// The wire form of `snapshot.stream_layouts`, used streams only.
+    ///
+    /// Built by [`vertex_layouts_from_snapshot`]; the slice outlives the
+    /// synchronous native pipeline creation that borrows it.
+    pub vertex_layouts: &'a [VertexBufferLayoutDesc],
+}
+
+/// One vertex buffer layout of a pipeline: how Metal steps through a D3D9 stream.
+///
+/// Part of the pipeline identity: a stream bound with a different stride or
+/// a different `SetStreamSourceFreq` needs a different vertex descriptor.
+/// `Copy` because the snapshot carries an array of them and the draw path
+/// builds that array by value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct StreamLayout {
+    /// Bytes per step; never 0 for a used stream (Metal rejects it).
+    pub stride: u32,
+    pub step: VertexStepFunction,
+    /// Instances per advance (`PerInstance`); 1 for `PerVertex`, 0 for `Constant`.
+    pub step_rate: u32,
+}
+
+impl StreamLayout {
+    /// The canonical value of a stream the draw does not read.
+    pub const UNUSED: Self = Self {
+        stride: 0,
+        step: VertexStepFunction::PerVertex,
+        step_rate: 0,
+    };
+
+    #[inline]
+    #[must_use]
+    pub const fn is_used(&self) -> bool {
+        self.stride != 0
+    }
+}
+
+/// The wire layouts of a snapshot, one per used stream.
+///
+/// Allocates; called only on a pipeline-cache miss, never per draw.
+#[must_use]
+pub fn vertex_layouts_from_snapshot(s: &PipelineSnapshot) -> Vec<VertexBufferLayoutDesc> {
+    // `0u32..` yields the stream index as a u32 without a fallible width
+    // conversion.
+    (0u32..)
+        .zip(s.stream_layouts.iter())
+        .filter(|(_, l)| l.is_used())
+        .map(|(stream, l)| VertexBufferLayoutDesc {
+            buffer_index: stream,
+            stride: l.stride,
+            step_function: l.step,
+            step_rate: l.step_rate,
+        })
+        .collect()
+}
+
+/// The cache key of a draw with pipeline state `s` reading `vertex_attrs`.
+///
+/// Called on a resolve-memo miss only, so the attribute hash and the blend
+/// canonicalization stay off the per-draw path.
+#[must_use]
+pub fn key_from_snapshot(s: &PipelineSnapshot, vertex_attrs: &[VertexAttrDesc]) -> PipelineKey {
+    let blend = effective_blend(s);
+    let color = s.has_color_output();
+    // With an extra target blending, the factors are keyed before target 0's
+    // destination-alpha clamp, with `COLOR_HAS_ALPHA` beside them: each
+    // target clamps them by its own alpha bit, and target 0's clamped
+    // factors alone would let two snapshots that differ only in a factor
+    // target 0 clamps away share a key while an extra target sees them apart.
+    // Without one, the clamped factors are the whole effect of the bit.
+    let mrt_blend = blend.enable && s.extra.present_mask != 0;
+    let factor = |d3d: u32| {
+        if mrt_blend {
+            d3d_to_metal_blend(d3d)
+        } else {
+            d3d_to_metal_blend_rt(d3d, s.color_has_alpha())
+        }
+    };
+    let mut flags = PipelineRsFlags::empty();
+    flags.set(PipelineRsFlags::BLEND_ENABLE, blend.enable);
+    flags.set(
+        PipelineRsFlags::ALPHA_TO_COVERAGE,
+        s.rs.alpha_to_coverage(s.sample_count),
+    );
+    PipelineKey {
+        vs_fn: s.vs_fn,
+        ps_fn: s.ps_fn,
+        vertex_attrs_hash: VertexAttrsHash::from_attrs(vertex_attrs),
+        stream_layouts: s.stream_layouts,
+        flags,
+        attach: if mrt_blend {
+            s.attach
+        } else {
+            s.attach.difference(PipelineAttachFlags::COLOR_HAS_ALPHA)
+        },
+        src_blend: factor(blend.src),
+        dst_blend: factor(blend.dst),
+        blend_op: d3d_to_metal_blend_op(blend.op),
+        src_blend_alpha: factor(blend.src_alpha),
+        dst_blend_alpha: factor(blend.dst_alpha),
+        blend_op_alpha: d3d_to_metal_blend_op(blend.op_alpha),
+        // Without a colour output neither reaches Metal.
+        color_write_mask: if color {
+            d3d_to_metal_write_mask(u32::from(s.rs.color_write_mask))
+        } else {
+            ColorWriteMask::empty()
+        },
+        color_format: if color {
+            s.color_format
+        } else {
+            ExtraColorAttachments::NONE.formats[0]
+        },
+        extra_present_mask: s.extra.present_mask,
+        // Absent slots drop their alpha bit so the key stays canonical, and
+        // so do all slots while blending is off.
+        extra_has_alpha_mask: if blend.enable {
+            s.extra.has_alpha_mask & s.extra.present_mask
+        } else {
+            0
+        },
+        extra_formats: core::array::from_fn(|i| s.extra_format(i)),
+        extra_write_masks: core::array::from_fn(|i| s.extra_write_mask(i)),
+        sample_count: s.sample_count.max(1),
+    }
+}
+
+/// Resolved blend fields of an additional native color attachment.
+pub struct ExtraColorAttachmentDescription {
+    pub format: PixelFormat,
+    pub write_mask: ColorWriteMask,
+    pub src_blend: BlendFactor,
+    pub dst_blend: BlendFactor,
+    pub src_blend_alpha: BlendFactor,
+    pub dst_blend_alpha: BlendFactor,
+}
+
+/// Resolved native pipeline inputs, borrowing the caller's vertex descriptions.
+pub struct PipelineDescription<'a> {
+    pub vs_fn_handle: MetalHandle<MTLFunctionKind>,
+    pub ps_fn_handle: MetalHandle<MTLFunctionKind>,
+    pub vertex_attrs: &'a [VertexAttrDesc],
+    pub vertex_layouts: &'a [VertexBufferLayoutDesc],
+    pub flags: PipelineRsFlags,
+    pub attach: PipelineAttachFlags,
+    pub src_blend: BlendFactor,
+    pub dst_blend: BlendFactor,
+    pub blend_op: BlendOperation,
+    pub src_blend_alpha: BlendFactor,
+    pub dst_blend_alpha: BlendFactor,
+    pub blend_op_alpha: BlendOperation,
+    pub color_write_mask: ColorWriteMask,
+    pub color_format: PixelFormat,
+    pub extra_present_mask: u8,
+    pub sample_count: u8,
+    pub extra: [ExtraColorAttachmentDescription; 3],
+}
+
+/// Build native pipeline inputs from the same snapshot used by the cache key.
+#[must_use]
+pub fn description_from_snapshot<'a>(inputs: &PipelineBuildInputs<'a>) -> PipelineDescription<'a> {
+    let s = inputs.snapshot;
+    let blend = effective_blend(s);
+    let mut flags = PipelineRsFlags::empty();
+    flags.set(PipelineRsFlags::BLEND_ENABLE, blend.enable);
+    flags.set(PipelineRsFlags::SEPARATE_ALPHA_BLEND, blend.separate_alpha);
+    flags.set(
+        PipelineRsFlags::ALPHA_TO_COVERAGE,
+        s.rs.alpha_to_coverage(s.sample_count),
+    );
+    PipelineDescription {
+        vs_fn_handle: s.vs_fn,
+        ps_fn_handle: s.ps_fn,
+        vertex_attrs: inputs.vertex_attrs,
+        vertex_layouts: inputs.vertex_layouts,
+        flags,
+        attach: s.attach,
+        src_blend: d3d_to_metal_blend_rt(blend.src, s.color_has_alpha()),
+        dst_blend: d3d_to_metal_blend_rt(blend.dst, s.color_has_alpha()),
+        blend_op: d3d_to_metal_blend_op(blend.op),
+        src_blend_alpha: d3d_to_metal_blend_rt(blend.src_alpha, s.color_has_alpha()),
+        dst_blend_alpha: d3d_to_metal_blend_rt(blend.dst_alpha, s.color_has_alpha()),
+        blend_op_alpha: d3d_to_metal_blend_op(blend.op_alpha),
+        color_write_mask: d3d_to_metal_write_mask(u32::from(s.rs.color_write_mask)),
+        color_format: s.color_format,
+        extra_present_mask: s.extra.present_mask,
+        sample_count: s.sample_count.max(1),
+        extra: core::array::from_fn(|i| {
+            let (src_blend, dst_blend, src_blend_alpha, dst_blend_alpha) =
+                s.extra_blend_factors(&blend, i);
+            ExtraColorAttachmentDescription {
+                format: s.extra_format(i),
+                write_mask: s.extra_write_mask(i),
+                src_blend,
+                dst_blend,
+                src_blend_alpha,
+                dst_blend_alpha,
+            }
+        }),
+    }
+}
+
+/// The blend factors and operations a compiled pipeline sees, as D3D9 enum values.
+///
+/// Built only by [`effective_blend`], which both the key and the wire params
+/// read, so the two cannot drift.
+struct EffectiveBlend {
+    /// `D3DRS_ALPHABLENDENABLE`, cleared when the pipeline has no colour output.
+    enable: bool,
+    src: u32,
+    dst: u32,
+    op: u32,
+    src_alpha: u32,
+    dst_alpha: u32,
+    op_alpha: u32,
+    /// `D3DRS_SEPARATEALPHABLENDENABLE`, cleared while it changes nothing.
+    ///
+    /// Clear while blending is off and whenever the alpha equation it selects
+    /// equals the colour one.
+    separate_alpha: bool,
+}
+
+/// Resolve the blend state that reaches Metal.
+///
+/// Metal ignores the factors and operations of an attachment whose blending
+/// is off, so with `D3DRS_ALPHABLENDENABLE` clear, or no colour output to
+/// blend into, they collapse to src `ONE`, dst `ZERO`, op `ADD` with separate
+/// alpha off, and draws that differ only in stale blend states share a
+/// pipeline. With blending on, the alpha factors and operation take effect
+/// only when `D3DRS_SEPARATEALPHABLENDENABLE` is TRUE (D3D9 spec); otherwise
+/// the RGB values apply to alpha too. A `BOTH*` source factor sets the
+/// destination factor of its own equation as well, see [`both_src_alpha`],
+/// and a `MIN` or `MAX` equation reads its factors as `ONE`, see
+/// [`min_max_factors`].
+fn effective_blend(s: &PipelineSnapshot) -> EffectiveBlend {
+    let rs = &s.rs;
+    if !rs.blend_enable() || !s.has_color_output() {
+        return EffectiveBlend {
+            enable: false,
+            src: D3DBLEND_ONE,
+            dst: D3DBLEND_ZERO,
+            op: D3DBLENDOP_ADD,
+            src_alpha: D3DBLEND_ONE,
+            dst_alpha: D3DBLEND_ZERO,
+            op_alpha: D3DBLENDOP_ADD,
+            separate_alpha: false,
+        };
+    }
+    let equation = |src: u8, dst: u8, op: u8| {
+        let (src, dst) = both_src_alpha(u32::from(src), u32::from(dst));
+        let op = u32::from(op);
+        let (src, dst) = min_max_factors(src, dst, op);
+        (src, dst, op)
+    };
+    let (src, dst, op) = equation(rs.src_blend, rs.dst_blend, rs.blend_op);
+    let (src_alpha, dst_alpha, op_alpha) = if rs.separate_alpha_blend_enable() {
+        equation(rs.src_blend_alpha, rs.dst_blend_alpha, rs.blend_op_alpha)
+    } else {
+        (src, dst, op)
+    };
+    let separate_alpha = (src_alpha, dst_alpha, op_alpha) != (src, dst, op);
+    EffectiveBlend {
+        enable: true,
+        src,
+        dst,
+        op,
+        src_alpha,
+        dst_alpha,
+        op_alpha,
+        separate_alpha,
+    }
+}
+
+/// Resolve the `D3DBLEND_BOTH*` source factors into the pair they stand for.
+///
+/// `D3DBLEND_BOTHSRCALPHA` as a source factor means source `SRCALPHA` and
+/// destination `INVSRCALPHA`, and `D3DBLEND_BOTHINVSRCALPHA` the reverse; the
+/// destination state is overridden either way (D3D9 spec). Any other pair
+/// passes through. A `BOTH*` value written as the destination factor is left
+/// to [`crate::convert::d3d_to_metal_blend`], which reads it as its source half.
+const fn both_src_alpha(src: u32, dst: u32) -> (u32, u32) {
+    match src {
+        D3DBLEND_BOTHSRCALPHA => (D3DBLEND_SRCALPHA, D3DBLEND_INVSRCALPHA),
+        D3DBLEND_BOTHINVSRCALPHA => (D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA),
+        _ => (src, dst),
+    }
+}
+
+/// The factors of one blend equation, read as `ONE` under `D3DBLENDOP_MIN` or `MAX`.
+///
+/// Both operations combine the unweighted source and destination (D3D9
+/// spec), and Metal ignores the factors of a `Min` or `Max` equation as
+/// well, so any pair is the same pipeline.
+const fn min_max_factors(src: u32, dst: u32, op: u32) -> (u32, u32) {
+    match op {
+        D3DBLENDOP_MIN | D3DBLENDOP_MAX => (D3DBLEND_ONE, D3DBLEND_ONE),
+        _ => (src, dst),
+    }
+}
+
+/// Whether two layout arrays are equal, folded into one reduction with no branch per field.
+///
+/// The destructuring names every field, so a new field fails to compile here.
+fn same_layouts(
+    left: &[StreamLayout; MAX_STREAMS as usize],
+    right: &[StreamLayout; MAX_STREAMS as usize],
+) -> bool {
+    let mut difference = 0;
+    for (left, right) in left.iter().zip(right) {
+        let StreamLayout {
+            stride,
+            step,
+            step_rate,
+        } = left;
+        difference |= (stride ^ right.stride)
+            | (*step as u32 ^ right.step as u32)
+            | (step_rate ^ right.step_rate);
+    }
+    difference == 0
+}
+
+#[cfg(test)]
+mod tests;

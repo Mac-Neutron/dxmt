@@ -1,0 +1,584 @@
+//! Present-time render pass: the game's back buffer onto the drawable.
+//!
+//! Every present that `MetalFX` does not upscale comes through here, matching
+//! extents included: the drawable is framebuffer-only, so no blit can write
+//! it. One fullscreen triangle, three fragment entry points, one for each
+//! thing present has to do:
+//!
+//! - **SDR at any ratio**: sample and write. Exact at matching extents, a
+//!   filtered stretch otherwise. This is the route that guarantees every
+//!   drawable pixel is written whatever the geometry, which
+//!   `MTLFXSpatialScaler` cannot do (it only enlarges).
+//! - **HDR without headroom**: sRGB → linear, no tone mapping.
+//! - **HDR with headroom**: sRGB → linear plus SDR→HDR inverse tone
+//!   mapping in **`ICtCp`** (BT.2100 perceptual color space).
+//!
+//! The HDR pair exists because when the `CAMetalLayer` is configured for
+//! EDR (`RGBA16Float` + `kCGColorSpaceExtendedLinear*` +
+//! `wantsExtendedDynamicRange = true`) the drawable expects linear float
+//! values, not the gamma-encoded bytes the game wrote.
+//!
+//! The `ICtCp` variant of BT.2446 Method A operates on the I (intensity)
+//! channel of `ICtCp` while leaving Ct/Cp (chroma) untouched, so
+//! saturated content (spells, fire, sunset) keeps its chroma when
+//! lifted into HDR brightness instead of desaturating toward white.
+//!
+//! Output values are in linear BT.709/sRGB primaries — the same
+//! primaries the source backbuffer uses. The display-class-matched
+//! layer colorspace (`ExtendedLinearSRGB` / `ExtendedLinearDisplayP3` /
+//! `ExtendedLinearITUR_2020`, picked at attach time in
+//! `macdrv::configure_metal_layer_inner`) tells macOS what primaries
+//! those values are in; macOS gamut-converts to the panel as needed.
+//!
+//! The library + pipeline states are created once per process on the
+//! first shader-driven present (via `OnceLock`) and reused. Resources
+//! intentionally leak on shutdown — they're process-lifetime objects
+//! alongside the device and command queue.
+
+use core::ptr::NonNull;
+use std::sync::{LazyLock, Mutex, OnceLock, PoisonError};
+
+use mtld3d_shared::{
+    MetalHandle,
+    mtl::PixelFormat,
+    mtl_handle::{MTLLibraryKind, MTLRenderPipelineStateKind},
+};
+use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLCompileOptions, MTLDevice, MTLFunction, MTLLanguageVersion, MTLLibrary, MTLMathMode,
+    MTLPixelFormat, MTLRenderPipelineDescriptor, MTLRenderPipelineState,
+};
+use rustc_hash::FxHashMap;
+
+use crate::{
+    LOG_TARGET,
+    metal::handle::{IntoRetained, ReleaseRetain, keep_first},
+};
+
+/// MSL source for the present-pass library.
+///
+/// One library, one shared vertex stage, **three frame fragment entry points**
+/// and their three cursor twins (`mtld3d_cursor_ps_*`: the same colour
+/// transform, then straight alpha premultiplied for the overlay window's
+/// compositor):
+///
+/// - `mtld3d_present_ps_copy`: sample the source backbuffer and return it
+///   unchanged. Source and destination are both gamma-encoded 8-bit, so
+///   the sampler's resample is the entire pass: bit-exact at matching
+///   extents, a bilinear stretch in either direction otherwise.
+///
+/// - `mtld3d_present_ps_hdr_passthrough` — sample the source backbuffer,
+///   apply the sRGB → linear EOTF, return. Selected on the CPU side
+///   when the panel reports no EDR headroom this frame (`peak <= 1.0`),
+///   either because macOS hasn't promoted the screen yet or because
+///   brightness/thermal state physically rules it out. Output is in
+///   linear sRGB/BT.709 primaries; the display-class-matched
+///   `kCGColorSpaceExtendedLinear*` layer tag lets macOS gamut-convert
+///   to the panel. BT.2446-A is **not** identity at `L_hdr = L_sdr`
+///   (the inverse mapping under-corrects), so we pick this pipeline
+///   rather than running BT.2446 with a no-op intent.
+///
+/// - `mtld3d_present_ps_hdr_bt2446` — sample, sRGB → linear EOTF, then
+///   **ITU-R BT.2446 Method A** SDR→HDR inverse tone mapping operated
+///   in `ICtCp` (BT.2100 perceptual color space). The inverse curve
+///   runs on the **I (intensity)** channel only; Ct, Cp (chroma) stay
+///   put. That keeps saturated content (spell effects, fire, sunset)
+///   from desaturating toward white as it's lifted into HDR
+///   brightness — the chroma-preserving property of operating in
+///   `ICtCp` rather than on luminance alone. Output is in linear BT.709
+///   primaries; `1.0` = SDR-paper-white = 100 nits, values exceed 1.0
+///   for HDR.
+///
+/// Vertex stage: synthesise a single oversized triangle covering the
+/// full viewport from `vertex_id` alone — no vertex buffer required.
+/// The standard fullscreen-triangle trick saves the edge-overlap
+/// rasterisation cost of a two-triangle quad. Shared between all three
+/// fragment entry points.
+///
+/// `L_SDR` is pinned to `100.0` because Apple's compositor anchors
+/// `1.0`-in-the-drawable to 100 nits and reports
+/// `maximumPotentialExtendedDynamicRangeColorComponentValue` as a
+/// multiplier of that same 100-nit reference. Any other `L_SDR` would
+/// put the BT.2446-A normalization out of phase with the compositor.
+///
+/// `P_SDR` is the constant `pSDR` from ITU-R BT.2446 §6.1.1 at
+/// `L_SDR=100`; precomputed so the compiler folds it.
+///
+/// Both HDR fragment stages use the **accurate piecewise sRGB EOTF** (not
+/// the `pow(x, 2.2)` shortcut — at EDR brightness the 2 % midtone
+/// error of the shortcut is visible).
+///
+/// Ported from the `ICtCp` branch of `Bt2446A` in Lilium's `ReShade` HDR
+/// shaders (`Shaders/lilium__include/inverse_tone_mappers.fxh`). The
+/// BT.709→LMS / LMS→BT.709 matrices and the LMS-PQ↔ICtCp matrices come
+/// from BT.2100 (transitively published in Lilium's `colour_space.fxh`).
+/// Stripped of the `InputNitsFactor`, `GammaIn/Out`, and `BT2020 + PQ
+/// encode` output steps that don't apply when we feed linearised sRGB
+/// and output linear sRGB (the layer's `ExtendedLinear*` tag handles
+/// gamut + OETF for the actual display).
+///
+/// MSL language version pinned to 2.4 for parity with the rest of mtld3d
+/// (`shader.rs`) — keeps the same library working on Intel/AMD Macs.
+const PRESENT_MSL: &str = include_str!("present.msl");
+
+/// Cached present-pass resources for the process's Metal device.
+///
+/// The unix side resolves one `MTLDevice` and hands it to every D3D device
+/// (`metal::device`), so a global `OnceLock` is the right grain; the fields
+/// are raw `u64` handles so the type is trivially `Send + Sync`. Handles leak
+/// at process exit: these are process-lifetime objects, the same as the device
+/// and command queue.
+///
+/// Six pipeline states share one MSL library, one per fragment entry
+/// point. `copy` writes the SDR drawable format; the two HDR states write
+/// the EDR one. A layer is one format or the other for its lifetime, so
+/// the unused pipelines cost one compile each and nothing else, cheaper
+/// than the per-format map the extra generality would need. The `cursor_*`
+/// trio are the software cursor's sprite passes, same formats, same
+/// transforms, premultiplied output.
+#[derive(Clone, Copy)]
+pub struct PresentPipelines {
+    pub copy: u64,               // MTLRenderPipelineState*
+    pub passthrough: u64,        // MTLRenderPipelineState*
+    pub bt2446: u64,             // MTLRenderPipelineState*
+    pub cursor_copy: u64,        // MTLRenderPipelineState*
+    pub cursor_passthrough: u64, // MTLRenderPipelineState*
+    pub cursor_bt2446: u64,      // MTLRenderPipelineState*
+}
+
+/// The BT.2446 fragment uniform block for a target peak, as the shader reads it.
+///
+/// `{ l_hdr_nits, p_hdr, log2_p_hdr, inv_p_minus_one }`, 16 bytes. BT.2446-A
+/// takes the target peak in nits, not a multiplier; Apple anchors scRGB `1.0`
+/// at 100 nits, so `L_hdr = peak × 100`. The three derived terms only depend
+/// on it and are hoisted out of the fragment stage. One function for the frame
+/// and the cursor sprite, so the two can never disagree on the curve.
+#[must_use]
+pub fn hdr_uniforms(peak: f32) -> [f32; 4] {
+    let l_hdr_nits = peak * 100.0;
+    let p_hdr = 32.0_f32.mul_add((l_hdr_nits / 10000.0).powf(1.0 / 2.4), 1.0);
+    let log2_p_hdr = p_hdr.log2();
+    let inv_p_minus_one = 1.0 / (p_hdr - 1.0);
+    [l_hdr_nits, p_hdr, log2_p_hdr, inv_p_minus_one]
+}
+
+impl PresentPipelines {
+    /// Release the six pipeline retains this set holds.
+    ///
+    /// # Safety
+    ///
+    /// Each field holds the retain `Retained::into_raw` gave it, and no copy
+    /// of this set is used afterwards.
+    unsafe fn release(self) {
+        for raw in [
+            self.copy,
+            self.passthrough,
+            self.bt2446,
+            self.cursor_copy,
+            self.cursor_passthrough,
+            self.cursor_bt2446,
+        ] {
+            // SAFETY: the caller's assertion: `raw` is a retained pipeline.
+            let handle = unsafe { MetalHandle::<MTLRenderPipelineStateKind>::new(raw) };
+            // SAFETY: the caller's assertion: nothing uses this retain after.
+            unsafe { handle.release_retain() };
+        }
+    }
+}
+
+static PIPELINES: OnceLock<PresentPipelines> = OnceLock::new();
+
+/// Which present stage a gamma pipeline is the twin of.
+///
+/// The six ordinary pipelines are built together at first use because every
+/// session presents; the gamma twins are built one at a time, on the first
+/// present that actually applies a ramp, so a game that never sets one
+/// compiles exactly what it compiled before gamma existed.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GammaStage {
+    Copy,
+    Passthrough,
+    Bt2446,
+    CursorCopy,
+    CursorPassthrough,
+    CursorBt2446,
+}
+
+impl GammaStage {
+    /// The MSL entry point and the colour format its pipeline writes.
+    const fn function(self) -> (&'static str, MTLPixelFormat) {
+        match self {
+            Self::Copy => ("mtld3d_present_ps_copy_gamma", MTLPixelFormat::BGRA8Unorm),
+            Self::Passthrough => (
+                "mtld3d_present_ps_hdr_passthrough_gamma",
+                MTLPixelFormat::RGBA16Float,
+            ),
+            Self::Bt2446 => (
+                "mtld3d_present_ps_hdr_bt2446_gamma",
+                MTLPixelFormat::RGBA16Float,
+            ),
+            Self::CursorCopy => ("mtld3d_cursor_ps_copy_gamma", MTLPixelFormat::BGRA8Unorm),
+            Self::CursorPassthrough => (
+                "mtld3d_cursor_ps_hdr_passthrough_gamma",
+                MTLPixelFormat::RGBA16Float,
+            ),
+            Self::CursorBt2446 => (
+                "mtld3d_cursor_ps_hdr_bt2446_gamma",
+                MTLPixelFormat::RGBA16Float,
+            ),
+        }
+    }
+}
+
+/// Gamma pipelines, built on the first present of their stage that needs one.
+///
+/// Keyed by stage; the values are retained `MTLRenderPipelineState` handles
+/// that live for the process, like the ordinary present pipelines.
+static GAMMA_PIPELINES: LazyLock<
+    Mutex<FxHashMap<GammaStage, MetalHandle<MTLRenderPipelineStateKind>>>,
+> = LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// The pipeline for `stage` with the gamma lookup, compiled on first use.
+///
+/// `None` when the library, the function or the pipeline state could not be
+/// created, logged at the point of failure; the caller then presents without
+/// the ramp rather than dropping the frame.
+pub fn ensure_gamma_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    stage: GammaStage,
+) -> Option<u64> {
+    if let Some(&handle) = GAMMA_PIPELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&stage)
+    {
+        return Some(handle.raw());
+    }
+    // Built outside the lock, as `ensure_readback_pipeline` does: a compile is
+    // milliseconds, and two threads building the same key both succeed, one
+    // copy is kept and the other's retain released.
+    let library = ensure_library(device)?;
+    let (ps_name, color_format) = stage.function();
+    let (Some(vs), Some(ps)) = (
+        library.newFunctionWithName(&NSString::from_str("mtld3d_present_vs")),
+        library.newFunctionWithName(&NSString::from_str(ps_name)),
+    ) else {
+        mtld3d_shared::log_once_warn!(
+            target: LOG_TARGET,
+            "present: the gamma pipeline's functions (mtld3d_present_vs, {ps_name}) are not in \
+             the present library; the frame is presented without the ramp"
+        );
+        return None;
+    };
+    let label = format!("mtld3d-present-pipeline-{ps_name}");
+    let pipeline = build_pipeline(device, &vs, &ps, color_format, &label)?;
+    // SAFETY: `Retained::into_raw` transfers the retain into the typed handle.
+    let handle = unsafe {
+        MetalHandle::<MTLRenderPipelineStateKind>::new(Retained::into_raw(pipeline) as u64)
+    };
+    let mut pipelines = GAMMA_PIPELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: `handle` holds the only retain on its pipeline.
+    Some(unsafe { keep_first(&mut pipelines, stage, handle) }.raw())
+}
+
+/// The compiled present library, retained for the process.
+///
+/// `create` builds the fixed present pipelines from it and the readback
+/// resolve builds one more per colour format on demand, so the library
+/// outlives the first call. A raw handle for the reason the pipelines are.
+static LIBRARY: OnceLock<u64> = OnceLock::new();
+
+/// Readback resolve pipelines, one per colour format and filter, built on demand.
+///
+/// The present pipelines write the two drawable formats; a readback resolve
+/// writes the source target's own format, whichever the game chose, so those
+/// states are keyed by format and by whether the copy snaps to the nearest
+/// texel. The values are retained `MTLRenderPipelineState` handles that live
+/// for the process, like the present pipelines.
+static READBACK_PIPELINES: LazyLock<
+    Mutex<FxHashMap<ReadbackKey, MetalHandle<MTLRenderPipelineStateKind>>>,
+> = LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+/// What a readback resolve pipeline is built for: the target's format and the filter.
+#[derive(PartialEq, Eq, Hash)]
+struct ReadbackKey {
+    format: PixelFormat,
+    /// The nearest-texel copy rather than the filtered one.
+    nearest: bool,
+}
+
+/// The pipeline that resamples a texture of `format` into a scratch of `format` for a readback.
+///
+/// `nearest` selects the nearest-texel copy over the filtered one, for the
+/// single-precision float formats and for the exact copy that carries a
+/// `MetalFX` output onto the drawable. Compiled on first use per key and cached
+/// for the process; `None` when the library, a function or the pipeline
+/// state could not be created, logged at the point of failure.
+pub fn ensure_readback_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    format: PixelFormat,
+    nearest: bool,
+) -> Option<u64> {
+    let key = ReadbackKey { format, nearest };
+    if let Some(&handle) = READBACK_PIPELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(handle.raw());
+    }
+    // Built outside the lock: a pipeline compile is milliseconds, and two
+    // threads building the same key both succeed, one copy is kept and the
+    // other's retain released.
+    let library = ensure_library(device)?;
+    let vs = library.newFunctionWithName(&NSString::from_str("mtld3d_present_vs"))?;
+    let ps_name = if nearest {
+        "mtld3d_readback_ps_copy_nearest"
+    } else {
+        "mtld3d_present_ps_copy"
+    };
+    let ps = library.newFunctionWithName(&NSString::from_str(ps_name))?;
+    let filter = if nearest { "nearest" } else { "linear" };
+    let label = format!("mtld3d-readback-resolve-{format:?}-{filter}");
+    let pipeline = build_pipeline(
+        device,
+        &vs,
+        &ps,
+        super::texture::mtl_pixel_format(format),
+        &label,
+    )?;
+    // SAFETY: `Retained::into_raw` transfers the retain into the typed handle.
+    let handle = unsafe {
+        MetalHandle::<MTLRenderPipelineStateKind>::new(Retained::into_raw(pipeline) as u64)
+    };
+    let mut pipelines = READBACK_PIPELINES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    // SAFETY: `handle` holds the only retain on its pipeline.
+    Some(unsafe { keep_first(&mut pipelines, key, handle) }.raw())
+}
+
+/// The present library, compiled on first use and retained for the process.
+///
+/// Two threads compiling at once both succeed and one copy is kept; the
+/// other's retain is released.
+fn ensure_library(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
+    if let Some(&handle) = LIBRARY.get() {
+        // SAFETY: the handle is the retained library `compile_library` produced
+        // and `LIBRARY` holds for the process.
+        return unsafe { MetalHandle::<MTLLibraryKind>::new(handle) }.into_retained();
+    }
+    let library = compile_library(device)?;
+    let handle = Retained::into_raw(library) as u64;
+    let kept = *LIBRARY.get_or_init(|| handle);
+    if kept != handle {
+        // SAFETY: `handle` is the retain `into_raw` transferred above and nothing
+        // else holds it.
+        drop(unsafe { Retained::from_raw(handle as *mut ProtocolObject<dyn MTLLibrary>) });
+    }
+    // SAFETY: `kept` is a retained library `LIBRARY` holds for the process.
+    unsafe { MetalHandle::<MTLLibraryKind>::new(kept) }.into_retained()
+}
+
+/// Lazily compile + cache the present-pass library + pipelines.
+///
+/// Called on the presenter thread by the first present, and by the cursor
+/// overlay on the main thread. The first call compiles MSL (~1–2 ms);
+/// subsequent calls are pointer loads.
+///
+/// Returns `None` (with an error at the failure site) if MSL compilation
+/// or pipeline creation fails. The present caller then clears the drawable:
+/// no blit can write a framebuffer-only drawable.
+pub fn ensure_resources(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
+    if let Some(r) = PIPELINES.get() {
+        return Some(*r);
+    }
+    // Built outside the `OnceLock`, as the gamma and readback pipelines are:
+    // the presenter thread and the cursor overlay on the main thread can both
+    // arrive first, and the set that loses is released.
+    let resources = create(device)?;
+    let kept = *PIPELINES.get_or_init(|| resources);
+    if kept.copy != resources.copy {
+        // SAFETY: `create` handed `resources` the only retains on its six
+        // pipelines, and the `OnceLock` kept another set.
+        unsafe { resources.release() };
+    }
+    Some(kept)
+}
+
+/// Compile [`PRESENT_MSL`] for `device`.
+fn compile_library(
+    device: &ProtocolObject<dyn MTLDevice>,
+) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
+    let source = NSString::from_str(PRESENT_MSL);
+    let options = MTLCompileOptions::new();
+    options.setLanguageVersion(MTLLanguageVersion::Version2_4);
+    // `mathMode` defaults to `Fast` for MSL ≤ 3.1 (Apple's back-compat with
+    // the deprecated `fastMathEnabled = true` default) and `Relaxed` for
+    // MSL ≥ 3.2. Pin explicitly so a future MSL bump doesn't silently
+    // halve transcendental throughput: the present pass is sRGB EOTF and
+    // PQ/ICtCp math, none of which needs IEEE-precise edge handling
+    // (existing `max(x, 0)` / `max(x, 1e-20)` clamps already guard the
+    // domain). Applies to every fragment entry point; the VS is a
+    // positional fullscreen triangle with no invariance concerns.
+    options.setMathMode(MTLMathMode::Fast);
+
+    let library = match device.newLibraryWithSource_options_error(&source, Some(&options)) {
+        Ok(lib) => lib,
+        Err(e) => {
+            log::error!(
+                target: LOG_TARGET,
+                "present: MSL compilation failed: {e}"
+            );
+            return None;
+        }
+    };
+    {
+        let label = NSString::from_str("mtld3d-present");
+        library.setLabel(Some(&label));
+    }
+    Some(library)
+}
+
+fn create(device: &ProtocolObject<dyn MTLDevice>) -> Option<PresentPipelines> {
+    let library = ensure_library(device)?;
+
+    let vs_name = NSString::from_str("mtld3d_present_vs");
+    let ps_copy_name = NSString::from_str("mtld3d_present_ps_copy");
+    let ps_passthrough_name = NSString::from_str("mtld3d_present_ps_hdr_passthrough");
+    let ps_bt2446_name = NSString::from_str("mtld3d_present_ps_hdr_bt2446");
+    let cursor_copy_name = NSString::from_str("mtld3d_cursor_ps_copy");
+    let cursor_passthrough_name = NSString::from_str("mtld3d_cursor_ps_hdr_passthrough");
+    let cursor_bt2446_name = NSString::from_str("mtld3d_cursor_ps_hdr_bt2446");
+    let vs = library.newFunctionWithName(&vs_name)?;
+    let ps_copy = library.newFunctionWithName(&ps_copy_name)?;
+    let ps_passthrough = library.newFunctionWithName(&ps_passthrough_name)?;
+    let ps_bt2446 = library.newFunctionWithName(&ps_bt2446_name)?;
+    let ps_cursor_copy = library.newFunctionWithName(&cursor_copy_name)?;
+    let ps_cursor_passthrough = library.newFunctionWithName(&cursor_passthrough_name)?;
+    let ps_cursor_bt2446 = library.newFunctionWithName(&cursor_bt2446_name)?;
+
+    let copy = build_pipeline(
+        device,
+        &vs,
+        &ps_copy,
+        MTLPixelFormat::BGRA8Unorm,
+        "mtld3d-present-pipeline-copy",
+    )?;
+    let passthrough = build_pipeline(
+        device,
+        &vs,
+        &ps_passthrough,
+        MTLPixelFormat::RGBA16Float,
+        "mtld3d-present-pipeline-hdr-passthrough",
+    )?;
+    let bt2446 = build_pipeline(
+        device,
+        &vs,
+        &ps_bt2446,
+        MTLPixelFormat::RGBA16Float,
+        "mtld3d-present-pipeline-hdr-bt2446",
+    )?;
+    let cursor_copy = build_pipeline(
+        device,
+        &vs,
+        &ps_cursor_copy,
+        MTLPixelFormat::BGRA8Unorm,
+        "mtld3d-present-pipeline-cursor-copy",
+    )?;
+    let cursor_passthrough = build_pipeline(
+        device,
+        &vs,
+        &ps_cursor_passthrough,
+        MTLPixelFormat::RGBA16Float,
+        "mtld3d-present-pipeline-cursor-hdr-passthrough",
+    )?;
+    let cursor_bt2446 = build_pipeline(
+        device,
+        &vs,
+        &ps_cursor_bt2446,
+        MTLPixelFormat::RGBA16Float,
+        "mtld3d-present-pipeline-cursor-hdr-bt2446",
+    )?;
+
+    // Library and functions are kept alive by the pipeline states
+    // (Metal copies what it needs at pipeline-state creation time).
+    // The pipeline handles themselves leak for process lifetime via
+    // `Retained::into_raw`.
+    let _ = library;
+    let _ = vs;
+    let _ = ps_copy;
+    let _ = ps_passthrough;
+    let _ = ps_bt2446;
+    let _ = ps_cursor_copy;
+    let _ = ps_cursor_passthrough;
+    let _ = ps_cursor_bt2446;
+
+    let pipeline_copy_handle = Retained::into_raw(copy) as u64;
+    let pipeline_passthrough_handle = Retained::into_raw(passthrough) as u64;
+    let pipeline_bt2446_handle = Retained::into_raw(bt2446) as u64;
+    let cursor_copy_handle = Retained::into_raw(cursor_copy) as u64;
+    let cursor_passthrough_handle = Retained::into_raw(cursor_passthrough) as u64;
+    let cursor_bt2446_handle = Retained::into_raw(cursor_bt2446) as u64;
+    // Sanity: a raw pointer cast through `Retained::into_raw` can't be
+    // null, but proving that to the type system requires the
+    // conversion below; the `NonNull` is purely a debug-time guard
+    // against a future API change.
+    debug_assert!(NonNull::new(pipeline_copy_handle as *mut u8).is_some());
+    debug_assert!(NonNull::new(pipeline_passthrough_handle as *mut u8).is_some());
+    debug_assert!(NonNull::new(pipeline_bt2446_handle as *mut u8).is_some());
+    debug_assert!(NonNull::new(cursor_copy_handle as *mut u8).is_some());
+    debug_assert!(NonNull::new(cursor_passthrough_handle as *mut u8).is_some());
+    debug_assert!(NonNull::new(cursor_bt2446_handle as *mut u8).is_some());
+
+    Some(PresentPipelines {
+        copy: pipeline_copy_handle,
+        passthrough: pipeline_passthrough_handle,
+        bt2446: pipeline_bt2446_handle,
+        cursor_copy: cursor_copy_handle,
+        cursor_passthrough: cursor_passthrough_handle,
+        cursor_bt2446: cursor_bt2446_handle,
+    })
+}
+
+fn build_pipeline(
+    device: &ProtocolObject<dyn MTLDevice>,
+    vs: &ProtocolObject<dyn MTLFunction>,
+    ps: &ProtocolObject<dyn MTLFunction>,
+    color_format: MTLPixelFormat,
+    label: &str,
+) -> Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+    let desc = MTLRenderPipelineDescriptor::new();
+    desc.setVertexFunction(Some(vs));
+    desc.setFragmentFunction(Some(ps));
+    // No vertex descriptor: the VS synthesises positions from
+    // `vertex_id`; Metal requires *some* vertex input slot, but with no
+    // attributes declared and no buffer bound, it's a no-op.
+    // SAFETY: `colorAttachments()` returns a non-null descriptor array;
+    // subscript 0 is always valid.
+    let color0 = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
+    color0.setPixelFormat(color_format);
+    {
+        let label = NSString::from_str(label);
+        desc.setLabel(Some(&label));
+    }
+
+    match device.newRenderPipelineStateWithDescriptor_error(&desc) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            log::error!(
+                target: LOG_TARGET,
+                "present: pipeline creation failed ({label}): {e}"
+            );
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

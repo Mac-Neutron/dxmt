@@ -1,0 +1,1416 @@
+//! Minimal hand-rolled Win32 bindings + the window plumbing every harness needs.
+//!
+//! Kept to bare `extern "system"` blocks (house style — no `windows` crate
+//! dependency); only the calls the tests exercise are declared.
+
+use core::ffi::{c_char, c_void};
+use std::{
+    sync::{Mutex, Once, PoisonError},
+    time::{Duration, Instant},
+};
+
+use mtld3d_types::{ICONINFO, IDirect3DDevice9Vtbl};
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn RegisterClassExA(wc: *const WndClassExA) -> u16;
+    fn CreateWindowExA(
+        ex_style: u32,
+        class_name: *const c_char,
+        window_name: *const c_char,
+        style: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        parent: usize,
+        menu: usize,
+        instance: usize,
+        param: *const c_void,
+    ) -> usize;
+    fn DestroyWindow(hwnd: usize) -> i32;
+    fn DefWindowProcA(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn PeekMessageA(
+        msg: *mut Msg,
+        hwnd: usize,
+        filter_min: u32,
+        filter_max: u32,
+        remove: u32,
+    ) -> i32;
+    fn MsgWaitForMultipleObjectsEx(
+        count: u32,
+        handles: *const usize,
+        millis: u32,
+        wake_mask: u32,
+        flags: u32,
+    ) -> u32;
+    fn TranslateMessage(msg: *const Msg) -> i32;
+    fn DispatchMessageA(msg: *const Msg) -> isize;
+    fn PostQuitMessage(exit_code: i32);
+    fn LoadCursorA(instance: usize, cursor_name: *const c_char) -> usize;
+    fn SendMessageA(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    fn GetCursor() -> usize;
+    fn SetCapture(hwnd: usize) -> usize;
+    fn ReleaseCapture() -> i32;
+    fn GetCapture() -> usize;
+    fn SetForegroundWindow(hwnd: usize) -> i32;
+    fn SetCursor(cursor: usize) -> usize;
+    fn GetIconInfo(icon: usize, info: *mut ICONINFO) -> i32;
+    fn GetWindowRect(hwnd: usize, rect: *mut Rect) -> i32;
+    fn GetClientRect(hwnd: usize, rect: *mut Rect) -> i32;
+    fn GetWindowLongA(hwnd: usize, index: i32) -> i32;
+    fn SetWindowLongA(hwnd: usize, index: i32, new_long: i32) -> i32;
+    fn GetSystemMetrics(index: i32) -> i32;
+    fn EnumDisplaySettingsW(device_name: *const u16, mode_num: u32, dev_mode: *mut DevModeW)
+    -> i32;
+    fn SetWindowPos(
+        hwnd: usize,
+        insert_after: usize,
+        x: i32,
+        y: i32,
+        cx: i32,
+        cy: i32,
+        flags: u32,
+    ) -> i32;
+    fn GetDC(hwnd: usize) -> usize;
+    fn ReleaseDC(hwnd: usize, hdc: usize) -> i32;
+    fn SetPropA(hwnd: usize, name: *const c_char, data: usize) -> i32;
+    fn GetPropA(hwnd: usize, name: *const c_char) -> usize;
+    fn RemovePropA(hwnd: usize, name: *const c_char) -> usize;
+}
+
+// `GetWindowLongPtrA` is a 64-bit export only; 32-bit user32 answers the
+// same query through `GetWindowLongA`, which the header aliases it to.
+#[cfg(target_pointer_width = "64")]
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetWindowLongPtrA(hwnd: usize, index: i32) -> isize;
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleA(name: *const c_char) -> usize;
+    fn GetProcAddress(module: usize, name: *const c_char) -> *mut c_void;
+    fn GetCurrentProcess() -> *mut c_void;
+    fn TerminateProcess(process: *mut c_void, exit_code: u32) -> i32;
+    fn GetLastError() -> u32;
+    fn VirtualQuery(
+        address: *const c_void,
+        buffer: *mut MemoryBasicInformation,
+        length: usize,
+    ) -> usize;
+    fn K32GetProcessMemoryInfo(
+        process: *mut c_void,
+        counters: *mut ProcessMemoryCounters,
+        size: u32,
+    ) -> i32;
+    fn VirtualAlloc(address: *mut c_void, size: usize, kind: u32, protect: u32) -> *mut c_void;
+    fn VirtualProtect(address: *mut c_void, size: usize, protect: u32, old: *mut u32) -> i32;
+    fn VirtualFree(address: *mut c_void, size: usize, kind: u32) -> i32;
+}
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn GetPixel(hdc: usize, x: i32, y: i32) -> u32;
+    fn SetPixel(hdc: usize, x: i32, y: i32, color: u32) -> u32;
+    fn GetBitmapBits(bitmap: *mut c_void, count: i32, bits: *mut c_void) -> i32;
+    fn DeleteObject(object: *mut c_void) -> i32;
+    fn ChoosePixelFormat(hdc: usize, pfd: *const PixelFormatDescriptor) -> i32;
+    fn SetPixelFormat(hdc: usize, format: i32, pfd: *const PixelFormatDescriptor) -> i32;
+}
+
+/// `PIXELFORMATDESCRIPTOR`, its byte fields as one array.
+///
+/// The array is the run between `dwFlags` and `dwLayerMask`: byte 0 is
+/// `iPixelType`, 1 `cColorBits`, 15 `cDepthBits`; the rest stay zero.
+#[repr(C)]
+struct PixelFormatDescriptor {
+    size: u16,
+    version: u16,
+    flags: u32,
+    bytes: [u8; 20],
+    layer_mask: u32,
+    visible_mask: u32,
+    damage_mask: u32,
+}
+
+const _: () = assert!(size_of::<PixelFormatDescriptor>() == 40);
+
+/// `MEM_COMMIT`: the region's pages are committed.
+const MEM_COMMIT: u32 = 0x1000;
+/// `MEM_RESERVE`: the region is reserved and not committed.
+const MEM_RESERVE: u32 = 0x2000;
+/// `MEM_FREE`: the region belongs to no allocation.
+const MEM_FREE: u32 = 0x1_0000;
+/// `MEM_RELEASE`: `VirtualFree` gives back the whole reservation.
+const MEM_RELEASE: u32 = 0x8000;
+/// `PAGE_NOACCESS`: any access to the page faults.
+const PAGE_NOACCESS: u32 = 0x01;
+/// `PAGE_READWRITE`.
+const PAGE_READWRITE: u32 = 0x04;
+/// Span of the readable part and of the guard of a [`GuardedSlice`].
+///
+/// 16 KiB, so the guard starts on a page boundary whether the host maps 4 KiB
+/// or 16 KiB pages.
+const GUARD_SPAN: usize = 16 * 1024;
+
+static FAILURE_EXIT_HOOK: Once = Once::new();
+
+/// Exit code a test process ends with once an assertion has failed.
+///
+/// The value libtest itself exits with after a failed run.
+const TEST_FAILURE_EXIT_CODE: u32 = 101;
+
+/// Make a failed assertion end the test process with a failing exit code.
+///
+/// mtld3d's `d3d9.dll` terminates the process from its `DLL_PROCESS_DETACH`
+/// at process exit once a device has been created (it cannot survive
+/// snmalloc's thread-local teardown on Wine's 1 MB main-thread stack), so a
+/// test binary's exit status is the one that `TerminateProcess` carries.
+/// The hook keeps the default hook's report, which names the failing test
+/// (libtest runs each test on a thread named after it), and then terminates
+/// with libtest's failure code at the first failed assertion, without
+/// waiting for libtest to reach the exit of its own. The tests of the suite
+/// share the process, so the ones in flight go down with it: the e2e runner
+/// marks the named test failed and runs the rest again in a fresh process.
+pub fn install_failure_exit_hook() {
+    FAILURE_EXIT_HOOK.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            // SAFETY: Win32 GetCurrentProcess returns a pseudo-handle for
+            // the current process.
+            let process = unsafe { GetCurrentProcess() };
+            // SAFETY: the current process's pseudo-handle; the documented
+            // self-terminate form.
+            unsafe { TerminateProcess(process, TEST_FAILURE_EXIT_CODE) };
+        }));
+    });
+}
+
+/// A copy of a slice that ends where a no-access page begins.
+///
+/// Reading one byte past the copy faults, so a test can pin that a call reads
+/// no more of an application's array than the API promises it may.
+pub struct GuardedSlice<T: Copy> {
+    base: *mut c_void,
+    data: *const T,
+    len: usize,
+}
+
+impl<T: Copy> GuardedSlice<T> {
+    /// Copy `items` so that their last byte is the last readable one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `items` exceed 16 KiB, are not a multiple of `T`'s alignment
+    /// long, or the allocation or protection change fails.
+    #[must_use]
+    pub fn new(items: &[T]) -> Self {
+        let bytes = size_of_val(items);
+        assert!(bytes <= GUARD_SPAN, "a guarded slice holds at most 16 KiB");
+        assert!(
+            bytes.is_multiple_of(align_of::<T>()),
+            "the copy ends on the guard, so its start keeps T's alignment"
+        );
+        // SAFETY: kernel32 export; a fresh reservation of two spans, committed
+        // read-write, at an address the system picks.
+        let base = unsafe {
+            VirtualAlloc(
+                core::ptr::null_mut(),
+                2 * GUARD_SPAN,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        assert!(!base.is_null(), "VirtualAlloc of a guarded slice failed");
+        // SAFETY: the guard span lies inside the reservation just made.
+        let guard = unsafe { base.cast::<u8>().add(GUARD_SPAN) };
+        let mut old = 0;
+        // SAFETY: kernel32 export; the second span of the reservation above.
+        let ok = unsafe {
+            VirtualProtect(
+                guard.cast::<c_void>(),
+                GUARD_SPAN,
+                PAGE_NOACCESS,
+                &raw mut old,
+            )
+        };
+        assert!(ok != 0, "VirtualProtect of the guard span failed");
+        // SAFETY: `bytes <= GUARD_SPAN`, so the copy starts inside the first span.
+        let data = unsafe { guard.sub(bytes) }.cast::<T>();
+        // SAFETY: `data` addresses `bytes` writable bytes, aligned for `T`
+        // (the reservation is page-aligned and `bytes` a multiple of the
+        // alignment), disjoint from `items`.
+        unsafe { core::ptr::copy_nonoverlapping(items.as_ptr(), data, items.len()) };
+        Self {
+            base,
+            data,
+            len: items.len(),
+        }
+    }
+
+    /// The copy, ending at the guard.
+    #[must_use]
+    pub const fn as_slice(&self) -> &[T] {
+        // SAFETY: `new` wrote `len` initialized items at `data`, which stay
+        // mapped read-write until `drop` releases the reservation.
+        unsafe { core::slice::from_raw_parts(self.data, self.len) }
+    }
+}
+
+impl<T: Copy> Drop for GuardedSlice<T> {
+    fn drop(&mut self) {
+        // SAFETY: kernel32 export; `base` is the reservation `new` made, released once.
+        let ok = unsafe { VirtualFree(self.base, 0, MEM_RELEASE) };
+        assert!(ok != 0, "VirtualFree of a guarded slice failed");
+    }
+}
+
+/// This process's address space by region state, and its peak working set, in bytes.
+///
+/// The address space is one `VirtualQuery` walk from address zero to the end
+/// of the user range, so committed, reserved and free add up to all of it.
+/// On i686 the largest free region is what a 32-bit process runs out of
+/// first: an allocation or a DLL load fails when no single hole fits it,
+/// however much free space the holes add up to.
+///
+/// The address space is the PE view of the process. The peak working set
+/// is not: under Wine the counters are read from the host process, so it is
+/// most likely the peak resident size of the whole macOS process, the unix
+/// side, the translator and Metal's allocations included.
+pub struct MemorySample {
+    committed: u64,
+    reserved: u64,
+    largest_free: u64,
+    peak_working_set: u64,
+}
+
+impl MemorySample {
+    /// Walk the address space and read the working-set counters now.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `K32GetProcessMemoryInfo` fails, which for the current
+    /// process means the harness declared the counters with the wrong size.
+    #[must_use]
+    pub fn now() -> Self {
+        let mut committed = 0_u64;
+        let mut reserved = 0_u64;
+        let mut largest_free = 0_u64;
+        let mut addr = 0_usize;
+        loop {
+            let mut info = MemoryBasicInformation::default();
+            let size = size_of::<MemoryBasicInformation>();
+            // SAFETY: kernel32 export; any address is accepted (one past the
+            // user range fails), and `info` is an owned local of the size passed.
+            let written =
+                unsafe { VirtualQuery(core::ptr::without_provenance(addr), &raw mut info, size) };
+            if written == 0 || info.region_size == 0 {
+                break;
+            }
+            let region = u64::try_from(info.region_size).expect("a region size fits u64");
+            match info.state {
+                MEM_COMMIT => committed += region,
+                MEM_RESERVE => reserved += region,
+                MEM_FREE => largest_free = largest_free.max(region),
+                other => panic!("VirtualQuery reported region state {other:#x}"),
+            }
+            // The region starts at `base_address`, the query address rounded
+            // down to a page, so the next one starts where this one ends.
+            match info.base_address.checked_add(info.region_size) {
+                Some(next) if next > addr => addr = next,
+                _ => break,
+            }
+        }
+        let mut counters = ProcessMemoryCounters::default();
+        let size = u32::try_from(size_of::<ProcessMemoryCounters>())
+            .expect("PROCESS_MEMORY_COUNTERS size fits u32");
+        counters.cb = size;
+        // SAFETY: Win32 GetCurrentProcess returns a pseudo-handle for the
+        // current process.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: kernel32 export; the current process's pseudo-handle and an
+        // owned `PROCESS_MEMORY_COUNTERS` whose `cb` is the size passed.
+        let ok = unsafe { K32GetProcessMemoryInfo(process, &raw mut counters, size) };
+        assert!(ok != 0, "K32GetProcessMemoryInfo failed");
+        Self {
+            committed,
+            reserved,
+            largest_free,
+            peak_working_set: u64::try_from(counters.peak_working_set_size)
+                .expect("a working set fits u64"),
+        }
+    }
+
+    /// Bytes in committed regions.
+    #[must_use]
+    pub const fn committed(&self) -> u64 {
+        self.committed
+    }
+
+    /// Bytes in regions reserved and not committed.
+    #[must_use]
+    pub const fn reserved(&self) -> u64 {
+        self.reserved
+    }
+
+    /// Bytes in the largest free region.
+    #[must_use]
+    pub const fn largest_free(&self) -> u64 {
+        self.largest_free
+    }
+
+    /// The peak working set so far, `PeakWorkingSetSize`; under Wine, the host process's peak RSS.
+    #[must_use]
+    pub const fn peak_working_set(&self) -> u64 {
+        self.peak_working_set
+    }
+}
+
+/// `MEMORY_BASIC_INFORMATION`, correct on both PE targets.
+///
+/// Pointer and `SIZE_T` fields are `usize`, so `repr(C)` lays out the
+/// 28-byte i686 form and the 48-byte x64 form (with its two alignment
+/// holes) without a per-target definition.
+#[repr(C)]
+#[derive(Default)]
+struct MemoryBasicInformation {
+    base_address: usize,
+    allocation_base: usize,
+    allocation_protect: u32,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    mem_type: u32,
+}
+
+/// `PROCESS_MEMORY_COUNTERS`, the `SIZE_T` fields as `usize` for both PE targets.
+#[repr(C)]
+#[derive(Default)]
+struct ProcessMemoryCounters {
+    cb: u32,
+    page_fault_count: u32,
+    peak_working_set_size: usize,
+    working_set_size: usize,
+    quota_peak_paged_pool_usage: usize,
+    quota_paged_pool_usage: usize,
+    quota_peak_non_paged_pool_usage: usize,
+    quota_non_paged_pool_usage: usize,
+    pagefile_usage: usize,
+    peak_pagefile_usage: usize,
+}
+
+#[repr(C)]
+struct WndClassExA {
+    size: u32,
+    style: u32,
+    wnd_proc: unsafe extern "system" fn(usize, u32, usize, isize) -> isize,
+    cls_extra: i32,
+    wnd_extra: i32,
+    instance: usize,
+    icon: usize,
+    cursor: usize,
+    background: usize,
+    menu_name: *const c_char,
+    class_name: *const c_char,
+    icon_sm: usize,
+}
+
+/// Win32 `MSG`. Public so `Harness` can own one for its pump loop.
+#[repr(C)]
+pub struct Msg {
+    hwnd: usize,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    time: u32,
+    pt_x: i32,
+    pt_y: i32,
+}
+
+const WM_DESTROY: u32 = 0x0002;
+/// `WM_DISPLAYCHANGE`: the display mode changed, sent to every top-level window.
+const WM_DISPLAYCHANGE: u32 = 0x007E;
+/// `GWL_USERDATA`: the long a window keeps for its application.
+///
+/// Here the top edge [`move_window_on_next_display_change`] arms.
+const GWL_USERDATA: i32 = -21;
+const WM_QUIT: u32 = 0x0012;
+/// `PM_NOREMOVE`: `PeekMessageA` leaves the message it finds in the queue.
+const PM_NOREMOVE: u32 = 0;
+/// `PM_REMOVE`: `PeekMessageA` takes the message it finds out of the queue.
+const PM_REMOVE: u32 = 1;
+/// `QS_SENDMESSAGE`: a message another thread sent is waiting in the queue.
+const QS_SENDMESSAGE: u32 = 0x0040;
+/// `PM_QS_SENDMESSAGE`: `PeekMessageA` handles sent messages and returns no other.
+const PM_QS_SENDMESSAGE: u32 = QS_SENDMESSAGE << 16;
+/// `MWMO_INPUTAVAILABLE`: the wait also returns for a message that was already waiting.
+const MWMO_INPUTAVAILABLE: u32 = 0x0004;
+const CW_USEDEFAULT: i32 = 0x8000_0000_u32.cast_signed();
+/// `WS_OVERLAPPEDWINDOW` — a normal framed window, initially hidden.
+const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
+/// `WS_VISIBLE` — the window is shown.
+pub const WS_VISIBLE: u32 = 0x1000_0000;
+/// `WS_POPUP` — no frame; what a fullscreen device window becomes.
+pub const WS_POPUP: u32 = 0x8000_0000;
+/// `WS_CAPTION` — title bar; dropped for a fullscreen device window.
+pub const WS_CAPTION: u32 = 0x00C0_0000;
+/// `WS_EX_TOPMOST` — above every non-topmost window.
+pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
+/// `IDC_ARROW` standard cursor id (`MAKEINTRESOURCE(32512)`).
+const IDC_ARROW: usize = 32512;
+
+static REGISTER_CLASS: Once = Once::new();
+const CLASS_NAME: &core::ffi::CStr = c"mtld3d_test_window";
+
+/// Whether a test window needs a title bar and resizing controls.
+pub enum WindowStyle {
+    /// A popup with no non-client frame, for rendering tests.
+    Borderless,
+    /// An overlapped window, for window-management tests.
+    Framed,
+    /// A child of an existing test window, with no Cocoa window of its own.
+    Child { parent: usize },
+}
+
+extern "system" fn wnd_proc(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize {
+    if msg == WM_HARNESS_PROBE {
+        return HARNESS_PROBE_REPLY;
+    }
+    if msg == WM_HARNESS_RESTORE {
+        replay_restore(hwnd, lparam);
+        return 0;
+    }
+    if run_cursor_script(hwnd, msg) {
+        return 0;
+    }
+    if msg == WM_DISPLAYCHANGE {
+        move_to_armed_top(hwnd);
+    }
+    if msg == WM_DESTROY {
+        // A window that `destroy_window` destroys takes this quit back out, so
+        // only a window destroyed from outside the harness ends the pump.
+        // SAFETY: Win32 message-loop thunk with no preconditions.
+        unsafe { PostQuitMessage(0) };
+        return 0;
+    }
+    // SAFETY: Win32 message-loop thunk; the loader-supplied args are forwarded
+    // verbatim to the default handler.
+    unsafe { DefWindowProcA(hwnd, msg, wparam, lparam) }
+}
+
+fn register_class() {
+    REGISTER_CLASS.call_once(|| {
+        // SAFETY: Win32 thunk; null module name returns the current process
+        // instance handle.
+        let instance = unsafe { GetModuleHandleA(core::ptr::null()) };
+        // SAFETY: Win32 thunk; `IDC_ARROW` is a standard predefined cursor id.
+        // Without a class cursor Wine's macOS driver hides the pointer over the
+        // client area.
+        let cursor = unsafe { LoadCursorA(0, IDC_ARROW as *const c_char) };
+        let size =
+            u32::try_from(core::mem::size_of::<WndClassExA>()).expect("WNDCLASSEX size fits u32");
+        let wc = WndClassExA {
+            size,
+            style: 0,
+            wnd_proc,
+            cls_extra: 0,
+            wnd_extra: 0,
+            instance,
+            icon: 0,
+            cursor,
+            background: 0,
+            menu_name: core::ptr::null(),
+            class_name: CLASS_NAME.as_ptr(),
+            icon_sm: 0,
+        };
+        // SAFETY: Win32 thunk; `&wc` is a fully-populated WNDCLASSEX valid for
+        // the duration of the call.
+        let atom = unsafe { RegisterClassExA(&raw const wc) };
+        assert!(atom != 0, "RegisterClassExA failed");
+    });
+}
+
+/// Create a test window of `width`×`height`.
+///
+/// Registers the shared window class once per process. `visible` controls
+/// `WS_VISIBLE` — hidden is preferred for parallel headless runs; the macdrv
+/// Metal layer still attaches because Wine creates the cocoa view when the
+/// HWND is created, not when it is shown.
+///
+/// # Panics
+///
+/// Panics if `CreateWindowExA` fails, with the thread's last error in the
+/// message.
+#[must_use]
+pub fn create_window(width: i32, height: i32, visible: bool) -> usize {
+    create_styled_window(width, height, visible, &WindowStyle::Framed)
+}
+
+/// Create a test window with the requested non-client frame.
+///
+/// # Panics
+///
+/// Panics if the window class cannot be registered or the window cannot be created.
+#[must_use]
+pub fn create_styled_window(
+    width: i32,
+    height: i32,
+    visible: bool,
+    window_style: &WindowStyle,
+) -> usize {
+    const WS_CHILD: u32 = 0x4000_0000;
+
+    register_class();
+    // SAFETY: Win32 thunk; null module name returns the current process handle.
+    let instance = unsafe { GetModuleHandleA(core::ptr::null()) };
+    let (style, position, parent) = match window_style {
+        WindowStyle::Borderless => (WS_POPUP, 0, 0),
+        WindowStyle::Framed => (WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, 0),
+        WindowStyle::Child { parent } => (WS_CHILD, 0, *parent),
+    };
+    let style = style | if visible { WS_VISIBLE } else { 0 };
+    // SAFETY: Win32 thunk; the class atom is registered above, the c-strings are
+    // valid for the call, and `instance` is this process's module handle.
+    let hwnd = unsafe {
+        CreateWindowExA(
+            0,
+            CLASS_NAME.as_ptr(),
+            c"mtld3d test".as_ptr(),
+            style,
+            position,
+            position,
+            width,
+            height,
+            parent,
+            0,
+            instance,
+            core::ptr::null(),
+        )
+    };
+    if hwnd == 0 {
+        // SAFETY: Win32 thunk with no preconditions; reads the calling
+        // thread's own last-error slot, which the failed call just set.
+        let err = unsafe { GetLastError() };
+        panic!("CreateWindowExA failed: GetLastError() = {err}");
+    }
+    hwnd
+}
+
+/// `SendMessageA` — synchronous dispatch, bypassing the queue.
+///
+/// The call runs straight through the window's (possibly subclassed) wndproc.
+/// Lets tests synthesize the macdrv-posted messages (e.g. `WM_SIZE`)
+/// deterministically.
+#[must_use]
+pub fn send_message(hwnd: usize, msg: u32, wparam: usize, lparam: isize) -> isize {
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created.
+    unsafe { SendMessageA(hwnd, msg, wparam, lparam) }
+}
+
+/// `GetCursor` — the calling thread's current cursor handle.
+///
+/// Reports what the last `SetCursor` on this thread pushed; 0 = none.
+pub fn get_cursor() -> usize {
+    // SAFETY: Win32 thunk with no preconditions.
+    unsafe { GetCursor() }
+}
+
+/// `SetCursor` — overwrite the thread cursor.
+///
+/// Lets tests simulate an external clobber (native cursor taking over while
+/// the pointer was outside).
+pub fn set_cursor(cursor: usize) -> usize {
+    // SAFETY: Win32 thunk; 0 (no cursor) is a valid argument.
+    unsafe { SetCursor(cursor) }
+}
+
+/// `GetIconInfo`: whether `cursor` still names a live cursor or icon.
+///
+/// A destroyed handle fails the lookup. A live one answers with copies of
+/// its two bitmaps, which are deleted again here, so the probe leaves no
+/// GDI object behind.
+#[must_use]
+pub fn cursor_is_live(cursor: usize) -> bool {
+    let mut info = ICONINFO {
+        f_icon: 0,
+        x_hotspot: 0,
+        y_hotspot: 0,
+        hbm_mask: core::ptr::null_mut(),
+        hbm_color: core::ptr::null_mut(),
+    };
+    // SAFETY: Win32 thunk; `info` is an owned, writable ICONINFO for the
+    // call, and any handle value is accepted (an invalid one fails).
+    let live = unsafe { GetIconInfo(cursor, &raw mut info) } != 0;
+    if live {
+        for bitmap in [info.hbm_mask, info.hbm_color] {
+            if !bitmap.is_null() {
+                // SAFETY: Win32 thunk; the bitmap is the copy `GetIconInfo`
+                // handed this caller, deleted exactly once.
+                unsafe { DeleteObject(bitmap) };
+            }
+        }
+    }
+    live
+}
+
+/// Copy the AND-mask DDB from a live cursor.
+///
+/// `byte_len` is the WORD-aligned 1 bpp extent that `CreateBitmap` stores.
+/// The cursor must carry a colour bitmap, so `GetIconInfo` returns the AND mask
+/// at the cursor's own height rather than a stacked monochrome AND/XOR pair.
+///
+/// # Panics
+///
+/// Panics if the cursor is invalid or GDI does not return exactly `byte_len` bytes.
+#[must_use]
+pub fn cursor_mask_bits(cursor: usize, byte_len: usize) -> Vec<u8> {
+    let mut info = ICONINFO {
+        f_icon: 0,
+        x_hotspot: 0,
+        y_hotspot: 0,
+        hbm_mask: core::ptr::null_mut(),
+        hbm_color: core::ptr::null_mut(),
+    };
+    // SAFETY: Win32 thunk; `info` is an owned, writable ICONINFO for the
+    // call, and any handle value is accepted (an invalid one fails).
+    let live = unsafe { GetIconInfo(cursor, &raw mut info) } != 0;
+    assert!(live, "GetIconInfo rejected cursor {cursor:#x}");
+    assert!(!info.hbm_mask.is_null(), "cursor has no AND-mask bitmap");
+    assert!(
+        !info.hbm_color.is_null(),
+        "cursor must have a colour bitmap for an unstacked AND mask",
+    );
+
+    let mut bits = vec![0u8; byte_len];
+    let count = i32::try_from(byte_len).expect("cursor mask byte count fits i32");
+    // SAFETY: `hbm_mask` is the live bitmap copy `GetIconInfo` returned, and
+    // `bits` has `count` writable bytes.
+    let copied = unsafe { GetBitmapBits(info.hbm_mask, count, bits.as_mut_ptr().cast()) };
+    for bitmap in [info.hbm_mask, info.hbm_color] {
+        // SAFETY: each bitmap is a non-null copy `GetIconInfo` handed this
+        // caller, deleted exactly once after `GetBitmapBits` is finished.
+        unsafe { DeleteObject(bitmap) };
+    }
+    assert_eq!(copied, count, "GetBitmapBits copied the complete AND mask");
+    bits
+}
+
+/// Win32 `RECT`, as reported by `Harness::window_rect`.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+/// `WM_ACTIVATEAPP` — the app-level activation message a fullscreen device answers.
+pub const WM_ACTIVATEAPP: u32 = 0x001C;
+
+/// A private message the harness window's own procedure answers with [`HARNESS_PROBE_REPLY`].
+///
+/// Sent to a test window, it tells whether the window's own procedure still
+/// receives what reaches the window, through whatever subclass the layer put
+/// in front of it: the default procedure answers it with 0. `WM_APP` range.
+pub const WM_HARNESS_PROBE: u32 = 0x8000 + 0x0E2E;
+
+/// What the harness window's procedure answers [`WM_HARNESS_PROBE`] with.
+pub const HARNESS_PROBE_REPLY: isize = 0x6D74_6C64;
+
+/// A private message the harness window's procedure answers the way Wine restores a window.
+///
+/// Wine delivers a restore as one `WM_SYSCOMMAND` (`SC_RESTORE`): inside it
+/// the window is resized, which sends `WM_WINDOWPOSCHANGED` and from that
+/// the `WM_SIZE` of the restored size, and then activated (`WM_ACTIVATEAPP`,
+/// then `WM_ACTIVATE`), all before it returns. The procedure does the same
+/// from inside its handling of this one: it resizes a borderless window to
+/// the client size `lParam` carries (height in the high word, width in the
+/// low) and sends the two activation messages. `WM_APP` range: a real
+/// `WM_SYSCOMMAND` would have the default procedure restore and show the
+/// hidden test window.
+pub const WM_HARNESS_RESTORE: u32 = 0x8000 + 0x0E2F;
+
+/// `WM_SIZE`: the window's client area changed size; `wParam` is the `SIZE_*` kind.
+pub const WM_SIZE: u32 = 0x0005;
+/// `WM_ACTIVATE`: the window was activated or deactivated; `wParam` is a `WA_*` state.
+pub const WM_ACTIVATE: u32 = 0x0006;
+/// `WA_INACTIVE`: the `WM_ACTIVATE` state of a window being deactivated.
+pub const WA_INACTIVE: usize = 0;
+/// `WA_ACTIVE`: the `WM_ACTIVATE` state of a window activated other than by a click.
+pub const WA_ACTIVE: usize = 1;
+
+/// The window property holding the device a cursor script hides through ([`script_cursor_hide`]).
+const SCRIPT_DEVICE: &core::ffi::CStr = c"mtld3d_test_script_device";
+/// The window property holding the message a cursor script hides on.
+const SCRIPT_HIDE_ON: &core::ffi::CStr = c"mtld3d_test_script_hide_on";
+/// The window property counting the hides a cursor script made.
+const SCRIPT_HIDES: &core::ffi::CStr = c"mtld3d_test_script_hides";
+/// The window property holding what the last scripted `ShowCursor(FALSE)` returned.
+const SCRIPT_LAST_HIDE: &core::ffi::CStr = c"mtld3d_test_script_last_hide";
+
+/// Have the window's own procedure hide `device`'s cursor whenever it receives `hide_on`.
+///
+/// The procedure calls `IDirect3DDevice9::ShowCursor(FALSE)` from inside its
+/// handling of the message, the way a game's window procedure does, and
+/// counts the calls ([`scripted_hides`]); `0` hides on nothing. While a script
+/// is set, the procedure also answers `WM_ACTIVATE` itself rather than
+/// passing it to the default procedure, whose focus change would activate the
+/// hidden test window for the whole process when a test synthesizes the
+/// message. [`end_cursor_script`] ends it. The script lives in window
+/// properties, the one per-window store a window procedure reaches by its
+/// `HWND`.
+///
+/// # Safety
+///
+/// `device` must stay a live `IDirect3DDevice9` until [`end_cursor_script`]
+/// runs for the window.
+pub unsafe fn script_cursor_hide(hwnd: usize, device: *mut c_void, hide_on: u32) {
+    let hide_on = usize::try_from(hide_on).expect("a message id fits usize");
+    for (name, value) in [
+        (SCRIPT_DEVICE, device as usize),
+        (SCRIPT_HIDE_ON, hide_on),
+        (SCRIPT_HIDES, 0),
+        (SCRIPT_LAST_HIDE, 0),
+    ] {
+        // SAFETY: Win32 thunk; `hwnd` is a window this process created and
+        // `name` a NUL-terminated string valid for the call.
+        let set = unsafe { SetPropA(hwnd, name.as_ptr(), value) };
+        assert!(set != 0, "SetPropA failed");
+    }
+}
+
+/// How many hides the window's cursor script made, and what the last one returned.
+#[must_use]
+pub fn scripted_hides(hwnd: usize) -> (usize, i32) {
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // name is a NUL-terminated string valid for the call.
+    let hides = unsafe { GetPropA(hwnd, SCRIPT_HIDES.as_ptr()) };
+    // SAFETY: as above.
+    let last = unsafe { GetPropA(hwnd, SCRIPT_LAST_HIDE.as_ptr()) };
+    let last = u32::try_from(last)
+        .expect("the stored result is a 32-bit value")
+        .cast_signed();
+    (hides, last)
+}
+
+/// End the window's cursor script; a window without one is left alone.
+pub fn end_cursor_script(hwnd: usize) {
+    for name in [
+        SCRIPT_DEVICE,
+        SCRIPT_HIDE_ON,
+        SCRIPT_HIDES,
+        SCRIPT_LAST_HIDE,
+    ] {
+        // SAFETY: Win32 thunk; any window handle is accepted, and a missing
+        // property is answered with 0.
+        unsafe { RemovePropA(hwnd, name.as_ptr()) };
+    }
+}
+
+/// Run the window's cursor script for `msg`; `true` when the procedure answered the message.
+fn run_cursor_script(hwnd: usize, msg: u32) -> bool {
+    // SAFETY: Win32 thunk; `hwnd` is the window this procedure runs for.
+    let device = unsafe { GetPropA(hwnd, SCRIPT_DEVICE.as_ptr()) };
+    if device == 0 {
+        return false;
+    }
+    // SAFETY: as above.
+    let hide_on = unsafe { GetPropA(hwnd, SCRIPT_HIDE_ON.as_ptr()) };
+    // `WM_NULL` is no message to hide on: Wine sends it to probe a window.
+    if hide_on != 0 && usize::try_from(msg).is_ok_and(|msg| msg == hide_on) {
+        let device = device as *mut c_void;
+        // SAFETY: `script_cursor_hide`'s contract keeps `device` a live
+        // `IDirect3DDevice9` while the script is set.
+        let vtbl = unsafe { crate::vtbl::deref_vtbl::<IDirect3DDevice9Vtbl>(device) };
+        // SAFETY: vtable thunk on that live device.
+        let result = unsafe { (vtbl.show_cursor)(device, 0) };
+        // SAFETY: Win32 thunk; `hwnd` is the window this procedure runs for.
+        let hides = unsafe { GetPropA(hwnd, SCRIPT_HIDES.as_ptr()) };
+        let result = usize::try_from(result.cast_unsigned()).expect("a u32 fits usize");
+        // SAFETY: as above, with NUL-terminated names valid for the call.
+        unsafe { SetPropA(hwnd, SCRIPT_HIDES.as_ptr(), hides + 1) };
+        // SAFETY: as above.
+        unsafe { SetPropA(hwnd, SCRIPT_LAST_HIDE.as_ptr(), result) };
+    }
+    msg == WM_ACTIVATE
+}
+
+/// Send the window what Wine sends from inside a restore ([`WM_HARNESS_RESTORE`]).
+///
+/// The size change is a real `SetWindowPos`, so the `WM_SIZE` is the one
+/// the default procedure sends from inside the `WM_WINDOWPOSCHANGED` it
+/// answers, as it does in Wine's restore.
+fn replay_restore(hwnd: usize, size_lparam: isize) {
+    let size = size_lparam.cast_unsigned();
+    let width = i32::try_from(size & 0xFFFF).expect("a 16-bit width fits i32");
+    let height = i32::try_from((size >> 16) & 0xFFFF).expect("a 16-bit height fits i32");
+    let rect = window_rect(hwnd);
+    set_window_pos(hwnd, rect.left, rect.top, width, height);
+    let _ = send_message(hwnd, WM_ACTIVATEAPP, 1, 0);
+    let _ = send_message(hwnd, WM_ACTIVATE, WA_ACTIVE, 0);
+}
+
+/// `GWLP_WNDPROC`: a window's procedure.
+const GWLP_WNDPROC: i32 = -4;
+
+/// `GWL_STYLE` — a window's style bits.
+pub const GWL_STYLE: i32 = -16;
+/// `GWL_EXSTYLE` — a window's extended style bits.
+pub const GWL_EXSTYLE: i32 = -20;
+
+/// `GetWindowRect` — a window's outer rect in screen coordinates.
+///
+/// # Panics
+///
+/// Panics if the call fails, which for a window this process owns means the
+/// handle is already destroyed.
+#[must_use]
+pub fn window_rect(hwnd: usize) -> Rect {
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and `rect`
+    // is an owned local.
+    let ok = unsafe { GetWindowRect(hwnd, &raw mut rect) };
+    assert!(ok != 0, "GetWindowRect failed");
+    rect
+}
+
+/// The procedure `hwnd` currently runs, as an address.
+///
+/// # Panics
+///
+/// Panics if a 32-bit target's procedure address does not fit `usize`, which
+/// it always does.
+#[must_use]
+pub fn window_proc(hwnd: usize) -> usize {
+    #[cfg(target_pointer_width = "64")]
+    {
+        // SAFETY: Win32 thunk; `hwnd` is a window this process created and
+        // the index is the documented `GWLP_WNDPROC`.
+        unsafe { GetWindowLongPtrA(hwnd, GWLP_WNDPROC) }.cast_unsigned()
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        usize::try_from(
+            // SAFETY: Win32 thunk; `hwnd` is a window this process created and
+            // the index is the documented `GWLP_WNDPROC`, a 32-bit long here.
+            unsafe { GetWindowLongA(hwnd, GWLP_WNDPROC) }.cast_unsigned(),
+        )
+        .expect("a 32-bit procedure address fits usize")
+    }
+}
+
+/// Have the window's own procedure move its top edge to `top` on the next `WM_DISPLAYCHANGE`.
+///
+/// The move a game makes answering a mode change, from inside the procedure
+/// the mode change calls: to a place of its own, keeping the window's left
+/// edge and size, whatever moved the window before the message arrived. One
+/// move per call; `top` lives in the window's `GWL_USERDATA`, which the
+/// harness uses for nothing else.
+///
+/// # Panics
+///
+/// Panics if `top` is not positive: zero is the disarmed value.
+pub fn move_window_on_next_display_change(hwnd: usize, top: i32) {
+    assert!(top > 0, "an armed top edge is positive, zero disarms");
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // index is the documented `GWL_USERDATA`.
+    unsafe { SetWindowLongA(hwnd, GWL_USERDATA, top) };
+}
+
+/// Make the move [`move_window_on_next_display_change`] armed, once.
+fn move_to_armed_top(hwnd: usize) {
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    // SAFETY: Win32 thunk; `hwnd` is the window this procedure runs for and
+    // the index is the documented `GWL_USERDATA`.
+    let top = unsafe { SetWindowLongA(hwnd, GWL_USERDATA, 0) };
+    if top == 0 {
+        return;
+    }
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: Win32 thunk; `hwnd` is live for the call and `rect` is an owned out-param.
+    if unsafe { GetWindowRect(hwnd, &raw mut rect) } == 0 {
+        return;
+    }
+    // SAFETY: Win32 thunk; `hwnd` is live for the call and the geometry is plain scalars.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            0,
+            rect.left,
+            top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// The procedure the harness window class registers, as an address.
+#[must_use]
+pub fn harness_window_proc() -> usize {
+    wnd_proc as *const () as usize
+}
+
+/// `GetWindowLongA` — one of a window's `GWL_*` longs, as a bit mask.
+pub fn window_long(hwnd: usize, index: i32) -> u32 {
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // index is one of the documented constants.
+    unsafe { GetWindowLongA(hwnd, index) }.cast_unsigned()
+}
+
+/// `GetClientRect` — a window's client area, origin (0, 0).
+///
+/// # Panics
+///
+/// Panics if the call fails, which for a window this process owns means the
+/// handle is already destroyed.
+pub fn client_rect(hwnd: usize) -> Rect {
+    let mut rect = Rect {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and `rect`
+    // is an owned local.
+    let ok = unsafe { GetClientRect(hwnd, &raw mut rect) };
+    assert!(ok != 0, "GetClientRect failed");
+    rect
+}
+
+/// Win32 `DEVMODEW`, display-device shape, as `EnumDisplaySettingsW` fills it.
+///
+/// Only the two resolution fields are read; everything before them has to be
+/// laid out exactly so they land where the API writes them.
+#[repr(C)]
+struct DevModeW {
+    device_name: [u16; 32],
+    spec_version: u16,
+    driver_version: u16,
+    size: u16,
+    driver_extra: u16,
+    fields: u32,
+    position_x: i32,
+    position_y: i32,
+    display_orientation: u32,
+    display_fixed_output: u32,
+    color: i16,
+    duplex: i16,
+    y_resolution: i16,
+    tt_option: i16,
+    collate: i16,
+    form_name: [u16; 32],
+    log_pixels: u16,
+    bits_per_pel: u32,
+    pels_width: u32,
+    pels_height: u32,
+    display_flags: u32,
+    display_frequency: u32,
+    icm_method: u32,
+    icm_intent: u32,
+    media_type: u32,
+    dither_type: u32,
+    reserved1: u32,
+    reserved2: u32,
+    panning_width: u32,
+    panning_height: u32,
+}
+
+/// `DEVMODEW`'s ABI size, which the API reads back out of `size`.
+const DEV_MODE_SIZE: u16 = 220;
+const _: () = assert!(size_of::<DevModeW>() == DEV_MODE_SIZE as usize);
+
+/// The primary display's current mode (`EnumDisplaySettingsW(ENUM_CURRENT_SETTINGS)`).
+///
+/// This is the mode a fullscreen device sets and puts back, read through the
+/// same user32 entry point Wine's own display tests use.
+///
+/// # Panics
+///
+/// Panics if the query fails, which means the prefix has no display at all.
+pub fn current_display_mode() -> (u32, u32) {
+    const ENUM_CURRENT_SETTINGS: u32 = 0xFFFF_FFFF;
+    display_settings(ENUM_CURRENT_SETTINGS, "ENUM_CURRENT_SETTINGS")
+}
+
+/// The primary display's registry mode (`EnumDisplaySettingsW(ENUM_REGISTRY_SETTINGS)`).
+///
+/// The mode a fullscreen device puts back on the way out. A mode-set that
+/// lasts only while a device is fullscreen leaves it alone.
+///
+/// # Panics
+///
+/// Panics if the query fails, which means the prefix has no display at all.
+pub fn registry_display_mode() -> (u32, u32) {
+    const ENUM_REGISTRY_SETTINGS: u32 = 0xFFFF_FFFE;
+    display_settings(ENUM_REGISTRY_SETTINGS, "ENUM_REGISTRY_SETTINGS")
+}
+
+/// The size `EnumDisplaySettingsW` answers for one of its two pseudo-indices.
+fn display_settings(mode_num: u32, name: &str) -> (u32, u32) {
+    // SAFETY: `DevModeW` is all-integer POD, so the all-zero bit pattern is a
+    // valid value.
+    let mut dm: DevModeW = unsafe { core::mem::zeroed() };
+    dm.size = DEV_MODE_SIZE;
+    // SAFETY: Win32 thunk; a null device name selects the primary display
+    // and `dm` is an owned local with `size` set per the API contract.
+    let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), mode_num, &raw mut dm) };
+    assert!(ok != 0, "EnumDisplaySettingsW({name}) failed");
+    (dm.pels_width, dm.pels_height)
+}
+
+/// Every size the primary display enumerates through this binary's own user32 import.
+///
+/// Walks indices from 0 until user32 says the list ends, once per mode, so
+/// a size appears as many times as user32 lists it (once per depth and
+/// rate). Read through the test binary's import, which is the one d3d9
+/// redirects for the process's main module.
+#[must_use]
+pub fn enumerate_display_sizes() -> Vec<(u32, u32)> {
+    let mut sizes = Vec::new();
+    for mode_num in 0..u32::MAX {
+        // SAFETY: `DevModeW` is all-integer POD, so the all-zero bit pattern is a
+        // valid value.
+        let mut dm: DevModeW = unsafe { core::mem::zeroed() };
+        dm.size = DEV_MODE_SIZE;
+        // SAFETY: Win32 thunk; a null device name selects the primary display
+        // and `dm` is an owned local with `size` set per the API contract.
+        let ok = unsafe { EnumDisplaySettingsW(core::ptr::null(), mode_num, &raw mut dm) };
+        if ok == 0 {
+            break;
+        }
+        sizes.push((dm.pels_width, dm.pels_height));
+    }
+    sizes
+}
+
+/// The primary display's current resolution (`SM_CXSCREEN` / `SM_CYSCREEN`).
+pub fn screen_size() -> (u32, u32) {
+    const SM_CXSCREEN: i32 = 0;
+    const SM_CYSCREEN: i32 = 1;
+    // SAFETY: Win32 thunk; both indices are documented constants.
+    let width = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    // SAFETY: as above.
+    let height = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    (
+        u32::try_from(width).expect("screen width is positive"),
+        u32::try_from(height).expect("screen height is positive"),
+    )
+}
+
+/// `SetWindowPos` without z-order or activation changes.
+///
+/// This is the app-side move a game makes when it manages its own window;
+/// tests use it to simulate an external resize of a device window.
+///
+/// # Panics
+///
+/// Panics if the call fails, which for a window this process owns means the
+/// handle is already destroyed.
+pub fn set_window_pos(hwnd: usize, x: i32, y: i32, width: i32, height: i32) {
+    const SWP_NOZORDER: u32 = 0x0004;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created and the
+    // geometry is plain scalars.
+    let ok = unsafe { SetWindowPos(hwnd, 0, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE) };
+    assert!(ok != 0, "SetWindowPos failed");
+}
+
+/// Give `hwnd` an OpenGL pixel format, as a game that opens a GL context on its window does.
+///
+/// Wine's Mac driver answers it with a client surface of the window's own
+/// for OpenGL, which it shows at once, hiding the window's other client
+/// view: the one a device's metal view sits in. A test uses it to have Wine
+/// hide that view the way a Wine does that hides it on a window surface
+/// flush.
+///
+/// `false` when the machine offers no OpenGL pixel format for the window at
+/// all, which a CI runner whose virtual GPU has no OpenGL does: the caller
+/// cannot have Wine hide the view this way there.
+///
+/// # Panics
+///
+/// Panics when the window has no device context, or when `SetPixelFormat`
+/// refuses the format `ChoosePixelFormat` offered.
+#[must_use]
+pub fn set_opengl_pixel_format(hwnd: usize) -> bool {
+    const PFD_DOUBLEBUFFER: u32 = 0x0000_0001;
+    const PFD_DRAW_TO_WINDOW: u32 = 0x0000_0004;
+    const PFD_SUPPORT_OPENGL: u32 = 0x0000_0020;
+    let mut bytes = [0_u8; 20];
+    bytes[1] = 32;
+    bytes[15] = 24;
+    let pfd = PixelFormatDescriptor {
+        size: 40,
+        version: 1,
+        flags: PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+        bytes,
+        layer_mask: 0,
+        visible_mask: 0,
+        damage_mask: 0,
+    };
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created.
+    let hdc = unsafe { GetDC(hwnd) };
+    assert_ne!(hdc, 0, "GetDC({hwnd:#x}) failed");
+    // SAFETY: GDI thunk; `hdc` is the live device context above and `pfd`
+    // a filled-in descriptor of the documented size.
+    let format = unsafe { ChoosePixelFormat(hdc, &raw const pfd) };
+    // SAFETY: as above, with the format `ChoosePixelFormat` answered.
+    let set = format != 0 && unsafe { SetPixelFormat(hdc, format, &raw const pfd) } != 0;
+    // SAFETY: Win32 thunk; gives back the device context `GetDC` handed out.
+    unsafe { ReleaseDC(hwnd, hdc) };
+    if format == 0 {
+        return false;
+    }
+    assert!(set, "SetPixelFormat({format}) refused for window {hwnd:#x}");
+    true
+}
+
+/// Read one pixel of a device context as a `COLORREF` (`0x00BBGGRR`).
+///
+/// For an `IDirect3DSurface9::GetDC` memory DC, this is how a test observes
+/// the pixels GDI sees through the DIB the DC wraps.
+#[must_use]
+pub fn dc_get_pixel(hdc: usize, x: i32, y: i32) -> u32 {
+    // SAFETY: GDI thunk; `hdc` is a live device context and the coordinates
+    // are plain scalars (an out-of-range one returns CLR_INVALID).
+    unsafe { GetPixel(hdc, x, y) }
+}
+
+/// Paint one pixel of a device context, `color` a `COLORREF` (`0x00BBGGRR`).
+///
+/// Returns the colour GDI actually stored, which for a DIB of a
+/// lower-precision format is the nearest representable one.
+pub fn dc_set_pixel(hdc: usize, x: i32, y: i32, color: u32) -> u32 {
+    // SAFETY: GDI thunk; `hdc` is a live device context and the coordinates
+    // and colour are plain scalars.
+    unsafe { SetPixel(hdc, x, y, color) }
+}
+
+/// `DestroyWindow`, one call at a time across the process.
+///
+/// Wine's Mac driver tears a window's client surfaces down under two locks
+/// taken in opposite orders on two of its paths: `detach_client_surfaces`
+/// holds the surface list and asks for the window data, `macdrv_DestroyWindow`
+/// holds the window data and releases a surface. Two threads destroying
+/// their windows at once can therefore deadlock inside the driver; one at a
+/// time, they cannot.
+static DESTROY_WINDOW: Mutex<()> = Mutex::new(());
+
+/// Destroy a window created by [`create_window`], leaving no `WM_QUIT` of its own behind.
+///
+/// The window procedure answers `WM_DESTROY` with `PostQuitMessage`, so a
+/// window destroyed from outside the harness ends the next
+/// [`Harness::pump`](crate::Harness::pump) on its thread. A window destroyed
+/// here takes that quit back out of the calling thread's queue, or the next
+/// window the thread creates would read it as the end of the run. A quit that
+/// was pending before the call stays pending: this destruction did not post
+/// it, and the pump still has to see it.
+///
+/// # Panics
+///
+/// Panics if the call fails, which for a window this process created means
+/// the handle is already destroyed.
+pub fn destroy_window(hwnd: usize) {
+    let quit_was_pending = peek_quit(PM_NOREMOVE);
+    {
+        let _one_at_a_time = DESTROY_WINDOW
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: Win32 thunk; `hwnd` is a window this process created.
+        let ret = unsafe { DestroyWindow(hwnd) };
+        assert!(ret != 0, "DestroyWindow failed");
+    }
+    if !quit_was_pending {
+        peek_quit(PM_REMOVE);
+    }
+}
+
+/// Post `WM_QUIT` to the calling thread's queue, as a window procedure does.
+pub fn post_quit_message() {
+    // SAFETY: Win32 thunk with no preconditions.
+    unsafe { PostQuitMessage(0) };
+}
+
+/// Drain the message queue. Returns `false` once `WM_QUIT` is seen.
+pub fn pump_messages(msg: &mut Msg) -> bool {
+    // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, hwnd 0 pumps the thread queue.
+    while unsafe { PeekMessageA(msg, 0, 0, 0, PM_REMOVE) } != 0 {
+        if msg.message == WM_QUIT {
+            return false;
+        }
+        // SAFETY: Win32 thunk; both calls only read the populated `msg`.
+        unsafe { TranslateMessage(msg) };
+        // SAFETY: Win32 thunk; both calls only read the populated `msg`.
+        unsafe { DispatchMessageA(msg) };
+    }
+    msg.message != WM_QUIT
+}
+
+/// A zeroed `MSG` for the pump loop.
+///
+/// The fields are overwritten by `PeekMessageA` before any are read.
+#[must_use]
+pub const fn zeroed_msg() -> Msg {
+    Msg {
+        hwnd: 0,
+        message: 0,
+        wparam: 0,
+        lparam: 0,
+        time: 0,
+        pt_x: 0,
+        pt_y: 0,
+    }
+}
+
+/// Capture mouse input without clipping it, or release this thread's capture.
+///
+/// Returns the window owning capture after the call, so a probe can verify setup.
+#[must_use]
+pub fn capture_mouse(hwnd: usize, captured: bool) -> usize {
+    if captured {
+        // SAFETY: the harness owns this live window on the calling thread.
+        unsafe { SetCapture(hwnd) };
+    } else {
+        // SAFETY: releases only the calling thread's mouse capture.
+        unsafe { ReleaseCapture() };
+    }
+    // SAFETY: reads the calling thread's capture owner, without dereferencing it.
+    unsafe { GetCapture() }
+}
+
+/// Bring a visible probe window to the foreground.
+#[must_use]
+pub fn foreground_window(hwnd: usize) -> bool {
+    // SAFETY: the harness owns the live window handle.
+    unsafe { SetForegroundWindow(hwnd) != 0 }
+}
+
+/// Put a window above every window that is not topmost, without moving or activating it.
+///
+/// A window a background process shows opens behind the active application's
+/// windows, which can leave it fully covered; a topmost one stays above them
+/// while its process is inactive.
+pub fn make_topmost(hwnd: usize) {
+    const HWND_TOPMOST: usize = usize::MAX;
+    const SWP_NOSIZE: u32 = 0x0001;
+    const SWP_NOMOVE: u32 = 0x0002;
+    const SWP_NOACTIVATE: u32 = 0x0010;
+    // SAFETY: Win32 thunk; `hwnd` is a window this process created.
+    let ok = unsafe {
+        SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+        )
+    };
+    assert!(ok != 0, "SetWindowPos(HWND_TOPMOST) failed");
+}
+
+/// Wait up to `timeout` for a message another thread sends to this thread's windows, and answer it.
+///
+/// For a thread that owns a window and waits for something it cannot wait
+/// on together with its queue: it waits in steps of this, answering
+/// between them, and looks at what it waits for after each. A message that
+/// was already waiting ends the wait at once. A display mode change sends
+/// `WM_DISPLAYCHANGE` to every top-level window and waits up to two seconds
+/// for each to answer, so a window whose thread blocks without answering
+/// holds up every mode change of the session for that long.
+///
+/// # Panics
+///
+/// Panics when `timeout` does not fit the wait's milliseconds.
+pub fn wait_answering_sent_messages(timeout: Duration) {
+    let millis = u32::try_from(timeout.as_micros().div_ceil(1000))
+        .expect("a wait between answers fits u32 milliseconds");
+    // SAFETY: Win32 thunk; no handles, so the wait is on the thread's own
+    // queue alone, for at most `millis`.
+    unsafe {
+        MsgWaitForMultipleObjectsEx(
+            0,
+            core::ptr::null(),
+            millis,
+            QS_SENDMESSAGE,
+            MWMO_INPUTAVAILABLE,
+        )
+    };
+    answer_sent_messages();
+}
+
+/// Let `duration` pass, answering the messages other threads send to this thread's windows.
+///
+/// The wait of [`wait_answering_sent_messages`] for a pause of a known length.
+pub fn answer_sent_messages_for(duration: Duration) {
+    let deadline = Instant::now() + duration;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        wait_answering_sent_messages(left);
+    }
+}
+
+/// Answer the messages other threads have sent to this thread's windows, leaving its queue alone.
+///
+/// A peek limited to sent messages calls the window procedure for each one
+/// that is waiting and returns no posted message, so what a test posted to
+/// itself, and a `WM_QUIT`, stay queued for its own pump.
+fn answer_sent_messages() {
+    let mut msg = zeroed_msg();
+    // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, and hwnd 0 with
+    // `PM_QS_SENDMESSAGE` handles the thread's sent messages alone.
+    unsafe { PeekMessageA(&raw mut msg, 0, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE) };
+}
+
+/// Whether the calling thread's queue holds a `WM_QUIT`, taken out when `remove` is `PM_REMOVE`.
+fn peek_quit(remove: u32) -> bool {
+    let mut msg = zeroed_msg();
+    // SAFETY: Win32 thunk; `msg` is a valid &mut MSG, and hwnd 0 with a
+    // `WM_QUIT`-only filter peeks the thread queue's quit message alone.
+    unsafe { PeekMessageA(&raw mut msg, 0, WM_QUIT, WM_QUIT, remove) != 0 }
+}
+
+/// The address the loaded `d3d9.dll` exports under `name`, or null when it exports none.
+///
+/// Resolving by name keeps an export the image lacks a test failure: a
+/// `raw-dylib` import of it would stop the whole binary from loading.
+#[must_use]
+pub fn d3d9_export(name: &core::ffi::CStr) -> *mut c_void {
+    // SAFETY: kernel32 export with a NUL-terminated module name.
+    let module = unsafe { GetModuleHandleA(c"d3d9.dll".as_ptr()) };
+    if module == 0 {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: kernel32 export; `module` is a loaded module and `name` is NUL-terminated.
+    unsafe { GetProcAddress(module, name.as_ptr()) }
+}
+
+/// Whether the process has loaded `mtld3d.dll`, the layer's bridge to its unix half.
+///
+/// Only the layer's `d3d9.dll` imports it, so after `Direct3DCreate9` it says
+/// the `d3d9.dll` the process loaded is the layer's and not Wine's own, which
+/// a Wine's compat database or a stale placeholder in the prefix can pick.
+#[must_use]
+pub fn layer_loaded() -> bool {
+    // SAFETY: kernel32 export with a NUL-terminated module name.
+    unsafe { GetModuleHandleA(c"mtld3d.dll".as_ptr()) != 0 }
+}

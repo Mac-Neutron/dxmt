@@ -1,0 +1,1433 @@
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
+};
+
+use mtld3d_core::depth_stencil_state::{DepthStencilDescription, StencilFaceDescription};
+use mtld3d_shared::{
+    MetalHandle, TextureCreateDesc,
+    mtl::{
+        BlendFactor as WireBlendFactor, CompareFunc, PixelFormat, StencilOp, StorageMode, Swizzle,
+        TextureCreateFlags, TextureUsage,
+    },
+    mtl_handle::{MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLTextureKind},
+    texture_views::TextureViews,
+};
+use objc2::{rc::Retained, runtime::ProtocolObject};
+use objc2_metal::{
+    MTLBlendFactor, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCompareFunction,
+    MTLDepthStencilDescriptor, MTLDevice, MTLLoadAction, MTLPixelFormat, MTLRenderPassDescriptor,
+    MTLResource, MTLStencilDescriptor, MTLStencilOperation, MTLStorageMode, MTLStoreAction,
+    MTLTexture, MTLTextureDescriptor, MTLTextureSwizzle, MTLTextureSwizzleChannels, MTLTextureType,
+    MTLTextureUsage,
+};
+
+use crate::metal::{
+    command::diagnostics,
+    handle::{IntoRetained, ReleaseRetain},
+};
+
+/// The texture handles this side has minted and not yet destroyed.
+///
+/// A handle enters at [`mint`] and leaves at [`destroy_texture`], so a
+/// destroy of a handle that is not here is a second destroy of one that was,
+/// or a value that never was one: the release it asks for would hand the
+/// Objective-C runtime an object that is gone, which ends the process where
+/// the memory has been reused and corrupts a live object where it has not.
+/// The check costs one hash per create and per destroy, both rare next to
+/// what they do.
+static LIVE_TEXTURES: std::sync::LazyLock<std::sync::Mutex<rustc_hash::FxHashSet<u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(rustc_hash::FxHashSet::default()));
+
+/// The waits before each new attempt at a create the device refused.
+///
+/// Doubling from a millisecond, a quarter of a second in all. Only a device
+/// whose refusals are transient retries (see [`retry_refused_create`]); a
+/// refusal that outlasts the schedule fails the create as it would have.
+const REFUSED_CREATE_BACKOFF: [Duration; 8] = [
+    Duration::from_millis(1),
+    Duration::from_millis(2),
+    Duration::from_millis(4),
+    Duration::from_millis(8),
+    Duration::from_millis(16),
+    Duration::from_millis(32),
+    Duration::from_millis(64),
+    Duration::from_millis(128),
+];
+
+/// Hand a texture's retain to a raw handle, recording it as live.
+///
+/// Every texture handle that reaches the PE side is minted here, so the
+/// ledger and [`destroy_texture`]'s check agree on what is live.
+fn mint<T: objc2::Message>(texture: Retained<T>) -> u64 {
+    let raw = Retained::into_raw(texture).cast::<core::ffi::c_void>() as usize as u64;
+    LIVE_TEXTURES
+        .lock()
+        .expect("live-texture ledger poisoned")
+        .insert(raw);
+    raw
+}
+
+/// Creates a persistent `BGRA8Unorm` render target texture for use as a backbuffer.
+///
+/// The caller passes the result to [`clear_new_color_textures`] before the
+/// handle reaches the PE side: the back buffer is presentable before the
+/// application's first draw or clear reaches it (a `Present` with no
+/// rendering is legal D3D9, and routine right after a `Reset`).
+pub fn create_backbuffer(
+    device_handle: MetalHandle<MTLDeviceKind>,
+    width: u32,
+    height: u32,
+) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
+    // A degenerate backbuffer size, e.g. resolved from the off-screen monitor
+    // geometry the conformance suite probes, fails CreateBackbuffer
+    // gracefully instead of aborting the process.
+    if !extent_is_creatable("create_backbuffer", width, height, 1) {
+        return None;
+    }
+    let Some(device) = device_handle.into_retained() else {
+        log::error!(target: crate::LOG_TARGET, "create_backbuffer: null device handle");
+        return None;
+    };
+    let texture = create_color_texture(
+        &device,
+        width,
+        height,
+        PixelFormat::Bgra8Unorm,
+        "mtld3d-backbuffer",
+    )?;
+    let srgb_handle = srgb_twin_view(
+        &texture,
+        PixelFormat::Bgra8Unorm,
+        1,
+        1,
+        IDENTITY_SWIZZLE,
+        "mtld3d-backbuffer",
+    );
+    // SAFETY: `Retained::into_raw` transfers the retain into a raw
+    // pointer; `MetalHandle::new` adopts it as the canonical retain.
+    Some((
+        unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) },
+        srgb_handle,
+    ))
+}
+
+/// The channel order a view leaves untouched.
+const IDENTITY_SWIZZLE: MTLTextureSwizzleChannels = MTLTextureSwizzleChannels {
+    red: objc2_metal::MTLTextureSwizzle::Red,
+    green: objc2_metal::MTLTextureSwizzle::Green,
+    blue: objc2_metal::MTLTextureSwizzle::Blue,
+    alpha: objc2_metal::MTLTextureSwizzle::Alpha,
+};
+
+/// Usage bits for a texture, by what it serves.
+///
+/// `ShaderRead` always, `RenderTarget` for an attachment. `PixelFormatView` is
+/// what a view of another pixel format needs on its base texture, and a colour
+/// texture takes such views: the sRGB twin, and the channel swizzle a format
+/// without an alpha lane samples through. An Apple-family GPU exempts a view
+/// that changes only transfer function or swizzle from the usage, and the bit
+/// would cost it lossless compression on every colour texture, so it stays
+/// off there; every other family refuses the view without it. Depth textures
+/// take no view and never carry the bit.
+fn texture_usage(
+    device: &ProtocolObject<dyn MTLDevice>,
+    render_target: bool,
+    takes_views: bool,
+) -> MTLTextureUsage {
+    let mut usage = MTLTextureUsage::ShaderRead;
+    if render_target {
+        usage |= MTLTextureUsage::RenderTarget;
+    }
+    if takes_views && !super::device::is_apple_family(device) {
+        usage |= MTLTextureUsage::PixelFormatView;
+    }
+    usage
+}
+
+/// The sRGB twin view of a colour texture, or 0 when it has none.
+///
+/// The base texture's usage allows the view (see [`texture_usage`]), and the
+/// view inherits that usage, which keeps a render target's twin
+/// render-targetable. `swizzle` mirrors whichever channel order the base
+/// handle is handed out with, so the two views differ only in transfer
+/// function; a render target is always handed out unswizzled, since Metal
+/// forbids rendering through a channel swizzle.
+///
+/// 0 means either that the format has no sRGB counterpart or that Metal
+/// declined the view. The PE side treats both alike: a target without a twin
+/// has `D3DRS_SRGBWRITEENABLE` applied in the pixel shader, ahead of the
+/// blender, so the second case is a fidelity loss, not a failure, and is
+/// warned about once here.
+fn srgb_twin_view(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    format: PixelFormat,
+    levels: usize,
+    slices: usize,
+    swizzle: MTLTextureSwizzleChannels,
+    label: &str,
+) -> u64 {
+    srgb_twin_view_native(texture, format, levels, slices, swizzle, label).map_or(0, mint)
+}
+
+fn srgb_twin_view_native(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    format: PixelFormat,
+    levels: usize,
+    slices: usize,
+    swizzle: MTLTextureSwizzleChannels,
+    label: &str,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let srgb_format = format.srgb_twin()?;
+    let create = || {
+        // SAFETY: objc2 typed binding; `texture` is live and the ranges match
+        // the descriptor it was created with.
+        unsafe {
+            texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                mtl_pixel_format(srgb_format),
+                texture.textureType(),
+                objc2_foundation::NSRange::new(0, levels),
+                objc2_foundation::NSRange::new(0, slices),
+                swizzle,
+            )
+        }
+    };
+    let view =
+        create().or_else(|| retry_refused_create(&texture.device(), label, "sRGB view", &create));
+    let Some(view) = view else {
+        if log::log_enabled!(target: "mtld3d::unix::command", log::Level::Debug) {
+            let device = texture.device();
+            log::debug!(
+                target: "mtld3d::unix::command",
+                "texture-view-refused base={texture:p} device={:p} registry_id={:#x} \
+                 label={:?} width={} height={} depth={} samples={} pixel_format={} \
+                 usage={:#x} texture_type={} mip_levels={} array_length={} \
+                 view_pixel_format={} view_texture_type={} view_levels=0..{levels} \
+                 view_slices=0..{slices} view_swizzle=({},{},{},{})",
+                Retained::as_ptr(&device),
+                device.registryID(),
+                texture.label().map(|label| label.to_string()),
+                texture.width(),
+                texture.height(),
+                texture.depth(),
+                texture.sampleCount(),
+                texture.pixelFormat().0,
+                texture.usage().0,
+                texture.textureType().0,
+                texture.mipmapLevelCount(),
+                texture.arrayLength(),
+                mtl_pixel_format(srgb_format).0,
+                texture.textureType().0,
+                swizzle.red.0,
+                swizzle.green.0,
+                swizzle.blue.0,
+                swizzle.alpha.0,
+            );
+        }
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{label}: Metal declined the {srgb_format:?} view of a {format:?} texture; \
+             D3DRS_SRGBWRITEENABLE on this target encodes in the pixel shader, before the \
+             blender",
+        );
+        return None;
+    };
+    let srgb_label = objc2_foundation::NSString::from_str(&format!("{label}-srgb"));
+    view.setLabel(Some(&srgb_label));
+    Some(view)
+}
+
+/// The contents a fresh colour texture starts with.
+///
+/// Transparent black, which is what a zeroed allocation reads as, alpha
+/// included. The back buffer takes [`OPAQUE_BLACK`] instead: it can be
+/// presented before anything draws into it, and a presented surface owes an
+/// opaque alpha.
+pub const TRANSPARENT_BLACK: MTLClearColor = MTLClearColor {
+    red: 0.0,
+    green: 0.0,
+    blue: 0.0,
+    alpha: 0.0,
+};
+
+/// The back buffer's creation contents. See [`TRANSPARENT_BLACK`].
+pub const OPAQUE_BLACK: MTLClearColor = MTLClearColor {
+    red: 0.0,
+    green: 0.0,
+    blue: 0.0,
+    alpha: 1.0,
+};
+
+/// Clear freshly created colour textures to `clear_color`.
+///
+/// Why a texture has to start defined is on
+/// [`TextureCreateFlags::CLEAR_ON_CREATE`], the wire value both sides read.
+/// This is the one place the ordering rule is stated.
+///
+/// One empty render pass with `LoadAction::Clear` per subresource, all of
+/// them in one command buffer on the frame queue, so commit order is the
+/// fence: every later frame command buffer observes the cleared texture and
+/// no CPU wait is involved.
+///
+/// Each texture must carry `RenderTarget` usage and a renderable pixel
+/// format. A null handle is skipped, so a caller can pass an optional
+/// companion without testing it first. Failure to encode leaves the contents
+/// undefined, which is what creation produced anyway, so it is logged and
+/// tolerated rather than failing the create.
+pub fn clear_new_color_textures(
+    queue_handle: MetalHandle<MTLCommandQueueKind>,
+    handles: &[MetalHandle<MTLTextureKind>],
+    clear_color: MTLClearColor,
+) {
+    let mut batch = TextureClearBatch::new();
+    for &handle in handles {
+        batch.retain(handle);
+    }
+    drop(batch.commit(queue_handle, clear_color));
+}
+
+/// New color textures awaiting one initialization clear before frame submission.
+///
+/// Retains textures independently of the cache, including same-frame releases.
+/// Dropping an uncommitted batch releases those retains without submitting work.
+pub struct TextureClearBatch {
+    textures: Vec<Retained<ProtocolObject<dyn MTLTexture>>>,
+}
+
+impl TextureClearBatch {
+    pub const fn new() -> Self {
+        Self {
+            textures: Vec::new(),
+        }
+    }
+
+    fn retain(&mut self, handle: MetalHandle<MTLTextureKind>) {
+        if let Some(texture) = handle.into_retained() {
+            self.textures.push(texture);
+        }
+    }
+
+    /// Commit one clear buffer, returning it when work was submitted.
+    ///
+    /// Drains retained textures on success and failure, keeping vector capacity.
+    /// The caller must commit before any submission that can access these textures.
+    pub fn commit(
+        &mut self,
+        queue_handle: MetalHandle<MTLCommandQueueKind>,
+        clear_color: MTLClearColor,
+    ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+        let textures = self.textures.drain(..);
+        if textures.len() == 0 {
+            return None;
+        }
+        let Some(queue) = queue_handle.into_retained() else {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "clear_new_color_textures: no queue for the creation-time clear; \
+                 the new texture starts with undefined contents",
+            );
+            return None;
+        };
+        let Some(cmd_buf) = diagnostics::command_buffer(&queue) else {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "clear_new_color_textures: commandBuffer() returned nil for the creation-time \
+                 clear; the new texture starts with undefined contents",
+            );
+            return None;
+        };
+        let cmd_label = objc2_foundation::NSString::from_str("mtld3d-init-clear");
+        cmd_buf.setLabel(Some(&cmd_label));
+        for texture in textures {
+            clear_one_texture(&cmd_buf, &texture, clear_color);
+        }
+        diagnostics::observe_initialization(&cmd_buf);
+        cmd_buf.commit();
+        Some(cmd_buf)
+    }
+}
+
+/// Encode the clear passes of one texture into an open command buffer.
+///
+/// A cube reports `arrayLength() == 1` while carrying six addressable faces,
+/// so its slice count is the constant rather than the reported length.
+fn clear_one_texture(
+    cmd_buf: &ProtocolObject<dyn MTLCommandBuffer>,
+    texture: &ProtocolObject<dyn MTLTexture>,
+    clear_color: MTLClearColor,
+) {
+    let slices = if texture.textureType() == MTLTextureType::TypeCube {
+        6
+    } else {
+        texture.arrayLength()
+    };
+    let name = texture
+        .label()
+        .map_or_else(|| String::from("mtld3d-texture"), |label| label.to_string());
+    // No volume carries the flag today, since only the 2D and cube creates set
+    // the render-target usage it keys on. The plane walk stays anyway: a
+    // partly cleared texture is the defect this exists to stop.
+    for level in 0..texture.mipmapLevelCount() {
+        let planes = (texture.depth() >> level).max(1);
+        for slice in 0..slices {
+            for plane in 0..planes {
+                let pass_desc = MTLRenderPassDescriptor::new();
+                // SAFETY: `colorAttachments()` returns a non-null descriptor
+                // array; subscript 0 is always valid.
+                let color0 = unsafe { pass_desc.colorAttachments().objectAtIndexedSubscript(0) };
+                color0.setTexture(Some(texture));
+                color0.setLevel(level);
+                color0.setSlice(slice);
+                color0.setDepthPlane(plane);
+                color0.setLoadAction(MTLLoadAction::Clear);
+                color0.setClearColor(clear_color);
+                color0.setStoreAction(MTLStoreAction::Store);
+                if let Some(enc) = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc) {
+                    // One batch clears the whole render-target working set, so
+                    // each pass names its texture and subresource: a capture is
+                    // how anyone answers which surface a stray pixel came from.
+                    let label = objc2_foundation::NSString::from_str(&format!(
+                        "{name}-init-clear-l{level}s{slice}p{plane}"
+                    ));
+                    enc.setLabel(Some(&label));
+                    enc.endEncoding();
+                } else {
+                    mtld3d_shared::log_once_warn!(
+                        target: crate::LOG_TARGET,
+                        "clear_new_color_textures: no encoder for the creation-time clear; \
+                         the new texture starts with undefined contents",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Creates a standalone depth/stencil texture for `CreateDepthStencilSurface`.
+///
+/// `pixel_format` is the Metal-side enum already resolved from the D3D9
+/// depth format on the PE side via `mtld3d_core::format::map_d3d_depth_format`.
+pub fn create_depth_texture(
+    device_handle: MetalHandle<MTLDeviceKind>,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    sample_count: u32,
+) -> Option<MetalHandle<MTLTextureKind>> {
+    // The implicit depth surface follows the back buffer's size, so a `Reset`
+    // retried at a size the back buffer was refused at asks for it too.
+    if !extent_is_creatable("create_depth_texture", width, height, 1) {
+        return None;
+    }
+    let device = device_handle.into_retained()?;
+    let mtl_format = mtl_pixel_format(pixel_format);
+
+    // SAFETY: objc2 typed binding; class-method constructor on
+    // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            mtl_format,
+            width as usize,
+            height as usize,
+            false,
+        )
+    };
+    desc.setUsage(MTLTextureUsage::RenderTarget);
+    if sample_count > 1 {
+        desc.setTextureType(MTLTextureType::Type2DMultisample);
+        // SAFETY: objc2 typed binding; the count was validated against
+        // `supportsTextureSampleCount:` before it crossed the boundary.
+        unsafe { desc.setSampleCount(sample_count as usize) };
+    }
+
+    // Depth textures must be in private storage on Apple Silicon
+    desc.setStorageMode(objc2_metal::MTLStorageMode::Private);
+
+    let texture = new_texture(&device, &desc, "mtld3d-depth")?;
+    let label = objc2_foundation::NSString::from_str("mtld3d-depth");
+    texture.setLabel(Some(&label));
+    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
+    // adopts it as canonical.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) })
+}
+
+/// Creates a standalone color render-target texture.
+///
+/// Serves `CreateRenderTarget` and
+/// `CreateOffscreenPlainSurface(D3DPOOL_DEFAULT)`. `pixel_format` is the
+/// Metal-side enum already resolved from the D3D9 color format on the PE side
+/// via `mtld3d_core::format::map_d3d_format`. Usage mirrors the backbuffer
+/// (`RenderTarget | ShaderRead`) so the result can be both rendered to and
+/// sampled / used as a `StretchRect` source.
+pub fn create_color_target(
+    device_handle: MetalHandle<MTLDeviceKind>,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
+    let device = device_handle.into_retained()?;
+    let texture =
+        create_color_texture(&device, width, height, pixel_format, "mtld3d-color-target")?;
+    let srgb_handle = srgb_twin_view(
+        &texture,
+        pixel_format,
+        1,
+        1,
+        IDENTITY_SWIZZLE,
+        "mtld3d-color-target",
+    );
+    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
+    // adopts it as canonical.
+    Some((
+        unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) },
+        srgb_handle,
+    ))
+}
+
+/// Creates the colour texture a `MetalFX` upscale reads or writes.
+///
+/// Same shape as [`create_color_target`] without the sRGB twin: nothing
+/// samples the scratch through a transfer function. `MTLFXSpatialScaler`
+/// rejects an output texture that is not `Private`, which every colour
+/// texture here is.
+///
+/// Takes the device by reference rather than by handle because `submit_frame`
+/// reaches this through `cmd_buf.device()` and carries no device handle of its
+/// own.
+pub fn create_upscale_target(
+    device: &ProtocolObject<dyn MTLDevice>,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+) -> Option<MetalHandle<MTLTextureKind>> {
+    let texture = create_color_texture(
+        device,
+        width,
+        height,
+        pixel_format,
+        "mtld3d-upscale-scratch",
+    )?;
+    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
+    // adopts it as canonical.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) })
+}
+
+/// Shared body of the colour-texture creators.
+///
+/// `Private` storage: nothing on the CPU touches a colour texture (every
+/// upload is a blit from a staging buffer and every readback a blit into one),
+/// and the descriptor's default, `Managed`, would keep a CPU mirror the GPU
+/// has to synchronise. Hands back the retained texture rather than a handle,
+/// so the caller can take an sRGB view of it before transferring the retain
+/// into the handle it returns.
+fn create_color_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    label: &'static str,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    if !extent_is_creatable(label, width, height, 1) {
+        return None;
+    }
+    // SAFETY: objc2 typed binding; class-method constructor on
+    // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            mtl_pixel_format(pixel_format),
+            width as usize,
+            height as usize,
+            false,
+        )
+    };
+    desc.setUsage(texture_usage(device, true, true));
+    desc.setStorageMode(MTLStorageMode::Private);
+
+    let Some(texture) = new_texture(device, &desc, label) else {
+        log_texture_refused(device, &desc, pixel_format, label);
+        return None;
+    };
+    let label = objc2_foundation::NSString::from_str(label);
+    texture.setLabel(Some(&label));
+    Some(texture)
+}
+
+/// Report a texture descriptor the device returned nil for.
+///
+/// `newTextureWithDescriptor:` gives no reason, so the line carries both
+/// sides of the refusal: the descriptor as it was submitted, and the device's
+/// identity and memory figures. Together they separate a request the layer
+/// got wrong from a sane one the device could not serve, which is the
+/// difference between a bug here and an exhausted or paravirtualized GPU.
+fn log_texture_refused(
+    device: &ProtocolObject<dyn MTLDevice>,
+    desc: &MTLTextureDescriptor,
+    pixel_format: PixelFormat,
+    label: &str,
+) {
+    log::error!(
+        target: crate::LOG_TARGET,
+        "{label}: newTextureWithDescriptor returned nil for {}x{} {pixel_format:?} samples={} \
+         usage={:#x} storage={} on '{}' (allocated {} B, recommended working set {} B, unified \
+         memory: {}) device={device:p} registry_id={:#x}",
+        desc.width(),
+        desc.height(),
+        desc.sampleCount(),
+        desc.usage().0,
+        desc.storageMode().0,
+        device.name(),
+        device.currentAllocatedSize(),
+        device.recommendedMaxWorkingSetSize(),
+        device.hasUnifiedMemory(),
+        device.registryID(),
+    );
+}
+
+/// Create a texture from `desc`, asking again when the device's refusal can lift.
+///
+/// A create that succeeds the first time costs what the bare call does; only
+/// a nil reaches [`retry_refused_create`]. Every `newTextureWithDescriptor:`
+/// in this crate goes through here.
+pub fn new_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    desc: &MTLTextureDescriptor,
+    label: &str,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let create = || device.newTextureWithDescriptor(desc);
+    create().or_else(|| retry_refused_create(device, label, "texture", create))
+}
+
+/// Ask again for a texture or view `device` refused, when its refusals are transient.
+///
+/// Returns `None` at once on a device whose refusals are final, which is
+/// every real GPU (`device::refuses_creates_transiently`). On the
+/// paravirtualized one it waits out [`REFUSED_CREATE_BACKOFF`] between
+/// attempts and returns the first object created, or `None` once the schedule
+/// is spent, so the caller's failure path runs as it would have.
+///
+/// The wait blocks the thread that asked: the API thread inside a `Reset` or
+/// a `Create*` call, the encoder or submit thread for a texture, view or
+/// scratch target it creates, or the main thread for a cursor sprite. That is
+/// a quarter of a second at most, on a device that only a CI runner exposes,
+/// against a create that otherwise fails and takes the resource or the device
+/// with it. A caller that holds a lock across the create holds it that long
+/// too, and says so where it does.
+///
+/// Every outcome logs. The first retry in the process warns once; each
+/// recovered create logs its retry number, which is also how many times the
+/// device refused it, the time it waited and how many creates the process has
+/// recovered so far; a create still refused after the last attempt warns,
+/// with its refusal count, before the caller reports the failure.
+#[cold]
+pub fn retry_refused_create<T>(
+    device: &ProtocolObject<dyn MTLDevice>,
+    label: &str,
+    what: &str,
+    create: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    /// Creates this process got on a retry after a refusal.
+    ///
+    /// A static because the resource is process-wide: the one `MTLDevice`
+    /// and its driver, whose refusals land on whichever device asked.
+    static RECOVERED: AtomicU64 = AtomicU64::new(0);
+
+    let transient = super::device::refuses_creates_transiently(device);
+    if transient {
+        mtld3d_shared::log_once_warn!(
+            target: crate::LOG_TARGET,
+            "{label}: '{}' refused a {what}; asking again for up to {} ms, since this \
+             device's refusals have been transient",
+            device.name(),
+            REFUSED_CREATE_BACKOFF.iter().sum::<Duration>().as_millis(),
+        );
+    }
+    let outcome = retry_with_backoff(
+        transient,
+        &REFUSED_CREATE_BACKOFF,
+        create,
+        std::thread::sleep,
+    );
+    if outcome.attempts == 0 {
+        return None;
+    }
+    if outcome.value.is_some() {
+        let recovered = RECOVERED.fetch_add(1, Ordering::Relaxed) + 1;
+        log::info!(
+            target: crate::LOG_TARGET,
+            "{label}: {what} created on retry {} ({} refused before it) after {} ms; \
+             {recovered} refused creates recovered in this process",
+            outcome.attempts,
+            outcome.attempts,
+            outcome.waited.as_millis(),
+        );
+    } else {
+        log::warn!(
+            target: crate::LOG_TARGET,
+            "{label}: {what} still refused after {} retries ({} refused in all) over {} ms",
+            outcome.attempts,
+            outcome.attempts + 1,
+            outcome.waited.as_millis(),
+        );
+    }
+    outcome.value
+}
+
+/// What [`retry_with_backoff`] got, and what it cost.
+struct RetryOutcome<T> {
+    /// The first object created, or `None` when every attempt was refused.
+    value: Option<T>,
+    /// The attempts made, 0 when the refusal was final and nothing was retried.
+    attempts: u32,
+    /// The total time waited before those attempts.
+    waited: Duration,
+}
+
+/// Call `create` again after each wait in `backoff`, until it returns an object.
+///
+/// `transient` false makes no attempt and no wait. `wait` is the sleep, which
+/// the tests replace.
+fn retry_with_backoff<T>(
+    transient: bool,
+    backoff: &[Duration],
+    mut create: impl FnMut() -> Option<T>,
+    mut wait: impl FnMut(Duration),
+) -> RetryOutcome<T> {
+    let mut outcome = RetryOutcome {
+        value: None,
+        attempts: 0,
+        waited: Duration::ZERO,
+    };
+    if !transient {
+        return outcome;
+    }
+    for &delay in backoff {
+        wait(delay);
+        outcome.waited += delay;
+        outcome.attempts += 1;
+        outcome.value = create();
+        if outcome.value.is_some() {
+            break;
+        }
+    }
+    outcome
+}
+
+/// Creates the multisampled companion of a single-sample render target.
+///
+/// The result is the colour attachment every pass renders into; the
+/// single-sample texture it was made for is its resolve target and stays the
+/// only one anything samples, blits, reads back or presents. `Private`
+/// storage rather than `Memoryless` because a D3D9 frame can render into the
+/// same target across several passes before the content is consumed, and only
+/// the last of those passes takes the resolve; the passes in between store
+/// the multisample content, which a memoryless texture cannot do.
+///
+/// The second element is the companion's sRGB twin view, or 0 when the format
+/// has no sRGB counterpart. A multisampled pass writing sRGB attaches that
+/// view and resolves into the single-sample texture's own twin, which Metal
+/// requires to carry the attachment's pixel format.
+///
+/// Returns `None` when `sample_count` is 1 (nothing to create) or when Metal
+/// declines the descriptor; the caller knows which by its own `sample_count`
+/// and reports the second case as a failed create.
+pub fn create_msaa_companion(
+    device_handle: MetalHandle<MTLDeviceKind>,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    sample_count: u32,
+    label: &'static str,
+) -> Option<(MetalHandle<MTLTextureKind>, u64)> {
+    if sample_count <= 1 || !extent_is_creatable(label, width, height, 1) {
+        return None;
+    }
+    let Some(device) = device_handle.into_retained() else {
+        log::error!(target: crate::LOG_TARGET, "{label}: null device handle");
+        return None;
+    };
+    let mtl_format = mtl_pixel_format(pixel_format);
+    // SAFETY: objc2 typed binding; class-method constructor on
+    // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
+    let desc = unsafe {
+        MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+            mtl_format,
+            width as usize,
+            height as usize,
+            false,
+        )
+    };
+    desc.setTextureType(MTLTextureType::Type2DMultisample);
+    // SAFETY: objc2 typed binding; the count was validated against
+    // `supportsTextureSampleCount:` before it crossed the boundary.
+    unsafe { desc.setSampleCount(sample_count as usize) };
+    desc.setUsage(texture_usage(&device, true, true));
+    desc.setStorageMode(MTLStorageMode::Private);
+
+    let Some(texture) = new_texture(&device, &desc, label) else {
+        log_texture_refused(&device, &desc, pixel_format, label);
+        return None;
+    };
+    let ns_label = objc2_foundation::NSString::from_str(label);
+    texture.setLabel(Some(&ns_label));
+    let srgb_handle = srgb_twin_view(&texture, pixel_format, 1, 1, IDENTITY_SWIZZLE, label);
+    // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
+    // adopts it as canonical.
+    Some((
+        unsafe { MetalHandle::<MTLTextureKind>::new(mint(texture)) },
+        srgb_handle,
+    ))
+}
+
+/// Creates an `MTLDepthStencilState` object.
+pub fn create_depth_stencil_state(
+    device: &ProtocolObject<dyn MTLDevice>,
+    params: &DepthStencilDescription,
+) -> Option<MetalHandle<MTLDepthStencilStateKind>> {
+    let desc = MTLDepthStencilDescriptor::new();
+    desc.setDepthCompareFunction(mtl_compare_function(params.depth_compare_func));
+    desc.setDepthWriteEnabled(params.depth_write_enable);
+    if let Some(stencil) = &params.stencil {
+        desc.setFrontFaceStencil(Some(&stencil_face_descriptor(
+            stencil.front,
+            stencil.read_mask,
+            stencil.write_mask,
+        )));
+        desc.setBackFaceStencil(Some(&stencil_face_descriptor(
+            stencil.back,
+            stencil.read_mask,
+            stencil.write_mask,
+        )));
+    }
+
+    let id = params.id;
+    let label = objc2_foundation::NSString::from_str(&format!("mtld3d-dss-{id:#x}"));
+    desc.setLabel(Some(&label));
+
+    let state = device.newDepthStencilStateWithDescriptor(&desc)?;
+    // SAFETY: Retained::into_raw transfers the retain into the typed handle.
+    Some(unsafe { MetalHandle::<MTLDepthStencilStateKind>::new(Retained::into_raw(state) as u64) })
+}
+
+/// Builds one `MTLStencilDescriptor` face.
+///
+/// Metal carries the read/write masks per face; D3D9 has one pair of masks
+/// (`D3DRS_STENCILMASK` / `D3DRS_STENCILWRITEMASK`) covering both, so the
+/// same pair is written to each face.
+fn stencil_face_descriptor(
+    face: StencilFaceDescription,
+    read_mask: u32,
+    write_mask: u32,
+) -> Retained<MTLStencilDescriptor> {
+    let desc = MTLStencilDescriptor::new();
+    desc.setStencilCompareFunction(mtl_compare_function(face.compare_func));
+    desc.setStencilFailureOperation(mtl_stencil_operation(face.stencil_fail_op));
+    desc.setDepthFailureOperation(mtl_stencil_operation(face.depth_fail_op));
+    desc.setDepthStencilPassOperation(mtl_stencil_operation(face.pass_op));
+    desc.setReadMask(read_mask);
+    desc.setWriteMask(write_mask);
+    desc
+}
+
+pub const fn mtl_stencil_operation(wire: StencilOp) -> MTLStencilOperation {
+    match wire {
+        StencilOp::Keep => MTLStencilOperation::Keep,
+        StencilOp::Zero => MTLStencilOperation::Zero,
+        StencilOp::Replace => MTLStencilOperation::Replace,
+        StencilOp::IncrementClamp => MTLStencilOperation::IncrementClamp,
+        StencilOp::DecrementClamp => MTLStencilOperation::DecrementClamp,
+        StencilOp::Invert => MTLStencilOperation::Invert,
+        StencilOp::IncrementWrap => MTLStencilOperation::IncrementWrap,
+        StencilOp::DecrementWrap => MTLStencilOperation::DecrementWrap,
+    }
+}
+
+pub const fn mtl_blend_factor(wire: WireBlendFactor) -> MTLBlendFactor {
+    match wire {
+        WireBlendFactor::Zero => MTLBlendFactor::Zero,
+        WireBlendFactor::One => MTLBlendFactor::One,
+        WireBlendFactor::SourceColor => MTLBlendFactor::SourceColor,
+        WireBlendFactor::OneMinusSourceColor => MTLBlendFactor::OneMinusSourceColor,
+        WireBlendFactor::SourceAlpha => MTLBlendFactor::SourceAlpha,
+        WireBlendFactor::OneMinusSourceAlpha => MTLBlendFactor::OneMinusSourceAlpha,
+        WireBlendFactor::DestinationAlpha => MTLBlendFactor::DestinationAlpha,
+        WireBlendFactor::OneMinusDestinationAlpha => MTLBlendFactor::OneMinusDestinationAlpha,
+        WireBlendFactor::DestinationColor => MTLBlendFactor::DestinationColor,
+        WireBlendFactor::OneMinusDestinationColor => MTLBlendFactor::OneMinusDestinationColor,
+        WireBlendFactor::SourceAlphaSaturated => MTLBlendFactor::SourceAlphaSaturated,
+        WireBlendFactor::BlendColor => MTLBlendFactor::BlendColor,
+        WireBlendFactor::OneMinusBlendColor => MTLBlendFactor::OneMinusBlendColor,
+    }
+}
+
+/// Create texture views, keeping successful slots when another creation fails.
+///
+/// The caller supplies an autorelease pool. Each distinct returned handle owns
+/// one retain. The caller commits `clears` before submitting texture-consuming work.
+/// Returns whether every creation succeeded.
+///
+/// # Panics
+/// Panics when the descriptor and output counts differ.
+pub fn create_textures(
+    device: &ProtocolObject<dyn MTLDevice>,
+    descs: &[TextureCreateDesc],
+    views: &mut [TextureViews],
+    clears: &mut TextureClearBatch,
+) -> bool {
+    assert_eq!(descs.len(), views.len());
+    let mut any_failed = false;
+    for (desc, slot) in descs.iter().zip(views) {
+        if let Some(created) = create_texture(device, desc) {
+            *slot = created;
+            if desc.flags.contains(TextureCreateFlags::CLEAR_ON_CREATE) {
+                clears.retain(slot.linear);
+            }
+        } else {
+            *slot = TextureViews::EMPTY;
+            any_failed = true;
+            // Logged once per texture: the encoder asks again on a later use.
+            mtld3d_shared::log_once_warn_by!(
+                target: crate::LOG_TARGET,
+                key: desc.tex_id,
+                "failed to create texture tex_id={:#x}",
+                desc.tex_id
+            );
+        }
+    }
+    !any_failed
+}
+
+/// Creates a texture for sampling.
+///
+/// Pixel format and swizzle are Metal-level values (already translated from
+/// D3D9 on the PE side).
+///
+/// Depth-format textures (sampleable shadow maps from
+/// `CreateTexture(format=D24X8, usage=D3DUSAGE_DEPTHSTENCIL)`) take the
+/// `RenderTarget | ShaderRead` usage path: the PE side flags
+/// `TextureUsage::DEPTH_STENCIL` AND picks a depth `PixelFormat`, the
+/// Metal texture is bindable as a depth attachment and sampleable in the
+/// subsequent lit pass. Swizzle views aren't applicable to depth formats.
+///
+/// One descriptor → one `MTLTexture`. The batched handler iterates this
+/// per element; same call shape used by both load-phase warmup batches
+/// and one-off lazy creates.
+///
+/// Attachment roles remain renderable; sampling roles carry the descriptor's
+/// channel swizzle. The sRGB roles share storage with their linear counterparts.
+/// Each distinct non-null returned handle owns one canonical retain.
+pub fn create_texture(
+    device: &ProtocolObject<dyn MTLDevice>,
+    desc: &TextureCreateDesc,
+) -> Option<TextureViews> {
+    let depth = if desc.flags.contains(TextureCreateFlags::TYPE_3D) {
+        desc.depth
+    } else {
+        1
+    };
+    if !extent_is_creatable("create_texture", desc.width, desc.height, depth) {
+        return None;
+    }
+    let mtl_format = mtl_pixel_format(desc.pixel_format);
+    let is_depth = is_depth_pixel_format(desc.pixel_format);
+
+    // Texture shape is carried explicitly. This keeps cube and single-slice
+    // volume descriptors distinct without changing the wire layout.
+    // there is no `texture3DDescriptor…` convenience constructor, so build the
+    // descriptor by hand. Everything else (usage, storage, swizzle, label) is
+    // shared with the 2D path below.
+    let tex_desc = if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
+        let d = MTLTextureDescriptor::new();
+        d.setTextureType(objc2_metal::MTLTextureType::TypeCube);
+        d.setPixelFormat(mtl_format);
+        // SAFETY: objc2 typed property setters on a fresh descriptor.
+        unsafe { d.setWidth(desc.width as usize) };
+        // SAFETY: cube faces are square; height is still set for an explicit,
+        // self-contained descriptor.
+        unsafe { d.setHeight(desc.height as usize) };
+        d
+    } else if desc.flags.contains(TextureCreateFlags::TYPE_3D) {
+        let d = MTLTextureDescriptor::new();
+        d.setTextureType(objc2_metal::MTLTextureType::Type3D);
+        d.setPixelFormat(mtl_format);
+        // SAFETY: objc2 typed property setters on a freshly-allocated descriptor.
+        unsafe { d.setWidth(desc.width as usize) };
+        // SAFETY: as above.
+        unsafe { d.setHeight(desc.height as usize) };
+        // SAFETY: as above.
+        unsafe { d.setDepth(desc.depth as usize) };
+        d
+    } else {
+        // SAFETY: objc2 typed binding; class-method constructor on
+        // `MTLTextureDescriptor` returns a freshly autoreleased descriptor.
+        unsafe {
+            MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
+                mtl_format,
+                desc.width as usize,
+                desc.height as usize,
+                desc.levels > 1,
+            )
+        }
+    };
+    // SAFETY: objc2 typed binding; pure accessor passthrough.
+    unsafe { tex_desc.setMipmapLevelCount(desc.levels as usize) };
+
+    // Honor RT bits: RENDER_TARGET textures also keep ShaderRead so the
+    // subsequent pass can sample them (water reflection, portrait models).
+    // Depth textures with DEPTH_STENCIL flag are sampleable shadow maps:
+    // they need both the depth-attachment binding AND ShaderRead.
+    let is_render_target = desc
+        .usage_flags
+        .intersects(TextureUsage::RENDER_TARGET | TextureUsage::DEPTH_STENCIL);
+    tex_desc.setUsage(texture_usage(device, is_render_target, !is_depth));
+
+    // Depth textures must live in private storage on Apple Silicon, regardless
+    // of what the PE side requested (CPU upload of a depth texture is meaningless).
+    if is_depth {
+        tex_desc.setStorageMode(objc2_metal::MTLStorageMode::Private);
+    } else {
+        tex_desc.setStorageMode(mtl_storage_mode(desc.storage_mode));
+    }
+
+    let texture = new_texture(device, &tex_desc, "mtld3d-tex")?;
+
+    // Label the handle the PE side will see — surfaces the mtld3d TextureId
+    // alongside the MTLTexture in Xcode frame captures, which is the
+    // mapping every cross-recreate / handle-recycle texture debugging
+    // step needs to correlate an MTLTexture back to its mtld3d TextureId.
+    let label_str = if is_depth {
+        format!("mtld3d-depthtex-{:#x}", desc.tex_id)
+    } else {
+        format!("mtld3d-tex-{:#x}", desc.tex_id)
+    };
+    let label = objc2_foundation::NSString::from_str(&label_str);
+
+    texture.setLabel(Some(&label));
+    let has_swizzle = !is_depth && desc.flags.contains(TextureCreateFlags::HAS_SWIZZLE);
+    let swizzle = if has_swizzle {
+        MTLTextureSwizzleChannels {
+            red: mtl_texture_swizzle(desc.swizzle_r),
+            green: mtl_texture_swizzle(desc.swizzle_g),
+            blue: mtl_texture_swizzle(desc.swizzle_b),
+            alpha: mtl_texture_swizzle(desc.swizzle_a),
+        }
+    } else {
+        IDENTITY_SWIZZLE
+    };
+    assemble_texture_views(
+        texture,
+        is_render_target,
+        has_swizzle,
+        |texture, srgb| {
+            required_sample_view(
+                texture,
+                if srgb {
+                    desc.pixel_format
+                        .srgb_twin()
+                        .expect("sRGB attachment format")
+                } else {
+                    desc.pixel_format
+                },
+                swizzle,
+                &label_str,
+            )
+        },
+        |texture| {
+            if is_depth {
+                None
+            } else {
+                srgb_twin_view_native(
+                    texture,
+                    desc.pixel_format,
+                    desc.levels as usize,
+                    if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
+                        6
+                    } else {
+                        1
+                    },
+                    if is_render_target {
+                        IDENTITY_SWIZZLE
+                    } else {
+                        swizzle
+                    },
+                    &label_str,
+                )
+            }
+        },
+    )
+}
+
+/// Build all required roles before any canonical retain escapes.
+///
+/// Constructors stay at the creation boundary so failure drops every temporary
+/// owner. Optional sRGB refusal leaves a linear sampling fallback; required
+/// sampling refusal fails the whole resource.
+fn assemble_texture_views(
+    texture: Retained<ProtocolObject<dyn MTLTexture>>,
+    is_render_target: bool,
+    has_swizzle: bool,
+    mut sample_view: impl FnMut(
+        &ProtocolObject<dyn MTLTexture>,
+        bool,
+    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+    srgb_view: impl FnOnce(
+        &ProtocolObject<dyn MTLTexture>,
+    ) -> Option<Retained<ProtocolObject<dyn MTLTexture>>>,
+) -> Option<TextureViews> {
+    let sample = if has_swizzle {
+        Some(sample_view(&texture, false)?)
+    } else {
+        None
+    };
+    let srgb = srgb_view(&texture);
+    let sample_srgb = if is_render_target && has_swizzle {
+        if let Some(view) = srgb.as_ref() {
+            Some(sample_view(view, true)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    // Required views are created before any canonical retain escapes. Failure
+    // above drops all native owners, including an optional sRGB attachment.
+    let native = if is_render_target {
+        [Some(texture), srgb, sample, sample_srgb]
+    } else {
+        [Some(sample.unwrap_or(texture)), srgb, None, None]
+    };
+    Some(mint_texture_views(native))
+}
+
+/// Create a sampling-only view without changing the allocation's usage.
+fn required_sample_view(
+    texture: &ProtocolObject<dyn MTLTexture>,
+    format: PixelFormat,
+    swizzle: MTLTextureSwizzleChannels,
+    label: &str,
+) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
+    let slices = if texture.textureType() == MTLTextureType::TypeCube {
+        6
+    } else {
+        1
+    };
+    let create = || {
+        // SAFETY: the retained source supplies its own level and slice extents;
+        // the compatible format and channel mapping are its creation descriptor's.
+        unsafe {
+            texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
+                mtl_pixel_format(format),
+                texture.textureType(),
+                objc2_foundation::NSRange::new(0, texture.mipmapLevelCount()),
+                objc2_foundation::NSRange::new(0, slices),
+                swizzle,
+            )
+        }
+    };
+    let view = create()
+        .or_else(|| retry_refused_create(&texture.device(), label, "sampling view", &create));
+    let Some(view) = view else {
+        mtld3d_shared::log_once_warn!(target: crate::LOG_TARGET,
+            "{label}: Metal declined the required {format:?} sampling view; texture creation failed");
+        return None;
+    };
+    view.setLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+        "{label}-sample"
+    ))));
+    Some(view)
+}
+
+/// Transfer one canonical retain per distinct native object.
+fn mint_texture_views(
+    native: [Option<Retained<ProtocolObject<dyn MTLTexture>>>; 4],
+) -> TextureViews {
+    let mut handles = [MetalHandle::<MTLTextureKind>::NULL; 4];
+    for (index, texture) in native.into_iter().enumerate() {
+        let Some(texture) = texture else { continue };
+        let raw = Retained::as_ptr(&texture).cast::<core::ffi::c_void>() as usize as u64;
+        handles[index] = if let Some(&existing) = handles[..index].iter().find(|h| h.raw() == raw) {
+            // The new native owner is dropped; the earlier role already owns
+            // the object's canonical retain and the ledger records it once.
+            existing
+        } else {
+            // SAFETY: mint transfers this retained MTLTexture's canonical
+            // retain to the returned bundle and records it in the ledger.
+            unsafe { MetalHandle::new(mint(texture)) }
+        };
+    }
+    TextureViews {
+        linear: handles[0],
+        srgb: handles[1],
+        sample_linear: if handles[2].is_null() {
+            handles[0]
+        } else {
+            handles[2]
+        },
+        sample_srgb: if handles[3].is_null() {
+            handles[1]
+        } else {
+            handles[3]
+        },
+    }
+}
+
+/// Create a single-slice, 2D view of one array slice of a texture.
+///
+/// The scaling `StretchRect` fragment function declares its source as
+/// `texture2d<float>`. A cube-map source therefore has to reach it as a 2D view
+/// of the face the D3D9 call named: the cube texture binds as a `texturecube`
+/// and the sample lands on face 0 whichever face the blit addressed. The view
+/// keeps the base format and spans every mip level, so no GPU family asks for
+/// `PixelFormatView` usage on the base texture, and the explicit `level()` the
+/// fragment function passes still selects the source mip.
+///
+/// The returned view is a fresh object whose retain the caller owns; the PE
+/// side destroys it once the frame that binds it has retired.
+pub fn create_texture_slice_view(
+    texture_handle: MetalHandle<MTLTextureKind>,
+    slice: u32,
+) -> Option<MetalHandle<MTLTextureKind>> {
+    let texture = texture_handle.into_retained()?;
+    let levels = texture.mipmapLevelCount();
+    let create = || {
+        // SAFETY: objc2 typed binding; `texture` is retained for the call, the
+        // format is the base texture's own, and the level range covers exactly the
+        // levels it declares.
+        unsafe {
+            texture.newTextureViewWithPixelFormat_textureType_levels_slices(
+                texture.pixelFormat(),
+                MTLTextureType::Type2D,
+                objc2_foundation::NSRange::new(0, levels),
+                objc2_foundation::NSRange::new(slice as usize, 1),
+            )
+        }
+    };
+    let label = format!("mtld3d-sliceview-{texture_handle:#x}-{slice}");
+    let view = create()
+        .or_else(|| retry_refused_create(&texture.device(), &label, "slice view", &create))?;
+    let label = objc2_foundation::NSString::from_str(&label);
+    view.setLabel(Some(&label));
+    // SAFETY: `Retained::into_raw` hands over the view's only retain, which
+    // the typed handle carries to the PE side.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(mint(view)) })
+}
+
+/// Release a Metal texture handle.
+pub fn destroy_texture(texture_handle: u64) {
+    if texture_handle == 0 {
+        return;
+    }
+    let was_live = LIVE_TEXTURES
+        .lock()
+        .expect("live-texture ledger poisoned")
+        .remove(&texture_handle);
+    if !was_live {
+        // A build with debug assertions stops here: the second destroy is
+        // a PE-side lifetime bug, and a test that provokes one has to fail
+        // rather than pass on a skipped release.
+        debug_assert!(
+            was_live,
+            "destroy_texture: {texture_handle:#x} is not a live texture handle"
+        );
+        // Not once: each occurrence names its handle, and the debug lines
+        // around it say which destroy asked twice.
+        log::warn!(
+            target: crate::LOG_TARGET,
+            "destroy_texture: {texture_handle:#x} is not a live texture handle; a second \
+             destroy of a texture already released, or a value that never was one; skipped",
+        );
+        return;
+    }
+    // SAFETY: bulk-destroy thunk; PE side has dropped its only copy of `texture_handle`.
+    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(texture_handle) };
+    // SAFETY: just wrapped the unique canonical retain.
+    unsafe { handle.release_retain() };
+}
+
+/// Release a Metal depth-stencil-state handle.
+pub fn destroy_depth_stencil_state(state_handle: u64) {
+    // SAFETY: bulk-destroy thunk; PE side has dropped its only copy of `state_handle`.
+    let handle = unsafe { MetalHandle::<MTLDepthStencilStateKind>::new(state_handle) };
+    // SAFETY: just wrapped the unique canonical retain.
+    unsafe { handle.release_retain() };
+}
+
+const fn mtl_compare_function(wire: CompareFunc) -> MTLCompareFunction {
+    match wire {
+        CompareFunc::Never => MTLCompareFunction::Never,
+        CompareFunc::Less => MTLCompareFunction::Less,
+        CompareFunc::Equal => MTLCompareFunction::Equal,
+        CompareFunc::LessEqual => MTLCompareFunction::LessEqual,
+        CompareFunc::Greater => MTLCompareFunction::Greater,
+        CompareFunc::NotEqual => MTLCompareFunction::NotEqual,
+        CompareFunc::GreaterEqual => MTLCompareFunction::GreaterEqual,
+        CompareFunc::Always => MTLCompareFunction::Always,
+    }
+}
+
+pub const fn mtl_pixel_format(wire: PixelFormat) -> MTLPixelFormat {
+    match wire {
+        PixelFormat::A8Unorm => MTLPixelFormat::A8Unorm,
+        PixelFormat::R8Unorm => MTLPixelFormat::R8Unorm,
+        PixelFormat::R16Unorm => MTLPixelFormat::R16Unorm,
+        PixelFormat::R16Float => MTLPixelFormat::R16Float,
+        PixelFormat::R32Float => MTLPixelFormat::R32Float,
+        PixelFormat::Bc4RUnorm => MTLPixelFormat::BC4_RUnorm,
+        PixelFormat::Rg8Unorm => MTLPixelFormat::RG8Unorm,
+        PixelFormat::Rg8Snorm => MTLPixelFormat::RG8Snorm,
+        PixelFormat::Rg16Unorm => MTLPixelFormat::RG16Unorm,
+        PixelFormat::Rg16Snorm => MTLPixelFormat::RG16Snorm,
+        PixelFormat::Rg16Float => MTLPixelFormat::RG16Float,
+        PixelFormat::Rg32Float => MTLPixelFormat::RG32Float,
+        PixelFormat::B5G6R5Unorm => MTLPixelFormat::B5G6R5Unorm,
+        PixelFormat::Abgr4Unorm => MTLPixelFormat::ABGR4Unorm,
+        PixelFormat::Bgr5A1Unorm => MTLPixelFormat::BGR5A1Unorm,
+        PixelFormat::Rgba8Unorm => MTLPixelFormat::RGBA8Unorm,
+        PixelFormat::Rgba8UnormSrgb => MTLPixelFormat::RGBA8Unorm_sRGB,
+        PixelFormat::Rgba8Snorm => MTLPixelFormat::RGBA8Snorm,
+        PixelFormat::Bgra8Unorm => MTLPixelFormat::BGRA8Unorm,
+        PixelFormat::Bgra8UnormSrgb => MTLPixelFormat::BGRA8Unorm_sRGB,
+        PixelFormat::Rgb10A2Unorm => MTLPixelFormat::RGB10A2Unorm,
+        PixelFormat::Bgr10A2Unorm => MTLPixelFormat::BGR10A2Unorm,
+        PixelFormat::Rgba16Unorm => MTLPixelFormat::RGBA16Unorm,
+        PixelFormat::Rgba16Snorm => MTLPixelFormat::RGBA16Snorm,
+        PixelFormat::Rgba16Float => MTLPixelFormat::RGBA16Float,
+        PixelFormat::Rgba32Float => MTLPixelFormat::RGBA32Float,
+        PixelFormat::Bc1Rgba => MTLPixelFormat::BC1_RGBA,
+        PixelFormat::Bc1RgbaSrgb => MTLPixelFormat::BC1_RGBA_sRGB,
+        PixelFormat::Bc2Rgba => MTLPixelFormat::BC2_RGBA,
+        PixelFormat::Bc2RgbaSrgb => MTLPixelFormat::BC2_RGBA_sRGB,
+        PixelFormat::Bc3Rgba => MTLPixelFormat::BC3_RGBA,
+        PixelFormat::Bc3RgbaSrgb => MTLPixelFormat::BC3_RGBA_sRGB,
+        PixelFormat::Depth32Float => MTLPixelFormat::Depth32Float,
+        PixelFormat::Depth32FloatStencil8 => MTLPixelFormat::Depth32Float_Stencil8,
+    }
+}
+
+/// The wire format a Metal pixel format came from, `None` for one mtld3d never sends.
+///
+/// The inverse of [`mtl_pixel_format`], for a path that starts from a live
+/// texture rather than from a wire message: the readback resolve creates its
+/// scratch in the source texture's own format.
+pub const fn wire_pixel_format(mtl: MTLPixelFormat) -> Option<PixelFormat> {
+    Some(match mtl {
+        MTLPixelFormat::A8Unorm => PixelFormat::A8Unorm,
+        MTLPixelFormat::R8Unorm => PixelFormat::R8Unorm,
+        MTLPixelFormat::R16Unorm => PixelFormat::R16Unorm,
+        MTLPixelFormat::R16Float => PixelFormat::R16Float,
+        MTLPixelFormat::R32Float => PixelFormat::R32Float,
+        MTLPixelFormat::BC4_RUnorm => PixelFormat::Bc4RUnorm,
+        MTLPixelFormat::RG8Unorm => PixelFormat::Rg8Unorm,
+        MTLPixelFormat::RG8Snorm => PixelFormat::Rg8Snorm,
+        MTLPixelFormat::RG16Unorm => PixelFormat::Rg16Unorm,
+        MTLPixelFormat::RG16Snorm => PixelFormat::Rg16Snorm,
+        MTLPixelFormat::RG16Float => PixelFormat::Rg16Float,
+        MTLPixelFormat::RG32Float => PixelFormat::Rg32Float,
+        MTLPixelFormat::B5G6R5Unorm => PixelFormat::B5G6R5Unorm,
+        MTLPixelFormat::ABGR4Unorm => PixelFormat::Abgr4Unorm,
+        MTLPixelFormat::BGR5A1Unorm => PixelFormat::Bgr5A1Unorm,
+        MTLPixelFormat::RGBA8Unorm => PixelFormat::Rgba8Unorm,
+        MTLPixelFormat::RGBA8Unorm_sRGB => PixelFormat::Rgba8UnormSrgb,
+        MTLPixelFormat::RGBA8Snorm => PixelFormat::Rgba8Snorm,
+        MTLPixelFormat::BGRA8Unorm => PixelFormat::Bgra8Unorm,
+        MTLPixelFormat::BGRA8Unorm_sRGB => PixelFormat::Bgra8UnormSrgb,
+        MTLPixelFormat::RGB10A2Unorm => PixelFormat::Rgb10A2Unorm,
+        MTLPixelFormat::BGR10A2Unorm => PixelFormat::Bgr10A2Unorm,
+        MTLPixelFormat::RGBA16Unorm => PixelFormat::Rgba16Unorm,
+        MTLPixelFormat::RGBA16Snorm => PixelFormat::Rgba16Snorm,
+        MTLPixelFormat::RGBA16Float => PixelFormat::Rgba16Float,
+        MTLPixelFormat::RGBA32Float => PixelFormat::Rgba32Float,
+        MTLPixelFormat::BC1_RGBA => PixelFormat::Bc1Rgba,
+        MTLPixelFormat::BC1_RGBA_sRGB => PixelFormat::Bc1RgbaSrgb,
+        MTLPixelFormat::BC2_RGBA => PixelFormat::Bc2Rgba,
+        MTLPixelFormat::BC2_RGBA_sRGB => PixelFormat::Bc2RgbaSrgb,
+        MTLPixelFormat::BC3_RGBA => PixelFormat::Bc3Rgba,
+        MTLPixelFormat::BC3_RGBA_sRGB => PixelFormat::Bc3RgbaSrgb,
+        MTLPixelFormat::Depth32Float => PixelFormat::Depth32Float,
+        MTLPixelFormat::Depth32Float_Stencil8 => PixelFormat::Depth32FloatStencil8,
+        _ => return None,
+    })
+}
+
+/// True for a colour format a render pass can write and a sampler can read.
+///
+/// The readback resolve renders the scaled source into a scratch of the same
+/// format, which rules out the block-compressed formats (never render
+/// targets) and the depth formats (read back through their own path).
+pub const fn is_resolvable_color_format(fmt: PixelFormat) -> bool {
+    !matches!(
+        fmt,
+        PixelFormat::Bc1Rgba
+            | PixelFormat::Bc1RgbaSrgb
+            | PixelFormat::Bc2Rgba
+            | PixelFormat::Bc2RgbaSrgb
+            | PixelFormat::Bc3Rgba
+            | PixelFormat::Bc3RgbaSrgb
+            | PixelFormat::Bc4RUnorm
+            | PixelFormat::Depth32Float
+            | PixelFormat::Depth32FloatStencil8
+    )
+}
+
+/// True for depth/stencil pixel formats.
+///
+/// Used by `create_texture` to route shadow-map textures into the depth
+/// attachment + sampleable usage path.
+pub const fn is_depth_pixel_format(fmt: PixelFormat) -> bool {
+    matches!(
+        fmt,
+        PixelFormat::Depth32Float | PixelFormat::Depth32FloatStencil8
+    )
+}
+
+const fn mtl_texture_swizzle(wire: Swizzle) -> MTLTextureSwizzle {
+    match wire {
+        Swizzle::Zero => MTLTextureSwizzle::Zero,
+        Swizzle::One => MTLTextureSwizzle::One,
+        Swizzle::Red => MTLTextureSwizzle::Red,
+        Swizzle::Green => MTLTextureSwizzle::Green,
+        Swizzle::Blue => MTLTextureSwizzle::Blue,
+        Swizzle::Alpha => MTLTextureSwizzle::Alpha,
+    }
+}
+
+const fn mtl_storage_mode(wire: StorageMode) -> MTLStorageMode {
+    match wire {
+        StorageMode::Shared => MTLStorageMode::Shared,
+        StorageMode::Managed => MTLStorageMode::Managed,
+        StorageMode::Private => MTLStorageMode::Private,
+        StorageMode::Memoryless => MTLStorageMode::Memoryless,
+    }
+}
+
+/// Whether Metal can create a texture of this extent, logging the refusal at `site`.
+///
+/// Metal raises an `NSException`, which aborts the process, for a zero or
+/// over-large texture dimension, so a creator rejects such a request
+/// before it reaches `newTextureWithDescriptor`. `depth` is 1 for every
+/// texture but a 3D one, which Metal holds to a smaller limit on each axis.
+fn extent_is_creatable(site: &'static str, width: u32, height: u32, depth: u32) -> bool {
+    use mtld3d_core::caps::{texture_extent_fits, volume_extent_fits};
+    let fits = if depth == 1 {
+        texture_extent_fits(width, height)
+    } else {
+        volume_extent_fits(width, height, depth)
+    };
+    if !fits {
+        // The encoder asks again for a texture whose creation failed, so the
+        // refusal is logged once per site and extent. The key only merges log
+        // lines: the site is a `'static` string, whose address is stable.
+        let key = (site.as_ptr() as u64).rotate_left(40)
+            ^ u64::from(depth).rotate_left(24)
+            ^ (u64::from(height) << 32)
+            ^ u64::from(width);
+        mtld3d_shared::log_once_warn_by!(
+            target: crate::LOG_TARGET,
+            key: key,
+            "{site}: {width}x{height}x{depth} is past the extent the device reports; refused",
+        );
+    }
+    fits
+}
+
+#[cfg(test)]
+mod tests;

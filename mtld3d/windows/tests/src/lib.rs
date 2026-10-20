@@ -1,0 +1,46 @@
+//! Shared support library for the mtld3d end-to-end test suite.
+//!
+//! Every integration test under `tests/` drives the real `d3d9.dll` through a
+//! [`Harness`]: one factory + window + device, with safe wrappers around the
+//! COM vtables and RAII `resource` handles. All FFI and `unsafe` live here so
+//! the test files read as plain D3D9 call sequences with pixel/`HRESULT`
+//! assertions. D3D9 constants come from `mtld3d_types`; nothing is restated.
+
+mod check;
+mod ffi;
+mod harness;
+mod in_flight;
+mod pixel;
+mod reread;
+mod resource;
+mod shared;
+mod vertex;
+mod vtbl;
+mod win32;
+
+pub use harness::{
+    DrawIndexedUpParams, Factory, Harness, HarnessConfig, UNWRITTEN, config_value, config_var,
+    extended::SharedHandle, render_scale_is_identity, run_child,
+};
+pub use in_flight::spawn_scoped;
+pub use pixel::{Rgba8, assert_pixel_approx, assert_pixel_eq};
+pub use reread::{Reading, assert_or_reread};
+pub use resource::{
+    BufferLock, CubeTexture, IndexBuffer, LockedRect, PRESENT_STATS_GUARD,
+    PRESENT_STATS_PROBE_BYTES, PixelShader, Query, StateBlock, Surface, SurfaceDc, SwapChain,
+    Texture, VertexBuffer, VertexDeclaration, VertexShader, Volume, VolumeTexture,
+};
+pub use shared::{SharedDevice, SharedQuery, SharedTexture, SharedVertexBuffer};
+pub use vertex::{
+    LitVertex, PosColorVertex, PosVertex, RhwVertex, SpecularVertex, TexturedVertex, Vertex,
+    VolumeVertex,
+};
+pub use vtbl::deref_vtbl;
+pub use win32::{
+    GuardedSlice, HARNESS_PROBE_REPLY, MemorySample, Rect, WA_ACTIVE, WA_INACTIVE, WM_ACTIVATE,
+    WM_ACTIVATEAPP, WM_HARNESS_PROBE, WM_HARNESS_RESTORE, WM_SIZE, WS_CAPTION, WS_EX_TOPMOST,
+    WS_POPUP, WS_VISIBLE, WindowStyle, create_window, cursor_is_live, cursor_mask_bits,
+    destroy_window, enumerate_display_sizes, harness_window_proc,
+    move_window_on_next_display_change, post_quit_message, send_message, set_opengl_pixel_format,
+    set_window_pos, window_proc, window_rect,
+};

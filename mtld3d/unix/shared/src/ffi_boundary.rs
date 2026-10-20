@@ -1,0 +1,335 @@
+//! Typed FFI-boundary references.
+//!
+//! Every untyped pointer that crosses an FFI seam (COM vtable `this` on the
+//! PE side, unix-call handler params, typed in/out C struct pointers) is
+//! wrapped in a zero-cost newtype defined here. The newtype constructor is
+//! `unsafe fn` — that is the **one** place a caller asserts the ABI contract
+//! (validity, lifetime, and alignment for the wrappers that hand out a
+//! reference). [`ValueIn`], [`OutPtr`] and the slice helpers copy instead and
+//! assume no alignment, since an application's pointer promises none. Methods
+//! on the newtype are safe because the invariant is type-encoded and the
+//! abstract lifetime `'a` is bound to the call frame via `PhantomData<&'a …>`,
+//! preventing escape.
+//!
+//! A safe `pub fn` that accepts an arbitrary raw pointer and hands back a
+//! reference synthesises an unbounded lifetime, which is unsound by strict
+//! Rust convention; the constructors here are `unsafe fn` for that reason.
+//! The analogous stdlib primitives — [`core::slice::from_raw_parts`],
+//! [`Box::from_raw`](std::boxed::Box::from_raw),
+//! [`core::pin::Pin::new_unchecked`] — are all `unsafe fn` on the same
+//! grounds.
+//!
+//! Each call site writes its `// SAFETY:` justification at the constructor,
+//! derived from the calling ABI (e.g. "`IDirect3DDevice9` vtable guarantees
+//! `this` is `*mut Direct3DDevice9` for the call duration"). See
+//! `docs/CONVENTIONS.md` §"Unsafe is a last resort" for the policy.
+
+use core::{
+    ffi::c_void,
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    ptr::NonNull,
+};
+use std::borrow::Cow;
+
+/// Borrowed input pointer at an FFI entry. Filters null via `opt`.
+///
+/// The lifetime `'a` is the call-frame scope during which the caller
+/// guarantees the pointee outlives. Implements [`Deref`] to `T` so callers
+/// invoke methods directly (`wrap.method()`).
+pub struct InPtr<'a, T>(NonNull<T>, PhantomData<&'a T>);
+
+impl<T> InPtr<'_, T> {
+    /// Wrap `p` as a borrowed `T`, filtering null to `None`.
+    ///
+    /// # Safety
+    ///
+    /// Caller asserts that any non-null `p` is a valid, properly-aligned,
+    /// initialised `T*` whose underlying storage outlives the call frame.
+    /// Common ABIs that satisfy this: COM vtable methods (the
+    /// `IDirect3DXxx9` ABI guarantees `this` is valid for the duration of
+    /// the call) and unix-call handler params. A struct the application
+    /// supplies promises no alignment, so it is read with [`ValueIn`].
+    #[must_use]
+    pub const unsafe fn opt(p: *const c_void) -> Option<Self> {
+        match NonNull::new(p.cast::<T>().cast_mut()) {
+            Some(nn) => Some(Self(nn, PhantomData)),
+            None => None,
+        }
+    }
+
+    /// [`Self::opt`] that panics on null.
+    ///
+    /// # Safety
+    /// As `opt`, plus caller asserts non-null.
+    ///
+    /// # Panics
+    /// Panics if `p` is null.
+    #[must_use]
+    pub const unsafe fn new(p: *const c_void) -> Self {
+        // SAFETY: forwarded from this fn's unsafe contract.
+        match unsafe { Self::opt(p) } {
+            Some(v) => v,
+            None => panic!("FFI in-ptr null"),
+        }
+    }
+}
+
+impl<T> Deref for InPtr<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: invariant carried from construction.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+/// Exclusively-borrowed input pointer (handler params written back to the caller).
+///
+/// Same shape as [`InPtr`] but yields `&mut T` via [`DerefMut`].
+pub struct InPtrMut<'a, T>(NonNull<T>, PhantomData<&'a mut T>);
+
+impl<T> InPtrMut<'_, T> {
+    /// Wrap `p` as an exclusively-borrowed `T`, filtering null to `None`.
+    ///
+    /// # Safety
+    ///
+    /// As [`InPtr::opt`], plus the caller asserts exclusive access for the
+    /// call frame. For unix-call handler params: the PE side blocks on
+    /// `unix_call` while the unix side holds the only reference.
+    #[must_use]
+    pub const unsafe fn opt(p: *mut c_void) -> Option<Self> {
+        match NonNull::new(p.cast::<T>()) {
+            Some(nn) => Some(Self(nn, PhantomData)),
+            None => None,
+        }
+    }
+
+    /// [`Self::opt`] that panics on null.
+    ///
+    /// # Safety
+    /// As `opt`, plus caller asserts non-null.
+    ///
+    /// # Panics
+    /// Panics if `p` is null.
+    #[must_use]
+    pub const unsafe fn new(p: *mut c_void) -> Self {
+        // SAFETY: forwarded from this fn's unsafe contract.
+        match unsafe { Self::opt(p) } {
+            Some(v) => v,
+            None => panic!("FFI in-ptr-mut null"),
+        }
+    }
+}
+
+impl<T> Deref for InPtrMut<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: invariant carried from construction.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl<T> DerefMut for InPtrMut<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: invariant carried from construction.
+        unsafe { self.0.as_mut() }
+    }
+}
+
+/// Read-by-value typed FFI in-param (`D3DRECT`, `D3DMATRIX`, etc.).
+///
+/// Filters null at `opt`; `read` consumes `self` and returns the value. The read does not
+/// assume the pointer is aligned for `T`: an application passes these structs from wherever
+/// it keeps them, a packed record or an odd stack slot included, and the D3D9 runtime copies
+/// them, so a caller's misaligned pointer is inside the contract.
+pub struct ValueIn<'a, T: Copy>(NonNull<T>, PhantomData<&'a T>);
+
+impl<T: Copy> ValueIn<'_, T> {
+    /// Wrap `p` for a by-value read, filtering null to `None`.
+    ///
+    /// # Safety
+    ///
+    /// Caller asserts that any non-null `p` addresses an initialised `T`
+    /// that stays readable for the call frame (the D3D9 ABI for typed-struct
+    /// in-params). Alignment is not required.
+    #[must_use]
+    pub const unsafe fn opt(p: *const c_void) -> Option<Self> {
+        match NonNull::new(p.cast::<T>().cast_mut()) {
+            Some(nn) => Some(Self(nn, PhantomData)),
+            None => None,
+        }
+    }
+
+    /// Consume `self` and return the pointee by value.
+    #[must_use]
+    pub const fn read(self) -> T {
+        // SAFETY: invariant carried from construction; `read_unaligned` assumes no alignment.
+        unsafe { self.0.as_ptr().read_unaligned() }
+    }
+
+    /// One-shot null-filtered read. Convenience for the `opt + read` pair.
+    ///
+    /// # Safety
+    /// As [`Self::opt`].
+    #[must_use]
+    pub const unsafe fn read_opt(p: *const c_void) -> Option<T> {
+        // SAFETY: forwarded from this fn's unsafe contract.
+        match unsafe { Self::opt(p) } {
+            Some(v) => Some(v.read()),
+            None => None,
+        }
+    }
+}
+
+/// Null-guarded FFI out-param. `write` consumes `self`.
+///
+/// Construction is `unsafe` (the caller asserts writeability);
+/// `write` is safe because the invariant is type-encoded. The write does not assume the
+/// pointer is aligned for `T`, for the reason [`ValueIn`] gives: an application may hand over
+/// an out-struct at any address.
+pub struct OutPtr<'a, T>(NonNull<T>, PhantomData<&'a mut T>);
+
+impl<T> OutPtr<'_, T> {
+    /// Wrap `out` as an out-param, filtering null to `None`.
+    ///
+    /// # Safety
+    ///
+    /// Caller asserts that any non-null `out` addresses `size_of::<T>()`
+    /// writable bytes valid for the call frame (the D3D9 ABI for typed
+    /// out-params). Alignment is not required.
+    #[must_use]
+    pub const unsafe fn opt(out: *mut T) -> Option<Self> {
+        match NonNull::new(out) {
+            Some(nn) => Some(Self(nn, PhantomData)),
+            None => None,
+        }
+    }
+
+    /// Consume `self` and write `val` through the pointer.
+    pub const fn write(self, val: T) {
+        // SAFETY: invariant carried from construction; `write_unaligned` assumes no alignment.
+        unsafe { self.0.as_ptr().write_unaligned(val) };
+    }
+
+    /// One-shot null-guarded write. Convenience for the `opt + write` pair.
+    ///
+    /// Silent no-op on null `out`.
+    ///
+    /// # Safety
+    /// As [`Self::opt`].
+    pub unsafe fn write_opt(out: *mut T, val: T) {
+        // SAFETY: forwarded from this fn's unsafe contract.
+        if let Some(o) = unsafe { Self::opt(out) } {
+            o.write(val);
+        }
+    }
+}
+
+/// `IUnknown` vtable `this`.
+///
+/// Crashes on null per D3D9 spec (the spec leaves null-`this` UB; silently
+/// filtering would mask refcount underflow).
+///
+/// Construction is `unsafe`; [`Deref`] and [`DerefMut`] are safe.
+pub struct VtableThis<'a, T>(NonNull<T>, PhantomData<&'a mut T>);
+
+impl<T> VtableThis<'_, T> {
+    /// Wrap a vtable `this`, panicking on null.
+    ///
+    /// # Safety
+    ///
+    /// Caller is invoked from an `IUnknown` vtable thunk (`AddRef`,
+    /// `Release`, `QueryInterface`, or any method that wants crash-on-bug
+    /// rather than silent recovery). The D3D9 ABI guarantees `this` is
+    /// `*mut T` for the call duration; null-`this` is UB per spec and is
+    /// deliberately not filtered.
+    ///
+    /// # Panics
+    ///
+    /// Panics on null `this` (preserves crash-on-refcount-miscount).
+    #[must_use]
+    pub const unsafe fn new(this: *mut c_void) -> Self {
+        match NonNull::new(this.cast::<T>()) {
+            Some(nn) => Self(nn, PhantomData),
+            None => panic!("D3D9 vtable this=null"),
+        }
+    }
+}
+
+impl<T> Deref for VtableThis<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: invariant carried from construction.
+        unsafe { self.0.as_ref() }
+    }
+}
+
+impl<T> DerefMut for VtableThis<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: invariant carried from construction.
+        unsafe { self.0.as_mut() }
+    }
+}
+
+/// A caller's array as a slice, copied when its pointer is not aligned for `T`.
+///
+/// A COM in-parameter that the callee copies carries no alignment promise: the
+/// D3D9 runtime takes these arrays by `memcpy`, so a caller handing over a
+/// pointer that is not aligned for `T` is inside the contract while a typed
+/// slice over it is not. Alignment holds for all but the rare call, so the
+/// common path borrows and only the other copies.
+///
+/// # Safety
+///
+/// `data` must be non-null. It must address `count` initialized, valid `T`
+/// values in one allocation; alignment is not required. The total byte size
+/// must fit in `isize::MAX`, and adding it to `data` must not wrap the address.
+/// The values must remain readable and unmodified for the returned lifetime
+/// `'a`, except through `UnsafeCell`, since the aligned path borrows them.
+/// These requirements also apply to references or other invariants within `T`;
+/// `Copy` alone does not make arbitrary bytes valid values.
+pub unsafe fn slice_from_caller<'a, T: Copy>(data: *const T, count: usize) -> Cow<'a, [T]> {
+    if data.is_aligned() {
+        // SAFETY: aligned per the branch, and the caller guarantees the extent.
+        return Cow::Borrowed(unsafe { core::slice::from_raw_parts(data, count) });
+    }
+    let mut owned = Vec::<T>::with_capacity(count);
+    // SAFETY: the regions cannot overlap (one is a fresh allocation), `owned`
+    // has capacity for `count` `T`s, and `copy_nonoverlapping` over bytes has
+    // no alignment requirement on either side.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.cast::<u8>(),
+            owned.as_mut_ptr().cast::<u8>(),
+            count * size_of::<T>(),
+        );
+    }
+    // SAFETY: the copy above initialised `count` elements.
+    unsafe { owned.set_len(count) };
+    Cow::Owned(owned)
+}
+
+/// Copy `values` into a caller's array, whatever the alignment of its pointer.
+///
+/// The out-parameter twin of [`slice_from_caller`]: an application hands over an array
+/// for the callee to fill, and nothing in the D3D9 contract promises the pointer is aligned
+/// for `T`, so the copy runs over bytes and never forms a typed slice of the caller's memory.
+///
+/// # Safety
+///
+/// `data` must be non-null and address `values.len() * size_of::<T>()` writable bytes in one
+/// allocation that do not overlap `values`; alignment is not required.
+pub const unsafe fn slice_to_caller<T: Copy>(data: *mut T, values: &[T]) {
+    // SAFETY: the caller guarantees the extent and that the regions do not overlap, and a
+    // byte copy has no alignment requirement on either side.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            values.as_ptr().cast::<u8>(),
+            data.cast::<u8>(),
+            core::mem::size_of_val(values),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests;

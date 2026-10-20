@@ -1,0 +1,256 @@
+//! The `CheckDeviceFormat` and creation answers that are rules, not format lists.
+
+use mtld3d_tests::{CubeTexture, Harness, Texture};
+use mtld3d_types::{
+    D3D_OK, D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A1R5G5B5, D3DFMT_A2B10G10R10,
+    D3DFMT_A2R10G10B10, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8L8, D3DFMT_A8R8G8B8,
+    D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_ATI1, D3DFMT_DXT1,
+    D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5, D3DFMT_G16R16, D3DFMT_L8, D3DFMT_L16,
+    D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F,
+    D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT,
+    D3DPOOL_MANAGED, D3DPOOL_SCRATCH, D3DRTYPE_CUBETEXTURE, D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE,
+    D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DYNAMIC,
+    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_RENDERTARGET,
+};
+
+/// The mapped colour formats, each with the name a failure prints.
+///
+/// The spread is what makes the rules below rules: colour attachments
+/// with and without an sRGB twin, sampled formats with and without one, the
+/// signed and packed-ten-bit families, and the two packed 16-bit members
+/// whose render-target answer depends on the device.
+const FORMATS: [(u32, &str); 31] = [
+    (D3DFMT_A8R8G8B8, "A8R8G8B8"),
+    (D3DFMT_X8R8G8B8, "X8R8G8B8"),
+    (D3DFMT_A8B8G8R8, "A8B8G8R8"),
+    (D3DFMT_X8B8G8R8, "X8B8G8R8"),
+    (D3DFMT_R8G8B8, "R8G8B8"),
+    (D3DFMT_R5G6B5, "R5G6B5"),
+    (D3DFMT_A1R5G5B5, "A1R5G5B5"),
+    (D3DFMT_X1R5G5B5, "X1R5G5B5"),
+    (D3DFMT_A4R4G4B4, "A4R4G4B4"),
+    (D3DFMT_A8, "A8"),
+    (D3DFMT_A8L8, "A8L8"),
+    (D3DFMT_L8, "L8"),
+    (D3DFMT_L16, "L16"),
+    (D3DFMT_G16R16, "G16R16"),
+    (D3DFMT_A16B16G16R16, "A16B16G16R16"),
+    (D3DFMT_R16F, "R16F"),
+    (D3DFMT_A16B16G16R16F, "A16B16G16R16F"),
+    (D3DFMT_R32F, "R32F"),
+    (D3DFMT_A32B32G32R32F, "A32B32G32R32F"),
+    (D3DFMT_ATI1, "ATI1"),
+    (D3DFMT_V8U8, "V8U8"),
+    (D3DFMT_V16U16, "V16U16"),
+    (D3DFMT_Q8W8V8U8, "Q8W8V8U8"),
+    (D3DFMT_Q16W16V16U16, "Q16W16V16U16"),
+    (D3DFMT_A2R10G10B10, "A2R10G10B10"),
+    (D3DFMT_A2B10G10R10, "A2B10G10R10"),
+    (D3DFMT_DXT1, "DXT1"),
+    (D3DFMT_DXT2, "DXT2"),
+    (D3DFMT_DXT3, "DXT3"),
+    (D3DFMT_DXT4, "DXT4"),
+    (D3DFMT_DXT5, "DXT5"),
+];
+
+/// The pools that keep the device's copy refuse dynamic usage, for every format.
+///
+/// `D3DUSAGE_DYNAMIC` says the application drives the copy the device reads.
+/// `D3DPOOL_MANAGED` gives that copy to the runtime and `D3DPOOL_SCRATCH` has
+/// no device copy at all, so D3D9 rejects the pair at creation, on a texture,
+/// a cube and a volume alike. Each format is created in the pool without the
+/// flag first: the formats a type cannot take at all (ATI1 cubes are
+/// scratch-only) drop out of the case that way, and what is left is a create
+/// the flag alone turns into `D3DERR_INVALIDCALL`.
+#[test]
+fn dynamic_usage_in_a_pool_that_refuses_it_is_rejected_for_every_format() {
+    let h = Harness::new();
+    for pool in [D3DPOOL_MANAGED, D3DPOOL_SCRATCH] {
+        for (format, name) in FORMATS {
+            let (plain, out) = h.try_create_texture(4, 4, 1, 0, format, pool);
+            if plain == D3D_OK {
+                drop(Texture::from_raw(out));
+                let (hr, out) = h.try_create_texture(4, 4, 1, D3DUSAGE_DYNAMIC, format, pool);
+                assert_eq!(
+                    hr, D3DERR_INVALIDCALL,
+                    "{name} dynamic texture, pool {pool}"
+                );
+                assert!(
+                    out.is_null(),
+                    "{name} dynamic texture out pointer, pool {pool}"
+                );
+            }
+            let (plain, out) = h.try_create_cube_texture(4, 1, 0, format, pool);
+            if plain == D3D_OK {
+                drop(CubeTexture::from_raw(out));
+                let (hr, out) = h.try_create_cube_texture(4, 1, D3DUSAGE_DYNAMIC, format, pool);
+                assert_eq!(hr, D3DERR_INVALIDCALL, "{name} dynamic cube, pool {pool}");
+                assert!(
+                    out.is_null(),
+                    "{name} dynamic cube out pointer, pool {pool}"
+                );
+            }
+            let (plain, volume) = h.try_create_volume_texture([4, 4, 4], 1, 0, format, pool);
+            if plain == D3D_OK {
+                drop(volume);
+                let (hr, _) =
+                    h.try_create_volume_texture([4, 4, 4], 1, D3DUSAGE_DYNAMIC, format, pool);
+                assert_eq!(hr, D3DERR_INVALIDCALL, "{name} dynamic volume, pool {pool}");
+            }
+        }
+    }
+}
+
+/// The default pool keeps taking dynamic usage.
+///
+/// The rejection above belongs to the pair, not to the flag: the same usage
+/// in the pool the application drives itself creates a texture, a cube and a
+/// volume of every one of these formats, the signed one the rule was first
+/// written for included.
+#[test]
+fn dynamic_usage_in_the_default_pool_is_accepted() {
+    let h = Harness::new();
+    for format in [D3DFMT_A8R8G8B8, D3DFMT_R5G6B5, D3DFMT_L8, D3DFMT_V16U16] {
+        drop(h.create_texture(4, 4, 1, D3DUSAGE_DYNAMIC, format, D3DPOOL_DEFAULT));
+        drop(h.create_cube_texture_owned(4, 1, D3DUSAGE_DYNAMIC, format, D3DPOOL_DEFAULT));
+        let (hr, volume) =
+            h.try_create_volume_texture([4, 4, 4], 1, D3DUSAGE_DYNAMIC, format, D3DPOOL_DEFAULT);
+        assert_eq!(hr, D3D_OK, "default dynamic volume, format {format}");
+        assert!(volume.is_some(), "default dynamic volume, format {format}");
+    }
+}
+
+/// The sRGB-write query answers the render-target question, for every format.
+///
+/// The encode belongs to the render pass, so a format that can be a colour
+/// attachment takes it and one that cannot has nothing to encode into. The
+/// expected answer is read from the device's own `D3DUSAGE_RENDERTARGET`
+/// answer rather than spelled out, so the case holds on a GPU family without
+/// the native packed 16-bit formats too.
+#[test]
+fn srgb_write_queries_answer_the_render_target_question() {
+    let h = Harness::factory_only();
+    for (format, name) in FORMATS {
+        let renderable = h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_RENDERTARGET,
+            D3DRTYPE_TEXTURE,
+            format,
+        ) == D3D_OK;
+        let expected = if renderable {
+            D3D_OK
+        } else {
+            D3DERR_NOTAVAILABLE
+        };
+        for extra in [
+            0,
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+            // A rejected sRGB write may not come back as the NOAUTOGEN
+            // success of the mip-generation half of a combined query.
+            D3DUSAGE_AUTOGENMIPMAP,
+        ] {
+            assert_eq!(
+                h.check_device_format(
+                    D3DFMT_X8R8G8B8,
+                    D3DUSAGE_QUERY_SRGBWRITE | extra,
+                    D3DRTYPE_TEXTURE,
+                    format
+                ),
+                expected,
+                "{name} texture sRGB write with {extra:#x}"
+            );
+        }
+    }
+}
+
+/// The sRGB read and the sRGB write questions are answered separately.
+///
+/// They were one question while the write answer came off the twin table.
+/// DXT1 has the twin view its `D3DSAMP_SRGBTEXTURE` decode needs and is no
+/// colour attachment; R32F is a colour attachment whose Metal format has no
+/// twin, so its write encodes in the pixel shader and its read has nothing
+/// to decode with. Each answers yes to one of the two.
+#[test]
+fn srgb_read_and_write_queries_are_independent() {
+    let h = Harness::factory_only();
+    let check = |usage: u32, format: u32| {
+        h.check_device_format(D3DFMT_X8R8G8B8, usage, D3DRTYPE_TEXTURE, format)
+    };
+    for format in [
+        D3DFMT_DXT1,
+        D3DFMT_DXT2,
+        D3DFMT_DXT3,
+        D3DFMT_DXT4,
+        D3DFMT_DXT5,
+    ] {
+        assert_eq!(check(D3DUSAGE_QUERY_SRGBREAD, format), D3D_OK);
+        assert_eq!(check(D3DUSAGE_QUERY_SRGBWRITE, format), D3DERR_NOTAVAILABLE);
+    }
+    for format in [D3DFMT_R32F, D3DFMT_A16B16G16R16F, D3DFMT_G16R16] {
+        assert_eq!(check(D3DUSAGE_QUERY_SRGBREAD, format), D3DERR_NOTAVAILABLE);
+        assert_eq!(check(D3DUSAGE_QUERY_SRGBWRITE, format), D3D_OK);
+    }
+    // The pair an engine probes together before it commits to a
+    // gamma-correct pipeline still answers both halves.
+    assert_eq!(
+        check(
+            D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE,
+            D3DFMT_A8R8G8B8
+        ),
+        D3D_OK
+    );
+}
+
+/// The legacy bump-map query answers yes for the signed bump formats as 2D textures alone.
+///
+/// `D3DCAPS9::TextureOpCaps` advertises `BUMPENVMAP` and
+/// `BUMPENVMAPLUMINANCE`. V8U8, V16U16 and Q8W8V8U8 carry the `(du, dv)`
+/// pair a bump stage reads, so a 2D texture of one answers yes to the query
+/// alone and, beside AUTOGENMIPMAP or SRGBREAD, what that usage alone gets.
+/// Every other format, and every other resource type, answers no.
+#[test]
+fn legacy_bump_map_queries_answer_for_the_bump_formats_alone() {
+    let h = Harness::factory_only();
+    for (format, name) in FORMATS {
+        let bump_format = matches!(format, D3DFMT_V8U8 | D3DFMT_V16U16 | D3DFMT_Q8W8V8U8);
+        for rtype in [
+            D3DRTYPE_SURFACE,
+            D3DRTYPE_TEXTURE,
+            D3DRTYPE_CUBETEXTURE,
+            D3DRTYPE_VOLUME,
+            D3DRTYPE_VOLUMETEXTURE,
+        ] {
+            for extra in [0, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_QUERY_SRGBREAD] {
+                let expected = if bump_format && rtype == D3DRTYPE_TEXTURE {
+                    h.check_device_format(D3DFMT_X8R8G8B8, extra, rtype, format)
+                } else {
+                    D3DERR_NOTAVAILABLE
+                };
+                assert_eq!(
+                    h.check_device_format(
+                        D3DFMT_X8R8G8B8,
+                        D3DUSAGE_QUERY_LEGACYBUMPMAP | extra,
+                        rtype,
+                        format
+                    ),
+                    expected,
+                    "{name} rtype {rtype} legacy bump map with {extra:#x}"
+                );
+            }
+        }
+        if bump_format {
+            assert_eq!(
+                h.check_device_format(
+                    D3DFMT_X8R8G8B8,
+                    D3DUSAGE_QUERY_LEGACYBUMPMAP,
+                    D3DRTYPE_TEXTURE,
+                    format
+                ),
+                D3D_OK,
+                "{name} legacy bump map"
+            );
+        }
+    }
+}

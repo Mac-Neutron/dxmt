@@ -1,0 +1,962 @@
+//! Fixed draw payloads. Every byte is an explicit little-endian integer field.
+
+use std::ptr::NonNull;
+
+use mtld3d_shared::{
+    encoder_wire::WireError,
+    mtl::{IndexType, PrimitiveType},
+};
+
+use crate::draw_data::{
+    DrawOp, ExtraStreams, IndexSource, ScratchSlice, StreamBinding, VertexSource,
+};
+
+/// Bound streams captured once on PE and borrowed while writing their command.
+///
+/// The first stream is captured directly in its fixed record layout, like the index buffer,
+/// so a one-stream draw copies it into the command unchanged.
+pub struct BoundVertices {
+    pub first: StreamRecord,
+    pub extra: ExtraStreams,
+    pub stream0_freq: u32,
+}
+
+/// Fixed draw header. Constructors preserve unsigned starts and signed index bases.
+#[repr(C, align(8))]
+pub struct DrawPrefix {
+    primitive: u8,
+    vertex_kind: u8,
+    index_kind: u8,
+    stream_count: u8,
+    stride_or_frequency: u32,
+    first_or_base: u32,
+    count: u32,
+}
+
+impl DrawPrefix {
+    /// Header for an ordinary nonindexed bound draw.
+    #[must_use]
+    pub const fn nonindexed(primitive: PrimitiveType, start_vertex: u32, count: u32) -> Self {
+        Self {
+            primitive: primitive as u8,
+            vertex_kind: 1,
+            index_kind: 0,
+            stream_count: 0,
+            stride_or_frequency: 0,
+            first_or_base: start_vertex,
+            count,
+        }
+    }
+
+    /// Header for an ordinary indexed bound draw.
+    #[must_use]
+    pub const fn indexed(primitive: PrimitiveType, base_vertex: i32, count: u32) -> Self {
+        Self {
+            index_kind: 1,
+            first_or_base: base_vertex.cast_unsigned(),
+            ..Self::nonindexed(primitive, 0, count)
+        }
+    }
+}
+
+/// One bound vertex stream in its fixed record layout.
+///
+/// Only this module constructs records, and every constructor zeroes `reserved`.
+#[repr(C, align(8))]
+pub struct StreamRecord {
+    pub buffer: u64,
+    pub address: u64,
+    pub length: u64,
+    pub generation: u64,
+    pub offset: u32,
+    pub stride: u32,
+    pub frequency: u32,
+    pub stream: u8,
+    reserved: [u8; 3],
+}
+
+#[repr(C, align(8))]
+pub struct VertexBytes {
+    pub address: u64,
+    pub length: u32,
+    pub size: u32,
+}
+
+#[repr(C, align(8))]
+pub struct IndexBuffer {
+    pub buffer: u64,
+    pub address: u64,
+    pub length: u64,
+    pub generation: u64,
+    pub offset: u32,
+    pub kind: u8,
+    pub reserved: [u8; 3],
+}
+
+#[repr(C, align(8))]
+pub struct IndexBytes {
+    pub address: u64,
+    pub length: u32,
+    pub maximum: u32,
+    pub kind: u8,
+    pub reserved: [u8; 7],
+}
+
+/// One bound vertex stream without indices, in its final payload layout.
+#[repr(C, align(8))]
+pub struct SingleBoundPayload {
+    prefix: DrawPrefix,
+    stream: StreamRecord,
+}
+
+/// One bound vertex stream and its bound index buffer, in their final payload layout.
+#[repr(C, align(8))]
+pub struct SingleIndexedBoundPayload {
+    prefix: DrawPrefix,
+    stream: StreamRecord,
+    index: IndexBuffer,
+}
+
+impl SingleBoundPayload {
+    /// Complete a nonindexed prefix with its one stream.
+    ///
+    /// Returns `None` when the prefix names an index tail.
+    #[inline]
+    #[must_use]
+    pub const fn new(prefix: &DrawPrefix, first: &StreamRecord, stream0_freq: u32) -> Option<Self> {
+        if prefix.index_kind == 1 {
+            return None;
+        }
+        Some(Self {
+            prefix: single_stream_prefix(prefix, stream0_freq),
+            stream: first.copied(),
+        })
+    }
+}
+
+impl SingleIndexedBoundPayload {
+    /// Complete an indexed prefix with its one stream and index buffer.
+    ///
+    /// Returns `None` when the prefix does not name an index tail.
+    #[inline]
+    #[must_use]
+    pub const fn new(
+        prefix: &DrawPrefix,
+        first: &StreamRecord,
+        stream0_freq: u32,
+        index: &IndexBuffer,
+    ) -> Option<Self> {
+        if prefix.index_kind != 1 {
+            return None;
+        }
+        Some(Self {
+            prefix: single_stream_prefix(prefix, stream0_freq),
+            stream: first.copied(),
+            index: index_record(index),
+        })
+    }
+}
+
+/// A one-stream bound draw whose payload is built in place once its command has room.
+///
+/// Each implementor fixes its prefix shape, so its payload always agrees with its index tail.
+/// The draw paths are generic over this trait so that each instance has one caller.
+pub trait SingleStreamDraw {
+    type Payload: crate::encoder_records::CommandRecord;
+    /// The prefix the checked writer receives for this draw.
+    fn prefix(&self) -> DrawPrefix;
+    /// The bound index tail, if the draw has one.
+    fn index(&self) -> Option<&IndexBuffer>;
+    /// The complete payload of this draw with its one stream.
+    fn payload(&self, first: &StreamRecord, stream0_freq: u32) -> Self::Payload;
+}
+
+/// An ordinary nonindexed draw over bound streams.
+pub struct NonindexedDraw {
+    pub primitive: PrimitiveType,
+    pub start_vertex: u32,
+    pub vertex_count: u32,
+}
+
+/// An ordinary indexed draw over bound streams and a bound index buffer.
+pub struct IndexedDraw<'a> {
+    pub primitive: PrimitiveType,
+    pub base_vertex: i32,
+    pub index_count: u32,
+    pub index: &'a IndexBuffer,
+}
+
+impl SingleStreamDraw for NonindexedDraw {
+    type Payload = SingleBoundPayload;
+    #[inline]
+    fn prefix(&self) -> DrawPrefix {
+        DrawPrefix::nonindexed(self.primitive, self.start_vertex, self.vertex_count)
+    }
+    #[inline]
+    fn index(&self) -> Option<&IndexBuffer> {
+        None
+    }
+    #[inline]
+    fn payload(&self, first: &StreamRecord, stream0_freq: u32) -> SingleBoundPayload {
+        SingleBoundPayload {
+            prefix: single_stream_prefix(&self.prefix(), stream0_freq),
+            stream: first.copied(),
+        }
+    }
+}
+
+impl SingleStreamDraw for IndexedDraw<'_> {
+    type Payload = SingleIndexedBoundPayload;
+    #[inline]
+    fn prefix(&self) -> DrawPrefix {
+        DrawPrefix::indexed(self.primitive, self.base_vertex, self.index_count)
+    }
+    #[inline]
+    fn index(&self) -> Option<&IndexBuffer> {
+        Some(self.index)
+    }
+    #[inline]
+    fn payload(&self, first: &StreamRecord, stream0_freq: u32) -> SingleIndexedBoundPayload {
+        SingleIndexedBoundPayload {
+            prefix: single_stream_prefix(&self.prefix(), stream0_freq),
+            stream: first.copied(),
+            index: index_record(self.index),
+        }
+    }
+}
+
+// The supported targets are little-endian; explicit fields cover the full record with no
+// implicit padding. Integer-only records accept all input bit patterns before validation.
+const _: () = {
+    assert!(cfg!(target_endian = "little"));
+    assert!(size_of::<DrawPrefix>() == 16 && align_of::<DrawPrefix>() == 8);
+    assert!(std::mem::offset_of!(DrawPrefix, primitive) == 0);
+    assert!(std::mem::offset_of!(DrawPrefix, vertex_kind) == 1);
+    assert!(std::mem::offset_of!(DrawPrefix, index_kind) == 2);
+    assert!(std::mem::offset_of!(DrawPrefix, stream_count) == 3);
+    assert!(std::mem::offset_of!(DrawPrefix, stride_or_frequency) == 4);
+    assert!(std::mem::offset_of!(DrawPrefix, first_or_base) == 8);
+    assert!(std::mem::offset_of!(DrawPrefix, count) == 12);
+    assert!(size_of::<StreamRecord>() == 48 && align_of::<StreamRecord>() == 8);
+    assert!(std::mem::offset_of!(StreamRecord, buffer) == 0);
+    assert!(std::mem::offset_of!(StreamRecord, address) == 8);
+    assert!(std::mem::offset_of!(StreamRecord, length) == 16);
+    assert!(std::mem::offset_of!(StreamRecord, generation) == 24);
+    assert!(std::mem::offset_of!(StreamRecord, offset) == 32);
+    assert!(std::mem::offset_of!(StreamRecord, stride) == 36);
+    assert!(std::mem::offset_of!(StreamRecord, frequency) == 40);
+    assert!(std::mem::offset_of!(StreamRecord, stream) == 44);
+    assert!(std::mem::offset_of!(StreamRecord, reserved) == 45);
+    assert!(size_of::<VertexBytes>() == 16 && align_of::<VertexBytes>() == 8);
+    assert!(std::mem::offset_of!(VertexBytes, address) == 0);
+    assert!(std::mem::offset_of!(VertexBytes, length) == 8);
+    assert!(std::mem::offset_of!(VertexBytes, size) == 12);
+    assert!(size_of::<IndexBuffer>() == 40 && align_of::<IndexBuffer>() == 8);
+    assert!(std::mem::offset_of!(IndexBuffer, buffer) == 0);
+    assert!(std::mem::offset_of!(IndexBuffer, address) == 8);
+    assert!(std::mem::offset_of!(IndexBuffer, length) == 16);
+    assert!(std::mem::offset_of!(IndexBuffer, generation) == 24);
+    assert!(std::mem::offset_of!(IndexBuffer, offset) == 32);
+    assert!(std::mem::offset_of!(IndexBuffer, kind) == 36);
+    assert!(std::mem::offset_of!(IndexBuffer, reserved) == 37);
+    assert!(size_of::<IndexBytes>() == 24 && align_of::<IndexBytes>() == 8);
+    assert!(std::mem::offset_of!(IndexBytes, address) == 0);
+    assert!(std::mem::offset_of!(IndexBytes, length) == 8);
+    assert!(std::mem::offset_of!(IndexBytes, maximum) == 12);
+    assert!(std::mem::offset_of!(IndexBytes, kind) == 16);
+    assert!(std::mem::offset_of!(IndexBytes, reserved) == 17);
+    assert!(size_of::<SingleBoundPayload>() == 64 && align_of::<SingleBoundPayload>() == 8);
+    assert!(std::mem::offset_of!(SingleBoundPayload, prefix) == 0);
+    assert!(std::mem::offset_of!(SingleBoundPayload, stream) == 16);
+    assert!(size_of::<SingleIndexedBoundPayload>() == 104);
+    assert!(align_of::<SingleIndexedBoundPayload>() == 8);
+    assert!(std::mem::offset_of!(SingleIndexedBoundPayload, prefix) == 0);
+    assert!(std::mem::offset_of!(SingleIndexedBoundPayload, stream) == 16);
+    assert!(std::mem::offset_of!(SingleIndexedBoundPayload, index) == 64);
+};
+
+/// An integer-only draw record with explicitly initialized padding.
+///
+/// # Safety
+///
+/// All bit patterns are valid, and every byte is an explicit initialized field.
+unsafe trait DrawPod {}
+// SAFETY: the layout assertions cover integer-only records and explicit reserved bytes.
+unsafe impl DrawPod for DrawPrefix {}
+// SAFETY: the layout assertions cover integer-only records and explicit reserved bytes.
+unsafe impl DrawPod for StreamRecord {}
+// SAFETY: the layout assertions cover integer-only records and explicit reserved bytes.
+unsafe impl DrawPod for VertexBytes {}
+// SAFETY: the layout assertions cover integer-only records and explicit reserved bytes.
+unsafe impl DrawPod for IndexBuffer {}
+// SAFETY: the layout assertions cover integer-only records and explicit reserved bytes.
+unsafe impl DrawPod for IndexBytes {}
+// SAFETY: the layout assertions show two integer-only records with no gap or tail.
+unsafe impl DrawPod for SingleBoundPayload {}
+// SAFETY: the layout assertions show three integer-only records with no gap or tail.
+unsafe impl DrawPod for SingleIndexedBoundPayload {}
+// SAFETY: every byte belongs to an integer field or explicit zeroed reserve, every bit pattern
+// is valid, and the asserted layout is the same on all four targets.
+unsafe impl crate::encoder_records::CommandRecord for SingleBoundPayload {}
+// SAFETY: every byte belongs to an integer field or explicit zeroed reserve, every bit pattern
+// is valid, and the asserted layout is the same on all four targets.
+unsafe impl crate::encoder_records::CommandRecord for SingleIndexedBoundPayload {}
+
+fn put<T: DrawPod>(destination: &mut [u8], at: &mut usize, value: T) {
+    let bytes = &mut destination[*at..*at + size_of::<T>()];
+    // SAFETY: the checked destination extent fits T; DrawPod has no implicit padding
+    // or ownership. Unaligned stores also support the generic test-record adapter.
+    unsafe { bytes.as_mut_ptr().cast::<T>().write_unaligned(value) };
+    *at += size_of::<T>();
+}
+
+impl StreamRecord {
+    /// The fixed record of one bound stream.
+    #[inline]
+    #[must_use]
+    pub const fn from_binding(value: &StreamBinding) -> Self {
+        Self {
+            buffer: value.buffer_id.raw(),
+            address: value.backing_ptr as u64,
+            length: value.backing_len as u64,
+            generation: value.backing_generation,
+            offset: value.offset,
+            stride: value.stride,
+            frequency: value.freq,
+            stream: value.stream,
+            reserved: [0; 3],
+        }
+    }
+
+    /// Copy every field, including the reserved bytes, which every constructor zeroes.
+    #[inline]
+    const fn copied(&self) -> Self {
+        Self {
+            buffer: self.buffer,
+            address: self.address,
+            length: self.length,
+            generation: self.generation,
+            offset: self.offset,
+            stride: self.stride,
+            frequency: self.frequency,
+            stream: self.stream,
+            reserved: self.reserved,
+        }
+    }
+}
+
+impl From<StreamBinding> for StreamRecord {
+    #[inline]
+    fn from(value: StreamBinding) -> Self {
+        Self::from_binding(&value)
+    }
+}
+
+fn put_prefix(
+    destination: &mut [u8],
+    mut prefix: DrawPrefix,
+    stream_count: u8,
+    stride_or_frequency: u32,
+) -> usize {
+    prefix.stream_count = stream_count;
+    prefix.stride_or_frequency = stride_or_frequency;
+    let mut at = 0;
+    put(destination, &mut at, prefix);
+    at
+}
+
+const fn index_record(index: &IndexBuffer) -> IndexBuffer {
+    IndexBuffer {
+        buffer: index.buffer,
+        address: index.address,
+        length: index.length,
+        generation: index.generation,
+        offset: index.offset,
+        kind: index.kind,
+        reserved: [0; 3],
+    }
+}
+
+const fn single_stream_prefix(prefix: &DrawPrefix, stream0_freq: u32) -> DrawPrefix {
+    DrawPrefix {
+        primitive: prefix.primitive,
+        vertex_kind: prefix.vertex_kind,
+        index_kind: prefix.index_kind,
+        stream_count: 1,
+        stride_or_frequency: stream0_freq,
+        first_or_base: prefix.first_or_base,
+        count: prefix.count,
+    }
+}
+
+fn put_bound_index(destination: &mut [u8], at: &mut usize, index: &IndexBuffer) {
+    put(destination, at, index_record(index));
+}
+
+const fn finish_payload(destination: &[u8], at: usize) -> Result<(), WireError> {
+    // Never publish a reservation whose size exceeds the initialized fields.
+    if at != destination.len() {
+        return Err(WireError::InvalidValue);
+    }
+    Ok(())
+}
+
+#[inline]
+fn put_extra_streams(destination: &mut [u8], at: &mut usize, extra: &ExtraStreams) {
+    for value in extra {
+        put(destination, at, StreamRecord::from_binding(&value));
+    }
+}
+
+/// Exact payload extent for one bound vertex stream without indices.
+pub const SINGLE_BOUND_BYTES: usize = size_of::<SingleBoundPayload>();
+/// Exact payload extent for one bound vertex stream with a bound index buffer.
+pub const SINGLE_INDEXED_BOUND_BYTES: usize = size_of::<SingleIndexedBoundPayload>();
+
+/// Write one bound vertex stream directly into its exact final reservation.
+///
+/// # Errors
+/// Returns an error if the prefix requires an index tail.
+pub fn write_single_bound_into(
+    prefix: &DrawPrefix,
+    first: &StreamRecord,
+    stream0_freq: u32,
+    destination: &mut [u8; SINGLE_BOUND_BYTES],
+) -> Result<(), WireError> {
+    let payload =
+        SingleBoundPayload::new(prefix, first, stream0_freq).ok_or(WireError::InvalidValue)?;
+    put(destination, &mut 0, payload);
+    Ok(())
+}
+
+/// Write one bound vertex stream and index buffer into their exact reservation.
+///
+/// # Errors
+/// Returns an error if the prefix does not require an index tail.
+pub fn write_single_indexed_bound_into(
+    prefix: &DrawPrefix,
+    first: &StreamRecord,
+    stream0_freq: u32,
+    index: &IndexBuffer,
+    destination: &mut [u8; SINGLE_INDEXED_BOUND_BYTES],
+) -> Result<(), WireError> {
+    let payload = SingleIndexedBoundPayload::new(prefix, first, stream0_freq, index)
+        .ok_or(WireError::InvalidValue)?;
+    put(destination, &mut 0, payload);
+    Ok(())
+}
+
+/// Extent of an ordinary bound draw, without generic vertex or index dispatch.
+///
+/// # Errors
+/// Returns an error when more than sixteen streams were supplied.
+pub const fn bound_payload_size(
+    vertices: &BoundVertices,
+    indices: Option<&IndexBuffer>,
+) -> Result<usize, WireError> {
+    if vertices.extra.len() > 15 {
+        return Err(WireError::InvalidValue);
+    }
+    Ok(size_of::<DrawPrefix>()
+        + (1 + vertices.extra.len()) * size_of::<StreamRecord>()
+        + if indices.is_some() {
+            size_of::<IndexBuffer>()
+        } else {
+            0
+        })
+}
+
+/// Write an ordinary bound draw into its already sized reservation.
+///
+/// The caller must compute `payload_bytes` with `bound_payload_size` first.
+/// Individual stores remain bounded, and unwritten bytes cannot be published.
+///
+/// # Errors
+/// Returns an error for a mismatched prefix/index tail, destination extent,
+/// unrepresentable stream count, or a supplied size larger than the fields written.
+///
+/// # Panics
+/// Panics if the supplied reservation is too small for its fields.
+pub fn write_bound_into(
+    prefix: DrawPrefix,
+    vertices: &BoundVertices,
+    indices: Option<&IndexBuffer>,
+    destination: &mut [u8],
+    payload_bytes: usize,
+) -> Result<(), WireError> {
+    if destination.len() != payload_bytes || (prefix.index_kind == 1) != indices.is_some() {
+        return Err(WireError::InvalidValue);
+    }
+    let stream_count =
+        u8::try_from(vertices.extra.len() + 1).map_err(|_| WireError::InvalidValue)?;
+    let mut at = put_prefix(destination, prefix, stream_count, vertices.stream0_freq);
+    put(destination, &mut at, vertices.first.copied());
+    put_extra_streams(destination, &mut at, &vertices.extra);
+    if let Some(index) = indices {
+        put_bound_index(destination, &mut at, index);
+    }
+    finish_payload(destination, at)
+}
+
+pub(super) const fn payload_size(draw: &DrawOp) -> Result<usize, WireError> {
+    let vertices = match &draw.vertex_source {
+        VertexSource::Up { .. } => 16,
+        VertexSource::Bound { extra, .. } => {
+            if extra.len() > 15 {
+                return Err(WireError::InvalidValue);
+            }
+            (1 + extra.len()) * 48
+        }
+    };
+    let indices = match draw.index_source {
+        IndexSource::None { .. } | IndexSource::Fan { .. } => 0,
+        IndexSource::Bound { .. } => 40,
+        IndexSource::Generated { .. } | IndexSource::Up { .. } => 24,
+    };
+    Ok(16 + vertices + indices)
+}
+
+pub(super) fn write_into(
+    draw: &DrawOp,
+    destination: &mut [u8],
+    payload_bytes: usize,
+) -> Result<(), WireError> {
+    if destination.len() != payload_bytes {
+        return Err(WireError::InvalidValue);
+    }
+    let (vertex_kind, stream_count, stride_or_frequency) = match &draw.vertex_source {
+        VertexSource::Up { stride, .. } => (0, 0, *stride),
+        VertexSource::Bound {
+            extra,
+            stream0_freq,
+            ..
+        } => (
+            1,
+            u8::try_from(extra.len() + 1).map_err(|_| WireError::InvalidValue)?,
+            *stream0_freq,
+        ),
+    };
+    let (index_kind, first_or_base, count) = match draw.index_source {
+        IndexSource::None {
+            start_vertex,
+            vertex_count,
+        } => (0, start_vertex, vertex_count),
+        IndexSource::Bound {
+            base_vertex,
+            index_count,
+            ..
+        } => (1, base_vertex.cast_unsigned(), index_count),
+        IndexSource::Fan {
+            start_vertex,
+            primitive_count,
+        } => (2, start_vertex, primitive_count),
+        IndexSource::Generated {
+            min_vertex,
+            index_count,
+            ..
+        } => (3, min_vertex, index_count),
+        IndexSource::Up { index_count, .. } => (4, 0, index_count),
+    };
+    let mut at = put_prefix(
+        destination,
+        DrawPrefix {
+            primitive: draw.metal_prim as u8,
+            vertex_kind,
+            index_kind,
+            stream_count: 0,
+            stride_or_frequency: 0,
+            first_or_base,
+            count,
+        },
+        stream_count,
+        stride_or_frequency,
+    );
+    match &draw.vertex_source {
+        VertexSource::Up { bytes, size, .. } => {
+            let (address, length) = bytes.as_raw();
+            put(
+                destination,
+                &mut at,
+                VertexBytes {
+                    address,
+                    length,
+                    size: *size,
+                },
+            );
+        }
+        VertexSource::Bound { first, extra, .. } => {
+            put(destination, &mut at, StreamRecord::from_binding(first));
+            put_extra_streams(destination, &mut at, extra);
+        }
+    }
+    match &draw.index_source {
+        IndexSource::Bound {
+            buffer_id,
+            backing_ptr,
+            backing_len,
+            backing_generation,
+            offset,
+            index_type,
+            ..
+        } => put_bound_index(
+            destination,
+            &mut at,
+            &IndexBuffer {
+                buffer: buffer_id.raw(),
+                address: *backing_ptr as u64,
+                length: *backing_len as u64,
+                generation: *backing_generation,
+                offset: *offset,
+                kind: *index_type as u8,
+                reserved: [0; 3],
+            },
+        ),
+        IndexSource::Generated {
+            data,
+            index_type,
+            max_vertex,
+            ..
+        } => {
+            let (address, length) = data.as_raw();
+            put(
+                destination,
+                &mut at,
+                IndexBytes {
+                    address,
+                    length,
+                    maximum: *max_vertex,
+                    kind: *index_type as u8,
+                    reserved: [0; 7],
+                },
+            );
+        }
+        IndexSource::Up {
+            bytes, index_type, ..
+        } => {
+            let (address, length) = bytes.as_raw();
+            put(
+                destination,
+                &mut at,
+                IndexBytes {
+                    address,
+                    length,
+                    maximum: 0,
+                    kind: *index_type as u8,
+                    reserved: [0; 7],
+                },
+            );
+        }
+        IndexSource::None { .. } | IndexSource::Fan { .. } => {}
+    }
+    finish_payload(destination, at)
+}
+
+/// A decoded fixed draw: its primitive and its typed vertex and index records.
+///
+/// The containing command allocation owns every record.
+pub struct DrawView<'a> {
+    primitive: PrimitiveType,
+    vertices: VertexView<'a>,
+    indices: IndexView<'a>,
+}
+
+/// Vertex input borrowed directly from a fixed draw command.
+pub enum VertexView<'a> {
+    Up {
+        record: &'a VertexBytes,
+        stride: u32,
+    },
+    Bound {
+        records: &'a [StreamRecord],
+        stream0_freq: u32,
+    },
+}
+
+/// Index input borrowed directly from a fixed draw command.
+pub enum IndexView<'a> {
+    None {
+        start_vertex: u32,
+        vertex_count: u32,
+    },
+    Bound {
+        record: &'a IndexBuffer,
+        index_count: u32,
+        base_vertex: i32,
+    },
+    Fan {
+        start_vertex: u32,
+        primitive_count: u32,
+    },
+    Generated {
+        record: &'a IndexBytes,
+        index_count: u32,
+        min_vertex: u32,
+    },
+    Up {
+        record: &'a IndexBytes,
+        index_count: u32,
+    },
+}
+
+/// Borrow exactly one aligned record.
+fn fixed_ref<T: DrawPod>(bytes: &[u8]) -> Result<&T, WireError> {
+    let pointer = bytes.as_ptr().cast::<T>();
+    if bytes.len() != size_of::<T>() || !pointer.is_aligned() {
+        return Err(WireError::InvalidValue);
+    }
+    // SAFETY: the pointer is aligned and names `size_of::<T>()` initialized bytes borrowed
+    // for the returned lifetime; DrawPod permits every bit pattern.
+    Ok(unsafe { &*pointer })
+}
+
+/// Borrow `count` aligned records from the front of `bytes`, and the bytes after them.
+fn fixed_records<T: DrawPod>(bytes: &[u8], count: usize) -> Result<(&[T], &[u8]), WireError> {
+    let (records, rest) = bytes
+        .split_at_checked(count * size_of::<T>())
+        .ok_or(WireError::Truncated)?;
+    let pointer = records.as_ptr().cast::<T>();
+    if !pointer.is_aligned() {
+        return Err(WireError::InvalidValue);
+    }
+    // SAFETY: the pointer is aligned and names `count` complete initialized records borrowed
+    // for the returned lifetime; DrawPod permits every bit pattern.
+    Ok((unsafe { core::slice::from_raw_parts(pointer, count) }, rest))
+}
+
+impl<'a> DrawView<'a> {
+    /// Decode an immutable draw payload into its primitive and typed record views.
+    ///
+    /// Every field the native consumer interprets is checked here, once and
+    /// before it changes encoder state: the prefix, the primitive, the vertex
+    /// kind and stream count, the index kind and index element type, and the
+    /// extent and alignment of every record. Record counts come from the
+    /// prefix, so no extent is divided back into a count.
+    ///
+    /// # Errors
+    /// Returns an error for a truncated or unaligned record, an unknown
+    /// primitive, vertex kind, index kind or index element type, a stream count
+    /// outside one to sixteen, or bytes left over after the index record.
+    pub fn new(bytes: &'a [u8]) -> Result<Self, WireError> {
+        let (prefix, rest) = bytes
+            .split_at_checked(size_of::<DrawPrefix>())
+            .ok_or(WireError::Truncated)?;
+        let prefix: &DrawPrefix = fixed_ref(prefix)?;
+        let primitive =
+            PrimitiveType::from_repr(u32::from(prefix.primitive)).ok_or(WireError::InvalidValue)?;
+        let (vertices, indices) = match prefix.vertex_kind {
+            0 if prefix.stream_count == 0 => {
+                let (record, rest) = rest
+                    .split_at_checked(size_of::<VertexBytes>())
+                    .ok_or(WireError::Truncated)?;
+                let vertices = VertexView::Up {
+                    record: fixed_ref(record)?,
+                    stride: prefix.stride_or_frequency,
+                };
+                (vertices, rest)
+            }
+            1 if (1..=16).contains(&prefix.stream_count) => {
+                let (records, rest) = fixed_records(rest, usize::from(prefix.stream_count))?;
+                let vertices = VertexView::Bound {
+                    records,
+                    stream0_freq: prefix.stride_or_frequency,
+                };
+                (vertices, rest)
+            }
+            _ => return Err(WireError::InvalidValue),
+        };
+        let first = prefix.first_or_base;
+        let count = prefix.count;
+        let indices = match prefix.index_kind {
+            0 if indices.is_empty() => IndexView::None {
+                start_vertex: first,
+                vertex_count: count,
+            },
+            1 => {
+                let record: &IndexBuffer = fixed_ref(indices)?;
+                record.index_type()?;
+                IndexView::Bound {
+                    record,
+                    index_count: count,
+                    base_vertex: first.cast_signed(),
+                }
+            }
+            2 if indices.is_empty() => IndexView::Fan {
+                start_vertex: first,
+                primitive_count: count,
+            },
+            3 => {
+                let record: &IndexBytes = fixed_ref(indices)?;
+                record.index_type()?;
+                IndexView::Generated {
+                    record,
+                    index_count: count,
+                    min_vertex: first,
+                }
+            }
+            4 => {
+                let record: &IndexBytes = fixed_ref(indices)?;
+                record.index_type()?;
+                IndexView::Up {
+                    record,
+                    index_count: count,
+                }
+            }
+            _ => return Err(WireError::InvalidValue),
+        };
+        Ok(Self {
+            primitive,
+            vertices,
+            indices,
+        })
+    }
+
+    /// The primitive type.
+    #[must_use]
+    pub const fn metal_primitive(&self) -> PrimitiveType {
+        self.primitive
+    }
+
+    /// The vertex records.
+    #[must_use]
+    pub const fn vertices(&self) -> &VertexView<'a> {
+        &self.vertices
+    }
+
+    /// The index records, whose element type is already checked.
+    #[must_use]
+    pub const fn indices(&self) -> &IndexView<'a> {
+        &self.indices
+    }
+}
+
+impl VertexBytes {
+    /// Borrow the already retained UP capture for a native draw.
+    ///
+    /// # Panics
+    /// Panics if a nonempty capture has a null address.
+    ///
+    /// # Safety
+    /// The authentic packet must retain address..address+length as initialized immutable bytes.
+    #[must_use]
+    pub const unsafe fn bytes(&self) -> ScratchSlice {
+        if self.length == 0 {
+            return ScratchSlice::EMPTY;
+        }
+        let address = NonNull::new(self.address as *mut u8).expect("retained UP allocation");
+        // SAFETY: the packet caller guarantees the exact immutable capture lifetime and extent.
+        unsafe { ScratchSlice::from_raw_parts(address, self.length) }
+    }
+}
+
+impl IndexBytes {
+    /// Borrow the already retained index capture for a native draw.
+    ///
+    /// # Panics
+    /// Panics if a nonempty capture has a null address.
+    ///
+    /// # Safety
+    /// The authentic packet must retain address..address+length as initialized immutable bytes.
+    #[must_use]
+    pub const unsafe fn bytes(&self) -> ScratchSlice {
+        if self.length == 0 {
+            return ScratchSlice::EMPTY;
+        }
+        let address = NonNull::new(self.address as *mut u8).expect("retained index allocation");
+        // SAFETY: the packet caller guarantees the exact immutable capture lifetime and extent.
+        unsafe { ScratchSlice::from_raw_parts(address, self.length) }
+    }
+
+    /// Read the index element type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index element type.
+    pub fn index_type(&self) -> Result<IndexType, WireError> {
+        IndexType::from_repr(u32::from(self.kind)).ok_or(WireError::InvalidValue)
+    }
+}
+
+impl IndexBuffer {
+    /// Read the index element type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown index element type.
+    pub fn index_type(&self) -> Result<IndexType, WireError> {
+        IndexType::from_repr(u32::from(self.kind)).ok_or(WireError::InvalidValue)
+    }
+}
+
+/// One stream's input, borrowed from its command rather than rebuilt as an owned binding.
+pub enum StreamViewFeed<'a> {
+    Inline { stride: u32 },
+    Buffer(&'a StreamRecord),
+    Null,
+}
+
+impl<'a> VertexView<'a> {
+    pub fn bindings(&self) -> core::slice::Iter<'a, StreamRecord> {
+        match self {
+            Self::Up { .. } => [].iter(),
+            Self::Bound { records, .. } => records.iter(),
+        }
+    }
+
+    #[must_use]
+    pub fn feed(&self, stream: u32) -> StreamViewFeed<'a> {
+        match self {
+            Self::Up { stride, .. } if stream == 0 => StreamViewFeed::Inline { stride: *stride },
+            Self::Up { .. } => StreamViewFeed::Null,
+            Self::Bound { records, .. } => records
+                .iter()
+                .find(|record| u32::from(record.stream) == stream)
+                .map_or(StreamViewFeed::Null, StreamViewFeed::Buffer),
+        }
+    }
+}
+
+/// Write into `layouts` the vertex layouts derived directly from borrowed command stream records.
+///
+/// Sets in `crossing` the streams an attribute crosses (see
+/// [`crate::draw_data::stream_layouts_with`]), and ORs into `offsets` the
+/// offset of every stream read from a vertex buffer, so a nonzero
+/// [`crate::streams::offset_shift`] of it says one of them is off a
+/// four-byte boundary.
+pub fn stream_layouts_view(
+    layouts: &mut [crate::pipeline_state::StreamLayout; mtld3d_types::MAX_STREAMS as usize],
+    source: &VertexView<'_>,
+    attrs: &crate::draw_data::AttrSnapshot,
+    crossing: &mut u16,
+    offsets: &mut u32,
+) {
+    use mtld3d_shared::mtl::VertexStepFunction;
+
+    use crate::{
+        pipeline_state::StreamLayout,
+        streams::{bound_stream_layout, layout_stride},
+    };
+    crate::draw_data::stream_layouts_with(
+        layouts,
+        attrs,
+        |stream, extent| match source.feed(stream) {
+            StreamViewFeed::Inline { stride } => StreamLayout {
+                stride: layout_stride(stride, extent),
+                step: VertexStepFunction::PerVertex,
+                step_rate: 1,
+            },
+            StreamViewFeed::Buffer(record) => {
+                *offsets |= record.offset;
+                bound_stream_layout(record.stride, extent, record.frequency)
+            }
+            StreamViewFeed::Null => StreamLayout {
+                stride: extent,
+                step: VertexStepFunction::Constant,
+                step_rate: 0,
+            },
+        },
+        crossing,
+    );
+}
+
+#[cfg(test)]
+mod tests;

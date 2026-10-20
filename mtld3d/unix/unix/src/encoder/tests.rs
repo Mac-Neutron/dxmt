@@ -1,0 +1,825 @@
+use std::sync::mpsc;
+
+use mtld3d_core::{
+    pipeline_state::{
+        ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits, PipelineSnapshot, StreamLayout,
+    },
+    shader_cache::ShaderRecordRef,
+    shader_key::CachedKind,
+};
+use mtld3d_shared::{MetalHandle, mtl::PixelFormat};
+use mtld3d_types::MAX_STREAMS;
+use objc2::{
+    rc::Retained,
+    runtime::{NSObjectProtocol, ProtocolObject},
+};
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction, MTLLibrary, MTLRenderPipelineDescriptor,
+    MTLRenderPipelineState,
+};
+
+use super::{
+    BufferGpuState, DepthSnapshot, DestroyKind, MipStagingBuffer, StageLibHandles, StretchScratch,
+    TextureGpuState, WarmCache, cached_buffer_handles, destroy_resources_bulk,
+    drain_source_scratch, staging_wrapped_bytes, take_released_buffer,
+    take_released_staging_wrapper, take_source_scratch, take_staging_wrapper,
+};
+
+struct NativeObjects {
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    function: Retained<ProtocolObject<dyn MTLFunction>>,
+    pipeline: Retained<ProtocolObject<dyn MTLRenderPipelineState>>,
+}
+
+impl NativeObjects {
+    /// Compiles a vertex function named `entry` and a pipeline that uses it.
+    ///
+    /// Each test passes its own `entry`. Metal returns the same `MTLFunction`
+    /// object for two libraries compiled from identical source, so tests that
+    /// shared one source would change each other's retain counts when they run
+    /// in parallel.
+    fn new(entry: &str) -> Self {
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device for ownership test");
+        let source = NSString::from_str(&format!(
+            "#include <metal_stdlib>\nusing namespace metal;\nvertex void {entry}(uint id [[vertex_id]]) {{}}",
+        ));
+        let library = device
+            .newLibraryWithSource_options_error(&source, None)
+            .expect("library");
+        let function = library
+            .newFunctionWithName(&NSString::from_str(entry))
+            .expect("function");
+        let descriptor = MTLRenderPipelineDescriptor::new();
+        descriptor.setVertexFunction(Some(&function));
+        descriptor.setRasterizationEnabled(false);
+        let pipeline = device
+            .newRenderPipelineStateWithDescriptor_error(&descriptor)
+            .expect("pipeline");
+        Self {
+            library,
+            function,
+            pipeline,
+        }
+    }
+
+    fn counts(&self) -> [usize; 3] {
+        [
+            self.pipeline.retainCount(),
+            self.function.retainCount(),
+            self.library.retainCount(),
+        ]
+    }
+
+    fn warm(&self) -> WarmCache {
+        // SAFETY: each handle owns the real object's extra retain transferred by into_raw.
+        let library = unsafe { MetalHandle::new(Retained::into_raw(self.library.clone()) as u64) };
+        // SAFETY: this handle owns the real function's transferred extra retain.
+        let func = unsafe { MetalHandle::new(Retained::into_raw(self.function.clone()) as u64) };
+        // SAFETY: this handle owns the real pipeline's transferred extra retain.
+        let pipeline =
+            unsafe { MetalHandle::new(Retained::into_raw(self.pipeline.clone()) as u64) };
+        let snapshot = PipelineSnapshot {
+            vdecl_hash: 0,
+            vs_fn: func,
+            ps_fn: MetalHandle::NULL,
+            stream_layouts: [StreamLayout::UNUSED; MAX_STREAMS as usize],
+            color_format: PixelFormat::Bgra8Unorm,
+            attach: PipelineAttachFlags::empty(),
+            rs: PipelineRsBits::default(),
+            extra: ExtraColorAttachments::NONE,
+            ps_color_out_mask: 0,
+            sample_count: 1,
+        };
+        WarmCache {
+            libraries: vec![(
+                ShaderRecordRef::new(CachedKind::Sm2Vs, 1),
+                StageLibHandles { library, func },
+            )],
+            pipelines: vec![(
+                mtld3d_core::pipeline_state::key_from_snapshot(&snapshot, &[]),
+                pipeline,
+            )],
+            no_color_siblings: vec![(pipeline.raw(), pipeline)],
+        }
+    }
+}
+
+#[test]
+fn failed_prewarm_send_releases_native_payload() {
+    objc2::rc::autoreleasepool(|_| {
+        let objects = NativeObjects::new("failed_send_probe");
+        let baseline = objects.counts();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        drop(receiver);
+        let result = sender.send(objects.warm());
+        assert!(result.is_err());
+        drop(result);
+        assert_eq!(
+            objects.counts(),
+            baseline,
+            "failed delivery releases all three retains"
+        );
+    });
+}
+
+#[test]
+fn unread_prewarm_payload_releases_native_objects() {
+    objc2::rc::autoreleasepool(|_| {
+        let objects = NativeObjects::new("unread_payload_probe");
+        let baseline = objects.counts();
+        let (sender, receiver) = mpsc::sync_channel(1);
+        assert!(sender.send(objects.warm()).is_ok());
+        drop(receiver);
+        assert_eq!(
+            objects.counts(),
+            baseline,
+            "queued payload is still an owner"
+        );
+    });
+}
+
+#[test]
+fn adopted_prewarm_retains_transfer_once_and_release_in_dependency_order() {
+    objc2::rc::autoreleasepool(|_| {
+        let objects = NativeObjects::new("adopted_prewarm_probe");
+        let baseline = objects.counts();
+        let mut source = objects.warm();
+        let retained = objects.counts();
+        let mut destination = WarmCache {
+            libraries: std::mem::take(&mut source.libraries),
+            pipelines: std::mem::take(&mut source.pipelines),
+            no_color_siblings: std::mem::take(&mut source.no_color_siblings),
+        };
+        drop(source);
+        assert_eq!(
+            objects.counts(),
+            retained,
+            "adoption leaves the old owner empty"
+        );
+        let mut releases = Vec::new();
+        destination.release_with(|kind, handles| {
+            releases.push((kind, handles.to_vec()));
+            destroy_resources_bulk(kind, handles);
+        });
+        assert_eq!(
+            releases
+                .iter()
+                .map(|(kind, handles)| (*kind, handles.len()))
+                .collect::<Vec<_>>(),
+            vec![
+                (DestroyKind::RenderPipeline, 1),
+                (DestroyKind::ShaderFunction, 1),
+                (DestroyKind::ShaderLibrary, 1),
+            ]
+        );
+        drop(destination);
+        assert_eq!(
+            objects.counts(),
+            baseline,
+            "aliases and empty owners release nothing extra"
+        );
+    });
+}
+
+#[test]
+fn native_shader_build_resets_empty_inputs_and_retains_outputs_after_pool_drain() {
+    use mtld3d_shared::perf::ShaderTimings;
+
+    use crate::metal::handle::IntoRetained;
+
+    objc2::rc::autoreleasepool(|_| {
+        for (source, entry) in [("", "probe"), ("invalid MSL", "")] {
+            let mut timings = ShaderTimings {
+                preparation_ns: u64::MAX,
+                library_ns: u64::MAX,
+                function_ns: u64::MAX,
+            };
+            assert!(
+                super::compile_stage_library(MetalHandle::NULL, source, entry, &mut timings)
+                    .is_none()
+            );
+            assert_eq!(
+                (
+                    timings.preparation_ns,
+                    timings.library_ns,
+                    timings.function_ns
+                ),
+                (0, 0, 0),
+                "empty input resets all phases before native compilation"
+            );
+        }
+
+        let device = MTLCreateSystemDefaultDevice().expect("Metal device for shader lifetime test");
+        // SAFETY: device owns this live Metal device until the build completes.
+        let device_handle = unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) };
+        let source = "#include <metal_stdlib>\nusing namespace metal;\nvertex float4 probe(uint id [[vertex_id]]) { return float4(float(id), 0, 0, 1); }";
+        let handles =
+            super::compile_stage_library(device_handle, source, "probe", &mut ShaderTimings::new())
+                .expect("native shader build succeeds");
+        // The build's inner pool has drained; only canonical output retains remain.
+        let library = handles
+            .library
+            .into_retained()
+            .expect("live library output");
+        let function = handles.func.into_retained().expect("live function output");
+        assert_eq!(library.label().expect("library label").to_string(), "probe");
+        assert_eq!(function.name().to_string(), "probe");
+        drop(function);
+        drop(library);
+        destroy_resources_bulk(DestroyKind::ShaderFunction, &[handles.func.raw()]);
+        destroy_resources_bulk(DestroyKind::ShaderLibrary, &[handles.library.raw()]);
+    });
+}
+
+#[test]
+fn payload_rotation_reuses_warm_scratch_chunks_across_the_submit_thread() {
+    use std::collections::BTreeSet;
+
+    use mtld3d_core::{passes::PassState, scratch::ScratchArena};
+
+    use super::{FramePayload, SUBMIT_PAYLOAD_CAP};
+
+    const FRAMES: usize = 48;
+    const WARM_FRAMES: usize = 8;
+    let (work_tx, work_rx) = mpsc::sync_channel::<FramePayload>(1);
+    let (return_tx, return_rx) = mpsc::channel::<FramePayload>();
+    // Stands in for the submit thread: it reads a payload and hands the whole of it back.
+    let submit = std::thread::spawn(move || {
+        while let Ok(payload) = work_rx.recv() {
+            assert!(
+                payload.scratch.bytes_used() > 0,
+                "the frame's snapshots rode along"
+            );
+            if return_tx.send(payload).is_err() {
+                break;
+            }
+        }
+    });
+    let mut live = ScratchArena::new();
+    let mut blits = Vec::new();
+    let mut pass_state = PassState::new();
+    let mut pool: Vec<FramePayload> = Vec::new();
+    let mut created = 0_u32;
+    let mut seen = BTreeSet::new();
+    let snapshot = vec![0x5a_u8; 30 * 1024];
+    for frame in 0..FRAMES {
+        // `begin_frame`, then two snapshot decodes' worth of storage and a constant block,
+        // which together need two chunks.
+        live.clear();
+        for _ in 0..3 {
+            live.alloc(&snapshot);
+        }
+        let chunks = live
+            .allocation_ranges()
+            .map(|(address, _)| address)
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 2);
+        if frame >= WARM_FRAMES {
+            assert!(
+                chunks.iter().all(|address| seen.contains(address)),
+                "frame {frame} recorded into a chunk no earlier frame had"
+            );
+        }
+        seen.extend(chunks);
+        // `acquire_clean_payload`: reclaim what came back, reuse, create up to the cap, wait.
+        while let Ok(mut returned) = return_rx.try_recv() {
+            returned.clear(&mut pass_state);
+            pool.push(returned);
+        }
+        let mut payload = pool.pop().unwrap_or_else(|| {
+            if created < SUBMIT_PAYLOAD_CAP {
+                created += 1;
+                FramePayload::default()
+            } else {
+                let mut returned = return_rx.recv().unwrap();
+                returned.clear(&mut pass_state);
+                returned
+            }
+        });
+        payload.adopt_frame_buffers(&mut live, &mut blits);
+        work_tx.send(payload).unwrap();
+    }
+    drop(work_tx);
+    submit.join().unwrap();
+    while let Ok(mut returned) = return_rx.try_recv() {
+        returned.clear(&mut pass_state);
+        pool.push(returned);
+    }
+    // The encoder's arena and at most two payloads' arenas exist, each warmed to two chunks.
+    let arenas = pool.iter().map(|payload| &payload.scratch).chain([&live]);
+    let chunk_total = arenas.map(ScratchArena::chunk_count).sum::<u32>();
+    assert_eq!(pool.len(), usize::try_from(created).unwrap());
+    assert_eq!(chunk_total, 2 * (created + 1));
+    assert_eq!(seen.len(), usize::try_from(chunk_total).unwrap());
+}
+
+/// An opaque texture handle, never dereferenced.
+fn texture(raw: u64) -> MetalHandle<mtld3d_shared::mtl_handle::MTLTextureKind> {
+    // SAFETY: tests; opaque values never dereferenced.
+    unsafe { MetalHandle::new(raw) }
+}
+
+/// A destroyed source takes its depth snapshot and `StretchRect` scratch with it.
+///
+/// Both caches are keyed by the source texture's handle. A source destroyed
+/// without its entries leaked a full-size Private copy per recreated depth
+/// target or back buffer, and a texture Metal later created at the same
+/// address was handed the old copy. Shutdown takes whatever is left.
+#[test]
+fn a_destroyed_source_takes_its_scratch_copies_and_leaves_the_others() {
+    let mut snapshots = rustc_hash::FxHashMap::default();
+    let mut scratch = rustc_hash::FxHashMap::default();
+    for (source, copy) in [(0x100, 0x1100), (0x200, 0x1200)] {
+        snapshots.insert(
+            source,
+            DepthSnapshot {
+                handle: texture(copy),
+                width: 64,
+                height: 64,
+                format: PixelFormat::Depth32Float,
+                epoch: 0,
+            },
+        );
+    }
+    for (source, copy) in [(0x100, 0x2100), (0x300, 0x2300)] {
+        scratch.insert(
+            source,
+            StretchScratch {
+                handle: texture(copy),
+                width: 64,
+                height: 64,
+                format: PixelFormat::Bgra8Unorm,
+            },
+        );
+    }
+
+    let taken = take_source_scratch(&mut snapshots, &mut scratch, 0x100);
+    assert_eq!(
+        taken.map(|copy| copy.map(MetalHandle::raw)),
+        [Some(0x1100), Some(0x2100)],
+        "both copies of the destroyed source are handed back for retirement"
+    );
+    assert_eq!(
+        take_source_scratch(&mut snapshots, &mut scratch, 0x100).map(|copy| copy.is_some()),
+        [false, false],
+        "a texture created later at the same address finds no copy of the old one"
+    );
+    assert!(
+        snapshots.contains_key(&0x200),
+        "another source keeps its snapshot"
+    );
+    assert!(
+        scratch.contains_key(&0x300),
+        "another source keeps its scratch"
+    );
+
+    let mut rest: Vec<u64> = drain_source_scratch(&mut snapshots, &mut scratch)
+        .into_iter()
+        .map(MetalHandle::raw)
+        .collect();
+    rest.sort_unstable();
+    assert_eq!(rest, [0x1200, 0x2300], "shutdown takes every copy left");
+    assert!(snapshots.is_empty() && scratch.is_empty());
+}
+
+/// An opaque buffer handle, never dereferenced.
+fn buffer(raw: u64) -> MetalHandle<mtld3d_shared::mtl_handle::MTLBufferKind> {
+    // SAFETY: tests; opaque values never dereferenced.
+    unsafe { MetalHandle::new(raw) }
+}
+
+/// A `Staged` entry whose CPU backing was released, the shape a `WRITEONLY` DEFAULT buffer reaches.
+fn staged(device_buffer: u64, last_submit_seq: u64) -> BufferGpuState {
+    BufferGpuState {
+        mtl_buffer: MetalHandle::NULL,
+        device_buffer: buffer(device_buffer),
+        is_staged: true,
+        backing_ptr: 0,
+        length: 4096,
+        backing_generation: 0,
+        last_submit_seq,
+    }
+}
+
+/// A `Direct` entry wrapping a CPU backing.
+fn direct(wrapper: u64) -> BufferGpuState {
+    BufferGpuState {
+        mtl_buffer: buffer(wrapper),
+        device_buffer: MetalHandle::NULL,
+        is_staged: false,
+        backing_ptr: 0x10_0000,
+        length: 4096,
+        backing_generation: 1,
+        last_submit_seq: 3,
+    }
+}
+
+/// A released `Staged` buffer with no backing hands its device buffer to the retention queue.
+///
+/// A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` buffer drops its CPU copy after
+/// its upload, so its release sends no backing through the retention intake,
+/// the one path that took the entry out before; its Private device buffer
+/// leaked on every release, and every DEFAULT buffer is recreated around a
+/// `Reset`. The destroy waits for the later of the frame that released the
+/// buffer and the last frame that drew with it.
+#[test]
+fn a_released_staged_buffer_retires_its_device_buffer() {
+    use mtld3d_core::ids::BufferId;
+
+    let mut cache = rustc_hash::FxHashMap::default();
+    let (released, kept, wrapped) = (
+        BufferId::from_raw(1),
+        BufferId::from_raw(2),
+        BufferId::from_raw(3),
+    );
+    cache.insert(released, staged(0xD100, 7));
+    cache.insert(kept, staged(0xD200, 7));
+    cache.insert(wrapped, direct(0xC300));
+
+    let entry = take_released_buffer(&mut cache, released, 5).expect("the device buffer retires");
+    assert!(matches!(entry.kind, DestroyKind::Buffer));
+    assert_eq!(entry.handle, 0xD100);
+    assert_eq!(entry.seq, 7, "gated on the last frame that drew with it");
+    assert!(entry.page_box.is_none(), "no CPU backing rides along");
+    assert!(!cache.contains_key(&released));
+    assert!(
+        take_released_buffer(&mut cache, released, 9).is_none(),
+        "a second destroy finds nothing"
+    );
+    assert_eq!(
+        take_released_buffer(&mut cache, kept, 9).map(|entry| entry.seq),
+        Some(9),
+        "a release after the last draw waits for its own frame"
+    );
+    assert!(
+        take_released_buffer(&mut cache, wrapped, 9).is_none(),
+        "a Direct wrapper retires with its backing, not here"
+    );
+    assert!(cache.contains_key(&wrapped));
+}
+
+/// Shutdown collects the `Staged` device buffers as well as the `Direct` wrappers.
+#[test]
+fn shutdown_collects_staged_device_buffers_and_direct_wrappers() {
+    use mtld3d_core::ids::BufferId;
+
+    let mut cache = rustc_hash::FxHashMap::default();
+    cache.insert(BufferId::from_raw(1), staged(0xD100, 1));
+    cache.insert(BufferId::from_raw(2), direct(0xC200));
+    // A staged entry whose warmup create failed holds no buffer yet.
+    cache.insert(BufferId::from_raw(3), staged(0, 1));
+
+    let mut handles = cached_buffer_handles(&cache);
+    handles.sort_unstable();
+    assert_eq!(handles, [0xC200, 0xD100]);
+}
+
+/// A cached level wrapper over `length` staging bytes, or an empty slot for a null `handle`.
+fn wrapper(handle: u64, length: u64) -> MipStagingBuffer {
+    MipStagingBuffer {
+        handle: buffer(handle),
+        backing_ptr: handle << 16,
+        length,
+        keepalive: None,
+        kept_after_release: false,
+    }
+}
+
+/// A cached texture whose level slots are `levels`.
+fn wrapped_texture(levels: Vec<MipStagingBuffer>) -> TextureGpuState {
+    TextureGpuState {
+        views: mtld3d_shared::texture_views::TextureViews::EMPTY,
+        mip_staging_buffers: levels,
+    }
+}
+
+/// The wrapper gauge sums every populated level slot of every cached texture.
+///
+/// An empty slot (a level never uploaded, or one whose wrapper was parked)
+/// adds nothing, whatever length it last recorded.
+#[test]
+fn the_wrapper_gauge_counts_populated_level_slots_only() {
+    let mut cache = rustc_hash::FxHashMap::default();
+    assert_eq!(staging_wrapped_bytes(&cache), 0);
+    cache.insert(
+        mtld3d_core::ids::TextureId::from_raw(1),
+        wrapped_texture(vec![
+            wrapper(0x10, 64 << 10),
+            wrapper(0x11, 16 << 10),
+            wrapper(0, 32 << 10),
+        ]),
+    );
+    cache.insert(
+        mtld3d_core::ids::TextureId::from_raw(2),
+        wrapped_texture(vec![wrapper(0, 16 << 10), wrapper(0x20, 1 << 20)]),
+    );
+    assert_eq!(
+        staging_wrapped_bytes(&cache),
+        (64 << 10) + (16 << 10) + (1 << 20)
+    );
+}
+
+/// Retiring a level's wrapper empties exactly that slot and hands back its keepalive.
+///
+/// The keepalive is the native owner of the guest pages, so it has to travel
+/// with the wrapper into the retention queue rather than stay in the cache;
+/// an empty slot, another level, an uncached texture and an index past the
+/// texture's levels hand back nothing.
+#[test]
+fn taking_a_staging_wrapper_empties_its_slot_and_keeps_the_others() {
+    let pages = std::sync::Arc::new(mtld3d_core::page_box::PageBox::new_zeroed(2));
+    let id = mtld3d_core::ids::TextureId::from_raw(7);
+    let mut cache = rustc_hash::FxHashMap::default();
+    cache.insert(
+        id,
+        wrapped_texture(vec![
+            MipStagingBuffer {
+                keepalive: Some(std::sync::Arc::clone(&pages)),
+                ..wrapper(0x70, 32 << 10)
+            },
+            wrapper(0x71, 16 << 10),
+            wrapper(0, 16 << 10),
+        ]),
+    );
+
+    let taken = take_staging_wrapper(&mut cache, id, 0).expect("level 0 is wrapped");
+    assert_eq!(taken.handle.raw(), 0x70);
+    assert!(
+        taken
+            .keepalive
+            .as_ref()
+            .is_some_and(|owner| std::sync::Arc::ptr_eq(owner, &pages)),
+        "the pages' owner leaves the cache with the wrapper"
+    );
+    assert!(
+        take_staging_wrapper(&mut cache, id, 0).is_none(),
+        "the slot is empty afterwards, so a later upload creates a fresh wrapper"
+    );
+    assert!(
+        take_staging_wrapper(&mut cache, id, 2).is_none(),
+        "an empty slot"
+    );
+    assert!(
+        take_staging_wrapper(&mut cache, id, 3).is_none(),
+        "past the levels"
+    );
+    assert!(
+        take_staging_wrapper(&mut cache, mtld3d_core::ids::TextureId::from_raw(8), 0).is_none(),
+        "an uncached texture"
+    );
+    assert_eq!(
+        staging_wrapped_bytes(&cache),
+        16 << 10,
+        "the other level keeps its wrapper"
+    );
+    drop(taken);
+    assert_eq!(std::sync::Arc::strong_count(&pages), 1);
+}
+
+/// A release answer retires a level's wrapper once per backing.
+///
+/// The first answer takes the wrapper and leaves the backing's address in
+/// the slot. An upload that wraps the same backing again shows the PE side
+/// kept it (a level rewritten every frame, whose answer a newer upload
+/// overtakes), so that wrapper stays cached through later answers instead
+/// of being created and destroyed every frame. A different backing starts
+/// over, and a backing change still retires a kept wrapper.
+#[test]
+fn a_release_retires_a_levels_wrapper_once_per_backing() {
+    let id = mtld3d_core::ids::TextureId::from_raw(9);
+    let pages = std::sync::Arc::new(mtld3d_core::page_box::PageBox::new_zeroed(2));
+    let mut cache = rustc_hash::FxHashMap::default();
+    cache.insert(id, wrapped_texture(vec![wrapper(0x90, 32 << 10)]));
+    let slot = |cache: &rustc_hash::FxHashMap<_, TextureGpuState>| {
+        let state: &TextureGpuState = &cache[&id];
+        let slot = &state.mip_staging_buffers[0];
+        (slot.handle.raw(), slot.backing_ptr, slot.kept_after_release)
+    };
+
+    let first = take_released_staging_wrapper(&mut cache, id, 0).expect("first release");
+    assert_eq!(first.handle.raw(), 0x90);
+    assert_eq!(
+        slot(&cache),
+        (0, 0x90 << 16, false),
+        "the emptied slot remembers the backing"
+    );
+    assert!(
+        take_released_staging_wrapper(&mut cache, id, 0).is_none(),
+        "an empty slot has nothing to retire"
+    );
+
+    let state = cache.get_mut(&id).expect("cached");
+    let prior = &state.mip_staging_buffers[0];
+    let again = MipStagingBuffer::created(
+        buffer(0x91),
+        0x90 << 16,
+        32 << 10,
+        std::sync::Arc::clone(&pages),
+        prior,
+    );
+    state.mip_staging_buffers[0] = again;
+    assert_eq!(slot(&cache), (0x91, 0x90 << 16, true));
+    assert!(
+        take_released_staging_wrapper(&mut cache, id, 0).is_none(),
+        "the second wrapper over the same backing stays cached"
+    );
+    assert_eq!(staging_wrapped_bytes(&cache), 32 << 10);
+    assert!(
+        take_staging_wrapper(&mut cache, id, 0).is_some(),
+        "a backing change still retires a kept wrapper"
+    );
+
+    for (prior, backing, length) in [
+        (wrapper(0, 32 << 10), 0x90 << 16, 32 << 10),
+        (wrapper(0x92, 32 << 10), 0x92 << 16, 32 << 10),
+        (
+            MipStagingBuffer {
+                handle: buffer(0),
+                backing_ptr: 0x90 << 16,
+                length: 32 << 10,
+                ..MipStagingBuffer::default()
+            },
+            0x90 << 16,
+            16 << 10,
+        ),
+    ] {
+        let fresh = MipStagingBuffer::created(
+            buffer(0x93),
+            backing,
+            length,
+            std::sync::Arc::clone(&pages),
+            &prior,
+        );
+        assert!(
+            !fresh.kept_after_release,
+            "a never-released slot, a live wrapper and another length start over"
+        );
+    }
+    drop(first);
+}
+
+/// A submission that fails on the CPU ends the frame-latency wait of a `Present` behind it.
+///
+/// The failed frame publishes its sequence as retired, but it was never noted
+/// as submitted and never presents; the failure is what has to end the wait,
+/// and it reaches the device's mailbox too.
+#[test]
+fn a_failed_submission_ends_the_frame_latency_wait() {
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicU32, AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
+
+    use mtld3d_shared::mtl::PresentDebugFlags;
+    use objc2::{rc::Retained, runtime::ProtocolObject};
+    use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+
+    use crate::metal::{
+        DeviceRecord, FrameWait,
+        submission::{RetirementCounter, SubmitDescription},
+    };
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let queue: Retained<ProtocolObject<dyn MTLCommandQueue>> = device
+        .newCommandQueue()
+        .expect("a queue on the default device");
+    // SAFETY: the raw address carries this retain, which the record adopts and
+    // releases when it drops at the end of this test.
+    let handle = unsafe { MetalHandle::new(Retained::into_raw(queue) as u64) };
+    let record = DeviceRecord::new(handle, None, PresentDebugFlags::empty());
+    let failure = AtomicU32::new(0);
+    let floor = AtomicU64::new(0);
+    let draw = Arc::new(AtomicU64::new(0));
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    let floor_counter =
+        unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) };
+    record.present().frame_signal().attach(floor_counter);
+    let (sender, receiver) = mpsc::channel();
+    let waiter = {
+        let signal = Arc::clone(record.present().frame_signal());
+        let draw = Arc::clone(&draw);
+        std::thread::spawn(move || {
+            // SAFETY: the waiter owns a reference to the atomic it reads.
+            let draw = unsafe { RetirementCounter::from_address(Arc::as_ptr(&draw) as u64) };
+            let _ = sender.send(signal.wait(draw, 3, crate::metal::PACED_PRESENT_CAP));
+        })
+    };
+    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    // An upload prefix longer than the pass list fails the encode on the CPU.
+    let description = SubmitDescription {
+        blit_commands_need_encoder: false,
+        upload_pass_count: 1,
+        present_layer: MetalHandle::NULL,
+        present_texture: MetalHandle::NULL,
+        present_view: MetalHandle::NULL,
+        submit_seq: 3,
+        // SAFETY: the waiter's own reference keeps this atomic alive past the submission.
+        draw_retirement: unsafe { RetirementCounter::from_address(Arc::as_ptr(&draw) as u64) },
+        upload_retirement: RetirementCounter::NONE,
+        failed_submission: RetirementCounter::NONE,
+    };
+    let (_payload, outcome) = super::execute_submit(
+        Some(&record),
+        &description,
+        super::FramePayload::default(),
+        core::ptr::from_ref(&failure) as u64,
+    );
+    assert_ne!(outcome.status, 0, "the submission failed");
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(5)),
+        Ok(FrameWait::Ended)
+    );
+    waiter.join().unwrap();
+    assert_eq!(
+        failure.load(Ordering::Acquire),
+        1,
+        "the mailbox holds the failure"
+    );
+}
+
+/// A grown-out fan index pattern counts in the retained bytes while it waits, and leaves them.
+///
+/// The retained-bytes counter is the API thread's retention-cap input and the
+/// HUD's in-flight figure; a box the drain subtracts without having added it
+/// wraps the counter to near `u64::MAX`. Shutdown, like a reset, drains the
+/// queue without waiting for the gate, and has to subtract what it takes too.
+#[test]
+fn a_grown_fan_pattern_is_counted_in_the_retained_bytes_until_it_drains() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    use mtld3d_core::{
+        config::Mtld3dConfig, convert::fan_pattern_bytes, gpu_caps::GpuCaps, page_box::PageBox,
+    };
+    use mtld3d_shared::{clock_calibration::ClockCalibration, record_handle::DeviceRecordHandle};
+
+    use crate::encoder_service::EncoderContext;
+
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    // Nothing is submitted, so every queued entry's sequence (0) has retired.
+    let coherent = AtomicU64::new(0);
+    let retained = AtomicU64::new(0);
+    let context = EncoderContext {
+        // SAFETY: `device` stays retained for the whole test; the encoder takes a retain of its own.
+        device_handle: unsafe { MetalHandle::new(Retained::as_ptr(&device) as u64) },
+        record_handle: DeviceRecordHandle::NULL,
+        coherent_seq_ptr: core::ptr::from_ref(&coherent) as u64,
+        upload_coherent_seq_ptr: 0,
+        failed_submit_seq_ptr: 0,
+        retained_bytes_ptr: core::ptr::from_ref(&retained) as u64,
+        paced_present_seq_ptr: 0,
+        largest_free_word_ptr: 0,
+        guest_page_bytes_ptr: 0,
+        guest_pool_bytes_ptr: 0,
+    };
+    let mut enc = super::FrameEncoder::new(
+        GpuCaps::apple_silicon_default(),
+        Arc::new(Mtld3dConfig::default()),
+        None,
+        Arc::new(ClockCalibration::new()),
+        &context,
+        super::NativeSubmitSpawner,
+    )
+    .expect("an encoder on the default device");
+
+    assert_ne!(enc.fan_index_buffer(300), 0);
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "the live pattern is not retention"
+    );
+    assert_ne!(enc.fan_index_buffer(1000), 0);
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        PageBox::padded_len(fan_pattern_bytes(300)) as u64,
+        "the grown-out pattern waits in retention"
+    );
+    enc.drain_retired_resource_retention();
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "the drain takes back exactly what was added"
+    );
+
+    assert_ne!(enc.fan_index_buffer(5000), 0);
+    assert_ne!(retained.load(Ordering::Relaxed), 0);
+    enc.shutdown_cleanup();
+    assert_eq!(
+        retained.load(Ordering::Relaxed),
+        0,
+        "shutdown's drain takes back what it empties"
+    );
+    drop(enc);
+}

@@ -1,0 +1,395 @@
+//! Unit tests for the baseline diff and its gate verdicts.
+//!
+//! Synthetic baselines and run results drive every branch: a count up, a new
+//! site or a fresh crash regress, while a count down or a vanished crash gate
+//! as a stale baseline rather than passing quietly. The tolerance classes get
+//! their own cases, `flaky` in both directions and `ceiling` only below the
+//! pin, each applying only to sites already in the baseline.
+
+use std::collections::BTreeMap;
+
+use super::{VersionNote, diff, tests_version_note, unrecorded_legs};
+use crate::{
+    classify::Classification,
+    model::{Arch, Baseline, Gpu, Leg, Site, Subtest, SubtestBaseline, SubtestResult, Variant},
+    triage::DocSite,
+};
+
+const OCCLUSION_SKIP: &str = "device.c:6702: Tests skipped: Test loop took too long (100 ms), skipping large query tests.\r\n";
+const DEVICE_SUMMARY: &str = "00dc:device: 58913 tests executed (75 marked as todo, 0 as flaky, 786 failures), 21 skipped.\r\n";
+
+fn key() -> (Leg, Subtest) {
+    (
+        Leg {
+            arch: Arch::I686,
+            variant: Variant::Native,
+            gpu: Gpu::Apple,
+        },
+        Subtest::Device,
+    )
+}
+
+fn site(line: u32) -> Site {
+    Site {
+        file: "device.c".to_owned(),
+        line,
+    }
+}
+
+fn baseline_with(sites: &[(u32, u32)], crash: bool) -> Baseline {
+    let mut sub = SubtestBaseline {
+        crash,
+        sites: BTreeMap::new(),
+    };
+    for &(line, count) in sites {
+        sub.sites.insert(site(line), count);
+    }
+    let mut baseline = Baseline::default();
+    baseline.entries.insert(key(), sub);
+    baseline
+}
+
+fn classes_with(entries: &[(u32, Classification)]) -> BTreeMap<Site, DocSite> {
+    entries
+        .iter()
+        .map(|&(line, class)| {
+            (
+                site(line),
+                DocSite {
+                    class,
+                    cluster: "device.c/test".to_owned(),
+                },
+            )
+        })
+        .collect()
+}
+
+fn current_with(sites: &[(u32, u32)], crash: bool) -> BTreeMap<(Leg, Subtest), SubtestResult> {
+    let mut s = BTreeMap::new();
+    for &(line, count) in sites {
+        s.insert(site(line), count);
+    }
+    let mut map = BTreeMap::new();
+    map.insert(
+        key(),
+        SubtestResult {
+            crash,
+            sites: s,
+            panic: None,
+            ..Default::default()
+        },
+    );
+    map
+}
+
+#[test]
+fn crash_with_panic_surfaces_the_location() {
+    let base = baseline_with(&[(1, 5)], false);
+    let classes = classes_with(&[(1, Classification::Real)]);
+    let mut cur = current_with(&[(1, 5)], true);
+    cur.get_mut(&key()).unwrap().panic =
+        Some("panicked at d3d9/src/device.rs:1080:22 — misaligned pointer dereference".into());
+    let report = diff(&base, &classes, &cur);
+    assert!(report.regressed, "new crash is a regression");
+    assert!(
+        report
+            .text
+            .contains("rust panicked at d3d9/src/device.rs:1080:22"),
+        "{}",
+        report.text
+    );
+}
+
+#[test]
+fn count_up_is_regression() {
+    let base = baseline_with(&[(1, 5)], false);
+    let classes = classes_with(&[(1, Classification::Real)]);
+    let cur = current_with(&[(1, 6)], false);
+    assert!(diff(&base, &classes, &cur).regressed);
+}
+
+#[test]
+fn new_site_is_regression() {
+    let base = baseline_with(&[(1, 5)], false);
+    let classes = classes_with(&[(1, Classification::Real)]);
+    let cur = current_with(&[(1, 5), (2, 1)], false);
+    assert!(diff(&base, &classes, &cur).regressed);
+}
+
+#[test]
+fn new_crash_is_regression() {
+    let base = baseline_with(&[(1, 5)], false);
+    let classes = classes_with(&[(1, Classification::Real)]);
+    let cur = current_with(&[(1, 5)], true);
+    assert!(diff(&base, &classes, &cur).regressed);
+}
+
+#[test]
+fn count_down_and_crash_gone_gate_as_stale_baseline() {
+    // An improvement the baseline doesn't record is a stale baseline —
+    // tolerating it would widen the budget a later regression hides in.
+    let base = baseline_with(&[(1, 5)], true);
+    let classes = classes_with(&[(1, Classification::Real)]);
+    let cur = current_with(&[(1, 3)], false);
+    let report = diff(&base, &classes, &cur);
+    assert!(
+        !report.regressed,
+        "stale is not a regression: {}",
+        report.text
+    );
+    assert!(report.stale, "count down must gate: {}", report.text);
+    assert!(report.text.contains("STALE BASELINE"), "{}", report.text);
+}
+
+#[test]
+fn ceiling_site_below_the_pin_is_tolerated() {
+    // A ceiling pin is a cross-environment maximum: an environment where
+    // the site reads lower (or zero) must neither gate nor demand a
+    // re-record.
+    let base = baseline_with(&[(2234, 1)], false);
+    let classes = classes_with(&[(2234, Classification::Ceiling)]);
+    let cur = current_with(&[(2234, 0)], false);
+    let report = diff(&base, &classes, &cur);
+    assert!(!report.regressed, "{}", report.text);
+    assert!(
+        !report.stale,
+        "below a ceiling pin is not stale: {}",
+        report.text
+    );
+    assert!(
+        report.text.contains("ceiling (below the pin"),
+        "{}",
+        report.text
+    );
+}
+
+#[test]
+fn ceiling_site_above_the_pin_is_a_regression() {
+    let base = baseline_with(&[(2234, 1)], false);
+    let classes = classes_with(&[(2234, Classification::Ceiling)]);
+    let cur = current_with(&[(2234, 2)], false);
+    let report = diff(&base, &classes, &cur);
+    assert!(
+        report.regressed,
+        "above a ceiling pin gates: {}",
+        report.text
+    );
+}
+
+#[test]
+fn new_site_still_regresses_even_with_a_ceiling_class_entry() {
+    // Like flaky, the ceiling pin applies only to sites already in the
+    // baseline.
+    let base = baseline_with(&[(2234, 1)], false);
+    let classes = classes_with(&[
+        (2234, Classification::Ceiling),
+        (9999, Classification::Ceiling),
+    ]);
+    let cur = current_with(&[(2234, 1), (9999, 1)], false);
+    assert!(diff(&base, &classes, &cur).regressed);
+}
+
+#[test]
+fn unchanged_is_ok() {
+    let base = baseline_with(&[(1, 5)], false);
+    let classes = classes_with(&[(1, Classification::Real)]);
+    let cur = current_with(&[(1, 5)], false);
+    assert!(!diff(&base, &classes, &cur).regressed);
+}
+
+#[test]
+fn flaky_site_count_up_is_tolerated_not_a_regression() {
+    let base = baseline_with(&[(5368, 1)], false);
+    let classes = classes_with(&[(5368, Classification::Flaky)]);
+    let cur = current_with(&[(5368, 2)], false);
+    let report = diff(&base, &classes, &cur);
+    assert!(!report.regressed, "a flaky site flutter must not gate");
+    assert!(report.text.contains("flaky (count up"), "{}", report.text);
+    assert!(report.text.contains("ok"), "{}", report.text);
+}
+
+#[test]
+fn flaky_site_count_down_is_tolerated_not_an_improvement() {
+    let base = baseline_with(&[(5368, 1)], false);
+    let classes = classes_with(&[(5368, Classification::Flaky)]);
+    let cur = current_with(&[(5368, 0)], false);
+    let report = diff(&base, &classes, &cur);
+    assert!(!report.regressed);
+    // A flaky flutter down is noise, not a celebrated improvement.
+    assert!(report.text.contains("flaky (count down"), "{}", report.text);
+    assert!(
+        !report.text.contains("improved"),
+        "flaky flutter must not read as an improvement: {}",
+        report.text
+    );
+}
+
+#[test]
+fn new_site_still_regresses_even_with_a_flaky_class_entry() {
+    // The flaky pin applies only to sites already in the baseline; a
+    // brand-new failing site regresses even if prose for it exists.
+    let base = baseline_with(&[(5368, 1)], false);
+    let classes = classes_with(&[(5368, Classification::Flaky), (9999, Classification::Flaky)]);
+    let cur = current_with(&[(5368, 1), (9999, 1)], false);
+    assert!(diff(&base, &classes, &cur).regressed);
+}
+
+#[test]
+fn baseline_site_without_a_class_entry_is_flagged_untriaged() {
+    let base = baseline_with(&[(1, 5)], false);
+    let classes = classes_with(&[]);
+    let cur = current_with(&[(1, 5)], false);
+    let report = diff(&base, &classes, &cur);
+    assert!(!report.regressed);
+    assert!(report.text.contains("untriaged"), "{}", report.text);
+}
+
+#[test]
+fn observed_occlusion_skip_is_not_a_passing_assertion() {
+    let base = baseline_with(&[(6776, 1)], false);
+    let classes = classes_with(&[(6776, Classification::Expected)]);
+    let output = format!("{OCCLUSION_SKIP}{DEVICE_SUMMARY}");
+    let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
+    let report = diff(&base, &classes, &cur);
+    assert!(!report.regressed, "{}", report.text);
+    assert!(!report.stale, "{}", report.text);
+    assert!(
+        report.text.contains("device.c:6776  SKIPPED"),
+        "{}",
+        report.text
+    );
+    assert!(
+        report.text.contains(OCCLUSION_SKIP.trim()),
+        "{}",
+        report.text
+    );
+
+    let passed = BTreeMap::from([(
+        key(),
+        crate::scan::parse_subtest_output(DEVICE_SUMMARY, false),
+    )]);
+    assert!(diff(&base, &classes, &passed).stale);
+}
+
+#[test]
+fn occlusion_skip_requires_the_reviewed_site_and_message() {
+    let base = baseline_with(&[(6776, 1)], false);
+    let classes = classes_with(&[(6776, Classification::Expected)]);
+    for skip in [
+        OCCLUSION_SKIP.replace("6702", "6703"),
+        OCCLUSION_SKIP.replace("device.c", "visual.c"),
+        OCCLUSION_SKIP.replace("large query tests", "other tests"),
+        OCCLUSION_SKIP.replace("100 ms", "70 ms"),
+        OCCLUSION_SKIP.replace("100 ms", "unknown ms"),
+        OCCLUSION_SKIP.replace("Tests skipped", "Test marked todo"),
+    ] {
+        let output = format!("{skip}{DEVICE_SUMMARY}");
+        let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
+        let report = diff(&base, &classes, &cur);
+        assert!(report.stale, "{output}\n{}", report.text);
+        assert!(!report.text.contains("SKIPPED"), "{}", report.text);
+    }
+}
+
+#[test]
+fn occlusion_skip_does_not_excuse_other_missing_or_failing_sites() {
+    let base = baseline_with(&[(6776, 1), (5975, 1)], false);
+    let classes = classes_with(&[
+        (6776, Classification::Expected),
+        (5975, Classification::Expected),
+    ]);
+    let output = format!("{OCCLUSION_SKIP}{DEVICE_SUMMARY}");
+    let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
+    let report = diff(&base, &classes, &cur);
+    assert!(report.stale, "{}", report.text);
+    assert!(
+        report
+            .text
+            .contains("device.c:5975  1 -> 0  STALE BASELINE")
+    );
+
+    let output = format!(
+        "{output}device.c:5975: Test failed: Got unexpected result.\n\
+        device.c:6776: Test failed: Got unexpected query result.\n\
+        device.c:6776: Test failed: Got unexpected query result.\n"
+    );
+    let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, false))]);
+    let report = diff(&base, &classes, &cur);
+    assert!(report.regressed, "{}", report.text);
+    assert!(!report.text.contains("SKIPPED"), "{}", report.text);
+}
+
+#[test]
+fn occlusion_skip_does_not_hide_a_truncated_or_signaled_subtest() {
+    let base = baseline_with(&[(6776, 1)], false);
+    let classes = classes_with(&[(6776, Classification::Expected)]);
+    for (output, signaled) in [
+        (OCCLUSION_SKIP.to_owned(), false),
+        (format!("{OCCLUSION_SKIP}{DEVICE_SUMMARY}"), true),
+    ] {
+        let cur = BTreeMap::from([(key(), crate::scan::parse_subtest_output(&output, signaled))]);
+        let report = diff(&base, &classes, &cur);
+        assert!(report.regressed, "{}", report.text);
+        assert!(report.stale, "{}", report.text);
+        assert!(!report.text.contains("SKIPPED"), "{}", report.text);
+    }
+}
+
+#[test]
+fn a_leg_the_baseline_never_recorded_is_named_and_its_sites_regress() {
+    let base = baseline_with(&[(6776, 1)], false);
+    assert_eq!(
+        unrecorded_legs(&base, &current_with(&[(6776, 1)], false)),
+        Vec::<Leg>::new()
+    );
+    let arm64 = Leg {
+        arch: Arch::I686Arm64,
+        variant: Variant::Native,
+        gpu: Gpu::Apple,
+    };
+    let mut cur = current_with(&[(6776, 1)], false);
+    let result = cur.remove(&key()).expect("current_with fills key()");
+    cur.insert((arm64, Subtest::Device), result);
+    assert_eq!(unrecorded_legs(&base, &cur), vec![arm64]);
+    let report = diff(
+        &base,
+        &classes_with(&[(6776, Classification::Expected)]),
+        &cur,
+    );
+    assert!(report.regressed, "{}", report.text);
+}
+
+fn baseline_of(version: &str) -> Baseline {
+    Baseline {
+        wine_version: version.to_owned(),
+        entries: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn the_header_is_held_against_the_tests_wine_version() {
+    let base = baseline_of("wine-11.19");
+    assert_eq!(tests_version_note(&base, Some("wine-11.19")), None);
+    assert_eq!(
+        tests_version_note(&base, Some("wine-11.20")),
+        Some(VersionNote::Differs {
+            baseline: "wine-11.19".to_owned(),
+            tests: "wine-11.20".to_owned(),
+        })
+    );
+    assert_eq!(
+        tests_version_note(&baseline_of(""), Some("wine-11.20")),
+        None,
+        "a baseline that names no version has nothing to compare"
+    );
+}
+
+#[test]
+fn an_unknown_tests_version_skips_the_comparison() {
+    for header in ["wine-11.19", ""] {
+        assert_eq!(
+            tests_version_note(&baseline_of(header), None),
+            Some(VersionNote::Unknown)
+        );
+    }
+}

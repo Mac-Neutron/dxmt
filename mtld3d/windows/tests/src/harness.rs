@@ -1,0 +1,3729 @@
+//! The [`Harness`]: one D3D9 factory + window + device per test.
+//!
+//! Safe wrappers around every device/factory vtable method the suite needs.
+//! All `unsafe` COM dispatch lives here and in [`crate::resource`]; test files
+//! call only safe methods and assert on the returned `HRESULT`s / pixels.
+
+use core::{cell::Cell, ffi::c_void};
+use std::{
+    fs::{File, OpenOptions, TryLockError},
+    path::PathBuf,
+    sync::{self, Mutex, MutexGuard, PoisonError, RwLock},
+    time::{Duration, Instant},
+};
+
+use mtld3d_types::{
+    D3D_OK, D3DADAPTER_IDENTIFIER9, D3DCAPS9, D3DCLEAR_TARGET, D3DCREATE_HARDWARE_VERTEXPROCESSING,
+    D3DDEVTYPE_HAL, D3DGAMMARAMP, D3DLIGHT9, D3DMATERIAL9, D3DPRESENT_PARAMETERS, D3DRECT,
+    D3DSDK_VERSION, D3DSWAPEFFECT_DISCARD, D3DTA_DIFFUSE, D3DTOP_SELECTARG1, D3DTSS_ALPHAARG1,
+    D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLOROP, D3DVIEWPORT9, Guid, IDirect3D9Vtbl,
+    IDirect3DDevice9Vtbl, IDirect3DSwapChain9Vtbl,
+};
+
+use crate::{
+    check::expect_ok,
+    ffi::{Direct3DCreate9, direct3d_create9_ex},
+    resource::{
+        CubeTexture, IndexBuffer, PixelShader, Query, StateBlock, Surface, SwapChain, Texture,
+        VertexBuffer, VertexDeclaration, VertexShader, VolumeTexture,
+    },
+    vtbl::deref_vtbl,
+    win32,
+};
+
+mod cursor_bitmap;
+pub mod extended;
+
+/// The process environment, which every `Direct3DCreate9` reads.
+///
+/// Configuration resolves from `MTLD3D_CONFIG` inside that call and belongs
+/// to the interface it returns, and the tests of the suite run on several
+/// threads of one process. So a test that needs an option of its own never
+/// leaves it in the environment: its creation holds this lock exclusively
+/// while it appends the entries, creates the interface and puts the
+/// variable back, and every other creation, and every read of the
+/// suite-wide value, holds it shared. A spawn holds it shared too: the
+/// child's environment block is copied out of this process at the spawn,
+/// which is a read of the variable like any other.
+static ENVIRONMENT: RwLock<()> = RwLock::new(());
+
+/// The value the seeded `try_*` getters put in their out slot before the call.
+///
+/// A getter that leaves the slot alone reads back as this, which no state a
+/// test sets holds.
+pub const UNWRITTEN: u32 = 0xDEAD_BEEF;
+
+/// The environment variable the layer reads its configuration overrides from.
+const CONFIG_VAR: &str = "MTLD3D_CONFIG";
+
+/// The display mode, held by one harness of the machine at a time.
+///
+/// A fullscreen device sets a mode the whole session sees, so two of them
+/// live at once would each read the other's, and a test that reads the
+/// mode, the screen size or a rect derived from them while another test's
+/// device is fullscreen reads that test's mode. A harness takes the mode
+/// when it goes fullscreen (created that way, or `Reset` into it) or when
+/// the test asks through [`Harness::hold_display_mode`], and keeps it until
+/// it is torn down, through a windowed `Reset` too, so everything the test
+/// reads after the first take is its own device's doing. A windowed device
+/// whose test reads nothing of the mode never waits for it. One harness
+/// holding the mode per test at a time: a second one on the same thread
+/// would wait for the first forever.
+///
+/// The mode is not this process's alone, nor its wineserver's: every Wine
+/// process of the macOS session reads and sets the same one, including the
+/// test processes of another checkout's isolated run under a wineserver of
+/// their own. So the harness that holds it here also holds the exclusive lock
+/// of [`lock_machine_display_mode`], taken after this process's turn and given
+/// back with it, which makes the take one per machine rather than one per
+/// process. It is a static because the resource is machine-wide: the open
+/// lock file is the hold, and no single harness outlives the others to own
+/// it.
+///
+/// The hold is a field under the mutex rather than a held `MutexGuard`,
+/// because the holder is a harness field and a guard there would put a
+/// significant drop into every test's `Harness`. A thread waiting for its
+/// turn never blocks on the mutex or on the file lock: it owns the window of
+/// its harness, so it answers the messages sent to it between looks
+/// ([`MODESET_POLL`]).
+static MODESET: Mutex<ModeSet> = Mutex::new(ModeSet {
+    lock: None,
+    released: None,
+});
+
+/// Whether a harness of this process holds the display mode, and when it was last given back.
+struct ModeSet {
+    /// The locked machine-wide file while a harness holds the mode.
+    lock: Option<File>,
+    /// When this process last gave the mode back.
+    released: Option<Instant>,
+}
+
+/// How long a process waits after giving the display mode back before it asks again.
+///
+/// A process waiting for the mode asks again every [`MODESET_POLL`], and one
+/// whose harness takes the machine-wide lock through Wine's blocking wait
+/// every 100 ms, which is how often Wine retries a lock another wineserver
+/// holds. The process that just gave the mode back would ask again within
+/// the same millisecond, so without a pause one process would keep the mode
+/// for its whole run of display-mode tests and another run's tests would
+/// wait for all of them. A pause longer than either interval lets a waiting
+/// process in first, so concurrent runs alternate test by test.
+/// Uncontended, it costs one pause per back-to-back take.
+const MODESET_HANDOFF_PAUSE: Duration = Duration::from_millis(150);
+
+/// How long a thread waiting for the display mode waits for a sent message before it looks again.
+///
+/// A mode change sends `WM_DISPLAYCHANGE` to every top-level window of the
+/// wineserver and waits up to two seconds for each to answer, and the thread
+/// waiting for its turn owns a window when its test asks for the mode after
+/// creating its device. So it waits on its message queue, answering what other
+/// threads send it, and looks at the mode after each message and at least
+/// this often. Each look is one `try_lock`, of the mutex or of the file.
+const MODESET_POLL: Duration = Duration::from_millis(10);
+
+/// The directory of the machine-wide display-mode lock, relative to the user's home.
+const MODESET_LOCK_DIR: &str = r"Library\Caches\mtld3d";
+/// The lock file's name in [`MODESET_LOCK_DIR`].
+const MODESET_LOCK_FILE: &str = "e2e-display-mode.lock";
+
+/// Take the session's display mode, waiting for the harness or process that holds it.
+///
+/// The machine-wide lock is taken under the mutex, so this process asks for
+/// it on one thread at a time and never holds it twice. Every wait here
+/// answers the messages other threads send to this thread's windows. A panic
+/// between this take and the harness that owns it ends the process through
+/// the failure hook every harness installs first, and the exit gives the lock
+/// back.
+fn take_display_mode() {
+    let mut mode = wait_for_this_process_turn();
+    if let Some(released) = mode.released {
+        win32::answer_sent_messages_for(MODESET_HANDOFF_PAUSE.saturating_sub(released.elapsed()));
+    }
+    mode.lock = Some(lock_machine_display_mode());
+}
+
+/// This process's display-mode record, once no other thread uses it and no harness holds the mode.
+///
+/// Looks with `try_lock` and waits between looks answering sent messages,
+/// so a thread that owns a window never sits in the mutex while another
+/// thread of the process waits for the machine-wide lock under it.
+fn wait_for_this_process_turn() -> MutexGuard<'static, ModeSet> {
+    loop {
+        let mode = match MODESET.try_lock() {
+            Ok(mode) => Some(mode),
+            Err(sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(sync::TryLockError::WouldBlock) => None,
+        };
+        if let Some(mode) = mode.filter(|mode| mode.lock.is_none()) {
+            return mode;
+        }
+        win32::wait_answering_sent_messages(MODESET_POLL);
+    }
+}
+
+/// Give the session's display mode back.
+///
+/// Dropping the lock file closes it, which releases the machine-wide lock.
+/// The threads waiting for the mode see it free at their next look.
+fn release_display_mode() {
+    let mut mode = MODESET.lock().unwrap_or_else(PoisonError::into_inner);
+    mode.lock = None;
+    mode.released = Some(Instant::now());
+}
+
+/// Lock the machine-wide display-mode file exclusively, waiting for the process that holds it.
+///
+/// The file sits in the user's cache directory, which every test process of
+/// the user reaches at the same path whatever its prefix, so test processes
+/// of all checkouts and both architectures meet on it. `LockFileEx` is the
+/// lock: Wine's server mirrors it as a POSIX record lock on the host file, so
+/// it excludes the processes of another wineserver too. It ends with the
+/// handle: when the harness gives the mode back, and when the process exits
+/// or is killed, since the wineserver closes a dead process's handles and the
+/// kernel drops a dead server's locks. The wait for another process tries the
+/// lock every [`MODESET_POLL`] and answers sent messages between tries,
+/// since Wine's own blocking wait answers none. A wait for another process is
+/// announced on stderr, which the runner keeps only for a process that ends
+/// with tests unaccounted for, so a timed-out test's kept stderr says whether
+/// it was waiting for the mode.
+///
+/// # Panics
+///
+/// Panics when Wine names no home directory or the file cannot be opened or
+/// locked, since a test that cannot take the mode cannot trust what it reads.
+fn lock_machine_display_mode() -> File {
+    let home = std::env::var("WINEHOMEDIR").expect("Wine names the home directory in WINEHOMEDIR");
+    // Wine gives the directory as an NT path, `\??\` and then a drive or its
+    // `unix` namespace, and its own shell32 opens files under it the same
+    // way, through the Win32 spelling of that prefix, `\\?\`.
+    let home = home
+        .strip_prefix(r"\??\")
+        .unwrap_or_else(|| panic!("WINEHOMEDIR is not an NT path: {home}"));
+    let dir = PathBuf::from(format!(r"\\?\{home}")).join(MODESET_LOCK_DIR);
+    std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        panic!(
+            "create the display-mode lock's directory {}: {e}",
+            dir.display()
+        )
+    });
+    let path = dir.join(MODESET_LOCK_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open the display-mode lock {}: {e}", path.display()));
+    let mut announced = false;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return file,
+            Err(TryLockError::WouldBlock) => {
+                if !announced {
+                    eprintln!(
+                        "[e2e] display mode held by another process; waiting on {}",
+                        path.display()
+                    );
+                    announced = true;
+                }
+                win32::wait_answering_sent_messages(MODESET_POLL);
+            }
+            Err(TryLockError::Error(e)) => panic!("lock the display mode {}: {e}", path.display()),
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// What a [`Harness`] has given up or holds beyond its own objects.
+    #[derive(Clone, Copy)]
+    struct HarnessState: u8 {
+        /// [`Harness::release_device`] has released the device reference.
+        const DEVICE_RELEASED = 1 << 0;
+        /// The harness holds the session's display mode until it is torn down.
+        const HOLDS_DISPLAY_MODE = 1 << 1;
+        /// The device window is another harness's, which destroys it.
+        const BORROWED_WINDOW = 1 << 2;
+    }
+}
+
+/// Which factory export a [`Harness`] creates its interface with, and how it creates the device.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Factory {
+    /// `Direct3DCreate9`, then `CreateDevice`.
+    Plain,
+    /// `Direct3DCreate9Ex`, then the base `CreateDevice`, which still makes an extended device.
+    Extended,
+    /// `Direct3DCreate9Ex`, then `CreateDeviceEx` with no display mode.
+    ExtendedDeviceEx,
+}
+
+/// How a [`Harness`] device is created.
+pub struct HarnessConfig {
+    pub width: u32,
+    pub height: u32,
+    pub back_buffer_format: u32,
+    /// `Some(fmt)` enables an auto depth-stencil of `fmt` (e.g. `D3DFMT_D24S8`).
+    pub depth_format: Option<u32>,
+    /// `WS_VISIBLE`. Hidden (default) keeps parallel runs off-screen.
+    pub visible: bool,
+    /// Borderless by default; window-management tests opt into a non-client frame.
+    ///
+    /// Wine builds the title bar and controls on the `AppKit` main thread,
+    /// serializing window creation and destruction even for hidden windows.
+    pub window_style: win32::WindowStyle,
+    /// Configuration entries for this harness's interface alone.
+    ///
+    /// `key=value` entries, `;`-separated, appended to the suite-wide
+    /// `MTLD3D_CONFIG` for the one `Direct3DCreate9` this harness makes and
+    /// taken out of the environment again before the call returns. The
+    /// parser keeps the last entry for a key, so these win over a
+    /// `make test SCALE=<n>` or `INTEL=1` run. Empty (the default) means
+    /// the suite-wide configuration.
+    pub config_entries: &'static str,
+    /// `D3DPRESENT_PARAMETERS.Windowed`, in its wire encoding (1 = windowed).
+    pub windowed: u32,
+    /// `CreateDevice` behaviour flags (`D3DCREATE_*`).
+    pub behavior_flags: u32,
+    /// `D3DPRESENT_PARAMETERS.Flags`, e.g. `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`.
+    pub present_flags: u32,
+    /// `D3DPRESENT_PARAMETERS.MultiSampleType` (`D3DMULTISAMPLE_*`).
+    pub multi_sample_type: u32,
+    /// `D3DPRESENT_PARAMETERS.MultiSampleQuality`.
+    pub multi_sample_quality: u32,
+    /// A window to create the device on instead of one of the harness's own; `0` creates one.
+    ///
+    /// The harness never destroys a window it was given, so the harness that
+    /// owns it outlives this one.
+    pub device_window: usize,
+    /// `D3DPRESENT_PARAMETERS.PresentationInterval` (`D3DPRESENT_INTERVAL_*`).
+    ///
+    /// `0` (the default) is `D3DPRESENT_INTERVAL_DEFAULT`, which waits for the
+    /// display; a benchmark that times frames asks for
+    /// `D3DPRESENT_INTERVAL_IMMEDIATE` so the refresh rate does not bound them.
+    pub presentation_interval: u32,
+    /// The factory export and device create; [`Factory::Plain`] by default.
+    pub factory: Factory,
+}
+
+impl Default for HarnessConfig {
+    fn default() -> Self {
+        Self {
+            width: 640,
+            height: 480,
+            back_buffer_format: mtld3d_types::D3DFMT_X8R8G8B8,
+            depth_format: None,
+            visible: false,
+            window_style: win32::WindowStyle::Borderless,
+            config_entries: "",
+            windowed: 1,
+            behavior_flags: D3DCREATE_HARDWARE_VERTEXPROCESSING,
+            present_flags: 0,
+            multi_sample_type: 0,
+            multi_sample_quality: 0,
+            device_window: 0,
+            presentation_interval: 0,
+            factory: Factory::Plain,
+        }
+    }
+}
+
+/// Scalar arguments for [`Harness::draw_indexed_primitive_up`].
+///
+/// The fixed D3D9 `DrawIndexedPrimitiveUP` parameters; the index and vertex
+/// slices are passed separately.
+pub struct DrawIndexedUpParams {
+    pub prim: u32,
+    pub min_vertex_index: u32,
+    pub num_vertices: u32,
+    pub prim_count: u32,
+    pub index_format: u32,
+}
+
+/// The suite-wide `MTLD3D_CONFIG`, read under the shared environment lock.
+///
+/// `None` when the variable is unset. The lock keeps a harness that is
+/// publishing entries of its own out of the read, so the value is always
+/// the suite-wide one, never a merged window in flight on another thread.
+#[must_use]
+pub fn config_var() -> Option<String> {
+    let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
+    std::env::var(CONFIG_VAR).ok()
+}
+
+/// Run a child process under the suite-wide `MTLD3D_CONFIG` plus `entries`.
+///
+/// A test that runs its workload in a private copy of the test executable
+/// spawns it from a thread of a running suite, and a `Command` copies the
+/// whole environment of this process as it stands at the spawn. A harness
+/// creating an interface of its own holds its merged entries in the variable
+/// for the length of that call, so a child spawned inside that window would
+/// run its whole workload under another test's configuration, and the copy
+/// is itself a read of the environment while it is being written. Both are
+/// closed here: the value is read through [`config_var`], which takes the
+/// shared lock, and fixed on the command rather than read again when the
+/// child starts, and the spawn runs under the shared lock too, so no window
+/// is ever open across it.
+///
+/// The lock is held for the spawn and nothing else. `spawn` returns once the
+/// child exists and its environment block has been copied, so the wait for
+/// the child's run happens with the lock released and a harness publishing
+/// entries of its own waits for a spawn rather than for a whole workload.
+///
+/// `entries` are the child's own `key=value` entries, `;`-separated. They
+/// win over the suite-wide value, because the parser keeps the last entry
+/// for a key. Empty means the suite-wide configuration alone.
+///
+/// The child gets the pipes and the null standard input that
+/// `Command::output` would have given it, and the caller gets its captured
+/// output.
+///
+/// # Errors
+/// Returns the spawn or wait error, for the caller to name its child in.
+pub fn run_child(
+    command: &mut std::process::Command,
+    entries: &str,
+) -> std::io::Result<std::process::Output> {
+    let suite = config_var().unwrap_or_default();
+    let config = if entries.is_empty() {
+        suite
+    } else {
+        format!("{suite};{entries}")
+    };
+    command
+        .env(CONFIG_VAR, config)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = {
+        let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
+        command.spawn()?
+    };
+    child.wait_with_output()
+}
+
+/// True when the suite rasterizes at the resolution D3D9 reports.
+///
+/// `make test SCALE=<n>` puts `render.scale` in `MTLD3D_CONFIG` for every test
+/// process: the frame is then rasterized smaller and resolved back up to the
+/// reported resolution on the way to a readback. A probe within a pixel or two
+/// of a colour boundary reads that resolve rather than what was rasterized, so
+/// an assertion that needs single-pixel resolution asks this first and pins its
+/// exact shape at the default scale. Everything that stays several pixels clear
+/// of a boundary holds at any scale and must not consult it.
+///
+/// Reads the environment the device reads, through [`config_value`], so it
+/// is the suite-wide value: a harness that pins its own scale through
+/// [`HarnessConfig::config_entries`] knows what it asked for.
+#[must_use]
+pub fn render_scale_is_identity() -> bool {
+    let Some(value) = config_value("render.scale") else {
+        return true;
+    };
+    // A value the parser rejects leaves the device at the identity, so
+    // answering `true` matches what the frame will do.
+    value
+        .parse::<f32>()
+        .map_or(true, |scale| (scale - 1.0).abs() < f32::EPSILON)
+}
+
+/// The suite-wide `MTLD3D_CONFIG` value of `key`, trimmed, or `None` when it names none.
+///
+/// The last segment for the key wins, because that is the one the config
+/// parser keeps. This is the suite-wide value: a harness that sets the key
+/// through [`HarnessConfig::config_entries`] knows what it asked for.
+#[must_use]
+pub fn config_value(key: &str) -> Option<String> {
+    config_var()?
+        .split(';')
+        .filter_map(|segment| segment.split_once('='))
+        .filter(|(name, _)| name.trim() == key)
+        .map(|(_, value)| value.trim().to_owned())
+        .next_back()
+}
+
+/// A live device with its factory and window. Drops them in COM-correct order.
+pub struct Harness {
+    d3d9: *mut c_void,
+    device: *mut c_void,
+    state: Cell<HarnessState>,
+    hwnd: usize,
+    width: Cell<u32>,
+    height: Cell<u32>,
+    back_buffer_format: u32,
+    depth_format: Option<u32>,
+    /// `CreateDevice` behaviour flags the device was created with.
+    behavior_flags: u32,
+    present_flags: u32,
+    /// `D3DMULTISAMPLE_TYPE` the swap chain was created with, carried into `reset`.
+    multi_sample_type: u32,
+    /// The entries the interface was created with on top of the suite-wide configuration.
+    config_entries: String,
+    /// The factory export the interface came from: whether it and its device are extended.
+    factory: Factory,
+}
+
+/// The factory export `factory` names, called under the environment lock.
+///
+/// Shared for the suite-wide configuration; exclusive, with `entries`
+/// appended to `MTLD3D_CONFIG` for the duration of the call and the variable
+/// put back afterwards, for a harness that carries entries of its own.
+///
+/// The thread names the test it runs first: this is the one call every test
+/// that reaches the layer makes, so the account of what was in flight when a
+/// process died is written before anything can end it.
+///
+/// # Panics
+/// Panics if the factory cannot be created.
+fn create_factory(entries: &str, factory: Factory) -> *mut c_void {
+    crate::in_flight::announce();
+    let d3d9 = if entries.is_empty() {
+        let _shared = ENVIRONMENT.read().unwrap_or_else(PoisonError::into_inner);
+        call_factory(factory)
+    } else {
+        let exclusive = ENVIRONMENT.write().unwrap_or_else(PoisonError::into_inner);
+        let previous = std::env::var(CONFIG_VAR).ok();
+        let merged = format!("{};{entries}", previous.as_deref().unwrap_or_default());
+        // SAFETY: the exclusive lock above keeps every reader of the variable
+        // in this process out until it is put back: interfaces read it only
+        // inside `Direct3DCreate9`, always under the shared lock, and the one
+        // other reader, the environment block a child spawn copies, takes the
+        // shared lock across the spawn in `run_child`.
+        unsafe { std::env::set_var(CONFIG_VAR, merged) };
+        let d3d9 = call_factory(factory);
+        match previous {
+            // SAFETY: as above, still under the exclusive lock.
+            Some(value) => unsafe { std::env::set_var(CONFIG_VAR, value) },
+            // SAFETY: as above, still under the exclusive lock.
+            None => unsafe { std::env::remove_var(CONFIG_VAR) },
+        }
+        drop(exclusive);
+        d3d9
+    };
+    assert!(!d3d9.is_null(), "the factory export returned null");
+    assert!(
+        win32::layer_loaded(),
+        "Direct3DCreate9 answered, but no mtld3d.dll is loaded: this process got another \
+         d3d9.dll than the layer's (the Wine's own, through its compat database or a stale \
+         placeholder in the prefix), so a test here would not test the layer"
+    );
+    d3d9
+}
+
+/// Call the factory export `factory` names; the caller holds the environment lock.
+///
+/// # Panics
+/// Panics if `d3d9.dll` does not export `Direct3DCreate9Ex` or it fails.
+fn call_factory(factory: Factory) -> *mut c_void {
+    if factory == Factory::Plain {
+        // SAFETY: Win32-style factory entrypoint with no preconditions.
+        return unsafe { Direct3DCreate9(D3DSDK_VERSION) };
+    }
+    let create_ex = direct3d_create9_ex().expect("d3d9.dll exports Direct3DCreate9Ex");
+    let mut out: *mut c_void = core::ptr::null_mut();
+    // SAFETY: factory entrypoint with a writable out slot.
+    let hr = unsafe { create_ex(D3DSDK_VERSION, &raw mut out) };
+    assert_eq!(hr, 0, "Direct3DCreate9Ex failed: 0x{hr:08X}");
+    out
+}
+
+impl Harness {
+    /// A 640×480 X8R8G8B8 device with no depth buffer.
+    ///
+    /// # Panics
+    /// Panics if the factory, window, or device cannot be created.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::create(&HarnessConfig::default())
+    }
+
+    /// A 640×480 device with an auto D24S8 depth-stencil.
+    #[must_use]
+    pub fn with_depth() -> Self {
+        Self::create(&HarnessConfig {
+            depth_format: Some(mtld3d_types::D3DFMT_D24S8),
+            ..HarnessConfig::default()
+        })
+    }
+
+    /// A 640×480 device whose back buffer carries `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`.
+    ///
+    /// The only configuration in which `LockRect` and `GetDC` on the implicit
+    /// back buffer are accepted.
+    #[must_use]
+    pub fn with_lockable_back_buffer() -> Self {
+        Self::create(&HarnessConfig {
+            present_flags: mtld3d_types::D3DPRESENTFLAG_LOCKABLE_BACKBUFFER,
+            ..HarnessConfig::default()
+        })
+    }
+
+    /// A fullscreen `width`×`height` X8R8G8B8 device with no depth buffer.
+    ///
+    /// # Panics
+    /// Panics if the factory, window, or device cannot be created.
+    #[must_use]
+    pub fn fullscreen(width: u32, height: u32) -> Self {
+        Self::create(&HarnessConfig {
+            width,
+            height,
+            windowed: 0,
+            ..HarnessConfig::default()
+        })
+    }
+
+    /// A factory only — no window or device.
+    ///
+    /// For pure `IDirect3D9` query tests (`Check*`, adapter enumeration, caps);
+    /// device methods must not be called.
+    ///
+    /// # Panics
+    /// Panics if the factory cannot be created.
+    #[must_use]
+    pub fn factory_only() -> Self {
+        Self::factory_only_with_config("")
+    }
+
+    /// A factory only, created under `config_entries` of its own.
+    ///
+    /// [`Self::factory_only`] with [`HarnessConfig::config_entries`]: the
+    /// interface resolves the suite-wide configuration plus `entries`.
+    ///
+    /// # Panics
+    /// Panics if the factory cannot be created.
+    #[must_use]
+    pub fn factory_only_with_config(entries: &str) -> Self {
+        Self::factory_only_from(entries, Factory::Plain)
+    }
+
+    /// A factory only, made by `Direct3DCreate9Ex`: an `IDirect3D9Ex` and no device.
+    ///
+    /// # Panics
+    /// Panics if `Direct3DCreate9Ex` fails.
+    #[must_use]
+    pub fn factory_only_extended() -> Self {
+        Self::factory_only_from("", Factory::Extended)
+    }
+
+    fn factory_only_from(entries: &str, factory: Factory) -> Self {
+        win32::install_failure_exit_hook();
+        let d3d9 = create_factory(entries, factory);
+        Self {
+            d3d9,
+            device: core::ptr::null_mut(),
+            state: Cell::new(HarnessState::empty()),
+            hwnd: 0,
+            width: Cell::new(0),
+            height: Cell::new(0),
+            back_buffer_format: mtld3d_types::D3DFMT_X8R8G8B8,
+            depth_format: None,
+            behavior_flags: 0,
+            present_flags: 0,
+            multi_sample_type: 0,
+            config_entries: entries.to_owned(),
+            factory,
+        }
+    }
+
+    /// A 640×480 device whose interface resolves `entries` on top of the suite-wide configuration.
+    ///
+    /// [`Self::new`] with [`HarnessConfig::config_entries`] set; the
+    /// entries apply to this harness alone.
+    ///
+    /// # Panics
+    /// Panics if the factory, window, or device cannot be created.
+    #[must_use]
+    pub fn with_config(entries: &'static str) -> Self {
+        Self::create(&HarnessConfig {
+            config_entries: entries,
+            ..HarnessConfig::default()
+        })
+    }
+
+    /// Create a device from an explicit [`HarnessConfig`].
+    ///
+    /// # Panics
+    /// Panics if the factory, window, or device cannot be created.
+    #[must_use]
+    pub fn create(cfg: &HarnessConfig) -> Self {
+        win32::install_failure_exit_hook();
+        let d3d9 = create_factory(cfg.config_entries, cfg.factory);
+        let mut state = HarnessState::empty();
+        if cfg.windowed == 0 {
+            take_display_mode();
+            state |= HarnessState::HOLDS_DISPLAY_MODE;
+        }
+
+        let hwnd = if cfg.device_window == 0 {
+            let width = i32::try_from(cfg.width).expect("width fits i32");
+            let height = i32::try_from(cfg.height).expect("height fits i32");
+            win32::create_styled_window(width, height, cfg.visible, &cfg.window_style)
+        } else {
+            state |= HarnessState::BORROWED_WINDOW;
+            cfg.device_window
+        };
+
+        let mut pp = present_params(cfg, hwnd);
+        let mut device: *mut c_void = core::ptr::null_mut();
+        let hr = if cfg.factory == Factory::ExtendedDeviceEx {
+            // SAFETY: `d3d9` came from `Direct3DCreate9Ex` and `device` is a
+            // writable local.
+            unsafe {
+                extended::create_device_ex(d3d9, cfg.behavior_flags, &mut pp, &raw mut device)
+            }
+        } else {
+            // SAFETY: D3D9 factory vtable thunk; `d3d9` is live, `&mut pp` and
+            // `&mut device` are writable, focus window null is permitted.
+            let vtbl = unsafe { deref_vtbl::<IDirect3D9Vtbl>(d3d9) };
+            // SAFETY: D3D9 vtable thunk; all pointers above are valid for the call.
+            unsafe {
+                (vtbl.create_device)(
+                    d3d9,
+                    0,
+                    D3DDEVTYPE_HAL,
+                    core::ptr::null_mut(),
+                    cfg.behavior_flags,
+                    (&raw mut pp).cast::<c_void>(),
+                    &raw mut device,
+                )
+            }
+        };
+        assert_eq!(hr, 0, "CreateDevice failed: 0x{hr:08X}");
+        assert!(!device.is_null(), "CreateDevice returned null device");
+
+        Self {
+            d3d9,
+            device,
+            state: Cell::new(state),
+            hwnd,
+            width: Cell::new(cfg.width),
+            height: Cell::new(cfg.height),
+            back_buffer_format: cfg.back_buffer_format,
+            depth_format: cfg.depth_format,
+            behavior_flags: cfg.behavior_flags,
+            present_flags: cfg.present_flags,
+            multi_sample_type: cfg.multi_sample_type,
+            config_entries: cfg.config_entries.to_owned(),
+            factory: cfg.factory,
+        }
+    }
+
+    // ── Accessors ──
+
+    /// The raw `IDirect3DDevice9*`.
+    #[must_use]
+    pub const fn device(&self) -> *mut c_void {
+        self.device
+    }
+
+    /// The raw `IDirect3D9*` factory.
+    #[must_use]
+    pub const fn factory(&self) -> *mut c_void {
+        self.d3d9
+    }
+
+    /// The device window handle.
+    #[must_use]
+    pub const fn hwnd(&self) -> usize {
+        self.hwnd
+    }
+
+    /// The configuration entries this harness's interface resolved on top of the suite-wide ones.
+    ///
+    /// Empty when it asked for none ([`HarnessConfig::config_entries`]).
+    #[must_use]
+    pub fn config_entries(&self) -> &str {
+        &self.config_entries
+    }
+
+    /// The `CreateDevice` behaviour flags (`D3DCREATE_*`) the device was created with.
+    #[must_use]
+    pub const fn behavior_flags(&self) -> u32 {
+        self.behavior_flags
+    }
+
+    /// Current backbuffer dimensions (tracks `reset`).
+    #[must_use]
+    pub const fn dims(&self) -> (u32, u32) {
+        (self.width.get(), self.height.get())
+    }
+
+    // ── IUnknown / device-misc plumbing ──
+
+    /// `IDirect3D9::AddRef` — returns the new reference count.
+    pub fn add_ref_factory(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.d3d9` is live.
+        unsafe { (self.factory_vtbl().add_ref)(self.d3d9) }
+    }
+
+    /// `IDirect3D9::Release` — returns the reference count after the decrement.
+    pub fn release_factory(&self) -> u32 {
+        // SAFETY: vtable thunk; balances a prior `add_ref_factory`, so the object stays live.
+        unsafe { (self.factory_vtbl().release)(self.d3d9) }
+    }
+
+    /// Release a device reference a `GetDevice` handed out.
+    ///
+    /// Returns the count after the decrement, so a caller can check the
+    /// reference it was given is the one it gave back.
+    ///
+    /// # Safety
+    /// `device` is a reference obtained from a `GetDevice` on this harness's
+    /// device and not yet released.
+    ///
+    /// # Panics
+    /// If `device` is not this harness's device.
+    pub unsafe fn release_device_ref(&self, device: *mut c_void) -> u32 {
+        assert_eq!(device, self.device, "not this harness's device");
+        // SAFETY: balances the reference `GetDevice` took, per the contract
+        // above, so the device stays live.
+        unsafe { (self.dev_vtbl().release)(device) }
+    }
+
+    /// Release the harness's own reference to the device.
+    ///
+    /// What an application dropping its last device reference does. Returns
+    /// the count after the decrement, so a caller can see what the resources
+    /// it still holds are keeping alive. [`Self::device`] keeps naming the
+    /// device for a `GetDevice` comparison, and `Drop` no longer releases it,
+    /// so every later call goes through a reference some child resource holds:
+    /// a harness whose device count reached zero here must not be used again.
+    ///
+    /// # Panics
+    /// Panics if the harness's device reference has already been released.
+    pub fn release_device(&self) -> u32 {
+        assert!(
+            !self.has(HarnessState::DEVICE_RELEASED),
+            "the device reference is released once"
+        );
+        self.set(HarnessState::DEVICE_RELEASED, true);
+        win32::end_cursor_script(self.hwnd);
+        // SAFETY: vtable thunk; this releases the reference `CreateDevice`
+        // handed the harness, which `Drop` now skips.
+        unsafe { (self.dev_vtbl().release)(self.device) }
+    }
+
+    /// The device's current public refcount.
+    ///
+    /// `AddRef` then `Release`, returning the post-decrement count — the
+    /// `get_refcount` idiom the D3D9 conformance suite uses. A child resource
+    /// holds one device reference for its public lifetime, so creating one
+    /// raises this by one and releasing it lowers it.
+    pub fn device_refcount(&self) -> u32 {
+        // SAFETY: vtable thunks; `self.device` is live for the harness lifetime.
+        unsafe { (self.dev_vtbl().add_ref)(self.device) };
+        // SAFETY: balances the AddRef above; the device stays live.
+        unsafe { (self.dev_vtbl().release)(self.device) }
+    }
+
+    /// `IDirect3DDevice9::QueryInterface` for an unknown GUID. Returns the hr.
+    pub fn device_query_interface_unknown(&self) -> i32 {
+        let guid = Guid {
+            data1: 0xDEAD_BEEF,
+            data2: 0,
+            data3: 0,
+            data4: [0; 8],
+        };
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&guid` and `&mut out` are valid for the call.
+        unsafe { (self.dev_vtbl().query_interface)(self.device, &raw const guid, &raw mut out) }
+    }
+
+    /// `IDirect3DDevice9::QueryInterface` for `iid`.
+    ///
+    /// Returns the hr, whether the interface handed back is the device object
+    /// itself, and the device's public refcount while that reference is held;
+    /// the reference is released again before returning.
+    pub fn device_query_interface(&self, iid: &Guid) -> (i32, bool, u32) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `iid` and `&mut out` are valid for the call.
+        let hr = unsafe { (self.dev_vtbl().query_interface)(self.device, iid, &raw mut out) };
+        if out.is_null() {
+            return (hr, false, self.device_refcount());
+        }
+        let same = out == self.device;
+        let held = self.device_refcount();
+        // SAFETY: releases the reference QueryInterface handed out; the device
+        // stays live through the harness's own reference.
+        unsafe { (self.dev_vtbl().release)(out) };
+        (hr, same, held)
+    }
+
+    /// `IDirect3D9::QueryInterface` for `iid`, shaped like [`Self::device_query_interface`].
+    pub fn factory_query_interface(&self, iid: &Guid) -> (i32, bool, u32) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `iid` and `&mut out` are valid for the call.
+        let hr = unsafe { (self.factory_vtbl().query_interface)(self.d3d9, iid, &raw mut out) };
+        if out.is_null() {
+            self.add_ref_factory();
+            return (hr, false, self.release_factory());
+        }
+        let same = out == self.d3d9;
+        self.add_ref_factory();
+        let held = self.release_factory();
+        // SAFETY: releases the reference QueryInterface handed out; the factory
+        // stays live through the harness's own reference.
+        unsafe { (self.factory_vtbl().release)(out) };
+        (hr, same, held)
+    }
+
+    /// `GetAvailableTextureMem`.
+    #[must_use]
+    pub fn available_texture_mem(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().get_available_texture_mem)(self.device) }
+    }
+
+    /// `EvictManagedResources`. Returns the hr.
+    pub fn evict_managed_resources(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().evict_managed_resources)(self.device) }
+    }
+
+    /// `ValidateDevice`. Returns the hr (the pass count is discarded).
+    pub fn validate_device_hr(&self) -> i32 {
+        self.validate_device(0).0
+    }
+
+    /// `ValidateDevice` with the pass count seeded to `seed`. Returns `(hr, passes)`.
+    ///
+    /// A failing call leaves the out-param alone, so a caller that seeds a
+    /// sentinel can tell an untouched count from a written one.
+    pub fn validate_device(&self, seed: u32) -> (i32, u32) {
+        let mut passes = seed;
+        // SAFETY: vtable thunk; `&mut passes` is writable.
+        let hr = unsafe { (self.dev_vtbl().validate_device)(self.device, &raw mut passes) };
+        (hr, passes)
+    }
+
+    /// `SetClipPlane(index, plane)`. Returns the hr.
+    pub fn set_clip_plane(&self, index: u32, plane: [f32; 4]) -> i32 {
+        // SAFETY: vtable thunk; `plane` is 4 floats, read-only for the call.
+        unsafe { (self.dev_vtbl().set_clip_plane)(self.device, index, plane.as_ptr()) }
+    }
+
+    /// `GetClipPlane(index)`. Returns `(hr, plane)`.
+    pub fn get_clip_plane(&self, index: u32) -> (i32, [f32; 4]) {
+        let mut plane = [0.0f32; 4];
+        // SAFETY: vtable thunk; `plane` is 4 writable floats.
+        let hr =
+            unsafe { (self.dev_vtbl().get_clip_plane)(self.device, index, plane.as_mut_ptr()) };
+        (hr, plane)
+    }
+
+    /// `SetGammaRamp` with a null ramp: ignored, and it must not crash.
+    pub fn set_gamma_ramp_null(&self) {
+        // SAFETY: vtable thunk; a null ramp is rejected before it is read.
+        unsafe { (self.dev_vtbl().set_gamma_ramp)(self.device, 0, 0, core::ptr::null()) };
+    }
+
+    /// `SetGammaRamp(swap_chain, flags, ramp)`. Returns nothing, as D3D9 does.
+    pub fn set_gamma_ramp(&self, swap_chain: u32, flags: u32, ramp: &D3DGAMMARAMP) {
+        // SAFETY: vtable thunk; `ramp` is one readable D3DGAMMARAMP for the call.
+        unsafe {
+            (self.dev_vtbl().set_gamma_ramp)(
+                self.device,
+                swap_chain,
+                flags,
+                core::ptr::from_ref(ramp).cast::<c_void>(),
+            );
+        }
+    }
+
+    /// `GetGammaRamp(swap_chain)` into a caller-visible ramp.
+    ///
+    /// Seeded with a sentinel the implementation never writes, so a caller can
+    /// tell an untouched buffer from an answered one.
+    pub fn get_gamma_ramp(&self, swap_chain: u32) -> D3DGAMMARAMP {
+        let mut ramp = D3DGAMMARAMP {
+            red: [0xDEAD; 256],
+            green: [0xDEAD; 256],
+            blue: [0xDEAD; 256],
+        };
+        // SAFETY: vtable thunk; `ramp` is one writable D3DGAMMARAMP.
+        unsafe {
+            (self.dev_vtbl().get_gamma_ramp)(
+                self.device,
+                swap_chain,
+                core::ptr::from_mut(&mut ramp).cast::<c_void>(),
+            );
+        }
+        ramp
+    }
+
+    /// `SetPaletteEntries` (a documented stub today). Returns the hr.
+    pub fn set_palette_entries_hr(&self) -> i32 {
+        let palette = [0u32; 256];
+        // SAFETY: vtable thunk; `palette` is 256 PALETTEENTRYs, read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_palette_entries)(self.device, 0, palette.as_ptr().cast::<c_void>())
+        }
+    }
+
+    /// `GetRasterStatus` (a documented stub today). Returns the hr.
+    pub fn get_raster_status_hr(&self) -> i32 {
+        let mut status = [0u32; 2];
+        // SAFETY: vtable thunk; `status` covers D3DRASTER_STATUS (BOOL + u32).
+        unsafe {
+            (self.dev_vtbl().get_raster_status)(
+                self.device,
+                0,
+                status.as_mut_ptr().cast::<c_void>(),
+            )
+        }
+    }
+
+    /// `GetClipStatus` (a documented stub today). Returns the hr.
+    pub fn get_clip_status_hr(&self) -> i32 {
+        let mut status = [0u32; 2];
+        // SAFETY: vtable thunk; `status` covers D3DCLIPSTATUS9 (two u32 fields).
+        unsafe {
+            (self.dev_vtbl().get_clip_status)(self.device, status.as_mut_ptr().cast::<c_void>())
+        }
+    }
+
+    /// `SetDialogBoxMode` (a documented stub today). Returns the hr.
+    pub fn set_dialog_box_mode_hr(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().set_dialog_box_mode)(self.device, 0) }
+    }
+
+    fn dev_vtbl(&self) -> &'static IDirect3DDevice9Vtbl {
+        // SAFETY: `self.device` is a live IDirect3DDevice9 for the harness lifetime.
+        unsafe { deref_vtbl::<IDirect3DDevice9Vtbl>(self.device) }
+    }
+
+    fn factory_vtbl(&self) -> &'static IDirect3D9Vtbl {
+        // SAFETY: `self.d3d9` is a live IDirect3D9 for the harness lifetime.
+        unsafe { deref_vtbl::<IDirect3D9Vtbl>(self.d3d9) }
+    }
+
+    // ── Frame loop ──
+
+    /// Drain the message queue once. Returns `false` on `WM_QUIT`.
+    pub fn pump(&self) -> bool {
+        let mut msg = win32::zeroed_msg();
+        win32::pump_messages(&mut msg)
+    }
+
+    /// `BeginScene`.
+    pub fn begin_scene(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().begin_scene)(self.device) }
+    }
+
+    /// `EndScene`.
+    pub fn end_scene(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().end_scene)(self.device) }
+    }
+
+    /// `Present` to the whole backbuffer.
+    pub fn present(&self) -> i32 {
+        // SAFETY: vtable thunk; all-null args present the entire backbuffer.
+        unsafe {
+            (self.dev_vtbl().present)(
+                self.device,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null_mut(),
+                core::ptr::null(),
+            )
+        }
+    }
+
+    /// Present through the implicit swap chain instead of the device entry point.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the implicit swap chain cannot be acquired.
+    pub fn present_swapchain(&self) -> i32 {
+        let mut chain = core::ptr::null_mut();
+        // SAFETY: live device and initialized output for its implicit swap chain.
+        let result = unsafe { (self.dev_vtbl().get_swap_chain)(self.device, 0, &raw mut chain) };
+        expect_ok(result, "GetSwapChain");
+        // SAFETY: successful GetSwapChain returned a live IDirect3DSwapChain9.
+        let vtbl = unsafe { deref_vtbl::<IDirect3DSwapChain9Vtbl>(chain) };
+        // SAFETY: live swap chain; null rectangles present the whole back buffer.
+        let result = unsafe {
+            (vtbl.present)(
+                chain,
+                core::ptr::null(),
+                core::ptr::null(),
+                0,
+                core::ptr::null(),
+                0,
+            )
+        };
+        // SAFETY: balances the reference returned by GetSwapChain above.
+        unsafe { (vtbl.release)(chain) };
+        result
+    }
+
+    /// `Clear` with explicit flags / colour / depth / stencil.
+    pub fn clear(&self, flags: u32, color: u32, z: f32, stencil: u32) -> i32 {
+        // SAFETY: vtable thunk; null rect array clears the whole target.
+        unsafe {
+            (self.dev_vtbl().clear)(self.device, 0, core::ptr::null(), flags, color, z, stencil)
+        }
+    }
+
+    /// `Clear` with explicit flags / colour / depth / stencil restricted to `pRects`.
+    ///
+    /// # Panics
+    ///
+    /// If `rects` holds more than `u32::MAX` entries, which no test writes.
+    pub fn clear_rects(
+        &self,
+        flags: u32,
+        color: u32,
+        z: f32,
+        stencil: u32,
+        rects: &[D3DRECT],
+    ) -> i32 {
+        let count = u32::try_from(rects.len()).expect("test rect count fits u32");
+        // SAFETY: vtable thunk; `rects` is a live slice of `count` D3DRECTs,
+        // read-only for the duration of the call.
+        unsafe {
+            (self.dev_vtbl().clear)(
+                self.device,
+                count,
+                rects.as_ptr().cast(),
+                flags,
+                color,
+                z,
+                stencil,
+            )
+        }
+    }
+
+    /// `Clear(D3DCLEAR_TARGET)` to a solid colour.
+    pub fn clear_target(&self, color: u32) -> i32 {
+        self.clear(D3DCLEAR_TARGET, color, 1.0, 0)
+    }
+
+    /// `Clear(D3DCLEAR_TARGET)` restricted to an explicit `pRects` array.
+    ///
+    /// Distinct from [`Self::clear_target`], which passes `NULL` and clears the
+    /// whole target: D3D9 gives the two different semantics, and only this form
+    /// exercises per-rect clipping.
+    ///
+    /// # Panics
+    ///
+    /// If `rects` holds more than `u32::MAX` entries, which no test writes.
+    pub fn clear_target_rects(&self, color: u32, rects: &[D3DRECT]) -> i32 {
+        let count = u32::try_from(rects.len()).expect("test rect count fits u32");
+        // SAFETY: vtable thunk; `rects` is a live slice of `count` D3DRECTs,
+        // read-only for the duration of the call.
+        unsafe {
+            (self.dev_vtbl().clear)(
+                self.device,
+                count,
+                rects.as_ptr().cast(),
+                D3DCLEAR_TARGET,
+                color,
+                1.0,
+                0,
+            )
+        }
+    }
+
+    /// Run one frame: pump → begin → clear → `body` → end → present.
+    ///
+    /// Asserts each step succeeds. Pair with [`Self::read_pixel`] (which flushes)
+    /// to verify the result deterministically — one frame suffices.
+    ///
+    /// # Panics
+    /// Panics if any step returns a failing `HRESULT` or `WM_QUIT` arrives.
+    pub fn render_once(&self, clear_color: u32, body: impl FnOnce(&Self)) {
+        assert!(self.pump(), "WM_QUIT before render");
+        assert_eq!(self.begin_scene(), 0, "BeginScene failed");
+        assert_eq!(self.clear_target(clear_color), 0, "Clear failed");
+        body(self);
+        assert_eq!(self.end_scene(), 0, "EndScene failed");
+        assert_eq!(self.present(), 0, "Present failed");
+    }
+
+    /// Read a backbuffer pixel as `0xAARRGGBB` through the D3D9 read-back chain.
+    ///
+    /// The same chain the Wine conformance suite uses: `GetRenderTarget(0)` →
+    /// `CreateOffscreenPlainSurface(D3DPOOL_SYSTEMMEM)` → `GetRenderTargetData`
+    /// (which flushes pending GPU work) → `LockRect(READONLY)`. The returned
+    /// value reflects every submitted frame. The system-memory surface is
+    /// always `D3DFMT_A8R8G8B8`, so a locked row is `pitch / 4` `u32` pixels in
+    /// `0xAARRGGBB` order.
+    ///
+    /// # Panics
+    /// Panics if any step of the read-back chain fails.
+    #[must_use]
+    pub fn read_pixel(&self, x: u32, y: u32) -> u32 {
+        let rt = self.render_target(0);
+        let (hr, desc) = rt.desc();
+        expect_ok(hr, "GetRenderTarget desc for read_pixel");
+        let sysmem = self.create_offscreen_plain_surface(
+            desc.width,
+            desc.height,
+            mtld3d_types::D3DFMT_A8R8G8B8,
+            mtld3d_types::D3DPOOL_SYSTEMMEM,
+        );
+        expect_ok(
+            self.get_render_target_data_hr(&rt, &sysmem),
+            "GetRenderTargetData for read_pixel",
+        );
+        let locked = sysmem.lock_rect(mtld3d_types::D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let idx = (y * pitch_px + x) as usize;
+        locked.as_u32(idx + 1)[idx]
+    }
+
+    // ── Fixed-function / pipeline state ──
+
+    /// `SetFVF`.
+    pub fn set_fvf(&self, fvf: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().set_fvf)(self.device, fvf) }
+    }
+
+    /// `GetFVF`.
+    #[must_use]
+    pub fn fvf(&self) -> u32 {
+        let mut fvf = 0u32;
+        // SAFETY: vtable thunk; `&mut fvf` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_fvf)(self.device, &raw mut fvf) };
+        expect_ok(hr, "GetFVF");
+        fvf
+    }
+
+    /// `SetRenderState`.
+    pub fn set_render_state(&self, state: u32, value: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().set_render_state)(self.device, state, value) }
+    }
+
+    /// `GetRenderState`, asserting success.
+    ///
+    /// Use [`Self::try_render_state`] for the raw `HRESULT`.
+    #[must_use]
+    pub fn render_state(&self, state: u32) -> u32 {
+        let (hr, value) = self.try_render_state(state);
+        expect_ok(hr, "GetRenderState");
+        value
+    }
+
+    /// `GetRenderState` returning `(hr, value)`.
+    ///
+    /// The out slot is seeded with [`UNWRITTEN`], so a call that leaves it
+    /// alone reads back as that value.
+    #[must_use]
+    pub fn try_render_state(&self, state: u32) -> (i32, u32) {
+        let mut value = UNWRITTEN;
+        // SAFETY: vtable thunk; `&mut value` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_render_state)(self.device, state, &raw mut value) };
+        (hr, value)
+    }
+
+    /// `SetSamplerState`.
+    pub fn set_sampler_state(&self, sampler: u32, state: u32, value: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().set_sampler_state)(self.device, sampler, state, value) }
+    }
+
+    /// `GetSamplerState` returning `(hr, value)`, the out slot seeded with [`UNWRITTEN`].
+    #[must_use]
+    pub fn try_sampler_state(&self, sampler: u32, state: u32) -> (i32, u32) {
+        let mut value = UNWRITTEN;
+        // SAFETY: vtable thunk; `&mut value` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_sampler_state)(self.device, sampler, state, &raw mut value)
+        };
+        (hr, value)
+    }
+
+    /// `GetSamplerState`, asserting success.
+    #[must_use]
+    pub fn sampler_state(&self, sampler: u32, state: u32) -> u32 {
+        let mut value = 0u32;
+        // SAFETY: vtable thunk; `&mut value` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_sampler_state)(self.device, sampler, state, &raw mut value)
+        };
+        expect_ok(hr, "GetSamplerState");
+        value
+    }
+
+    /// `SetTextureStageState`.
+    pub fn set_texture_stage_state(&self, stage: u32, ts_state: u32, value: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().set_texture_stage_state)(self.device, stage, ts_state, value) }
+    }
+
+    /// Route `stage` to pass vertex DIFFUSE through unchanged (colour + alpha).
+    ///
+    /// The common fixed-function setup when no texture is bound.
+    ///
+    /// # Panics
+    /// Panics if any `SetTextureStageState` fails.
+    pub fn select_diffuse_stage(&self, stage: u32) {
+        for (ts_state, value) in [
+            (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+            (D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+            (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+            (D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+        ] {
+            expect_ok(
+                self.set_texture_stage_state(stage, ts_state, value),
+                "SetTextureStageState",
+            );
+        }
+    }
+
+    /// Route `stage` to emit the sampled texel directly (colour + alpha).
+    ///
+    /// Ignores vertex diffuse — for sampler/format tests.
+    ///
+    /// # Panics
+    /// Panics if any `SetTextureStageState` fails.
+    pub fn select_texture_stage(&self, stage: u32) {
+        for (ts_state, value) in [
+            (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+            (D3DTSS_COLORARG1, mtld3d_types::D3DTA_TEXTURE),
+            (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+            (D3DTSS_ALPHAARG1, mtld3d_types::D3DTA_TEXTURE),
+        ] {
+            expect_ok(
+                self.set_texture_stage_state(stage, ts_state, value),
+                "SetTextureStageState",
+            );
+        }
+    }
+
+    /// `GetTextureStageState` returning `(hr, value)`, the out slot seeded with [`UNWRITTEN`].
+    #[must_use]
+    pub fn try_texture_stage_state(&self, stage: u32, ts_state: u32) -> (i32, u32) {
+        let mut value = UNWRITTEN;
+        // SAFETY: vtable thunk; `&mut value` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_texture_stage_state)(self.device, stage, ts_state, &raw mut value)
+        };
+        (hr, value)
+    }
+
+    /// `GetTextureStageState`, asserting success.
+    #[must_use]
+    pub fn texture_stage_state(&self, stage: u32, ts_state: u32) -> u32 {
+        let mut value = 0u32;
+        // SAFETY: vtable thunk; `&mut value` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_texture_stage_state)(self.device, stage, ts_state, &raw mut value)
+        };
+        expect_ok(hr, "GetTextureStageState");
+        value
+    }
+
+    /// `SetTexture(stage, texture)`.
+    pub fn set_texture(&self, stage: u32, texture: &Texture<'_>) -> i32 {
+        // SAFETY: vtable thunk; `texture` is a live binding for the call.
+        unsafe { (self.dev_vtbl().set_texture)(self.device, stage, texture.as_ptr()) }
+    }
+
+    /// `SetTexture(stage, cube_texture)`.
+    pub fn set_cube_texture(&self, stage: u32, texture: &CubeTexture<'_>) -> i32 {
+        // SAFETY: cube textures implement `IDirect3DBaseTexture9` and remain
+        // live for the call.
+        unsafe { (self.dev_vtbl().set_texture)(self.device, stage, texture.as_ptr()) }
+    }
+
+    /// `SetTexture(stage, volume_texture)`.
+    pub fn set_volume_texture(&self, stage: u32, texture: &VolumeTexture<'_>) -> i32 {
+        // SAFETY: volume textures implement `IDirect3DBaseTexture9` and remain
+        // live for the call.
+        unsafe { (self.dev_vtbl().set_texture)(self.device, stage, texture.as_ptr()) }
+    }
+
+    /// `SetTexture(stage, null)` — unbind whatever is on `stage`.
+    pub fn clear_texture(&self, stage: u32) -> i32 {
+        // SAFETY: vtable thunk; null unbinds the stage.
+        unsafe { (self.dev_vtbl().set_texture)(self.device, stage, core::ptr::null_mut()) }
+    }
+
+    /// `GetTexture(stage)` — the raw bound `this` (null if unbound).
+    #[must_use]
+    pub fn texture_raw(&self, stage: u32) -> *mut c_void {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_texture)(self.device, stage, &raw mut out) };
+        expect_ok(hr, "GetTexture");
+        out
+    }
+
+    /// Compare a bound texture pointer and release the `GetTexture` reference.
+    #[must_use]
+    pub fn texture_matches_raw(&self, stage: u32, expected: *mut c_void) -> bool {
+        let (hr, matches) = self.texture_matches_raw_result(stage, expected);
+        expect_ok(hr, "GetTexture");
+        matches
+    }
+
+    /// Compare a `GetTexture` result and release any reference it returned.
+    #[must_use]
+    pub fn texture_matches_raw_result(&self, stage: u32, expected: *mut c_void) -> (i32, bool) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_texture)(self.device, stage, &raw mut out) };
+        let matches = out == expected;
+        if !out.is_null() {
+            type ReleaseFn = unsafe extern "system" fn(*mut c_void) -> u32;
+            // SAFETY: a live COM object's first field is its vtable pointer.
+            let vtbl = unsafe { *out.cast::<*const ReleaseFn>() };
+            // SAFETY: `IUnknown::Release` is slot 2 of every D3D9 vtable.
+            let slot = unsafe { vtbl.add(2) };
+            // SAFETY: `slot` points at the live `Release` function pointer.
+            let release = unsafe { *slot };
+            // SAFETY: balances the reference returned by `GetTexture`.
+            unsafe { release(out) };
+        }
+        (hr, matches)
+    }
+
+    /// `SetTransform`.
+    pub fn set_transform(&self, state: u32, matrix: &[f32; 16]) -> i32 {
+        // SAFETY: vtable thunk; `matrix` is 16 floats, read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_transform)(self.device, state, matrix.as_ptr().cast::<c_void>())
+        }
+    }
+
+    /// `GetTransform`, asserting success.
+    #[must_use]
+    pub fn transform(&self, state: u32) -> [f32; 16] {
+        let mut m = [0f32; 16];
+        // SAFETY: vtable thunk; `m` is 16 writable floats.
+        let hr = unsafe {
+            (self.dev_vtbl().get_transform)(self.device, state, m.as_mut_ptr().cast::<c_void>())
+        };
+        expect_ok(hr, "GetTransform");
+        m
+    }
+
+    /// `MultiplyTransform`.
+    pub fn multiply_transform(&self, state: u32, matrix: &[f32; 16]) -> i32 {
+        // SAFETY: vtable thunk; `matrix` is 16 floats, read-only for the call.
+        unsafe {
+            (self.dev_vtbl().multiply_transform)(
+                self.device,
+                state,
+                matrix.as_ptr().cast::<c_void>(),
+            )
+        }
+    }
+
+    /// `SetViewport`.
+    pub fn set_viewport(&self, vp: &D3DVIEWPORT9) -> i32 {
+        // SAFETY: vtable thunk; `vp` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_viewport)(self.device, core::ptr::from_ref(vp).cast::<c_void>())
+        }
+    }
+
+    /// `GetViewport`, asserting success.
+    #[must_use]
+    pub fn viewport(&self) -> D3DVIEWPORT9 {
+        let mut vp = D3DVIEWPORT9 {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            min_z: 0.0,
+            max_z: 0.0,
+        };
+        // SAFETY: vtable thunk; `&mut vp` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_viewport)(
+                self.device,
+                core::ptr::from_mut(&mut vp).cast::<c_void>(),
+            )
+        };
+        expect_ok(hr, "GetViewport");
+        vp
+    }
+
+    /// `SetScissorRect`.
+    pub fn set_scissor_rect(&self, rect: &D3DRECT) -> i32 {
+        // SAFETY: vtable thunk; `rect` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_scissor_rect)(
+                self.device,
+                core::ptr::from_ref(rect).cast::<c_void>(),
+            )
+        }
+    }
+
+    /// `GetScissorRect`, asserting success.
+    #[must_use]
+    pub fn scissor_rect(&self) -> D3DRECT {
+        let mut rect = D3DRECT {
+            x1: 0,
+            y1: 0,
+            x2: 0,
+            y2: 0,
+        };
+        // SAFETY: vtable thunk; `&mut rect` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_scissor_rect)(
+                self.device,
+                core::ptr::from_mut(&mut rect).cast::<c_void>(),
+            )
+        };
+        expect_ok(hr, "GetScissorRect");
+        rect
+    }
+
+    /// `TestCooperativeLevel`.
+    pub fn test_cooperative_level(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().test_cooperative_level)(self.device) }
+    }
+
+    // ── Draws ──
+
+    /// `DrawPrimitiveUP` with inline vertices; stride is `size_of::<V>()`.
+    ///
+    /// # Panics
+    /// Panics if `size_of::<V>()` does not fit in a `u32`.
+    pub fn draw_primitive_up<V>(&self, prim: u32, prim_count: u32, verts: &[V]) -> i32 {
+        let stride = u32::try_from(core::mem::size_of::<V>()).expect("vertex stride fits u32");
+        // SAFETY: vtable thunk; `verts` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().draw_primitive_up)(
+                self.device,
+                prim,
+                prim_count,
+                verts.as_ptr().cast::<c_void>(),
+                stride,
+            )
+        }
+    }
+
+    /// `DrawPrimitiveUP` with a stride the caller names rather than `size_of::<V>()`.
+    ///
+    /// For a test of the stride's own validation, such as a zero stride.
+    pub fn draw_primitive_up_with_stride<V>(
+        &self,
+        prim: u32,
+        prim_count: u32,
+        verts: &[V],
+        stride: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `verts` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().draw_primitive_up)(
+                self.device,
+                prim,
+                prim_count,
+                verts.as_ptr().cast::<c_void>(),
+                stride,
+            )
+        }
+    }
+
+    /// `DrawPrimitive` against the bound stream source.
+    pub fn draw_primitive(&self, prim: u32, start_vertex: u32, prim_count: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().draw_primitive)(self.device, prim, start_vertex, prim_count) }
+    }
+
+    /// `DrawIndexedPrimitive` against the bound stream source + indices.
+    pub fn draw_indexed_primitive(
+        &self,
+        prim: u32,
+        base_vertex_index: i32,
+        min_vertex_index: u32,
+        num_vertices: u32,
+        start_index: u32,
+        prim_count: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe {
+            (self.dev_vtbl().draw_indexed_primitive)(
+                self.device,
+                prim,
+                base_vertex_index,
+                min_vertex_index,
+                num_vertices,
+                start_index,
+                prim_count,
+            )
+        }
+    }
+
+    /// `DrawIndexedPrimitiveUP`. Returns the hr.
+    ///
+    /// # Panics
+    /// Panics if `size_of::<V>()` does not fit in a `u32`.
+    pub fn draw_indexed_primitive_up<I, V>(
+        &self,
+        params: &DrawIndexedUpParams,
+        indices: &[I],
+        verts: &[V],
+    ) -> i32 {
+        let stride = u32::try_from(core::mem::size_of::<V>()).expect("vertex stride fits u32");
+        self.draw_indexed_primitive_up_with_stride(params, indices, verts, stride)
+    }
+
+    /// `DrawIndexedPrimitiveUP` with a vertex stride the caller names. Returns the hr.
+    ///
+    /// For a test of the stride's own validation, such as a zero stride.
+    pub fn draw_indexed_primitive_up_with_stride<I, V>(
+        &self,
+        params: &DrawIndexedUpParams,
+        indices: &[I],
+        verts: &[V],
+        stride: u32,
+    ) -> i32 {
+        let &DrawIndexedUpParams {
+            prim,
+            min_vertex_index,
+            num_vertices,
+            prim_count,
+            index_format,
+        } = params;
+        // SAFETY: vtable thunk; both slices are read-only for the call.
+        unsafe {
+            (self.dev_vtbl().draw_indexed_primitive_up)(
+                self.device,
+                prim,
+                min_vertex_index,
+                num_vertices,
+                prim_count,
+                indices.as_ptr().cast::<c_void>(),
+                index_format,
+                verts.as_ptr().cast::<c_void>(),
+                stride,
+            )
+        }
+    }
+
+    /// `SetStreamSource(stream, vb, offset, stride)`.
+    pub fn set_stream_source(
+        &self,
+        stream: u32,
+        vb: &VertexBuffer<'_>,
+        offset: u32,
+        stride: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `vb` is a live binding for the call.
+        unsafe {
+            (self.dev_vtbl().set_stream_source)(self.device, stream, vb.as_ptr(), offset, stride)
+        }
+    }
+
+    /// `SetStreamSource(stream, NULL, offset, stride)` — clears the vertex-buffer binding.
+    ///
+    /// D3D9 retains the previous offset/stride on a NULL bind, so callers pass
+    /// `0, 0` like the runtime requires.
+    pub fn set_stream_source_null(&self, stream: u32, offset: u32, stride: u32) -> i32 {
+        // SAFETY: vtable thunk; a null stream source is the documented "unbind".
+        unsafe {
+            (self.dev_vtbl().set_stream_source)(
+                self.device,
+                stream,
+                core::ptr::null_mut(),
+                offset,
+                stride,
+            )
+        }
+    }
+
+    /// `SetIndices(ib)`.
+    pub fn set_indices(&self, ib: &IndexBuffer<'_>) -> i32 {
+        // SAFETY: vtable thunk; `ib` is a live binding for the call.
+        unsafe { (self.dev_vtbl().set_indices)(self.device, ib.as_ptr()) }
+    }
+
+    /// `ProcessVertices` with a null destination — the argument-validation path.
+    pub fn process_vertices_hr(&self) -> i32 {
+        // SAFETY: vtable thunk; a null destination is the rejection this checks.
+        unsafe {
+            (self.dev_vtbl().process_vertices)(
+                self.device,
+                0,
+                0,
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                0,
+            )
+        }
+    }
+
+    /// `ProcessVertices(src_start, dst_index, count, dst_vb, NULL, 0)`. Returns the hr.
+    pub fn process_vertices(
+        &self,
+        src_start: u32,
+        dst_index: u32,
+        count: u32,
+        dst_vb: &VertexBuffer<'_>,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `dst_vb` is a live buffer, the declaration is
+        // NULL (the current-FVF path).
+        unsafe {
+            (self.dev_vtbl().process_vertices)(
+                self.device,
+                src_start,
+                dst_index,
+                count,
+                dst_vb.as_ptr(),
+                core::ptr::null_mut(),
+                0,
+            )
+        }
+    }
+
+    /// `GetStreamSource(stream)`.
+    ///
+    /// Returns `(hr, vb, offset, stride)`. On success the bound stream-0 buffer
+    /// (or `None` when nothing is bound) is wrapped so its `Drop` balances the
+    /// `AddRef` D3D9 applies to the out-pointer.
+    pub fn get_stream_source(&self, stream: u32) -> (i32, Option<VertexBuffer<'_>>, u32, u32) {
+        let mut vb: *mut c_void = core::ptr::null_mut();
+        let mut offset = 0u32;
+        let mut stride = 0u32;
+        // SAFETY: vtable thunk; all out-pointers are writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_stream_source)(
+                self.device,
+                stream,
+                &raw mut vb,
+                &raw mut offset,
+                &raw mut stride,
+            )
+        };
+        let wrapped = (!vb.is_null()).then(|| VertexBuffer::from_raw(vb));
+        (hr, wrapped, offset, stride)
+    }
+
+    /// `GetIndices()`.
+    ///
+    /// Returns `(hr, ib)`, with the bound index buffer (or `None`) wrapped so
+    /// its `Drop` balances the `AddRef` on the out-pointer.
+    pub fn get_indices(&self) -> (i32, Option<IndexBuffer<'_>>) {
+        let mut ib: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut ib` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_indices)(self.device, &raw mut ib) };
+        let wrapped = (!ib.is_null()).then(|| IndexBuffer::from_raw(ib));
+        (hr, wrapped)
+    }
+
+    /// `SetStreamSourceFreq(stream, setting)`. Returns the hr.
+    pub fn set_stream_source_freq(&self, stream: u32, freq: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().set_stream_source_freq)(self.device, stream, freq) }
+    }
+
+    /// `GetStreamSourceFreq(stream)`. Returns `(hr, setting)`.
+    pub fn get_stream_source_freq(&self, stream: u32) -> (i32, u32) {
+        let mut setting = 0u32;
+        // SAFETY: vtable thunk; `&mut setting` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_stream_source_freq)(self.device, stream, &raw mut setting)
+        };
+        (hr, setting)
+    }
+
+    // ── Resource creation ──
+
+    /// `CreateTexture`, asserting success. Returns an owned [`Texture`].
+    ///
+    /// # Panics
+    /// Panics if creation fails.
+    #[must_use]
+    pub fn create_texture(
+        &self,
+        width: u32,
+        height: u32,
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> Texture<'_> {
+        let (hr, ptr) = self.try_create_texture(width, height, levels, usage, format, pool);
+        assert_eq!(hr, 0, "CreateTexture failed: 0x{hr:08X}");
+        assert!(!ptr.is_null(), "CreateTexture returned null");
+        Texture::from_raw(ptr)
+    }
+
+    /// `CreateTexture` returning `(hr, this)` for error-path tests.
+    #[must_use]
+    pub fn try_create_texture(
+        &self,
+        width: u32,
+        height: u32,
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_texture)(
+                self.device,
+                width,
+                height,
+                levels,
+                usage,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        (hr, out)
+    }
+
+    /// `CreateCubeTexture`.
+    ///
+    /// Returns the hr; on success the created cube texture is released here
+    /// (callers only inspect the hr), so the helper never leaks a COM object
+    /// via its own `IUnknown::Release` (vtbl slot 2).
+    pub fn create_cube_texture(
+        &self,
+        edge: u32,
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> i32 {
+        let (hr, out) = self.try_create_cube_texture(edge, levels, usage, format, pool);
+        if hr == 0 && !out.is_null() {
+            drop(CubeTexture::from_raw(out));
+        }
+        hr
+    }
+
+    /// Create an owned cube texture, asserting success.
+    ///
+    /// # Panics
+    /// Panics if creation fails or returns a null pointer.
+    #[must_use]
+    pub fn create_cube_texture_owned(
+        &self,
+        edge: u32,
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> CubeTexture<'_> {
+        let (hr, out) = self.try_create_cube_texture(edge, levels, usage, format, pool);
+        assert_eq!(hr, 0, "CreateCubeTexture failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateCubeTexture returned null");
+        CubeTexture::from_raw(out)
+    }
+
+    #[must_use]
+    pub fn try_create_cube_texture(
+        &self,
+        edge: u32,
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_cube_texture)(
+                self.device,
+                edge,
+                levels,
+                usage,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        (hr, out)
+    }
+
+    /// `CreateVolumeTexture`, returning the raw hr.
+    ///
+    /// `extent` is `[width, height, depth]`.
+    pub fn create_volume_texture(
+        &self,
+        extent: [u32; 3],
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> i32 {
+        self.try_create_volume_texture(extent, levels, usage, format, pool)
+            .0
+    }
+
+    /// Probe volume creation with a null result pointer.
+    #[must_use]
+    pub fn create_volume_texture_null_output(&self, format: u32, pool: u32) -> i32 {
+        // SAFETY: the live device receives a deliberately null out-pointer;
+        // this invalid API call must reject it before writing the result.
+        unsafe {
+            (self.dev_vtbl().create_volume_texture)(
+                self.device,
+                4,
+                4,
+                2,
+                1,
+                0,
+                format,
+                pool,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// `CreateVolumeTexture` returning the hr and the texture when it succeeded.
+    pub fn try_create_volume_texture(
+        &self,
+        extent: [u32; 3],
+        levels: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, Option<VolumeTexture<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_volume_texture)(
+                self.device,
+                extent[0],
+                extent[1],
+                extent[2],
+                levels,
+                usage,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        let texture = (hr == 0 && !out.is_null()).then(|| VolumeTexture::from_raw(out));
+        (hr, texture)
+    }
+
+    /// `CreateVertexBuffer` returning `(hr, this)` for error-path tests.
+    #[must_use]
+    pub fn try_create_vertex_buffer(
+        &self,
+        length: u32,
+        usage: u32,
+        fvf: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_vertex_buffer)(
+                self.device,
+                length,
+                usage,
+                fvf,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        (hr, out)
+    }
+
+    /// `CreateIndexBuffer` returning `(hr, this)` for error-path tests.
+    #[must_use]
+    pub fn try_create_index_buffer(
+        &self,
+        length: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_index_buffer)(
+                self.device,
+                length,
+                usage,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        (hr, out)
+    }
+
+    /// `CreateVertexBuffer`, asserting success.
+    ///
+    /// # Panics
+    /// Panics if creation fails.
+    #[must_use]
+    pub fn create_vertex_buffer(
+        &self,
+        length: u32,
+        usage: u32,
+        fvf: u32,
+        pool: u32,
+    ) -> VertexBuffer<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_vertex_buffer)(
+                self.device,
+                length,
+                usage,
+                fvf,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, 0, "CreateVertexBuffer failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateVertexBuffer returned null");
+        VertexBuffer::from_raw(out)
+    }
+
+    /// `CreateIndexBuffer`, asserting success.
+    ///
+    /// # Panics
+    /// Panics if creation fails.
+    #[must_use]
+    pub fn create_index_buffer(
+        &self,
+        length: u32,
+        usage: u32,
+        format: u32,
+        pool: u32,
+    ) -> IndexBuffer<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle is allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_index_buffer)(
+                self.device,
+                length,
+                usage,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, 0, "CreateIndexBuffer failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateIndexBuffer returned null");
+        IndexBuffer::from_raw(out)
+    }
+
+    /// `CreateVertexShader` from DXSO bytecode, asserting success.
+    ///
+    /// # Panics
+    /// Panics if creation fails.
+    #[must_use]
+    pub fn create_vertex_shader(&self, bytecode: &[u32]) -> VertexShader<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `bytecode` is read-only, `&mut out` writable.
+        let hr = unsafe {
+            (self.dev_vtbl().create_vertex_shader)(self.device, bytecode.as_ptr(), &raw mut out)
+        };
+        assert_eq!(hr, 0, "CreateVertexShader failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateVertexShader returned null");
+        VertexShader::from_raw(out)
+    }
+
+    /// `CreatePixelShader` from DXSO bytecode, asserting success.
+    ///
+    /// # Panics
+    /// Panics if creation fails.
+    #[must_use]
+    pub fn create_pixel_shader(&self, bytecode: &[u32]) -> PixelShader<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `bytecode` is read-only, `&mut out` writable.
+        let hr = unsafe {
+            (self.dev_vtbl().create_pixel_shader)(self.device, bytecode.as_ptr(), &raw mut out)
+        };
+        assert_eq!(hr, 0, "CreatePixelShader failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreatePixelShader returned null");
+        PixelShader::from_raw(out)
+    }
+
+    /// `SetVertexShader(shader)`.
+    pub fn set_vertex_shader(&self, shader: &VertexShader<'_>) -> i32 {
+        // SAFETY: vtable thunk; `shader` is a live binding for the call.
+        unsafe { (self.dev_vtbl().set_vertex_shader)(self.device, shader.as_ptr()) }
+    }
+
+    /// `SetVertexShader(null)`.
+    pub fn clear_vertex_shader(&self) -> i32 {
+        // SAFETY: vtable thunk; null unbinds the vertex shader.
+        unsafe { (self.dev_vtbl().set_vertex_shader)(self.device, core::ptr::null_mut()) }
+    }
+
+    /// `SetPixelShader(shader)`.
+    pub fn set_pixel_shader(&self, shader: &PixelShader<'_>) -> i32 {
+        // SAFETY: vtable thunk; `shader` is a live binding for the call.
+        unsafe { (self.dev_vtbl().set_pixel_shader)(self.device, shader.as_ptr()) }
+    }
+
+    /// `SetPixelShader(null)`.
+    pub fn clear_pixel_shader(&self) -> i32 {
+        // SAFETY: vtable thunk; null unbinds the pixel shader.
+        unsafe { (self.dev_vtbl().set_pixel_shader)(self.device, core::ptr::null_mut()) }
+    }
+
+    /// `SetVertexShaderConstantF`. `data` is whole vec4 registers (len % 4 == 0).
+    ///
+    /// # Panics
+    /// Panics if the vec4 count does not fit in a `u32`.
+    pub fn set_vertex_shader_constant_f(&self, start: u32, data: &[f32]) -> i32 {
+        let count = u32::try_from(data.len() / 4).expect("vec4 count fits u32");
+        // SAFETY: vtable thunk; `data` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_vertex_shader_constant_f)(self.device, start, data.as_ptr(), count)
+        }
+    }
+
+    /// `SetPixelShaderConstantF`. `data` is whole vec4 registers (len % 4 == 0).
+    ///
+    /// # Panics
+    /// Panics if the vec4 count does not fit in a `u32`.
+    pub fn set_pixel_shader_constant_f(&self, start: u32, data: &[f32]) -> i32 {
+        let count = u32::try_from(data.len() / 4).expect("vec4 count fits u32");
+        // SAFETY: vtable thunk; `data` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_pixel_shader_constant_f)(self.device, start, data.as_ptr(), count)
+        }
+    }
+
+    /// `SetPixelShaderConstantF` from an arbitrary pointer.
+    ///
+    /// The typed setter above can only hand over a pointer the allocator
+    /// aligned. D3D9 copies these arrays and promises no alignment, so a test
+    /// needs to be able to pass one that is not aligned.
+    ///
+    /// # Safety
+    ///
+    /// `data` must hold `count * 4` initialized floats in one allocation,
+    /// readable and unmodified throughout the call.
+    pub unsafe fn set_pixel_shader_constant_f_raw(
+        &self,
+        start: u32,
+        data: *const f32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; the caller guarantees the extent.
+        unsafe { (self.dev_vtbl().set_pixel_shader_constant_f)(self.device, start, data, count) }
+    }
+
+    /// `SetVertexShaderConstantF` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// `data` must hold `count * 4` initialized floats in one allocation,
+    /// readable and unmodified throughout the call.
+    pub unsafe fn set_vertex_shader_constant_f_raw(
+        &self,
+        start: u32,
+        data: *const f32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_vertex_shader_constant_f)(self.device, start, data, count) }
+    }
+
+    /// `SetVertexShaderConstantI` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// When `start` is in range, `data` must hold `min(count, 16 - start) * 4`
+    /// initialized integers in one allocation, readable and unmodified
+    /// throughout the call.
+    pub unsafe fn set_vertex_shader_constant_i_raw(
+        &self,
+        start: u32,
+        data: *const i32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_vertex_shader_constant_i)(self.device, start, data, count) }
+    }
+
+    /// `SetVertexShaderConstantB` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// When `start` is in range, `data` must hold `min(count, 16 - start)`
+    /// initialized integers in one allocation, readable and unmodified
+    /// throughout the call.
+    pub unsafe fn set_vertex_shader_constant_b_raw(
+        &self,
+        start: u32,
+        data: *const i32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_vertex_shader_constant_b)(self.device, start, data, count) }
+    }
+
+    /// `SetPixelShaderConstantI` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// When `start` is in range, `data` must hold `min(count, 16 - start) * 4`
+    /// initialized integers in one allocation, readable and unmodified
+    /// throughout the call.
+    pub unsafe fn set_pixel_shader_constant_i_raw(
+        &self,
+        start: u32,
+        data: *const i32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_pixel_shader_constant_i)(self.device, start, data, count) }
+    }
+
+    /// `SetPixelShaderConstantB` from a possibly unaligned pointer.
+    ///
+    /// # Safety
+    ///
+    /// When `start` is in range, `data` must hold `min(count, 16 - start)`
+    /// initialized integers in one allocation, readable and unmodified
+    /// throughout the call.
+    pub unsafe fn set_pixel_shader_constant_b_raw(
+        &self,
+        start: u32,
+        data: *const i32,
+        count: u32,
+    ) -> i32 {
+        // SAFETY: the caller guarantees the input extent for this vtable call.
+        unsafe { (self.dev_vtbl().set_pixel_shader_constant_b)(self.device, start, data, count) }
+    }
+
+    /// `SetVertexShaderConstantI` (each register is 4 ints).
+    ///
+    /// # Panics
+    /// Panics if the register count does not fit in a `u32`.
+    pub fn set_vertex_shader_constant_i(&self, start: u32, data: &[i32]) -> i32 {
+        let count = u32::try_from(data.len() / 4).expect("ivec4 count fits u32");
+        // SAFETY: vtable thunk; `data` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_vertex_shader_constant_i)(self.device, start, data.as_ptr(), count)
+        }
+    }
+
+    /// `SetVertexShaderConstantB` (each register is one BOOL).
+    ///
+    /// # Panics
+    /// Panics if the register count does not fit in a `u32`.
+    pub fn set_vertex_shader_constant_b(&self, start: u32, data: &[i32]) -> i32 {
+        let count = u32::try_from(data.len()).expect("bool count fits u32");
+        // SAFETY: vtable thunk; `data` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_vertex_shader_constant_b)(self.device, start, data.as_ptr(), count)
+        }
+    }
+
+    /// `SetPixelShaderConstantI` (each register is 4 ints).
+    ///
+    /// # Panics
+    /// Panics if the register count does not fit in a `u32`.
+    pub fn set_pixel_shader_constant_i(&self, start: u32, data: &[i32]) -> i32 {
+        let count = u32::try_from(data.len() / 4).expect("ivec4 count fits u32");
+        // SAFETY: vtable thunk; `data` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_pixel_shader_constant_i)(self.device, start, data.as_ptr(), count)
+        }
+    }
+
+    /// `SetPixelShaderConstantB` (each register is one BOOL).
+    ///
+    /// # Panics
+    /// Panics if the register count does not fit in a `u32`.
+    pub fn set_pixel_shader_constant_b(&self, start: u32, data: &[i32]) -> i32 {
+        let count = u32::try_from(data.len()).expect("bool count fits u32");
+        // SAFETY: vtable thunk; `data` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_pixel_shader_constant_b)(self.device, start, data.as_ptr(), count)
+        }
+    }
+
+    /// `GetVertexShaderConstantF` reading `count` vec4 registers from `start`.
+    ///
+    /// Returns the hr and the read-back floats (`count * 4`).
+    pub fn get_vertex_shader_constant_f(&self, start: u32, count: u32) -> (i32, Vec<f32>) {
+        let mut out = vec![0f32; count as usize * 4];
+        // SAFETY: vtable thunk; `out` holds `count * 4` writable floats.
+        let hr = unsafe {
+            (self.dev_vtbl().get_vertex_shader_constant_f)(
+                self.device,
+                start,
+                out.as_mut_ptr(),
+                count,
+            )
+        };
+        (hr, out)
+    }
+
+    /// `GetPixelShaderConstantF` — see [`Self::get_vertex_shader_constant_f`].
+    pub fn get_pixel_shader_constant_f(&self, start: u32, count: u32) -> (i32, Vec<f32>) {
+        let mut out = vec![0f32; count as usize * 4];
+        // SAFETY: vtable thunk; `out` holds `count * 4` writable floats.
+        let hr = unsafe {
+            (self.dev_vtbl().get_pixel_shader_constant_f)(
+                self.device,
+                start,
+                out.as_mut_ptr(),
+                count,
+            )
+        };
+        (hr, out)
+    }
+
+    /// `GetVertexShaderConstantI` reading `count` ivec4 registers from `start`.
+    pub fn get_vertex_shader_constant_i(&self, start: u32, count: u32) -> (i32, Vec<i32>) {
+        let mut out = vec![0i32; count as usize * 4];
+        // SAFETY: vtable thunk; `out` holds `count * 4` writable ints.
+        let hr = unsafe {
+            (self.dev_vtbl().get_vertex_shader_constant_i)(
+                self.device,
+                start,
+                out.as_mut_ptr(),
+                count,
+            )
+        };
+        (hr, out)
+    }
+
+    /// `GetPixelShaderConstantI` — see [`Self::get_vertex_shader_constant_i`].
+    pub fn get_pixel_shader_constant_i(&self, start: u32, count: u32) -> (i32, Vec<i32>) {
+        let mut out = vec![0i32; count as usize * 4];
+        // SAFETY: vtable thunk; `out` holds `count * 4` writable ints.
+        let hr = unsafe {
+            (self.dev_vtbl().get_pixel_shader_constant_i)(
+                self.device,
+                start,
+                out.as_mut_ptr(),
+                count,
+            )
+        };
+        (hr, out)
+    }
+
+    /// `GetVertexShaderConstantB` reading `count` BOOL registers from `start`.
+    pub fn get_vertex_shader_constant_b(&self, start: u32, count: u32) -> (i32, Vec<i32>) {
+        let mut out = vec![0i32; count as usize];
+        // SAFETY: vtable thunk; `out` holds `count` writable BOOLs.
+        let hr = unsafe {
+            (self.dev_vtbl().get_vertex_shader_constant_b)(
+                self.device,
+                start,
+                out.as_mut_ptr(),
+                count,
+            )
+        };
+        (hr, out)
+    }
+
+    /// `GetPixelShaderConstantB` — see [`Self::get_vertex_shader_constant_b`].
+    pub fn get_pixel_shader_constant_b(&self, start: u32, count: u32) -> (i32, Vec<i32>) {
+        let mut out = vec![0i32; count as usize];
+        // SAFETY: vtable thunk; `out` holds `count` writable BOOLs.
+        let hr = unsafe {
+            (self.dev_vtbl().get_pixel_shader_constant_b)(
+                self.device,
+                start,
+                out.as_mut_ptr(),
+                count,
+            )
+        };
+        (hr, out)
+    }
+
+    /// `GetVertexDeclaration` — the raw bound declaration `this` (null if unset).
+    #[must_use]
+    pub fn vertex_declaration_raw(&self) -> *mut c_void {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_vertex_declaration)(self.device, &raw mut out) };
+        expect_ok(hr, "GetVertexDeclaration");
+        out
+    }
+
+    /// `SetMaterial`.
+    pub fn set_material(&self, material: &D3DMATERIAL9) -> i32 {
+        // SAFETY: vtable thunk; `material` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_material)(
+                self.device,
+                core::ptr::from_ref(material).cast::<c_void>(),
+            )
+        }
+    }
+
+    /// `GetMaterial`, asserting success.
+    #[must_use]
+    pub fn material(&self) -> D3DMATERIAL9 {
+        // SAFETY: POD struct overwritten by the call before any field is read.
+        let mut m = unsafe { core::mem::zeroed::<D3DMATERIAL9>() };
+        // SAFETY: vtable thunk; `&mut m` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_material)(
+                self.device,
+                core::ptr::from_mut(&mut m).cast::<c_void>(),
+            )
+        };
+        expect_ok(hr, "GetMaterial");
+        m
+    }
+
+    /// `SetLight`.
+    pub fn set_light(&self, index: u32, light: &D3DLIGHT9) -> i32 {
+        // SAFETY: vtable thunk; `light` is read-only for the call.
+        unsafe {
+            (self.dev_vtbl().set_light)(
+                self.device,
+                index,
+                core::ptr::from_ref(light).cast::<c_void>(),
+            )
+        }
+    }
+
+    /// `GetLight`, asserting success.
+    #[must_use]
+    pub fn light(&self, index: u32) -> D3DLIGHT9 {
+        // SAFETY: POD struct overwritten by the call before any field is read.
+        let mut l = unsafe { core::mem::zeroed::<D3DLIGHT9>() };
+        // SAFETY: vtable thunk; `&mut l` is writable.
+        let hr = unsafe {
+            (self.dev_vtbl().get_light)(
+                self.device,
+                index,
+                core::ptr::from_mut(&mut l).cast::<c_void>(),
+            )
+        };
+        expect_ok(hr, "GetLight");
+        l
+    }
+
+    /// `LightEnable`.
+    pub fn light_enable(&self, index: u32, enable: bool) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().light_enable)(self.device, index, i32::from(enable)) }
+    }
+
+    /// `GetLightEnable`, asserting success.
+    #[must_use]
+    pub fn light_enabled(&self, index: u32) -> bool {
+        let mut enabled = 0i32;
+        // SAFETY: vtable thunk; `&mut enabled` is writable.
+        let hr =
+            unsafe { (self.dev_vtbl().get_light_enable)(self.device, index, &raw mut enabled) };
+        expect_ok(hr, "GetLightEnable");
+        enabled != 0
+    }
+
+    /// `CreateStateBlock(type)`, asserting success.
+    ///
+    /// # Panics
+    /// Panics if creation fails.
+    #[must_use]
+    pub fn create_state_block(&self, sbt: u32) -> StateBlock<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().create_state_block)(self.device, sbt, &raw mut out) };
+        assert_eq!(hr, 0, "CreateStateBlock failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateStateBlock returned null");
+        StateBlock::from_raw(out)
+    }
+
+    /// `BeginStateBlock`.
+    pub fn begin_state_block(&self) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is live.
+        unsafe { (self.dev_vtbl().begin_state_block)(self.device) }
+    }
+
+    /// `EndStateBlock`, asserting success.
+    ///
+    /// # Panics
+    /// Panics if recording was not open or capture fails.
+    #[must_use]
+    pub fn end_state_block(&self) -> StateBlock<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().end_state_block)(self.device, &raw mut out) };
+        assert_eq!(hr, 0, "EndStateBlock failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "EndStateBlock returned null");
+        StateBlock::from_raw(out)
+    }
+
+    /// `CreateQuery(type, null)` — the support probe. Returns the hr.
+    pub fn query_supported(&self, query_type: u32) -> i32 {
+        // SAFETY: vtable thunk; null out-pointer is the documented probe form.
+        unsafe { (self.dev_vtbl().create_query)(self.device, query_type, core::ptr::null_mut()) }
+    }
+
+    /// `CreateQuery(type)`. Returns `None` if the type is unsupported.
+    #[must_use]
+    pub fn create_query(&self, query_type: u32) -> Option<Query<'_>> {
+        self.try_create_query(query_type).ok()
+    }
+
+    /// `CreateQuery(type)`, preserving the error returned by the device.
+    ///
+    /// # Errors
+    /// Returns the HRESULT when creation fails or returns no object.
+    pub fn try_create_query(&self, query_type: u32) -> Result<Query<'_>, i32> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().create_query)(self.device, query_type, &raw mut out) };
+        if hr != 0 || out.is_null() {
+            return Err(hr);
+        }
+        Ok(Query::from_raw(out))
+    }
+
+    /// `CreateVertexDeclaration` from a `D3DVERTEXELEMENT9` array, asserting success.
+    ///
+    /// # Panics
+    /// Panics if creation fails.
+    #[must_use]
+    pub fn create_vertex_declaration(
+        &self,
+        elements: &[mtld3d_types::D3DVERTEXELEMENT9],
+    ) -> VertexDeclaration<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `elements` is read-only, `&mut out` writable.
+        let hr = unsafe {
+            (self.dev_vtbl().create_vertex_declaration)(
+                self.device,
+                elements.as_ptr().cast::<c_void>(),
+                &raw mut out,
+            )
+        };
+        assert_eq!(hr, 0, "CreateVertexDeclaration failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateVertexDeclaration returned null");
+        VertexDeclaration::from_raw(out)
+    }
+
+    /// `SetVertexDeclaration(decl)`.
+    pub fn set_vertex_declaration(&self, decl: &VertexDeclaration<'_>) -> i32 {
+        // SAFETY: vtable thunk; `decl` is a live binding for the call.
+        unsafe { (self.dev_vtbl().set_vertex_declaration)(self.device, decl.as_ptr()) }
+    }
+
+    /// `SetVertexDeclaration(NULL)` — clears the bound vertex declaration.
+    ///
+    /// D3D9 also resets the effective FVF to zero when a declaration is cleared.
+    pub fn set_vertex_declaration_null(&self) -> i32 {
+        // SAFETY: vtable thunk; a null declaration is the documented "unbind".
+        unsafe { (self.dev_vtbl().set_vertex_declaration)(self.device, core::ptr::null_mut()) }
+    }
+
+    // ── Render targets / depth ──
+
+    /// `CreateRenderTarget` returning the raw hr, for the rejection paths.
+    ///
+    /// Non-multisampled and non-lockable. A format with no renderable colour
+    /// mapping is INVALIDCALL; [`Self::create_render_target`] asserts success.
+    /// The sampleable render-target path is `CreateTexture(D3DUSAGE_RENDERTARGET)`.
+    pub fn create_render_target_hr(&self, width: u32, height: u32, format: u32) -> i32 {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        unsafe {
+            (self.dev_vtbl().create_render_target)(
+                self.device,
+                width,
+                height,
+                format,
+                0,
+                0,
+                0,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// `CreateRenderTarget`, asserting success and returning the surface.
+    ///
+    /// Use [`Self::create_render_target_hr`] to test the rejection paths
+    /// instead.
+    ///
+    /// # Panics
+    /// Panics if the call fails or returns null.
+    #[must_use]
+    pub fn create_render_target(&self, width: u32, height: u32, format: u32) -> Surface<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_render_target)(
+                self.device,
+                width,
+                height,
+                format,
+                0,
+                0,
+                0,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, 0, "CreateRenderTarget failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateRenderTarget returned null");
+        Surface::from_raw(out)
+    }
+
+    /// `CreateRenderTarget` with `Lockable == TRUE`, asserting success.
+    ///
+    /// The surface is a `D3DPOOL_DEFAULT` render target like
+    /// [`Self::create_render_target`] and additionally serves `LockRect` /
+    /// `UnlockRect` out of a CPU staging buffer.
+    ///
+    /// # Panics
+    /// Panics if the call fails or returns null.
+    #[must_use]
+    pub fn create_lockable_render_target(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> Surface<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_render_target)(
+                self.device,
+                width,
+                height,
+                format,
+                0,
+                0,
+                1,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, 0, "lockable CreateRenderTarget failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "lockable CreateRenderTarget returned null");
+        Surface::from_raw(out)
+    }
+
+    /// `CreateRenderTarget` with a multisample type, returning the raw hr.
+    ///
+    /// `lockable` is passed through so the rejection of a lockable
+    /// multisampled target can be pinned.
+    pub fn create_render_target_ms_hr(
+        &self,
+        size: (u32, u32),
+        format: u32,
+        multi_sample: (u32, u32),
+        lockable: i32,
+    ) -> (i32, Option<Surface<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_render_target)(
+                self.device,
+                size.0,
+                size.1,
+                format,
+                multi_sample.0,
+                multi_sample.1,
+                lockable,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        if hr == 0 && !out.is_null() {
+            (hr, Some(Surface::from_raw(out)))
+        } else {
+            (hr, None)
+        }
+    }
+
+    /// `CreateRenderTarget` with a multisample type, asserting success.
+    ///
+    /// # Panics
+    /// Panics if the call fails or returns null.
+    #[must_use]
+    pub fn create_render_target_ms(
+        &self,
+        size: (u32, u32),
+        format: u32,
+        multi_sample: (u32, u32),
+    ) -> Surface<'_> {
+        let (hr, surf) = self.create_render_target_ms_hr(size, format, multi_sample, 0);
+        assert_eq!(hr, 0, "CreateRenderTarget(multisampled) failed: 0x{hr:08X}");
+        surf.expect("CreateRenderTarget(multisampled) returned null")
+    }
+
+    /// `CreateDepthStencilSurface` with a multisample type, returning the raw hr.
+    pub fn create_depth_stencil_surface_ms_hr(
+        &self,
+        size: (u32, u32),
+        format: u32,
+        multi_sample: (u32, u32),
+    ) -> (i32, Option<Surface<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_depth_stencil_surface)(
+                self.device,
+                size.0,
+                size.1,
+                format,
+                multi_sample.0,
+                multi_sample.1,
+                0,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        if hr == 0 && !out.is_null() {
+            (hr, Some(Surface::from_raw(out)))
+        } else {
+            (hr, None)
+        }
+    }
+
+    /// `CreateDepthStencilSurface`, asserting success.
+    ///
+    /// # Panics
+    /// Panics if creation fails.
+    #[must_use]
+    pub fn create_depth_stencil_surface(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+    ) -> Surface<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_depth_stencil_surface)(
+                self.device,
+                width,
+                height,
+                format,
+                0,
+                0,
+                0,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, 0, "CreateDepthStencilSurface failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateDepthStencilSurface returned null");
+        Surface::from_raw(out)
+    }
+
+    /// `SetRenderTarget(index, surface)`.
+    pub fn set_render_target(&self, index: u32, surface: &Surface<'_>) -> i32 {
+        // SAFETY: vtable thunk; `surface` is a live binding for the call.
+        unsafe { (self.dev_vtbl().set_render_target)(self.device, index, surface.as_ptr()) }
+    }
+
+    /// `GetRenderTarget(index)`, asserting success.
+    ///
+    /// # Panics
+    /// Panics if the call fails.
+    #[must_use]
+    pub fn render_target(&self, index: u32) -> Surface<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_render_target)(self.device, index, &raw mut out) };
+        assert_eq!(hr, 0, "GetRenderTarget({index}) failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "GetRenderTarget returned null");
+        Surface::from_raw(out)
+    }
+
+    /// `GetRenderTarget(index)` with the raw `HRESULT`.
+    ///
+    /// Returns `(hr, surface)`; the surface is `None` when the call left the
+    /// out-pointer null (an unbound slot reports `D3DERR_NOTFOUND` that way).
+    pub fn render_target_hr(&self, index: u32) -> (i32, Option<Surface<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_render_target)(self.device, index, &raw mut out) };
+        let wrapped = (!out.is_null()).then(|| Surface::from_raw(out));
+        (hr, wrapped)
+    }
+
+    /// `SetRenderTarget(index, NULL)`.
+    pub fn clear_render_target(&self, index: u32) -> i32 {
+        // SAFETY: vtable thunk; a null surface is the documented unbind.
+        unsafe { (self.dev_vtbl().set_render_target)(self.device, index, core::ptr::null_mut()) }
+    }
+
+    /// `SetDepthStencilSurface(surface)`.
+    pub fn set_depth_stencil_surface(&self, surface: &Surface<'_>) -> i32 {
+        // SAFETY: vtable thunk; `surface` is a live binding for the call.
+        unsafe { (self.dev_vtbl().set_depth_stencil_surface)(self.device, surface.as_ptr()) }
+    }
+
+    /// `SetDepthStencilSurface(null)` — unbind the depth-stencil surface.
+    pub fn clear_depth_stencil_surface(&self) -> i32 {
+        // SAFETY: vtable thunk; null unbinds the depth-stencil surface.
+        unsafe { (self.dev_vtbl().set_depth_stencil_surface)(self.device, core::ptr::null_mut()) }
+    }
+
+    /// `GetDepthStencilSurface` with the raw `HRESULT`.
+    ///
+    /// Returns `(hr, surface)`; the surface is `None` when the call left the
+    /// out-pointer null (no depth-stencil bound reports `D3DERR_NOTFOUND`
+    /// that way).
+    pub fn depth_stencil_surface_hr(&self) -> (i32, Option<Surface<'_>>) {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_depth_stencil_surface)(self.device, &raw mut out) };
+        let wrapped = (!out.is_null()).then(|| Surface::from_raw(out));
+        (hr, wrapped)
+    }
+
+    /// `GetDepthStencilSurface` — `None` if no depth-stencil is bound.
+    #[must_use]
+    pub fn depth_stencil_surface(&self) -> Option<Surface<'_>> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable.
+        let hr = unsafe { (self.dev_vtbl().get_depth_stencil_surface)(self.device, &raw mut out) };
+        if hr != 0 || out.is_null() {
+            return None;
+        }
+        Some(Surface::from_raw(out))
+    }
+
+    /// `StretchRect` between explicit `(left, top, right, bottom)` rects. Returns the hr.
+    pub fn stretch_rect_rects(
+        &self,
+        src: &Surface<'_>,
+        src_rect: (i32, i32, i32, i32),
+        dst: &Surface<'_>,
+        dst_rect: (i32, i32, i32, i32),
+        filter: u32,
+    ) -> i32 {
+        let to_rect = |r: (i32, i32, i32, i32)| mtld3d_types::D3DRECT {
+            x1: r.0,
+            y1: r.1,
+            x2: r.2,
+            y2: r.3,
+        };
+        let (src_rect, dst_rect) = (to_rect(src_rect), to_rect(dst_rect));
+        // SAFETY: vtable thunk; both surfaces are live and both rects are stack
+        // locals that outlive the call.
+        unsafe {
+            (self.dev_vtbl().stretch_rect)(
+                self.device,
+                src.as_ptr(),
+                (&raw const src_rect).cast(),
+                dst.as_ptr(),
+                (&raw const dst_rect).cast(),
+                filter,
+            )
+        }
+    }
+
+    /// `StretchRect` over whole surfaces (null rects). Returns the hr.
+    pub fn stretch_rect(&self, src: &Surface<'_>, dst: &Surface<'_>, filter: u32) -> i32 {
+        // SAFETY: vtable thunk; both surfaces are live, null rects = whole surface.
+        unsafe {
+            (self.dev_vtbl().stretch_rect)(
+                self.device,
+                src.as_ptr(),
+                core::ptr::null(),
+                dst.as_ptr(),
+                core::ptr::null(),
+                filter,
+            )
+        }
+    }
+
+    /// `StretchRect` between two explicit rectangles. Returns the hr.
+    ///
+    /// Rectangles are `left`/`top`/`right`/`bottom` in the surface's own
+    /// coordinates, the same layout `D3DRECT` carries.
+    pub fn stretch_rect_regions(
+        &self,
+        src: &Surface<'_>,
+        src_rect: &D3DRECT,
+        dst: &Surface<'_>,
+        dst_rect: &D3DRECT,
+        filter: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; both surfaces are live and both rects are
+        // read-only for the duration of the call.
+        unsafe {
+            (self.dev_vtbl().stretch_rect)(
+                self.device,
+                src.as_ptr(),
+                core::ptr::from_ref(src_rect).cast(),
+                dst.as_ptr(),
+                core::ptr::from_ref(dst_rect).cast(),
+                filter,
+            )
+        }
+    }
+
+    /// `StretchRect` from one source rectangle onto the whole destination.
+    ///
+    /// The destination rectangle stays null, so the source rectangle alone
+    /// decides whether the copy scales.
+    pub fn stretch_rect_region_hr(
+        &self,
+        src: &Surface<'_>,
+        src_rect: &D3DRECT,
+        dst: &Surface<'_>,
+        filter: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; both surfaces are live, `src_rect` is a live
+        // D3DRECT, null dst rect = whole destination surface.
+        unsafe {
+            (self.dev_vtbl().stretch_rect)(
+                self.device,
+                src.as_ptr(),
+                core::ptr::from_ref(src_rect).cast(),
+                dst.as_ptr(),
+                core::ptr::null(),
+                filter,
+            )
+        }
+    }
+
+    /// `ColorFill` over the whole surface (null rect). Returns the hr.
+    ///
+    /// Only a `D3DPOOL_DEFAULT` render target or offscreen-plain surface is a
+    /// valid destination; anything else is INVALIDCALL.
+    pub fn color_fill_hr(&self, surface: &Surface<'_>, color: u32) -> i32 {
+        // SAFETY: vtable thunk; null rect = whole surface.
+        unsafe {
+            (self.dev_vtbl().color_fill)(self.device, surface.as_ptr(), core::ptr::null(), color)
+        }
+    }
+
+    /// `ColorFill` over `rect`, given as `(left, top, right, bottom)`. Returns the hr.
+    ///
+    /// The rect is clipped to the surface, so one that hangs over an edge
+    /// fills the part that lands on it.
+    pub fn color_fill_rect_hr(
+        &self,
+        surface: &Surface<'_>,
+        rect: (i32, i32, i32, i32),
+        color: u32,
+    ) -> i32 {
+        let rect = mtld3d_types::D3DRECT {
+            x1: rect.0,
+            y1: rect.1,
+            x2: rect.2,
+            y2: rect.3,
+        };
+        // SAFETY: vtable thunk; `&rect` outlives the call.
+        unsafe {
+            (self.dev_vtbl().color_fill)(
+                self.device,
+                surface.as_ptr(),
+                (&raw const rect).cast(),
+                color,
+            )
+        }
+    }
+
+    /// `GetRenderTargetData` — copy a render target into a system-memory surface.
+    ///
+    /// Returns the hr; a destination outside `D3DPOOL_SYSTEMMEM` is INVALIDCALL.
+    pub fn get_render_target_data_hr(&self, rt: &Surface<'_>, dst: &Surface<'_>) -> i32 {
+        // SAFETY: vtable thunk; both surfaces are live.
+        unsafe { (self.dev_vtbl().get_render_target_data)(self.device, rt.as_ptr(), dst.as_ptr()) }
+    }
+
+    /// `UpdateSurface` for the complete source and destination surfaces.
+    pub fn update_surface_hr(&self, src: &Surface<'_>, dst: &Surface<'_>) -> i32 {
+        // SAFETY: vtable thunk; both surfaces are live and null selects the
+        // complete source rectangle and destination origin.
+        unsafe {
+            (self.dev_vtbl().update_surface)(
+                self.device,
+                src.as_ptr(),
+                core::ptr::null(),
+                dst.as_ptr(),
+                core::ptr::null(),
+            )
+        }
+    }
+
+    /// `UpdateSurface` for one source rectangle landing at a destination point.
+    pub fn update_surface_region_hr(
+        &self,
+        src: &Surface<'_>,
+        src_rect: &D3DRECT,
+        dst: &Surface<'_>,
+        dst_point: (i32, i32),
+    ) -> i32 {
+        let point: [i32; 2] = dst_point.into();
+        // SAFETY: vtable thunk; both surfaces are live, `src_rect` is a live
+        // D3DRECT and `point` a live POINT (two i32).
+        unsafe {
+            (self.dev_vtbl().update_surface)(
+                self.device,
+                src.as_ptr(),
+                core::ptr::from_ref(src_rect).cast(),
+                dst.as_ptr(),
+                point.as_ptr().cast(),
+            )
+        }
+    }
+
+    /// `UpdateTexture` between two 2D textures.
+    pub fn update_texture_hr(&self, src: &Texture<'_>, dst: &Texture<'_>) -> i32 {
+        // SAFETY: vtable thunk; both textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
+    }
+
+    /// `UpdateTexture` between two cube textures.
+    pub fn update_cube_texture_hr(&self, src: &CubeTexture<'_>, dst: &CubeTexture<'_>) -> i32 {
+        // SAFETY: vtable thunk; both cube textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
+    }
+
+    /// `UpdateTexture` from a 2D texture into a volume texture. Returns the hr.
+    ///
+    /// A resource-type mismatch, which D3D9 rejects; the vtable slot takes
+    /// `IDirect3DBaseTexture9` on both sides, so an application can express it.
+    pub fn update_texture_into_volume_hr(&self, src: &Texture<'_>, dst: &VolumeTexture<'_>) -> i32 {
+        // SAFETY: vtable thunk; both textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
+    }
+
+    /// `UpdateTexture` from a volume texture into a 2D texture. Returns the hr.
+    ///
+    /// The other half of the resource-type mismatch above.
+    pub fn update_volume_into_texture_hr(&self, src: &VolumeTexture<'_>, dst: &Texture<'_>) -> i32 {
+        // SAFETY: vtable thunk; both textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
+    }
+
+    /// `UpdateTexture` between two volume textures. Returns the hr.
+    pub fn update_volume_texture_hr(
+        &self,
+        src: &VolumeTexture<'_>,
+        dst: &VolumeTexture<'_>,
+    ) -> i32 {
+        // SAFETY: vtable thunk; both volume textures are live base textures.
+        unsafe { (self.dev_vtbl().update_texture)(self.device, src.as_ptr(), dst.as_ptr()) }
+    }
+
+    /// Read the device's implicit front buffer into `dst`.
+    pub fn get_front_buffer_data_hr(&self, dst: &Surface<'_>) -> i32 {
+        self.get_front_buffer_data_index_hr(0, dst)
+    }
+
+    /// Probe a device front-buffer read with an explicit swapchain index.
+    pub fn get_front_buffer_data_index_hr(&self, index: u32, dst: &Surface<'_>) -> i32 {
+        // SAFETY: vtable thunk; `dst` is a live surface.
+        unsafe { (self.dev_vtbl().get_front_buffer_data)(self.device, index, dst.as_ptr()) }
+    }
+
+    /// Acquire an owned reference to the implicit swapchain.
+    ///
+    /// # Panics
+    /// Panics if `GetSwapChain` fails.
+    pub fn implicit_swapchain(&self) -> SwapChain<'_> {
+        let mut chain = core::ptr::null_mut();
+        // SAFETY: live device and initialized output for its implicit swapchain.
+        let hr = unsafe { (self.dev_vtbl().get_swap_chain)(self.device, 0, &raw mut chain) };
+        expect_ok(hr, "GetSwapChain");
+        // SAFETY: successful query returned one owned reference, tied to self.
+        unsafe { SwapChain::from_raw(chain) }
+    }
+
+    /// Create an additional windowed swapchain on this harness's window.
+    ///
+    /// # Panics
+    /// Panics if `CreateAdditionalSwapChain` fails.
+    pub fn additional_swapchain(&self) -> SwapChain<'_> {
+        let cfg = HarnessConfig {
+            width: self.width.get(),
+            height: self.height.get(),
+            ..HarnessConfig::default()
+        };
+        let mut pp = present_params(&cfg, self.hwnd);
+        self.additional_swapchain_params(&mut pp)
+    }
+
+    /// Create an additional swapchain and retain the resolved parameters.
+    ///
+    /// # Panics
+    /// Panics if `CreateAdditionalSwapChain` fails.
+    pub fn additional_swapchain_params(&self, pp: &mut D3DPRESENT_PARAMETERS) -> SwapChain<'_> {
+        let (hr, chain) = self.try_additional_swapchain(pp);
+        expect_ok(hr, "CreateAdditionalSwapChain");
+        chain.expect("a created swap chain")
+    }
+
+    /// `CreateAdditionalSwapChain` with `pp`: the hr, and the chain when one was made.
+    pub fn try_additional_swapchain(
+        &self,
+        pp: &mut D3DPRESENT_PARAMETERS,
+    ) -> (i32, Option<SwapChain<'_>>) {
+        let mut chain = core::ptr::null_mut();
+        // SAFETY: live device, readable presentation parameters and writable output.
+        let hr = unsafe {
+            (self.dev_vtbl().create_additional_swap_chain)(
+                self.device,
+                core::ptr::from_mut(pp).cast::<c_void>(),
+                &raw mut chain,
+            )
+        };
+        if hr != D3D_OK || chain.is_null() {
+            return (hr, None);
+        }
+        // SAFETY: successful creation returned one owned reference, tied to self.
+        (hr, Some(unsafe { SwapChain::from_raw(chain) }))
+    }
+
+    /// `CreateAdditionalSwapChain` with a window-sized request and a null `ppSwapChain`.
+    ///
+    /// Returns the hr: a call that has nowhere to hand the chain must make none.
+    #[must_use]
+    pub fn additional_swapchain_null_output_hr(&self) -> i32 {
+        let cfg = HarnessConfig {
+            width: self.width.get(),
+            height: self.height.get(),
+            ..HarnessConfig::default()
+        };
+        let mut pp = present_params(&cfg, self.hwnd);
+        // SAFETY: live device and valid presentation parameters; the output
+        // is deliberately null, which the call has to refuse before writing.
+        unsafe {
+            (self.dev_vtbl().create_additional_swap_chain)(
+                self.device,
+                core::ptr::from_mut(&mut pp).cast::<c_void>(),
+                core::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// `CreateOffscreenPlainSurface` returning the raw hr, for the rejection paths.
+    pub fn create_offscreen_plain_surface_hr(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        pool: u32,
+    ) -> i32 {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        unsafe {
+            (self.dev_vtbl().create_offscreen_plain_surface)(
+                self.device,
+                width,
+                height,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        }
+    }
+
+    /// `CreateOffscreenPlainSurface` with the out slot seeded non-null, for the rejection paths.
+    ///
+    /// Returns `(hr, out)`. D3D9 nulls the out pointer of a refused create, and
+    /// a slot that starts null cannot show that, so this one starts at a
+    /// dangling sentinel: a refused create has to hand back null. A create
+    /// that succeeds is released here, and its non-null pointer only says so.
+    #[must_use]
+    pub fn create_offscreen_plain_surface_seeded(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        pool: u32,
+    ) -> (i32, *mut c_void) {
+        let sentinel = core::ptr::dangling_mut::<c_void>();
+        let mut out = sentinel;
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_offscreen_plain_surface)(
+                self.device,
+                width,
+                height,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        if hr == 0 && !out.is_null() && out != sentinel {
+            drop(Surface::from_raw(out));
+        }
+        (hr, out)
+    }
+
+    /// `CreateOffscreenPlainSurface`, asserting success and returning the surface.
+    ///
+    /// Use [`Self::create_offscreen_plain_surface_hr`] to test the rejection
+    /// paths instead.
+    ///
+    /// # Panics
+    /// Panics if the call fails or returns null.
+    #[must_use]
+    pub fn create_offscreen_plain_surface(
+        &self,
+        width: u32,
+        height: u32,
+        format: u32,
+        pool: u32,
+    ) -> Surface<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable, null shared-handle allowed.
+        let hr = unsafe {
+            (self.dev_vtbl().create_offscreen_plain_surface)(
+                self.device,
+                width,
+                height,
+                format,
+                pool,
+                &raw mut out,
+                core::ptr::null_mut(),
+            )
+        };
+        assert_eq!(hr, 0, "CreateOffscreenPlainSurface failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "CreateOffscreenPlainSurface returned null");
+        Surface::from_raw(out)
+    }
+
+    /// `SetCursorProperties(x_hotspot, y_hotspot, surface)`.
+    ///
+    /// Returns the hr so callers can exercise both the accept and reject paths.
+    pub fn set_cursor_properties_hr(
+        &self,
+        x_hotspot: u32,
+        y_hotspot: u32,
+        surface: &Surface<'_>,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `surface` is a live IDirect3DSurface9.
+        unsafe {
+            (self.dev_vtbl().set_cursor_properties)(
+                self.device,
+                x_hotspot,
+                y_hotspot,
+                surface.as_ptr(),
+            )
+        }
+    }
+
+    /// Capture mouse input without changing `ClipCursor`, for the visible cursor probe.
+    ///
+    /// Returns whether this window owns capture after the call.
+    #[must_use]
+    pub fn capture_mouse(&self, captured: bool) -> bool {
+        win32::capture_mouse(self.hwnd(), captured) == self.hwnd()
+    }
+
+    /// Bring this harness's window to the foreground for a visible probe.
+    #[must_use]
+    pub fn foreground(&self) -> bool {
+        win32::foreground_window(self.hwnd())
+    }
+
+    /// Keep this harness's shown window above every window that is not topmost.
+    pub fn make_topmost(&self) {
+        win32::make_topmost(self.hwnd());
+    }
+
+    /// `ShowCursor(show)`.
+    ///
+    /// Returns the previous visibility state as reported by the device (BOOL).
+    pub fn show_cursor(&self, show: bool) -> i32 {
+        // SAFETY: vtable thunk; `self.device` is a live IDirect3DDevice9.
+        unsafe { (self.dev_vtbl().show_cursor)(self.device, i32::from(show)) }
+    }
+
+    /// Have the window's own procedure call this device's `ShowCursor(FALSE)` on every `msg`.
+    ///
+    /// The hide a game's window procedure makes from inside its handler of a
+    /// message. `0` hides on nothing and only has the procedure answer a
+    /// synthesized `WM_ACTIVATE` itself (`win32::script_cursor_hide` says
+    /// why). The script ends before the harness releases the device.
+    pub fn hide_cursor_from_window_procedure_on(&self, msg: u32) {
+        // SAFETY: the device stays live until `Drop` or `release_device`,
+        // and both end the window's script before releasing it.
+        unsafe { win32::script_cursor_hide(self.hwnd, self.device, msg) };
+    }
+
+    /// How many hides the window's procedure made for this device, and what the last one returned.
+    #[must_use]
+    pub fn window_procedure_hides(&self) -> (usize, i32) {
+        win32::scripted_hides(self.hwnd)
+    }
+
+    /// Send `msg` synchronously through the device window's wndproc.
+    ///
+    /// mtld3d subclasses that wndproc at `CreateDevice`, so tests can
+    /// synthesize the messages macdrv posts (e.g. `WM_SIZE`) deterministically.
+    pub fn send_window_message(&self, msg: u32, wparam: usize, lparam: isize) -> isize {
+        win32::send_message(self.hwnd, msg, wparam, lparam)
+    }
+
+    /// user32 `GetCursor` — the thread cursor handle the d3d9 cursor module last pushed.
+    ///
+    /// Zero means none. The harness runs device calls and the window's wndproc
+    /// on this thread, so this observes cursor realization directly.
+    pub fn thread_cursor(&self) -> usize {
+        win32::get_cursor()
+    }
+
+    /// user32 `SetCursor` — clobber the thread cursor.
+    ///
+    /// Simulates the native cursor taking over while the pointer was outside
+    /// the window.
+    pub fn set_thread_cursor(&self, cursor: usize) -> usize {
+        win32::set_cursor(cursor)
+    }
+
+    /// user32 `GetWindowRect` — the device window's outer rect, in screen coordinates.
+    ///
+    /// A fullscreen device stretches that window over the monitor and puts it
+    /// back on the way out, so the rect is how tests observe both.
+    pub fn window_rect(&self) -> win32::Rect {
+        win32::window_rect(self.hwnd)
+    }
+
+    /// user32 `GetWindowLong(GWL_STYLE)` — the device window's style bits.
+    pub fn window_style(&self) -> u32 {
+        win32::window_long(self.hwnd, win32::GWL_STYLE)
+    }
+
+    /// user32 `GetWindowLong(GWL_EXSTYLE)` — the device window's extended style bits.
+    pub fn window_exstyle(&self) -> u32 {
+        win32::window_long(self.hwnd, win32::GWL_EXSTYLE)
+    }
+
+    /// The primary display's current resolution, straight from `GetSystemMetrics`.
+    ///
+    /// Win32's own answer, independent of anything d3d9 reports — which is what
+    /// makes it usable as the expectation in a display-mode test.
+    #[must_use]
+    pub fn screen_size() -> (u32, u32) {
+        win32::screen_size()
+    }
+
+    /// The primary display's current mode, from `EnumDisplaySettingsW`.
+    ///
+    /// The mode a fullscreen device sets through user32 and restores on the
+    /// way out; Win32's answer, so it pins the mode-set rather than what
+    /// d3d9 reports.
+    #[must_use]
+    pub fn current_display_mode() -> (u32, u32) {
+        win32::current_display_mode()
+    }
+
+    /// The primary display's registry mode, from `EnumDisplaySettingsW`.
+    ///
+    /// The mode the desktop has while no device is fullscreen and the one a
+    /// fullscreen device puts back. A fullscreen device's mode-set does not
+    /// change it, so it reads the same whether or not a device holds a mode.
+    #[must_use]
+    pub fn registry_display_mode() -> (u32, u32) {
+        win32::registry_display_mode()
+    }
+
+    /// user32 `GetClientRect` — the device window's client size.
+    ///
+    /// The space mouse coordinates arrive in, so equality with the back
+    /// buffer is what keeps a game's clicks where its UI is drawn.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an inverted client rect, which Win32 never reports.
+    pub fn client_size(&self) -> (u32, u32) {
+        let rect = win32::client_rect(self.hwnd);
+        (
+            u32::try_from(rect.right - rect.left).expect("client width is positive"),
+            u32::try_from(rect.bottom - rect.top).expect("client height is positive"),
+        )
+    }
+
+    /// `IDirect3DDevice9::GetDisplayMode(0)` into a `D3DDISPLAYMODE`. Returns the hr.
+    pub fn display_mode(&self, mode: &mut mtld3d_types::D3DDISPLAYMODE) -> i32 {
+        // SAFETY: vtable thunk; `mode` is writable for the call.
+        unsafe {
+            (self.dev_vtbl().get_display_mode)(
+                self.device,
+                0,
+                core::ptr::from_mut(mode).cast::<c_void>(),
+            )
+        }
+    }
+
+    /// `GetBackBuffer(0, index, MONO)`, asserting success.
+    ///
+    /// # Panics
+    /// Panics if the call fails.
+    #[must_use]
+    pub fn back_buffer(&self, index: u32) -> Surface<'_> {
+        let mut out: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `&mut out` is writable; type 0 = D3DBACKBUFFER_TYPE_MONO.
+        let hr =
+            unsafe { (self.dev_vtbl().get_back_buffer)(self.device, 0, index, 0, &raw mut out) };
+        assert_eq!(hr, 0, "GetBackBuffer({index}) failed: 0x{hr:08X}");
+        assert!(!out.is_null(), "GetBackBuffer returned null");
+        Surface::from_raw(out)
+    }
+
+    /// `Reset` to `width`×`height`, preserving the configured formats.
+    ///
+    /// Updates [`Self::dims`] on success. Returns the hr.
+    pub fn reset(&self, width: u32, height: u32) -> i32 {
+        let cfg = HarnessConfig {
+            width,
+            height,
+            back_buffer_format: self.back_buffer_format,
+            depth_format: self.depth_format,
+            visible: false,
+            windowed: 1,
+            present_flags: self.present_flags,
+            multi_sample_type: self.multi_sample_type,
+            ..HarnessConfig::default()
+        };
+        let mut pp = present_params(&cfg, self.hwnd);
+        let hr = self.reset_params(&mut pp);
+        if hr == 0 {
+            self.width.set(width);
+            self.height.set(height);
+        }
+        hr
+    }
+
+    /// Hold the session's display mode from here until the harness is torn down.
+    ///
+    /// For a test that reads the display mode, the screen size or window
+    /// geometry it compares across a fullscreen transition: called before
+    /// the first such read, it keeps every other test's device out of
+    /// fullscreen for the rest of the test. A following fullscreen
+    /// [`Self::reset_params`] keeps the same ownership interval rather than
+    /// taking the non-reentrant mode lock again. Does nothing when the
+    /// harness already holds the mode.
+    pub fn hold_display_mode(&self) {
+        if !self.has(HarnessState::HOLDS_DISPLAY_MODE) {
+            take_display_mode();
+            self.set(HarnessState::HOLDS_DISPLAY_MODE, true);
+        }
+    }
+
+    /// `Reset` with caller-built parameters (for malformed-input tests).
+    ///
+    /// Returns the hr; does not touch [`Self::dims`]. A fullscreen request
+    /// takes the session's display mode before the call, and the harness
+    /// keeps it through a later windowed `Reset` until it is torn down, so
+    /// what the test reads after leaving fullscreen is still its own.
+    pub fn reset_params(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
+        if pp.windowed == 0 {
+            self.hold_display_mode();
+        }
+        // SAFETY: vtable thunk; `pp` is writable for the call.
+        unsafe { (self.dev_vtbl().reset)(self.device, core::ptr::from_mut(pp).cast::<c_void>()) }
+    }
+
+    const fn has(&self, flag: HarnessState) -> bool {
+        self.state.get().contains(flag)
+    }
+
+    fn set(&self, flag: HarnessState, on: bool) {
+        let mut state = self.state.get();
+        state.set(flag, on);
+        self.state.set(state);
+    }
+
+    // ── Factory (IDirect3D9) queries ──
+
+    /// `IDirect3D9::CheckDeviceType`.
+    pub fn check_device_type(
+        &self,
+        adapter_format: u32,
+        backbuffer_format: u32,
+        windowed: bool,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `self.d3d9` is live.
+        unsafe {
+            (self.factory_vtbl().check_device_type)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                adapter_format,
+                backbuffer_format,
+                i32::from(windowed),
+            )
+        }
+    }
+
+    /// `IDirect3D9::CheckDeviceFormat`.
+    pub fn check_device_format(
+        &self,
+        adapter_format: u32,
+        usage: u32,
+        resource_type: u32,
+        check_format: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `self.d3d9` is live.
+        unsafe {
+            (self.factory_vtbl().check_device_format)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                adapter_format,
+                usage,
+                resource_type,
+                check_format,
+            )
+        }
+    }
+
+    /// `IDirect3D9::CheckDepthStencilMatch`.
+    pub fn check_depth_stencil_match(
+        &self,
+        adapter_format: u32,
+        render_target_format: u32,
+        depth_stencil_format: u32,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `self.d3d9` is live.
+        unsafe {
+            (self.factory_vtbl().check_depth_stencil_match)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                adapter_format,
+                render_target_format,
+                depth_stencil_format,
+            )
+        }
+    }
+
+    /// `IDirect3D9::CreateDevice` on this factory, into a hidden window of its own.
+    ///
+    /// For the creation answers themselves: `pp` goes to the call as given,
+    /// with its device window replaced by the new window, and is read back
+    /// resolved. A device the call creates is released at once, and the
+    /// window is destroyed after it. Returns the `HRESULT`.
+    ///
+    /// # Panics
+    /// Panics if the back-buffer size does not fit a window's `i32` extent.
+    pub fn create_device_hr(&self, pp: &mut D3DPRESENT_PARAMETERS) -> i32 {
+        let width = i32::try_from(pp.back_buffer_width.max(1)).expect("width fits i32");
+        let height = i32::try_from(pp.back_buffer_height.max(1)).expect("height fits i32");
+        let hwnd =
+            win32::create_styled_window(width, height, false, &win32::WindowStyle::Borderless);
+        pp.device_window = hwnd;
+        let mut device: *mut c_void = core::ptr::null_mut();
+        // SAFETY: vtable thunk; `self.d3d9` is live, `pp` and `device` are
+        // writable for the call and a null focus window is permitted.
+        let hr = unsafe {
+            (self.factory_vtbl().create_device)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                core::ptr::null_mut(),
+                D3DCREATE_HARDWARE_VERTEXPROCESSING,
+                core::ptr::from_mut(pp).cast::<c_void>(),
+                &raw mut device,
+            )
+        };
+        if !device.is_null() {
+            // SAFETY: `device` is the live IDirect3DDevice9 the call above returned.
+            let vtbl = unsafe { deref_vtbl::<IDirect3DDevice9Vtbl>(device) };
+            // SAFETY: vtable thunk; `device` is live and released exactly once.
+            unsafe { (vtbl.release)(device) };
+        }
+        win32::destroy_window(hwnd);
+        hr
+    }
+
+    /// `IDirect3D9::CheckDeviceFormatConversion`.
+    pub fn check_device_format_conversion(&self, source: u32, target: u32) -> i32 {
+        // SAFETY: vtable thunk; `self.d3d9` is live.
+        unsafe {
+            (self.factory_vtbl().check_device_format_conversion)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                source,
+                target,
+            )
+        }
+    }
+
+    /// `IDirect3D9::GetAdapterCount`.
+    #[must_use]
+    pub fn adapter_count(&self) -> u32 {
+        // SAFETY: vtable thunk; `self.d3d9` is live.
+        unsafe { (self.factory_vtbl().get_adapter_count)(self.d3d9) }
+    }
+
+    /// Whether the device is the paravirtualized one a hosted runner exposes.
+    ///
+    /// That device claims no GPU family and implements less than the Mac2
+    /// family it stands in for. Measured, not assumed, by the workflow's
+    /// probe job: it hands back a texture view with a channel swizzle and
+    /// then samples the view through the base texture's lanes, where every
+    /// real GPU family applies the swizzle; and a later encoder of the same
+    /// command buffer that loads or samples a multisample depth resolve
+    /// target sees the content an earlier encoder stored there, not the
+    /// resolve, which is why the layer resolves depth through a transfer
+    /// instead. The renderer keys two sampler fallbacks on the same name. A
+    /// test of a feature the device lacks returns early on it, since its
+    /// assertion would measure the device rather than the layer.
+    #[must_use]
+    pub fn device_is_paravirtual(&self) -> bool {
+        self.adapter_description().contains("Paravirtual")
+    }
+
+    /// The adapter's description string, which is the Metal device's name.
+    ///
+    /// A failure report that carries it says which GPU produced it.
+    #[must_use]
+    pub fn adapter_description(&self) -> String {
+        let id = self.adapter_identifier();
+        let len = id
+            .description
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(id.description.len());
+        String::from_utf8_lossy(&id.description[..len]).into_owned()
+    }
+
+    /// `IDirect3D9::GetAdapterIdentifier`, asserting success.
+    #[must_use]
+    pub fn adapter_identifier(&self) -> D3DADAPTER_IDENTIFIER9 {
+        // SAFETY: POD struct overwritten by the call before any field is read.
+        let mut id = unsafe { core::mem::zeroed::<D3DADAPTER_IDENTIFIER9>() };
+        // SAFETY: vtable thunk; `&mut id` is writable.
+        let hr =
+            unsafe { (self.factory_vtbl().get_adapter_identifier)(self.d3d9, 0, 0, &raw mut id) };
+        expect_ok(hr, "GetAdapterIdentifier");
+        id
+    }
+
+    /// `IDirect3D9::GetAdapterModeCount`.
+    #[must_use]
+    pub fn adapter_mode_count(&self, format: u32) -> u32 {
+        // SAFETY: vtable thunk; `self.d3d9` is live.
+        unsafe { (self.factory_vtbl().get_adapter_mode_count)(self.d3d9, 0, format) }
+    }
+
+    /// `IDirect3D9::EnumAdapterModes` into a `D3DDISPLAYMODE`. Returns the hr.
+    pub fn enum_adapter_modes(
+        &self,
+        format: u32,
+        index: u32,
+        mode: &mut mtld3d_types::D3DDISPLAYMODE,
+    ) -> i32 {
+        // SAFETY: vtable thunk; `mode` is writable for the call.
+        unsafe {
+            (self.factory_vtbl().enum_adapter_modes)(
+                self.d3d9,
+                0,
+                format,
+                index,
+                core::ptr::from_mut(mode).cast::<c_void>(),
+            )
+        }
+    }
+
+    /// `IDirect3D9::GetAdapterDisplayMode` into a `D3DDISPLAYMODE`. Returns the hr.
+    pub fn adapter_display_mode(&self, mode: &mut mtld3d_types::D3DDISPLAYMODE) -> i32 {
+        // SAFETY: vtable thunk; `mode` is writable for the call.
+        unsafe {
+            (self.factory_vtbl().get_adapter_display_mode)(
+                self.d3d9,
+                0,
+                core::ptr::from_mut(mode).cast::<c_void>(),
+            )
+        }
+    }
+
+    /// `CheckDeviceMultiSampleType`, returning `(hr, quality_levels)`.
+    pub fn check_device_multi_sample_type(
+        &self,
+        surface_format: u32,
+        windowed: i32,
+        multi_sample_type: u32,
+    ) -> (i32, u32) {
+        let mut levels = 0u32;
+        // SAFETY: vtable thunk; `self.d3d9` is live and `&mut levels` writable.
+        let hr = unsafe {
+            (self.factory_vtbl().check_device_multi_sample_type)(
+                self.d3d9,
+                0,
+                D3DDEVTYPE_HAL,
+                surface_format,
+                windowed,
+                multi_sample_type,
+                &raw mut levels,
+            )
+        };
+        (hr, levels)
+    }
+
+    /// `IDirect3D9::GetDeviceCaps`, asserting success.
+    #[must_use]
+    pub fn device_caps(&self) -> D3DCAPS9 {
+        // SAFETY: POD struct overwritten by the call before any field is read.
+        let mut caps = unsafe { core::mem::zeroed::<D3DCAPS9>() };
+        // SAFETY: vtable thunk; `&mut caps` is writable.
+        let hr = unsafe {
+            (self.factory_vtbl().get_device_caps)(self.d3d9, 0, D3DDEVTYPE_HAL, &raw mut caps)
+        };
+        expect_ok(hr, "GetDeviceCaps");
+        caps
+    }
+}
+
+impl Default for Harness {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if !self.device.is_null() && !self.has(HarnessState::DEVICE_RELEASED) {
+            win32::end_cursor_script(self.hwnd);
+            // SAFETY: vtable thunk; `self.device` is live and released exactly once.
+            unsafe { (self.dev_vtbl().release)(self.device) };
+        }
+        // SAFETY: vtable thunk; `self.d3d9` is live and released exactly once.
+        unsafe { (self.factory_vtbl().release)(self.d3d9) };
+        if self.hwnd != 0 && !self.has(HarnessState::BORROWED_WINDOW) {
+            win32::destroy_window(self.hwnd);
+        }
+        // The device release above put the mode back; only now may another
+        // fullscreen harness take it.
+        if self.has(HarnessState::HOLDS_DISPLAY_MODE) {
+            release_display_mode();
+        }
+    }
+}
+
+fn present_params(cfg: &HarnessConfig, hwnd: usize) -> D3DPRESENT_PARAMETERS {
+    D3DPRESENT_PARAMETERS {
+        back_buffer_width: cfg.width,
+        back_buffer_height: cfg.height,
+        back_buffer_format: cfg.back_buffer_format,
+        back_buffer_count: 1,
+        multi_sample_type: cfg.multi_sample_type,
+        multi_sample_quality: cfg.multi_sample_quality,
+        swap_effect: D3DSWAPEFFECT_DISCARD,
+        device_window: hwnd,
+        windowed: cfg.windowed,
+        enable_auto_depth_stencil: u32::from(cfg.depth_format.is_some()),
+        auto_depth_stencil_format: cfg.depth_format.unwrap_or(0),
+        flags: cfg.present_flags,
+        full_screen_refresh_rate_in_hz: 0,
+        presentation_interval: cfg.presentation_interval,
+    }
+}

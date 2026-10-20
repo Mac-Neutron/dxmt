@@ -1,0 +1,8122 @@
+//! Offscreen render target round-trip and depth-buffered occlusion.
+//!
+//! The round-trip renders to a texture, then samples it.
+
+use mtld3d_tests::{
+    CubeTexture, Harness, HarnessConfig, PosColorVertex, Rgba8, RhwVertex, Surface, SwapChain,
+    Texture, TexturedVertex, Vertex, VolumeVertex,
+};
+use mtld3d_types::{
+    D3D_OK, D3DBLEND_INVSRCALPHA, D3DBLEND_SRCALPHA, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER,
+    D3DCMP_ALWAYS, D3DCMP_LESS, D3DCMP_LESSEQUAL, D3DERR_INVALIDCALL, D3DERR_NOTFOUND,
+    D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8,
+    D3DFMT_A16B16G16R16F, D3DFMT_A32B32G32R32F, D3DFMT_D24S8, D3DFMT_INTZ, D3DFMT_L8, D3DFMT_NV12,
+    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_UYVY, D3DFMT_X1R5G5B5, D3DFMT_X8B8G8R8, D3DFMT_X8R8G8B8,
+    D3DFMT_YUY2, D3DFMT_YV12, D3DFVF_DIFFUSE, D3DFVF_TEX1, D3DFVF_XYZ, D3DFVF_XYZRHW,
+    D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DPOOL_MANAGED,
+    D3DPOOL_SCRATCH, D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRECT, D3DRS_ALPHABLENDENABLE,
+    D3DRS_DESTBLEND, D3DRS_LIGHTING, D3DRS_SRCBLEND, D3DRS_ZENABLE, D3DRS_ZFUNC,
+    D3DRS_ZWRITEENABLE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER, D3DSAMP_MAXMIPLEVEL,
+    D3DSAMP_MINFILTER, D3DSAMP_MIPFILTER, D3DTA_DIFFUSE, D3DTA_TEXTURE, D3DTADDRESS_CLAMP,
+    D3DTEXF_LINEAR, D3DTEXF_NONE, D3DTEXF_POINT, D3DTOP_MODULATE, D3DTOP_SELECTARG1,
+    D3DTSS_ALPHAARG1, D3DTSS_ALPHAOP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_COLOROP,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET, D3DVIEWPORT9,
+    IID_IDIRECT3DSWAPCHAIN9,
+};
+
+const RED: u32 = 0xFFFF_0000;
+const BLACK: u32 = 0xFF00_0000;
+const WHITE: u32 = 0xFFFF_FFFF;
+const GREEN: u32 = 0xFF00_FF00;
+const BLUE: u32 = 0xFF00_00FF;
+const MAGENTA: u32 = 0xFFFF_00FF;
+/// What a colour render target reads as before anything draws into it.
+const FRESH: u32 = 0x0000_0000;
+
+/// `left`/`top`/`right`/`bottom` in surface coordinates.
+const fn rect(x1: i32, y1: i32, x2: i32, y2: i32) -> D3DRECT {
+    D3DRECT { x1, y1, x2, y2 }
+}
+
+/// `ps_3_0 { dcl_2d s0; dcl_texcoord0 v0; texld r0, v0, s0; mov oC0, r0; }`
+///
+/// Tokens follow the `D3DSHADER_PARAM` layout (bit 31 set; register type split
+/// across bits `[30:28]` and `[12:11]`; `0xE4` = `.xyzw` swizzle; `0xF` write
+/// mask). Sampling an INTZ (`Depth32Float`) texture on s0 drives the emitter's
+/// raw-depth-fetch variant: `depth2d` bound + a plain `.sample()` returning the
+/// stored normalized depth (INTZ/DF24/DF16 are NOT shadow-compare formats).
+#[rustfmt::skip]
+const PS_SAMPLE_DEPTH: [u32; 15] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0005, 0x900F_0000,              // dcl_texcoord0 v0
+    0x0300_0042, 0x800F_0000, 0x90E4_0000, 0xA0E4_0800, // texld r0, v0, s0
+    0x0200_0001, 0x800F_0800, 0x80E4_0000,              // mov oC0, r0
+    0x0000_FFFF,                                        // end
+];
+
+/// A single triangle covering the whole viewport, in `color`.
+const fn fullscreen_triangle(color: u32) -> [PosColorVertex; 3] {
+    [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color,
+        },
+    ]
+}
+
+#[test]
+fn render_to_texture_then_sample() {
+    let h = Harness::new();
+
+    let rt = h.create_texture(
+        256,
+        256,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+
+    // MODULATE(texture, diffuse) so pass 2 shows the texel; set once.
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_MODULATE),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_COLORARG2, D3DTA_DIFFUSE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    // Lighting defaults ON; the draws below carry a diffuse colour but no normal,
+    // so the lit path emits only the (zero) material ambient + emissive — black.
+    // Disable lighting to exercise the unlit vertex-colour path this test checks.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+
+    // ── Pass 1: fill the RT red (clear + an explicit draw so TBDR can't drop it).
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    assert_eq!(h.clear_target(RED), 0, "clear RT red");
+    assert_eq!(h.clear_texture(0), 0, "no texture for the fill draw");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let fill = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: RED,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: RED,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: RED,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fill),
+        0,
+        "RT fill draw"
+    );
+
+    // ── Pass 2: back to the backbuffer, sample the RT onto a centred quad.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+    assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer black");
+    assert_eq!(h.set_texture(0, &rt), 0, "bind RT as texture");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF TEX1"
+    );
+
+    let quad = [
+        TexturedVertex {
+            x: -0.5,
+            y: 0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 0.5,
+            y: 0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: 0.5,
+            y: 0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample-RT draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // Quad covers clip (-0.5,-0.5)..(0.5,0.5) → pixels (160,120)..(480,360).
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.r > 200 && center.g < 40 && center.b < 40,
+        "center samples red RT, got {center:?}"
+    );
+    let corner = Rgba8::from_pixel(h.read_pixel(10, 10));
+    assert!(
+        corner.r < 20 && corner.g < 20 && corner.b < 20,
+        "corner stays black, got {corner:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "unbind RT texture");
+}
+
+#[test]
+fn depth_test_near_occludes_far() {
+    let h = Harness::with_depth();
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "ZENABLE");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL),
+        0,
+        "ZFUNC"
+    );
+    // Lighting defaults ON; these depth-marker quads carry a diffuse colour but
+    // no normal, so the lit path would render them black. Disable lighting to
+    // exercise the unlit vertex-colour path (the colours are depth markers).
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+
+    let far = [
+        Vertex {
+            x: 0.0,
+            y: 0.8,
+            z: 0.7,
+            color: RED,
+        },
+        Vertex {
+            x: 0.8,
+            y: -0.8,
+            z: 0.7,
+            color: RED,
+        },
+        Vertex {
+            x: -0.8,
+            y: -0.8,
+            z: 0.7,
+            color: RED,
+        },
+    ];
+    let near = [
+        Vertex {
+            x: -0.2,
+            y: 0.8,
+            z: 0.3,
+            color: 0xFF00_00FF,
+        },
+        Vertex {
+            x: 0.6,
+            y: -0.8,
+            z: 0.3,
+            color: 0xFF00_00FF,
+        },
+        Vertex {
+            x: -1.0,
+            y: -0.8,
+            z: 0.3,
+            color: 0xFF00_00FF,
+        },
+    ];
+    assert!(h.pump(), "WM_QUIT");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, GREEN, 1.0, 0),
+        0,
+        "clear color+depth"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &far),
+        0,
+        "far draw"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &near),
+        0,
+        "near draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_eq!(h.read_pixel(10, 10), GREEN, "background cleared green");
+    let overlap = Rgba8::from_pixel(h.read_pixel(280, 300));
+    assert!(
+        overlap.b > overlap.r,
+        "overlap: near blue wins, got {overlap:?}"
+    );
+    let far_only = Rgba8::from_pixel(h.read_pixel(500, 350));
+    assert!(
+        far_only.r > far_only.b,
+        "far-only region is red, got {far_only:?}"
+    );
+}
+
+#[test]
+fn auto_depth_stencil_get_set_round_trip() {
+    // A depth device exposes its auto depth-stencil; the save/restore pattern
+    // (Get → … → Set) round-trips.
+    let h = Harness::with_depth();
+    let ds = h
+        .depth_stencil_surface()
+        .expect("auto depth-stencil present");
+    let (hr, _desc) = ds.desc();
+    assert_eq!(hr, 0, "depth-stencil surface describes");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ds),
+        0,
+        "SetDepthStencilSurface(saved)"
+    );
+}
+
+#[test]
+fn create_depth_stencil_surface_succeeds() {
+    let h = Harness::new();
+    let ds = h.create_depth_stencil_surface(256, 256, D3DFMT_D24S8);
+    let (hr, _desc) = ds.desc();
+    assert_eq!(hr, 0, "created depth-stencil surface describes");
+}
+
+#[test]
+fn get_depth_stencil_surface_reports_the_bound_surface() {
+    // `GetDepthStencilSurface` answers with the object `SetDepthStencilSurface`
+    // bound, not with the device's auto depth-stencil, so pointer identity
+    // holds and the save/restore pattern round-trips through an app-created
+    // surface. With nothing bound it reports `D3DERR_NOTFOUND` and nulls the
+    // caller's out-pointer.
+    let h = Harness::with_depth();
+    let implicit = h
+        .depth_stencil_surface()
+        .expect("auto depth-stencil present");
+    let custom = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    assert_eq!(
+        h.set_depth_stencil_surface(&custom),
+        0,
+        "bind the app-created depth-stencil"
+    );
+
+    let saved = h.depth_stencil_surface().expect("a depth-stencil is bound");
+    assert_eq!(
+        saved.as_ptr(),
+        custom.as_ptr(),
+        "GetDepthStencilSurface must hand back the bound surface"
+    );
+
+    // Save / bind another / restore: the restore has to put the app surface
+    // back, not the auto depth the saved handle would name if `Get` reported
+    // the implicit shell.
+    assert_eq!(
+        h.set_depth_stencil_surface(&implicit),
+        0,
+        "temporarily bind the auto depth-stencil"
+    );
+    assert_eq!(
+        h.set_depth_stencil_surface(&saved),
+        0,
+        "restore the saved depth-stencil"
+    );
+    let restored = h
+        .depth_stencil_surface()
+        .expect("a depth-stencil is bound after the restore");
+    assert_eq!(
+        restored.as_ptr(),
+        custom.as_ptr(),
+        "the restore must leave the app-created surface bound"
+    );
+
+    assert_eq!(h.clear_depth_stencil_surface(), 0, "unbind depth-stencil");
+    let (hr, none) = h.depth_stencil_surface_hr();
+    assert_eq!(hr, D3DERR_NOTFOUND, "no depth-stencil bound");
+    assert!(none.is_none(), "a rejected Get nulls the out-pointer");
+}
+
+#[test]
+fn depth_clear_with_rects_touches_only_the_rects() {
+    // `Clear(D3DCLEAR_ZBUFFER, pRects)` clears depth inside the rects and
+    // leaves the rest of the attachment alone, like a colour clear does.
+    let h = Harness::with_depth();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let left_half = [D3DRECT {
+        x1: 0,
+        y1: 0,
+        x2: 320,
+        y2: 480,
+    }];
+    assert_eq!(
+        h.clear_rects(D3DCLEAR_ZBUFFER, BLACK, 0.0, 0, &left_half),
+        0,
+        "rect-bounded depth clear"
+    );
+
+    // A full-screen quad at 0.5 passes only where depth stayed 1.0.
+    let cover = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &cover), 0);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(
+        h.read_pixel(160, 240),
+        BLACK,
+        "inside the rect depth is 0.0 and rejects the quad"
+    );
+    assert_eq!(
+        h.read_pixel(480, 240),
+        GREEN,
+        "outside the rect depth keeps 1.0 and accepts the quad"
+    );
+}
+
+#[test]
+fn depth_to_depth_stretch_rect_copies_depth() {
+    // A full-surface depth→depth StretchRect copies the source depth, so a
+    // later depth test against the destination sees the copied values rather
+    // than the destination's own clear.
+    let h = Harness::with_depth();
+    let src = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    let dst = h.depth_stencil_surface().expect("implicit depth-stencil");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+
+    // Source: depth 0.0 everywhere, 0.5 over the top-left 480x360 and 1.0
+    // over the top-left 320x240 (rect-bounded clears, so the source pass
+    // holds only clear quads).
+    assert_eq!(h.set_depth_stencil_surface(&src), 0, "bind source depth");
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 0.0, 0), 0);
+    let rect = |x2, y2| {
+        [D3DRECT {
+            x1: 0,
+            y1: 0,
+            x2,
+            y2,
+        }]
+    };
+    assert_eq!(
+        h.clear_rects(D3DCLEAR_ZBUFFER, BLACK, 0.5, 0, &rect(480, 360)),
+        0
+    );
+    assert_eq!(
+        h.clear_rects(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0, &rect(320, 240)),
+        0
+    );
+    // Copies into the still-unbound destination are valid and are then
+    // overwritten by its clear below; the filtered form is accepted too.
+    assert_eq!(h.stretch_rect(&src, &dst, D3DTEXF_POINT), 0, "early copy");
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_LINEAR),
+        0,
+        "filtered copy"
+    );
+
+    // Destination: cleared to red / 1.0, then its depth is overwritten by
+    // the copy while the red clear must survive underneath.
+    assert_eq!(
+        h.set_depth_stencil_surface(&dst),
+        0,
+        "bind destination depth"
+    );
+    assert_eq!(h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, RED, 1.0, 0), 0);
+    assert_eq!(h.stretch_rect(&src, &dst, D3DTEXF_POINT), 0, "depth copy");
+
+    // Two full-screen quads, green at 0.33 and blue at 0.66, depth-tested
+    // against the copy without writing depth.
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+    let cover = |z: f32, color: u32| {
+        [
+            PosColorVertex {
+                x: -1.0,
+                y: 3.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 3.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+        ]
+    };
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &cover(0.33, GREEN)),
+        0
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &cover(0.66, BLUE)),
+        0
+    );
+    assert_eq!(h.end_scene(), 0);
+    // Copied 1.0: both quads pass, blue on top. Copied 0.5: only green.
+    // Copied 0.0: neither, the red clear shows.
+    let expected = [
+        [BLUE, BLUE, GREEN, RED],
+        [BLUE, BLUE, GREEN, RED],
+        [GREEN, GREEN, GREEN, RED],
+        [RED, RED, RED, RED],
+    ];
+    for (i, row) in (0u32..).zip(&expected) {
+        for (j, &want) in (0u32..).zip(row) {
+            let x = 80 * (2 * j + 1);
+            let y = 60 * (2 * i + 1);
+            assert_eq!(
+                h.read_pixel(x, y),
+                want,
+                "depth copied into the destination at ({x}, {y})"
+            );
+        }
+    }
+}
+
+#[test]
+fn stretch_rect_addresses_source_and_destination_mip_levels() {
+    // A StretchRect between surfaces that are upper mip levels reads and
+    // writes those levels, on both the scaling and the 1:1 path.
+    let h = Harness::new();
+    let tex = h.create_texture(
+        128,
+        128,
+        2,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level0 = tex.surface_level(0);
+    let level1 = tex.surface_level(1);
+    let backbuffer = h.render_target(0);
+    let small = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+
+    assert_eq!(h.set_render_target(0, &level0), 0);
+    assert_eq!(h.clear_target(RED), 0);
+    assert_eq!(h.set_render_target(0, &level1), 0);
+    assert_eq!(h.clear_target(GREEN), 0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+
+    // Scaling path: level 1 (64x64) onto the 640x480 back buffer.
+    assert_eq!(
+        h.stretch_rect(&level1, &backbuffer, D3DTEXF_NONE),
+        0,
+        "scaled copy from level 1"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "scaled copy samples the source's own level"
+    );
+
+    // 1:1 path: level 1 (64x64) into a 64x64 target, then that target onto
+    // the back buffer so it can be read.
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.stretch_rect(&level1, &small, D3DTEXF_NONE),
+        0,
+        "1:1 copy from level 1"
+    );
+    assert_eq!(
+        h.stretch_rect(&small, &backbuffer, D3DTEXF_NONE),
+        0,
+        "scaled copy of the 1:1 result"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "1:1 copy reads the source's own level"
+    );
+
+    // 1:1 into level 1: paint the small target, copy it into level 1, then
+    // read level 1 back through the scaling path.
+    assert_eq!(h.set_render_target(0, &small), 0);
+    assert_eq!(h.clear_target(WHITE), 0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(
+        h.stretch_rect(&small, &level1, D3DTEXF_NONE),
+        0,
+        "1:1 copy into level 1"
+    );
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.stretch_rect(&level1, &backbuffer, D3DTEXF_NONE),
+        0,
+        "scaled copy from the written level 1"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        WHITE,
+        "1:1 copy writes the destination's own level"
+    );
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.stretch_rect(&level0, &backbuffer, D3DTEXF_NONE),
+        0,
+        "scaled copy from level 0"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        RED,
+        "level 0 is untouched by the level-1 writes"
+    );
+}
+
+#[test]
+fn clear_zbuffer_without_depth_stencil_is_invalid() {
+    // `Clear(D3DCLEAR_ZBUFFER)` with no depth-stencil attachment bound is
+    // invalid per the D3D9 spec. The guard must key on
+    // whether a depth-stencil is *actually* bound, not on whether an auto
+    // depth-stencil exists: a custom depth surface bound for an offscreen
+    // render target still satisfies the clear.
+
+    // (a) Explicit `SetDepthStencilSurface(NULL)` leaves no attachment: a
+    // depth clear must fail.
+    let h = Harness::with_depth();
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "auto depth-stencil present: depth clear succeeds",
+    );
+    assert_eq!(h.clear_depth_stencil_surface(), 0, "unbind depth-stencil");
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        D3DERR_INVALIDCALL,
+        "depth clear with no depth-stencil bound is invalid",
+    );
+
+    // (b) An offscreen render target with a custom depth surface bound: the
+    // auto depth handle does not reflect that surface, so the guard must not
+    // regress this combined color+depth clear to INVALIDCALL.
+    let rt = h.create_render_target(256, 256, D3DFMT_A8R8G8B8);
+    let depth = h.create_depth_stencil_surface(256, 256, D3DFMT_D24S8);
+    assert_eq!(
+        h.set_render_target(0, &rt),
+        0,
+        "bind offscreen color target"
+    );
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth),
+        0,
+        "bind custom depth surface",
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "color+depth clear with a bound custom depth surface succeeds",
+    );
+}
+
+#[test]
+fn create_render_target_rejects_unrenderable_format() {
+    // CreateRenderTarget is implemented for renderable color formats (see
+    // create_render_target_default_pool_reports_desc); an unmappable / non-
+    // renderable format is still rejected with INVALIDCALL.
+    let h = Harness::new();
+    assert_eq!(
+        h.create_render_target_hr(640, 480, 0 /* D3DFMT_UNKNOWN */),
+        D3DERR_INVALIDCALL,
+        "CreateRenderTarget rejects an unmappable format",
+    );
+}
+
+#[test]
+fn back_buffer_desc_matches_device() {
+    let h = Harness::new();
+    let bb = h.back_buffer(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "GetDesc");
+    assert_eq!(
+        (desc.width, desc.height),
+        (640, 480),
+        "backbuffer dimensions"
+    );
+}
+
+#[test]
+fn stretch_rect_accepts_one_to_one_same_format() {
+    // StretchRect is accepted for a 1:1 same-format blit between a render-target
+    // texture surface and the backbuffer (both BGRA8), and the copy carries the
+    // source's content: a clear-only pass whose target is then copied out must
+    // keep its store.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    assert_eq!(h.clear_target(RED), 0, "clear RT red");
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    assert_eq!(
+        h.stretch_rect(&rt_surface, &backbuffer, D3DTEXF_NONE),
+        0,
+        "1:1 same-format StretchRect is accepted",
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        RED,
+        "the copy carries the cleared colour into the backbuffer"
+    );
+}
+
+/// Read a colour surface back as `0xAARRGGBB` words through `GetRenderTargetData`.
+pub fn read_back(h: &Harness, surface: &Surface<'_>, size: (u32, u32), format: u32) -> Vec<u32> {
+    let sysmem = h.create_offscreen_plain_surface(size.0, size.1, format, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(surface, &sysmem),
+        0,
+        "read-back"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+    let words = locked.as_u32(pitch * size.1 as usize);
+    (0..size.1 as usize)
+        .flat_map(|y| words[y * pitch..][..size.0 as usize].iter().copied())
+        .collect()
+}
+
+/// `StretchRect` from an X render target into its A counterpart writes alpha one.
+///
+/// The X byte is padding that D3D9 reads as alpha one, so a copy into the A
+/// format writes alpha one whatever the padding holds; the fill here leaves
+/// its zero alpha in it. Checked 1:1 into a render target with the point and
+/// the linear filter, scaled into part of one (the rest keeping its own
+/// fill), and 1:1 into a render-target texture level, in both 8-bit channel
+/// orders. Each word is read in its own
+/// format's order, so red is `0xFFFF0000` in A8R8G8B8 and `0xFF0000FF` in
+/// A8B8G8R8.
+#[test]
+fn stretch_rect_from_an_x_render_target_into_its_a_counterpart_writes_opaque_alpha() {
+    const SIZE: (u32, u32) = (16, 16);
+    let h = Harness::new();
+    for (x_format, a_format, opaque_red) in [
+        (D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8, RED),
+        (D3DFMT_X8B8G8R8, D3DFMT_A8B8G8R8, 0xFF00_00FF),
+    ] {
+        let src = h.create_render_target(SIZE.0, SIZE.1, x_format);
+        assert_eq!(
+            h.color_fill_hr(&src, 0x00FF_0000),
+            D3D_OK,
+            "fill {x_format:#x}"
+        );
+
+        let one_to_one = h.create_render_target(SIZE.0, SIZE.1, a_format);
+        assert_eq!(
+            h.stretch_rect(&src, &one_to_one, D3DTEXF_NONE),
+            D3D_OK,
+            "1:1 {x_format:#x} -> {a_format:#x}"
+        );
+        for (i, &word) in read_back(&h, &one_to_one, SIZE, a_format)
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                word, opaque_red,
+                "1:1 {x_format:#x} -> {a_format:#x}, pixel {i}"
+            );
+        }
+
+        let linear = h.create_render_target(SIZE.0, SIZE.1, a_format);
+        assert_eq!(
+            h.stretch_rect(&src, &linear, D3DTEXF_LINEAR),
+            D3D_OK,
+            "1:1 linear {x_format:#x} -> {a_format:#x}"
+        );
+        for (i, &word) in read_back(&h, &linear, SIZE, a_format).iter().enumerate() {
+            assert_eq!(
+                word, opaque_red,
+                "1:1 linear {x_format:#x} -> {a_format:#x}, pixel {i}"
+            );
+        }
+
+        let scaled = h.create_render_target(SIZE.0, SIZE.1, a_format);
+        assert_eq!(
+            h.color_fill_hr(&scaled, GREEN),
+            D3D_OK,
+            "seed {a_format:#x}"
+        );
+        assert_eq!(
+            h.stretch_rect_rects(&src, (0, 0, 16, 16), &scaled, (0, 0, 8, 8), D3DTEXF_POINT),
+            D3D_OK,
+            "scaled {x_format:#x} -> {a_format:#x}"
+        );
+        let words = read_back(&h, &scaled, SIZE, a_format);
+        for y in 0..SIZE.1 as usize {
+            for x in 0..SIZE.0 as usize {
+                let expected = if x < 8 && y < 8 { opaque_red } else { GREEN };
+                assert_eq!(
+                    words[y * SIZE.0 as usize + x],
+                    expected,
+                    "scaled {x_format:#x} -> {a_format:#x}, pixel ({x}, {y})"
+                );
+            }
+        }
+
+        let texture = h.create_texture(
+            SIZE.0,
+            SIZE.1,
+            1,
+            D3DUSAGE_RENDERTARGET,
+            a_format,
+            D3DPOOL_DEFAULT,
+        );
+        let level = texture.surface_level(0);
+        assert_eq!(
+            h.stretch_rect(&src, &level, D3DTEXF_NONE),
+            D3D_OK,
+            "1:1 {x_format:#x} -> {a_format:#x} texture level"
+        );
+        for (i, &word) in read_back(&h, &level, SIZE, a_format).iter().enumerate() {
+            assert_eq!(
+                word, opaque_red,
+                "1:1 {x_format:#x} -> {a_format:#x} texture level, pixel {i}"
+            );
+        }
+    }
+}
+
+/// `StretchRect` from the X8R8G8B8 back buffer into an A8R8G8B8 texture writes alpha one.
+///
+/// A frame copies its back buffer into a render-target texture of the same
+/// size and samples it afterwards. The back buffer's padding holds the fill's
+/// zero alpha, and the copy still reads alpha one. A render target of the
+/// back buffer's size scales with it under `render.scale`, so the copy stays
+/// 1:1 there too.
+#[test]
+fn stretch_rect_from_the_x8r8g8b8_back_buffer_into_an_a8r8g8b8_texture_writes_opaque_alpha() {
+    const SIZE: (u32, u32) = (640, 480);
+    let h = Harness::new();
+    let back_buffer = h.render_target(0);
+    assert_eq!(h.color_fill_hr(&back_buffer, 0x00FF_0000), D3D_OK, "fill");
+    let texture = h.create_texture(
+        SIZE.0,
+        SIZE.1,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = texture.surface_level(0);
+    assert_eq!(
+        h.stretch_rect(&back_buffer, &level, D3DTEXF_NONE),
+        D3D_OK,
+        "back buffer -> A8R8G8B8 texture level"
+    );
+    let words = read_back(&h, &level, SIZE, D3DFMT_A8R8G8B8);
+    for (x, y) in [(0, 0), (320, 240), (639, 479)] {
+        assert_eq!(words[y * SIZE.0 as usize + x], RED, "pixel ({x}, {y})");
+    }
+}
+
+/// `StretchRect` from an X8R8G8B8 render target into an A16B16G16R16F one writes alpha one.
+///
+/// The two storages differ, so the copy converts through the render quad, and
+/// the X byte's zero still reads as alpha one in the half-float destination.
+#[test]
+fn stretch_rect_from_an_x8r8g8b8_render_target_into_a16b16g16r16f_writes_opaque_alpha() {
+    let h = Harness::new();
+    let src = h.create_render_target(16, 16, D3DFMT_X8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, 0x00FF_0000), D3D_OK, "fill");
+    let dst = h.create_render_target(16, 16, D3DFMT_A16B16G16R16F);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "X8R8G8B8 -> A16B16G16R16F"
+    );
+    let sysmem = h.create_offscreen_plain_surface(16, 16, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&dst, &sysmem),
+        D3D_OK,
+        "read-back"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 2;
+    let halves = locked.as_u16(pitch * 16);
+    for (x, y) in [(0usize, 0usize), (8, 8), (15, 15)] {
+        let texel = y * pitch + x * 4;
+        let lanes = [0, 1, 2, 3].map(|lane| f16_to_f32(halves[texel + lane]).to_bits());
+        assert_eq!(
+            lanes,
+            [1.0f32, 0.0, 0.0, 1.0].map(f32::to_bits),
+            "texel ({x}, {y}) as R, G, B, A"
+        );
+    }
+}
+
+/// `StretchRect` from an X offscreen plain into one with alpha writes alpha one.
+///
+/// An offscreen-plain destination cannot be rendered into, so the pair is
+/// converted on the CPU, and the conversion reads the padding as alpha one:
+/// X8R8G8B8 into A8R8G8B8, X1R5G5B5 into A1R5G5B5, and X8R8G8B8 into
+/// A1R5G5B5 and A4R4G4B4, each source locked with its padding clear.
+#[test]
+fn stretch_rect_from_an_x_offscreen_plain_into_one_with_alpha_writes_opaque_alpha() {
+    const SIDE: usize = 4;
+    // Red with the top bit, the X1R5G5B5 padding, clear, and the same red opaque.
+    const X1_RED: u16 = 0x7C00;
+    const A1_OPAQUE_RED: u16 = 0xFC00;
+    const A4_OPAQUE_RED: u16 = 0xFF00;
+    let h = Harness::new();
+
+    let x8 = h.create_offscreen_plain_surface(4, 4, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    let a8 = h.create_offscreen_plain_surface(4, 4, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    x8.lock_rect(0)
+        .write_u32_rect(SIDE, SIDE, &[0x00FF_0000; SIDE * SIDE]);
+    a8.lock_rect(0)
+        .write_u32_rect(SIDE, SIDE, &[GREEN; SIDE * SIDE]);
+    assert_eq!(
+        h.stretch_rect(&x8, &a8, D3DTEXF_NONE),
+        D3D_OK,
+        "X8R8G8B8 -> A8R8G8B8"
+    );
+    {
+        let locked = a8.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+        let words = locked.as_u32(pitch * SIDE);
+        for y in 0..SIDE {
+            assert_eq!(
+                &words[y * pitch..y * pitch + SIDE],
+                &[RED; SIDE],
+                "A8R8G8B8 row {y}"
+            );
+        }
+    }
+
+    // Each source is red with its padding clear. X8R8G8B8 shares its storage
+    // with A1R5G5B5 and A4R4G4B4 on a device that widens the packed 16-bit
+    // formats (`make test INTEL=1`), where a byte copy would hand the padding
+    // over; on a device with them the pair is two storages either way.
+    let fill = |format: u32| -> Vec<u8> {
+        if format == D3DFMT_X1R5G5B5 {
+            core::iter::repeat_n(X1_RED.to_le_bytes(), SIDE * SIDE)
+                .flatten()
+                .collect()
+        } else {
+            core::iter::repeat_n(0x00FF_0000u32.to_le_bytes(), SIDE * SIDE)
+                .flatten()
+                .collect()
+        }
+    };
+    for (src_format, dst_format, opaque_red) in [
+        (D3DFMT_X1R5G5B5, D3DFMT_A1R5G5B5, A1_OPAQUE_RED),
+        (D3DFMT_X8R8G8B8, D3DFMT_A1R5G5B5, A1_OPAQUE_RED),
+        (D3DFMT_X8R8G8B8, D3DFMT_A4R4G4B4, A4_OPAQUE_RED),
+    ] {
+        let src = h.create_offscreen_plain_surface(4, 4, src_format, D3DPOOL_DEFAULT);
+        let dst = h.create_offscreen_plain_surface(4, 4, dst_format, D3DPOOL_DEFAULT);
+        let src_bytes = fill(src_format);
+        src.lock_rect(0)
+            .write_u8_rect(src_bytes.len() / SIDE, SIDE, &src_bytes);
+        dst.lock_rect(0)
+            .write_u8_rect(SIDE * 2, SIDE, &[0; SIDE * SIDE * 2]);
+        assert_eq!(
+            h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+            D3D_OK,
+            "{src_format:#x} -> {dst_format:#x}"
+        );
+        let locked = dst.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 2;
+        let texels = locked.as_u16(pitch * SIDE);
+        for y in 0..SIDE {
+            assert_eq!(
+                &texels[y * pitch..y * pitch + SIDE],
+                &[opaque_red; SIDE],
+                "{src_format:#x} -> {dst_format:#x} row {y}"
+            );
+        }
+    }
+}
+
+/// `StretchRect` from an A render target into its X counterpart keeps the colour.
+///
+/// The X destination ignores alpha, so the copy only has to carry the colour
+/// channels, which it does 1:1 and scaled.
+#[test]
+fn stretch_rect_from_an_a_render_target_into_its_x_counterpart_keeps_the_colour() {
+    const SIZE: (u32, u32) = (16, 16);
+    let h = Harness::new();
+    let src = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_A8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, 0x80FF_0000), D3D_OK, "fill A8R8G8B8");
+    let one_to_one = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_X8R8G8B8);
+    assert_eq!(
+        h.stretch_rect(&src, &one_to_one, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1"
+    );
+    for (i, &word) in read_back(&h, &one_to_one, SIZE, D3DFMT_X8R8G8B8)
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(word & 0x00FF_FFFF, 0x00FF_0000, "1:1 pixel {i}");
+    }
+    let scaled = h.create_render_target(SIZE.0, SIZE.1, D3DFMT_X8R8G8B8);
+    assert_eq!(
+        h.stretch_rect_rects(&src, (0, 0, 16, 16), &scaled, (0, 0, 8, 8), D3DTEXF_POINT),
+        D3D_OK,
+        "scaled"
+    );
+    assert_eq!(
+        read_back(&h, &scaled, SIZE, D3DFMT_X8R8G8B8)[0] & 0x00FF_FFFF,
+        0x00FF_0000,
+        "scaled pixel (0, 0)"
+    );
+}
+
+/// `StretchRect` refuses a rect that leaves its surface instead of clamping it.
+///
+/// A source rect past the source's edge, a negative one, and a destination
+/// rect past the destination's edge are each `D3DERR_INVALIDCALL`, and none of
+/// them writes the destination. The in-bounds copy beside them goes through.
+#[test]
+fn stretch_rect_refuses_a_rect_outside_its_surface() {
+    let h = Harness::new();
+    let src = h.create_render_target(64, 64, D3DFMT_X8R8G8B8);
+    let dst = h.create_render_target(128, 128, D3DFMT_X8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, RED), 0);
+    assert_eq!(h.color_fill_hr(&dst, BLUE), 0);
+    for (src_rect, dst_rect, name) in [
+        (
+            (0, 0, 128, 128),
+            (0, 0, 128, 128),
+            "a source rect past the source",
+        ),
+        ((-32, 0, 32, 64), (0, 0, 64, 64), "a negative source rect"),
+        (
+            (0, 0, 64, 64),
+            (100, 100, 164, 164),
+            "a destination rect past the destination",
+        ),
+        (
+            (0, 0, 64, 64),
+            (-8, -8, 56, 56),
+            "a negative destination rect",
+        ),
+    ] {
+        assert_eq!(
+            h.stretch_rect_rects(&src, src_rect, &dst, dst_rect, D3DTEXF_POINT),
+            D3DERR_INVALIDCALL,
+            "{name}"
+        );
+    }
+    let pixels = read_back(&h, &dst, (128, 128), D3DFMT_X8R8G8B8);
+    for (x, y) in [(4, 4), (40, 40), (110, 110), (127, 127)] {
+        assert_eq!(
+            pixels[y * 128 + x] & 0x00FF_FFFF,
+            BLUE & 0x00FF_FFFF,
+            "({x}, {y})"
+        );
+    }
+    assert_eq!(
+        h.stretch_rect_rects(
+            &src,
+            (0, 0, 64, 64),
+            &dst,
+            (64, 64, 128, 128),
+            D3DTEXF_POINT
+        ),
+        0,
+        "an in-bounds copy"
+    );
+    let pixels = read_back(&h, &dst, (128, 128), D3DFMT_X8R8G8B8);
+    assert_eq!(
+        pixels[100 * 128 + 100] & 0x00FF_FFFF,
+        RED & 0x00FF_FFFF,
+        "copied"
+    );
+    assert_eq!(
+        pixels[10 * 128 + 10] & 0x00FF_FFFF,
+        BLUE & 0x00FF_FFFF,
+        "outside"
+    );
+}
+
+#[test]
+fn stretch_rect_copies_between_disjoint_rects_of_one_surface() {
+    // D3D9 copies between two rectangles of one surface; titles use it to
+    // scroll or duplicate a UI region. The rects here do not overlap, so the
+    // copy rides the blit encoder inside the single texture.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    assert_eq!(h.clear_target(BLACK), 0, "clear the back buffer");
+    assert_eq!(
+        h.clear_target_rects(RED, &[rect(0, 0, 64, 64)]),
+        0,
+        "paint the source block"
+    );
+
+    assert_eq!(
+        h.stretch_rect_regions(
+            &bb,
+            &rect(0, 0, 64, 64),
+            &bb,
+            &rect(256, 128, 320, 192),
+            D3DTEXF_NONE,
+        ),
+        D3D_OK,
+        "a disjoint copy inside one surface is accepted"
+    );
+    assert_eq!(
+        h.read_pixel(288, 160),
+        RED,
+        "the block reached the destination rect"
+    );
+    assert_eq!(h.read_pixel(32, 32), RED, "the source block is untouched");
+    assert_eq!(
+        h.read_pixel(400, 300),
+        BLACK,
+        "nothing outside the rects moved"
+    );
+}
+
+#[test]
+fn stretch_rect_refuses_a_stretch_inside_one_surface() {
+    // D3D9 copies between two rects of one surface only 1:1: a stretch or a
+    // shrink there is INVALIDCALL and leaves the surface as it was, also when
+    // one side reaches the back buffer through the implicit swap chain. Two
+    // faces of one cube are two surfaces, and so are an additional swap chain's
+    // back buffer and the device's, so a stretch between either pair is still
+    // accepted.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let chain = h.implicit_swapchain();
+    let chain_bb = chain.back_buffer();
+    assert_eq!(h.clear_target(BLACK), 0, "clear the back buffer");
+    assert_eq!(
+        h.clear_target_rects(RED, &[rect(0, 0, 64, 64)]),
+        0,
+        "paint the source block"
+    );
+
+    for (destination, what) in [
+        (rect(256, 128, 384, 256), "a stretch"),
+        (rect(256, 128, 288, 160), "a shrink"),
+    ] {
+        assert_eq!(
+            h.stretch_rect_regions(&bb, &rect(0, 0, 64, 64), &bb, &destination, D3DTEXF_LINEAR),
+            D3DERR_INVALIDCALL,
+            "{what} inside the back buffer",
+        );
+    }
+    assert_eq!(
+        h.stretch_rect_regions(
+            &bb,
+            &rect(0, 0, 64, 64),
+            &chain_bb,
+            &rect(256, 128, 384, 256),
+            D3DTEXF_LINEAR,
+        ),
+        D3DERR_INVALIDCALL,
+        "a stretch into the back buffer reached through the implicit swap chain",
+    );
+    assert_eq!(
+        h.read_pixel(272, 144),
+        BLACK,
+        "no refused call wrote the back buffer"
+    );
+    assert_eq!(h.read_pixel(32, 32), RED, "the source block is untouched");
+
+    // An additional swap chain's back buffer aliases the device's texture here
+    // but is another surface to the application, so a stretch from it into the
+    // device's back buffer is accepted and lands as one between two surfaces.
+    let extra = h.additional_swapchain();
+    let extra_bb = extra.back_buffer();
+    assert_eq!(
+        h.stretch_rect_regions(
+            &extra_bb,
+            &rect(0, 0, 64, 64),
+            &bb,
+            &rect(256, 128, 384, 256),
+            D3DTEXF_POINT,
+        ),
+        D3D_OK,
+        "a stretch from an additional swap chain's back buffer into the device's",
+    );
+    assert_eq!(h.read_pixel(320, 192), RED, "the stretched block landed");
+
+    let texture = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = texture.surface_level(0);
+    assert_eq!(
+        h.stretch_rect_regions(
+            &level,
+            &rect(0, 0, 16, 16),
+            &level,
+            &rect(32, 32, 64, 64),
+            D3DTEXF_POINT,
+        ),
+        D3DERR_INVALIDCALL,
+        "a stretch inside one render-target texture level",
+    );
+    assert_eq!(
+        h.stretch_rect_regions(
+            &level,
+            &rect(0, 0, 16, 16),
+            &level,
+            &rect(32, 32, 48, 48),
+            D3DTEXF_POINT,
+        ),
+        D3D_OK,
+        "a 1:1 copy inside the same level",
+    );
+
+    let cube = h.create_cube_texture_owned(
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let (face1, face3) = (cube.surface(1, 0), cube.surface(3, 0));
+    assert_eq!(
+        h.stretch_rect_regions(
+            &face1,
+            &rect(0, 0, 64, 64),
+            &face1,
+            &rect(0, 0, 32, 32),
+            D3DTEXF_LINEAR,
+        ),
+        D3DERR_INVALIDCALL,
+        "a shrink inside one cube face",
+    );
+    assert_eq!(
+        h.stretch_rect_regions(
+            &face1,
+            &rect(0, 0, 64, 64),
+            &face3,
+            &rect(0, 0, 32, 32),
+            D3DTEXF_LINEAR,
+        ),
+        D3D_OK,
+        "a shrink between two faces of one cube",
+    );
+}
+
+#[test]
+fn stretch_rect_shifts_an_overlapping_rect_of_one_surface() {
+    // An overlapping copy reads the whole source region before it writes any
+    // of the destination, so both halves of the source land shifted rather
+    // than being smeared by the copy's own writes.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    assert_eq!(h.clear_target(BLACK), 0, "clear the back buffer");
+    assert_eq!(
+        h.clear_target_rects(RED, &[rect(0, 0, 32, 64)]),
+        0,
+        "paint the source's left half"
+    );
+    assert_eq!(
+        h.clear_target_rects(GREEN, &[rect(32, 0, 64, 64)]),
+        0,
+        "paint the source's right half"
+    );
+
+    assert_eq!(
+        h.stretch_rect_regions(
+            &bb,
+            &rect(0, 0, 64, 64),
+            &bb,
+            &rect(32, 0, 96, 64),
+            D3DTEXF_NONE,
+        ),
+        D3D_OK,
+        "an overlapping copy inside one surface is accepted"
+    );
+    assert_eq!(
+        h.read_pixel(16, 32),
+        RED,
+        "the part of the source the destination does not cover keeps its colour"
+    );
+    assert_eq!(
+        h.read_pixel(48, 32),
+        RED,
+        "the source's left half arrives 32 pixels to the right"
+    );
+    assert_eq!(
+        h.read_pixel(80, 32),
+        GREEN,
+        "the source's right half arrives 32 pixels to the right"
+    );
+    assert_eq!(
+        h.read_pixel(100, 32),
+        BLACK,
+        "nothing past the destination rect moved"
+    );
+}
+
+/// Sampling the INTZ texture that is still the bound depth attachment.
+///
+/// A deferred renderer keeps its scene depth bound for the depth test while
+/// its light-volume draws sample it to reconstruct positions. Metal forbids
+/// reading an attachment of the running pass, so the encoder copies the
+/// attachment before such a draw and binds the copy: the sampled value is
+/// the depth written earlier, not garbage. The depth is 0.25 (a value a
+/// `1 - z` mix-up cannot fake) and the stage's filters are LINEAR, which
+/// the fetch sampler must override: Apple GPUs cannot filter `Depth32Float`.
+#[test]
+fn intz_depth_sampled_while_bound_as_depth_attachment() {
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_surf = depth_tex.surface_level(0);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind INTZ as depth"
+    );
+    assert_eq!(h.clear_texture(0), 0, "no sampler while writing depth");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+    // The INTZ texture stays bound as the depth attachment: depth test on,
+    // depth write off, and the same texture sampled through stage 0.
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_texture(0, &depth_tex), 0, "bind INTZ as a sampler");
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_LINEAR),
+        (D3DSAMP_MAGFILTER, D3DTEXF_LINEAR),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample-depth draw with the attachment still bound"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (48..=90).contains(&center.r)
+            && (48..=90).contains(&center.g)
+            && (48..=90).contains(&center.b),
+        "the depth written by the occluder (0.25) samples back as dark gray, got {center:?}"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+}
+
+/// A RESZ resolve into an INTZ texture reaches the next draw that samples it while bound.
+///
+/// Sampling the bound depth attachment reads a copy the encoder keeps until
+/// a depth write moves its epoch. A RESZ resolve into the texture is such a
+/// write even though no draw or clear touches it: sampled again while bound,
+/// the texture must read the 0.75 the resolve brought in, not the 0.25 the
+/// first copy held.
+#[test]
+fn intz_depth_sampled_while_bound_sees_a_resz_resolve_into_it() {
+    let h = Harness::new();
+    let depth_texture = || {
+        h.create_texture(
+            640,
+            480,
+            1,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DFMT_INTZ,
+            D3DPOOL_DEFAULT,
+        )
+    };
+    let sampled = depth_texture();
+    let source = depth_texture();
+    let sampled_surf = sampled.surface_level(0);
+    let source_surf = source.surface_level(0);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(h.clear_texture(0), 0, "no sampler while writing depth");
+
+    // The resolve's source holds 0.75, written before the first sample takes its copy.
+    assert_eq!(h.set_depth_stencil_surface(&source_surf), 0, "bind source");
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 0.75, 0), 0);
+
+    // The sampled texture gets 0.25 from a draw, then is sampled while bound.
+    assert_eq!(
+        h.set_depth_stencil_surface(&sampled_surf),
+        0,
+        "bind the sampled texture as depth"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    let sample_center = || {
+        assert_eq!(h.set_texture(0, &sampled), 0, "bind INTZ as a sampler");
+        h.select_texture_stage(0);
+        for (state, value) in [
+            (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+            (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+            (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+            (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+        ] {
+            assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+        }
+        assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+        let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+            x,
+            y,
+            z: 0.5,
+            color: WHITE,
+            u,
+            v: vv,
+        };
+        let quad = [
+            v(-0.5, 0.5, 0.0, 0.0),
+            v(0.5, 0.5, 1.0, 0.0),
+            v(-0.5, -0.5, 0.0, 1.0),
+            v(0.5, 0.5, 1.0, 0.0),
+            v(0.5, -0.5, 1.0, 1.0),
+            v(-0.5, -0.5, 0.0, 1.0),
+        ];
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample-depth draw with the attachment still bound"
+        );
+        assert_eq!(h.end_scene(), 0);
+        assert_eq!(h.present(), 0);
+        let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+        assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+        center
+    };
+    let first = sample_center();
+    assert!(
+        (48..=90).contains(&first.r),
+        "the first sample reads the drawn 0.25 as dark gray, got {first:?}"
+    );
+
+    // The resolve copies the bound source into the texture at stage 0, with
+    // no draw or clear on either; then the texture is the attachment again.
+    assert_eq!(h.set_depth_stencil_surface(&source_surf), 0, "bind source");
+    assert_eq!(h.set_texture(0, &sampled), 0, "bind resolve destination");
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "RESZ into the sampled texture"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind the resolve destination");
+    assert_eq!(
+        h.set_depth_stencil_surface(&sampled_surf),
+        0,
+        "bind the sampled texture as depth again"
+    );
+    assert_eq!(h.clear(D3DCLEAR_TARGET, BLACK, 1.0, 0), 0);
+    let second = sample_center();
+    assert!(
+        (170..=210).contains(&second.r),
+        "the second sample reads the resolved 0.75 as light gray, got {second:?}"
+    );
+}
+
+#[test]
+fn intz_depth_sample_via_fixed_function() {
+    // The cascade-shadow plumbing under the fixed-function pixel pipeline: an
+    // INTZ texture is bound as a depth target, has depth rendered into it, then
+    // is rebound as an FF texture stage and sampled in a later pass. Because the
+    // texture is `Depth32Float`, the FF emitter must declare it `depth2d<float>`
+    // and read it with `sample_compare` (the slot is a LessEqual comparison
+    // sampler) — a plain `texture2d` + `sample()` trips Metal validation, which
+    // is on under `make test`. `make test` is the regression guard for that.
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_surf = depth_tex.surface_level(0);
+    let backbuffer = h.render_target(0);
+
+    // ── Pass 1: write a known depth (0.5) into the INTZ surface.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind INTZ as depth"
+    );
+    assert_eq!(
+        h.clear_texture(0),
+        0,
+        "no sampler bound while writing depth"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 0.5, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+
+    // ── Pass 2: swap to a scratch depth target (so INTZ is no longer the live
+    // depth attachment), then sample the INTZ texture through stage 0.
+    // The sample pass needs no depth: unbind it so INTZ stops being the live
+    // depth attachment (otherwise it would be both attachment and sampler in a
+    // single Metal encoder) — no separate depth surface, no format to match.
+    assert_eq!(
+        h.clear_depth_stencil_surface(),
+        0,
+        "unbind depth for the sample pass"
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_ZENABLE, 0),
+        0,
+        "depth off for sample"
+    );
+    assert_eq!(h.set_texture(0, &depth_tex), 0, "bind INTZ as a sampler");
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    // INTZ is a "readable raw depth" format (not a shadow-compare format):
+    // `.sample()`
+    // returns the stored normalized depth (0.5) broadcast to all channels — NOT
+    // a 0/1 shadow comparison. Stage 0 MODULATE(texture, white diffuse) →
+    // mid-gray ~0.5. Centre quad clips (-0.5,-0.5)..(0.5,0.5) → pixels
+    // (160,120)..(480,360).
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample-depth draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (96..=160).contains(&center.r)
+            && (96..=160).contains(&center.g)
+            && (96..=160).contains(&center.b),
+        "raw INTZ depth fetch (0.5) modulated by white diffuse should be ~mid-gray, got {center:?}"
+    );
+    let corner = Rgba8::from_pixel(h.read_pixel(10, 10));
+    assert!(
+        corner.r < 40 && corner.g < 40 && corner.b < 40,
+        "corner stays cleared black, got {corner:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+}
+
+/// A depth texture keeps its content across a standalone depth-surface bind.
+///
+/// A shadow-map pass renders into a `CreateTexture(DEPTHSTENCIL)` texture, and
+/// the engine then binds a `CreateDepthStencilSurface` surface for the rest of
+/// the frame, which ends the texture's pass. Nothing samples the texture that
+/// frame, so the only thing keeping the attachment's store action at `Store` is
+/// the `is_sampleable` flag `SetDepthStencilSurface` reports for a
+/// texture-backed depth surface. The next frame restores that surface and
+/// samples the texture: the depth written a frame earlier must still be there.
+#[test]
+fn sampleable_depth_survives_a_standalone_depth_bind() {
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_surf = depth_tex.surface_level(0);
+    let scratch_depth = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+    let backbuffer = h.render_target(0);
+
+    // ── Frame 1: write depth 0.5 into the texture, then bind the standalone
+    // depth surface, which ends the texture's pass with no sample behind it.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind the depth texture"
+    );
+    assert_eq!(
+        h.clear_texture(0),
+        0,
+        "no sampler bound while writing depth"
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+    assert_eq!(
+        h.set_depth_stencil_surface(&scratch_depth),
+        0,
+        "bind the standalone depth surface"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear the standalone depth"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // ── Frame 2: restore the texture's surface, then unbind depth (the
+    // texture cannot be attachment and sampler in one Metal encoder) and
+    // sample the depth written last frame.
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "restore the depth texture"
+    );
+    assert_eq!(
+        h.clear_depth_stencil_surface(),
+        0,
+        "unbind depth for the sample pass"
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_ZENABLE, 0),
+        0,
+        "depth off for sample"
+    );
+    assert_eq!(
+        h.set_texture(0, &depth_tex),
+        0,
+        "bind the depth texture as a sampler"
+    );
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample-depth draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // Raw INTZ fetch of the stored 0.5 modulated by white diffuse: mid-gray.
+    // A discarded attachment reads back as the 1.0 clear (white) or garbage.
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (96..=160).contains(&center.r)
+            && (96..=160).contains(&center.g)
+            && (96..=160).contains(&center.b),
+        "the depth written before the standalone bind samples back as mid-gray, got {center:?}"
+    );
+    let corner = Rgba8::from_pixel(h.read_pixel(10, 10));
+    assert!(
+        corner.r < 40 && corner.g < 40 && corner.b < 40,
+        "corner stays cleared black, got {corner:?}"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind the depth texture");
+}
+
+#[test]
+fn intz_depth_sample_via_programmable_ps() {
+    // Same INTZ create → render-depth → sample plumbing as the FF variant, but
+    // the sampling pass runs a hand-assembled `ps_3_0` that does `texld` on s0.
+    // Because slot 0 holds a `Depth32Float` texture, `depth_sampler_mask`
+    // selects the `depth2d` + `sample_compare` variant — the path the real
+    // cascade-shadow shaders take. The FF vertex pipeline feeds the
+    // programmable PS (VS/PS source resolve independently). `make test` runs
+    // with Metal validation on, so a depth/`texture2d` mismatch would fail here.
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_surf = depth_tex.surface_level(0);
+    let backbuffer = h.render_target(0);
+
+    // ── Pass 1: write a known depth (0.5) into the INTZ surface (FF pipeline).
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind INTZ as depth"
+    );
+    assert_eq!(
+        h.clear_texture(0),
+        0,
+        "no sampler bound while writing depth"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 0.5, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+
+    // ── Pass 2: swap depth target, bind a programmable PS, sample the INTZ.
+    let ps = h.create_pixel_shader(&PS_SAMPLE_DEPTH);
+    assert_eq!(h.set_pixel_shader(&ps), 0, "SetPixelShader");
+    // The sample pass needs no depth: unbind it so INTZ stops being the live
+    // depth attachment (otherwise it would be both attachment and sampler in a
+    // single Metal encoder) — no separate depth surface, no format to match.
+    assert_eq!(
+        h.clear_depth_stencil_surface(),
+        0,
+        "unbind depth for the sample pass"
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_ZENABLE, 0),
+        0,
+        "depth off for sample"
+    );
+    assert_eq!(h.set_texture(0, &depth_tex), 0, "bind INTZ as a sampler");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    // INTZ raw depth fetch: `texld` returns the stored normalized depth (0.5),
+    // NOT a shadow comparison. The PS moves it to the output → mid-gray quad.
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample-depth draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        (96..=160).contains(&center.r)
+            && (96..=160).contains(&center.g)
+            && (96..=160).contains(&center.b),
+        "programmable raw INTZ depth fetch (texld→mov oC0) should output the stored 0.5 (mid-gray), got {center:?}"
+    );
+    let corner = Rgba8::from_pixel(h.read_pixel(10, 10));
+    assert!(
+        corner.r < 40 && corner.g < 40 && corner.b < 40,
+        "corner stays cleared black, got {corner:?}"
+    );
+
+    assert_eq!(h.clear_pixel_shader(), 0, "unbind PS");
+    assert_eq!(h.clear_texture(0), 0, "unbind INTZ");
+}
+
+#[test]
+fn color_fill_render_target_texture_succeeds() {
+    // ColorFill on a DEFAULT-pool render-target texture surface succeeds and
+    // fills it. A non-RT texture is rejected.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(
+        h.color_fill_hr(&rt.surface_level(0), 0xFF80_4020),
+        0,
+        "ColorFill on a DEFAULT render-target texture → S_OK",
+    );
+
+    // A plain managed texture (no RENDERTARGET usage) is not fillable.
+    let plain = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED);
+    assert_eq!(
+        h.color_fill_hr(&plain.surface_level(0), 0xFF80_4020),
+        D3DERR_INVALIDCALL,
+        "ColorFill on a non-RT texture → INVALIDCALL",
+    );
+}
+
+#[test]
+fn color_fill_of_a_render_target_texture_level_outlasts_a_pending_cpu_write() {
+    // A level of a non-dynamic DEFAULT-pool texture is lockable here, so a
+    // render-target texture level can carry a CPU write that no bind has
+    // uploaded yet. `ColorFill` paints such a level on the GPU and never
+    // touches its staging, so the pending upload has to be scheduled ahead of
+    // the fill: the bind that samples the level afterwards would otherwise
+    // push the older CPU bytes over the fill.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    {
+        let mut locked = rt.lock_rect(0, 0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![GREEN; (pitch_px * 64) as usize]);
+    }
+    assert_eq!(
+        h.color_fill_hr(&rt.surface_level(0), RED),
+        D3D_OK,
+        "ColorFill of the level the lock left dirty",
+    );
+    // Close the frame the fill was queued in. An upload leads the frame it is
+    // scheduled in, so the pending write has to be flushed here rather than by
+    // the bind in the frame after this one, where it would lead that frame and
+    // land on top of the fill.
+    assert_eq!(h.present(), 0, "submit the fill");
+
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_texture(0, &rt), 0, "bind the filled texture");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF TEX1"
+    );
+    let quad = textured_fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample the filled level"
+        );
+    });
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.r > 200 && center.g < 40 && center.b < 40,
+        "the sampled level shows the fill, got {center:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "unbind the texture");
+}
+
+/// A quad over the whole backbuffer with UVs spanning the unit square.
+pub const fn textured_fullscreen_quad() -> [TexturedVertex; 6] {
+    [
+        TexturedVertex {
+            x: -1.0,
+            y: 1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 1.0,
+            y: 1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: 1.0,
+            y: 1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+    ]
+}
+
+#[test]
+fn fresh_default_offscreen_plain_round_trips_through_lock_rect() {
+    // A DEFAULT offscreen plain is lockable, so it owns its level-0 staging
+    // from creation on. Three locks a fresh surface has to serve out of that
+    // staging: a read-only one on a surface nothing has written, a write, and
+    // the read after it, with no draw, ColorFill or StretchRect in between. A
+    // ColorFill of a plain no lock has ever touched reads back the same way.
+    let h = Harness::new();
+    let surface = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let (hr, desc) = surface.desc();
+    assert_eq!(hr, D3D_OK, "a DEFAULT offscreen plain describes");
+    assert_eq!(
+        (desc.width, desc.height),
+        (64, 64),
+        "at the requested extent"
+    );
+    assert_eq!(desc.pool, D3DPOOL_DEFAULT, "in the requested pool");
+
+    let pitch_px = {
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        assert!(
+            pitch_px >= 64,
+            "a read-only lock of a never-written plain maps a full row, got {pitch_px}",
+        );
+        pitch_px
+    };
+
+    let pattern: Vec<u32> = (0..pitch_px * 64)
+        .map(|i| 0xFF00_0000 | (i.wrapping_mul(7) & 0x00FF_FFFF))
+        .collect();
+    {
+        let mut locked = surface.lock_rect(0);
+        assert_eq!(
+            locked.pitch().cast_unsigned() / 4,
+            pitch_px,
+            "the pitch is stable across locks",
+        );
+        locked.write_u32(&pattern);
+    }
+    {
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(
+            locked.as_u32(pattern.len()),
+            pattern.as_slice(),
+            "LockRect reads back what the lock before it wrote",
+        );
+    }
+
+    let fresh = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.color_fill_hr(&fresh, GREEN),
+        D3D_OK,
+        "ColorFill of a plain that has never been locked",
+    );
+    let locked = fresh.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let pixels = locked.as_u32((pitch_px * 64) as usize);
+    assert_eq!(
+        pixels[(32 * pitch_px + 32) as usize],
+        GREEN,
+        "the fill is visible to the lock that follows it",
+    );
+}
+
+#[test]
+fn color_fill_sub_rect_of_offscreen_plain_reads_back() {
+    // A lockable DEFAULT offscreen-plain surface reads its fill back through
+    // LockRect, so the fill has to be visible to the very next lock: inside the
+    // rect it is the fill colour, outside it the seed the lock before wrote.
+    // A rect hanging over the edge fills the part that lands on the surface.
+    let h = Harness::new();
+    let surface = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+
+    {
+        let mut locked = surface.lock_rect(0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let seed = vec![GREEN; (pitch_px * 64) as usize];
+        locked.write_u32(&seed);
+    }
+
+    assert_eq!(
+        h.color_fill_rect_hr(&surface, (16, 16, 48, 48), BLUE),
+        D3D_OK,
+        "ColorFill of a sub-rect on a DEFAULT offscreen-plain surface",
+    );
+    assert_eq!(
+        h.color_fill_rect_hr(&surface, (56, 56, 96, 96), RED),
+        D3D_OK,
+        "ColorFill of a rect hanging over the surface edge is clipped, not rejected",
+    );
+
+    let locked = surface.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let pixels = locked.as_u32((pitch_px * 64) as usize);
+    let at = |x: u32, y: u32| pixels[(y * pitch_px + x) as usize];
+    assert_eq!(at(32, 32), BLUE, "inside the filled sub-rect");
+    assert_eq!(at(16, 16), BLUE, "the sub-rect's top-left corner");
+    assert_eq!(at(47, 47), BLUE, "the sub-rect's bottom-right corner");
+    assert_eq!(at(8, 8), GREEN, "outside the sub-rect keeps the seed");
+    assert_eq!(
+        at(48, 48),
+        GREEN,
+        "one pixel past the sub-rect keeps the seed"
+    );
+    assert_eq!(at(60, 60), RED, "inside the clipped overhanging rect");
+    assert_eq!(at(55, 55), GREEN, "outside the clipped overhanging rect");
+}
+
+#[test]
+fn color_fill_of_offscreen_plain_packs_the_destination_format() {
+    // A DEFAULT offscreen plain reads its fill back out of the staging the
+    // fill wrote, so LockRect sees the encoded pixel itself: the packed
+    // 16-bit formats hold the top bits of each D3DCOLOR channel, L8 the
+    // colour's luminance and A8 its alpha byte. Every surface is seeded
+    // first, so a fill that never lands reads back as the seed.
+    const FILL: u32 = 0xDEAD_BEEF;
+    let h = Harness::new();
+
+    for (format, name, expected) in [
+        (D3DFMT_A1R5G5B5, "A1R5G5B5", 0xD6FDu16),
+        (D3DFMT_X1R5G5B5, "X1R5G5B5", 0xD6FD),
+        (D3DFMT_A4R4G4B4, "A4R4G4B4", 0xDABE),
+    ] {
+        let surface = h.create_offscreen_plain_surface(64, 64, format, D3DPOOL_DEFAULT);
+        {
+            let mut locked = surface.lock_rect(0);
+            let lanes = locked.pitch().cast_unsigned() / 2 * 64;
+            locked.write(&vec![0x5555u16; lanes as usize]);
+        }
+        assert_eq!(
+            h.color_fill_hr(&surface, FILL),
+            D3D_OK,
+            "ColorFill of a DEFAULT {name} offscreen plain",
+        );
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        let pitch_lanes = locked.pitch().cast_unsigned() / 2;
+        let lanes = locked.as_u16((pitch_lanes * 64) as usize);
+        assert_eq!(
+            lanes[(32 * pitch_lanes + 32) as usize],
+            expected,
+            "{name} packs the fill colour into its own layout",
+        );
+    }
+
+    for (format, name, expected) in [(D3DFMT_L8, "L8", 0xBEu8), (D3DFMT_A8, "A8", 0xDE)] {
+        let surface = h.create_offscreen_plain_surface(64, 64, format, D3DPOOL_DEFAULT);
+        {
+            let mut locked = surface.lock_rect(0);
+            let bytes = locked.pitch().cast_unsigned() * 64;
+            locked.write(&vec![0x55u8; bytes as usize]);
+        }
+        assert_eq!(
+            h.color_fill_hr(&surface, FILL),
+            D3D_OK,
+            "ColorFill of a DEFAULT {name} offscreen plain",
+        );
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        let pitch = locked.pitch().cast_unsigned();
+        let bytes = locked.as_u8((pitch * 64) as usize);
+        assert_eq!(
+            bytes[(32 * pitch + 32) as usize],
+            expected,
+            "{name} takes the channel it stores",
+        );
+    }
+}
+
+#[test]
+fn cpu_stretch_rect_converts_a_cpu_written_source_full() {
+    check_cpu_stretch_rect_source(false, false);
+}
+
+#[test]
+fn cpu_stretch_rect_converts_a_cpu_written_source_partial() {
+    check_cpu_stretch_rect_source(false, true);
+}
+
+#[test]
+fn cpu_stretch_rect_converts_a_gpu_written_source_full() {
+    check_cpu_stretch_rect_source(true, false);
+}
+
+#[test]
+fn cpu_stretch_rect_converts_a_gpu_written_source_partial() {
+    check_cpu_stretch_rect_source(true, true);
+}
+
+fn check_cpu_stretch_rect_source(gpu_written: bool, partial: bool) {
+    const WIDTH: usize = 4;
+    const HEIGHT: usize = 3;
+    const PIXELS: [u32; WIDTH * HEIGHT] = [
+        0x8010_20f0,
+        0x9040_50c0,
+        0xa070_8090,
+        0xb0a0_b060,
+        0xc030_40e0,
+        0xd060_70b0,
+        0xe090_a080,
+        0xf0c0_d050,
+        0x9050_60d0,
+        0xa080_90a0,
+        0xb0b0_c070,
+        0xc0e0_f040,
+    ];
+    let h = Harness::new();
+    let source = h.create_offscreen_plain_surface(4, 3, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let writer = h.create_offscreen_plain_surface(4, 3, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let destination = h.create_offscreen_plain_surface(4, 3, D3DFMT_A8B8G8R8, D3DPOOL_DEFAULT);
+    let mirror = h.create_offscreen_plain_surface(4, 3, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    writer.lock_rect(0).write_u32_rect(WIDTH, HEIGHT, &PIXELS);
+
+    source
+        .lock_rect(0)
+        .write_u32_rect(WIDTH, HEIGHT, &[RED; WIDTH * HEIGHT]);
+    destination
+        .lock_rect(0)
+        .write_u32_rect(WIDTH, HEIGHT, &[GREEN; WIDTH * HEIGHT]);
+    if gpu_written {
+        assert_eq!(h.stretch_rect(&writer, &source, D3DTEXF_NONE), D3D_OK);
+    } else {
+        source.lock_rect(0).write_u32_rect(WIDTH, HEIGHT, &PIXELS);
+    }
+    // No source map may occur between its GPU write and the CPU conversion.
+    // BGRA8 and RGBA8 stay distinct on every device, so the offscreen pair
+    // takes the same CPU conversion path under either packed-format policy.
+    let result = if partial {
+        h.stretch_rect_rects(
+            &source,
+            (1, 1, 3, 3),
+            &destination,
+            (2, 0, 4, 2),
+            D3DTEXF_NONE,
+        )
+    } else {
+        h.stretch_rect(&source, &destination, D3DTEXF_NONE)
+    };
+    assert_eq!(
+        result, D3D_OK,
+        "convert source, gpu_written={gpu_written}, partial={partial}"
+    );
+    {
+        let locked = destination.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+        let pixels = locked.as_u32(pitch * HEIGHT);
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let input = if !partial {
+                    PIXELS[y * WIDTH + x]
+                } else if x >= 2 && y < 2 {
+                    PIXELS[(y + 1) * WIDTH + x - 1]
+                } else {
+                    GREEN
+                };
+                let [blue, green, red, alpha] = input.to_le_bytes();
+                let expected = u32::from_le_bytes([red, green, blue, alpha]);
+                assert_eq!(
+                    pixels[y * pitch + x],
+                    expected,
+                    "destination ({x}, {y}), gpu_written={gpu_written}, partial={partial}"
+                );
+            }
+        }
+    }
+    assert_eq!(h.stretch_rect(&source, &mirror, D3DTEXF_NONE), D3D_OK);
+    let locked = mirror.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+    let pixels = locked.as_u32(pitch * HEIGHT);
+    for y in 0..HEIGHT {
+        assert_eq!(
+            &pixels[y * pitch..y * pitch + WIDTH],
+            &PIXELS[y * WIDTH..(y + 1) * WIDTH],
+            "source row {y} after conversion, gpu_written={gpu_written}, partial={partial}"
+        );
+    }
+}
+
+#[test]
+fn stretch_rect_into_offscreen_plain_is_visible_to_lock_rect() {
+    // A StretchRect into a lockable DEFAULT offscreen plain writes the plain's
+    // Metal texture; its LockRect reads CPU staging, so the lock has to
+    // materialise the level from the texture. Whole-surface first, then a
+    // sub-rect, which must land in the destination without disturbing the
+    // pixels the copy did not cover.
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let dst = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let fill = |surface: &Surface<'_>, color: u32| {
+        let mut locked = surface.lock_rect(0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![color; (pitch_px * 64) as usize]);
+    };
+    let read = |surface: &Surface<'_>, x: u32, y: u32| {
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * 64) as usize)[(y * pitch_px + x) as usize]
+    };
+
+    fill(&src, RED);
+    fill(&dst, GREEN);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect between two DEFAULT offscreen plains",
+    );
+    assert_eq!(
+        read(&dst, 32, 32),
+        RED,
+        "LockRect reads the copied pixels, not the seed the destination held",
+    );
+
+    fill(&src, BLUE);
+    fill(&dst, GREEN);
+    assert_eq!(
+        h.stretch_rect_rects(&src, (0, 0, 32, 32), &dst, (32, 32, 64, 64), D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect of a sub-rect between two offscreen plains",
+    );
+    assert_eq!(read(&dst, 48, 48), BLUE, "inside the copied sub-rect");
+    assert_eq!(read(&dst, 32, 32), BLUE, "the sub-rect's top-left corner");
+    assert_eq!(
+        read(&dst, 63, 63),
+        BLUE,
+        "the sub-rect's bottom-right corner"
+    );
+    assert_eq!(read(&dst, 16, 48), GREEN, "outside the copied sub-rect");
+    assert_eq!(read(&dst, 31, 31), GREEN, "one pixel before the sub-rect");
+}
+
+#[test]
+fn evict_managed_resources_keeps_a_stretched_offscreen_plain() {
+    // EvictManagedResources drops the device copy of a D3DPOOL_MANAGED
+    // resource, which the runtime owns a system-memory copy of and replays on
+    // the next use. A DEFAULT offscreen plain has no such copy: its staging
+    // holds what the last lock wrote, and the StretchRect into it puts newer
+    // pixels on its Metal texture alone. Evicting it would publish that stale
+    // staging over them. The destination is read through a blit out of it
+    // rather than through a lock, which would read the level back into its
+    // staging first and so hide the loss.
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let dst = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let fill = |surface: &Surface<'_>, color: u32| {
+        let mut locked = surface.lock_rect(0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![color; (pitch_px * 64) as usize]);
+    };
+    let gpu_pixel = || {
+        let mirror = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+        assert_eq!(h.stretch_rect(&dst, &mirror, D3DTEXF_NONE), D3D_OK);
+        let locked = mirror.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * 64) as usize)[(32 * pitch_px + 32) as usize]
+    };
+
+    fill(&dst, GREEN);
+    // The blit out of the destination is also what uploads its staging, which
+    // is the state the eviction walk acts on.
+    assert_eq!(
+        gpu_pixel(),
+        GREEN,
+        "the lock's pixels reach the Metal texture"
+    );
+    fill(&src, RED);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect between two DEFAULT offscreen plains",
+    );
+    assert_eq!(gpu_pixel(), RED, "the transfer's pixels are on the texture");
+    assert_eq!(h.evict_managed_resources(), D3D_OK);
+    assert_eq!(gpu_pixel(), RED, "EvictManagedResources leaves them there");
+}
+
+#[test]
+fn discard_lock_after_a_stretch_rect_keeps_what_the_lock_wrote() {
+    // A StretchRect into a lockable DEFAULT offscreen plain leaves the level's
+    // pixels on the plain's Metal texture alone. D3DLOCK_DISCARD declares them
+    // dead, so that lock hands out staging without reading them back, and the
+    // level belongs to the staging from then on: a claim left standing would
+    // send the next lock to the GPU for the pixels the application had just
+    // overwritten, and hand them back as the level's contents.
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let dst = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let fill = |surface: &Surface<'_>, color: u32, flags: u32| {
+        let mut locked = surface.lock_rect(flags);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![color; (pitch_px * 64) as usize]);
+    };
+    let read = |surface: &Surface<'_>, x: u32, y: u32| {
+        let locked = surface.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * 64) as usize)[(y * pitch_px + x) as usize]
+    };
+
+    fill(&src, RED, 0);
+    fill(&dst, GREEN, 0);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect between two DEFAULT offscreen plains",
+    );
+    fill(&dst, BLUE, D3DLOCK_DISCARD);
+    assert_eq!(
+        read(&dst, 32, 32),
+        BLUE,
+        "the lock after a discard reads what the discard lock wrote, not the blitted pixels",
+    );
+}
+
+#[test]
+fn stretch_rect_rejects_a_render_target_into_an_offscreen_plain() {
+    // D3D9 allows an offscreen-plain destination only from an offscreen-plain
+    // source: a render-target source, standalone or texture-backed, and the back
+    // buffer are all INVALIDCALL. The reverse direction is allowed.
+    let h = Harness::new();
+    let plain = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let standalone = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+
+    for (source, what) in [
+        (&standalone, "a standalone CreateRenderTarget surface"),
+        (&rt_surface, "a render-target texture surface"),
+    ] {
+        assert_eq!(
+            h.stretch_rect(source, &plain, D3DTEXF_NONE),
+            D3DERR_INVALIDCALL,
+            "StretchRect from {what} into an offscreen plain",
+        );
+    }
+    assert_eq!(
+        h.stretch_rect(&plain, &standalone, D3DTEXF_NONE),
+        D3D_OK,
+        "StretchRect from an offscreen plain into a render target",
+    );
+}
+
+#[test]
+fn stretch_rect_follows_the_surface_class_matrix_on_a_plain_device() {
+    // The D3D9 surface-class matrix for default-pool colour surfaces, with
+    // and without a stretch: every class copies into a render target (a
+    // standalone one, a render-target texture level or cube face), an
+    // offscreen plain only into another offscreen plain or a render target,
+    // and nothing into an ordinary texture level or cube face. A plain device
+    // refuses the whole-surface copy between two texture levels of one format
+    // and size that an extended device accepts. A surface is never paired with
+    // itself here: that is a copy inside one surface, pinned on its own.
+    let h = Harness::new();
+    let texture = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let texture_twin = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let rt_texture = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let cube = h.create_cube_texture_owned(64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let rt_cube = h.create_cube_texture_owned(
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = texture.surface_level(0);
+    let level_twin = texture_twin.surface_level(0);
+    let rt_level = rt_texture.surface_level(0);
+    let face = cube.surface(1, 0);
+    let rt_face = rt_cube.surface(1, 0);
+    let standalone = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let back_buffer = h.render_target(0);
+    let plain = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let plain_twin = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let small_plain = h.create_offscreen_plain_surface(32, 32, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+
+    // Each source with what D3D9 answers for it into an offscreen plain.
+    let sources = [
+        (&level, "a texture level", D3DERR_INVALIDCALL),
+        (&face, "a cube face", D3DERR_INVALIDCALL),
+        (
+            &rt_level,
+            "a render-target texture level",
+            D3DERR_INVALIDCALL,
+        ),
+        (&rt_face, "a render-target cube face", D3DERR_INVALIDCALL),
+        (
+            &standalone,
+            "a standalone render target",
+            D3DERR_INVALIDCALL,
+        ),
+        (&back_buffer, "the back buffer", D3DERR_INVALIDCALL),
+        (&plain, "an offscreen plain", D3D_OK),
+    ];
+    for (source, what, into_plain) in sources {
+        for (destination, into) in [
+            (&rt_level, "a render-target texture level"),
+            (&rt_face, "a render-target cube face"),
+            (&standalone, "a standalone render target"),
+        ] {
+            if core::ptr::eq(source, destination) {
+                continue;
+            }
+            assert_eq!(
+                h.stretch_rect(source, destination, D3DTEXF_NONE),
+                D3D_OK,
+                "StretchRect from {what} into {into}",
+            );
+        }
+        for (destination, into) in [(&level_twin, "a texture level"), (&face, "a cube face")] {
+            if core::ptr::eq(source, destination) {
+                continue;
+            }
+            assert_eq!(
+                h.stretch_rect(source, destination, D3DTEXF_NONE),
+                D3DERR_INVALIDCALL,
+                "StretchRect from {what} into {into}",
+            );
+        }
+        assert_eq!(
+            h.stretch_rect(source, &plain_twin, D3DTEXF_NONE),
+            into_plain,
+            "StretchRect from {what} into an offscreen plain",
+        );
+    }
+    assert_eq!(
+        h.stretch_rect(&level, &small_plain, D3DTEXF_LINEAR),
+        D3DERR_INVALIDCALL,
+        "a stretch from a texture level into an offscreen plain",
+    );
+    assert_eq!(
+        h.stretch_rect(&small_plain, &standalone, D3DTEXF_LINEAR),
+        D3D_OK,
+        "a stretch from an offscreen plain into a render target",
+    );
+}
+
+/// `UpdateSurface` writes into a render-target surface and into the back buffer.
+///
+/// Neither has a texture behind it. The region lands at its destination point
+/// and nowhere else, after the draw or `Clear` recorded before it and before
+/// the draw recorded after it: on the render target a whole-target draw, the
+/// update and a draw over its bottom-right quarter are recorded with no
+/// read-back between them. A source in another format the update codec
+/// covers is converted, as it is into a texture level. A multisampled
+/// destination is refused, as D3D9 refuses one.
+#[test]
+fn update_surface_reaches_a_render_target_and_the_back_buffer() {
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    src.lock_rect(0).write_u32(&[GREEN; 64 * 64]);
+
+    let rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let back = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the render target");
+    draw_fill(&h, MAGENTA);
+    assert_eq!(
+        h.update_surface_region_hr(&src, &rect(0, 0, 32, 32), &rt, (16, 16)),
+        0,
+        "UpdateSurface into a render target",
+    );
+    // Pre-transformed, so it covers texels 32..64 on both axes: the bottom-right
+    // quarter of the region and the target beyond it.
+    assert_eq!(h.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let corner = |x: f32, y: f32| RhwVertex {
+        x,
+        y,
+        z: 0.5,
+        rhw: 1.0,
+        color: WHITE,
+    };
+    let quad = [
+        corner(32.0, 32.0),
+        corner(64.0, 32.0),
+        corner(32.0, 64.0),
+        corner(64.0, 32.0),
+        corner(64.0, 64.0),
+        corner(32.0, 64.0),
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "the draw after the update"
+    );
+    assert_eq!(h.set_render_target(0, &back), 0, "restore the back buffer");
+    let pixels = read_back(&h, &rt, (64, 64), D3DFMT_A8R8G8B8);
+    for (x, y, expected, what) in [
+        (
+            8,
+            8,
+            MAGENTA,
+            "the earlier draw, left of and above the region",
+        ),
+        (56, 8, MAGENTA, "the earlier draw, right of the region"),
+        (8, 56, MAGENTA, "the earlier draw, below the region"),
+        (20, 20, GREEN, "the region outside the later draw"),
+        (44, 20, GREEN, "the region beside the later draw"),
+        (40, 40, WHITE, "the later draw over the region"),
+        (56, 56, WHITE, "the later draw outside the region"),
+    ] {
+        assert_eq!(
+            pixels[y * 64 + x],
+            expected,
+            "render target ({x}, {y}): {what}"
+        );
+    }
+
+    let narrow = h.create_offscreen_plain_surface(8, 8, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+    narrow.lock_rect(0).write::<u16>(&[0x001F; 64]);
+    assert_eq!(h.update_surface_hr(&narrow, &rt), 0, "a converting source");
+    let pixels = read_back(&h, &rt, (64, 64), D3DFMT_A8R8G8B8);
+    assert_eq!(pixels[4 * 64 + 4], BLUE, "the converted region");
+    assert_eq!(pixels[20 * 64 + 20], GREEN, "the earlier region");
+
+    let bb = h.back_buffer(0);
+    let bb_src = h.create_offscreen_plain_surface(64, 64, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    bb_src.lock_rect(0).write_u32(&[GREEN; 64 * 64]);
+    assert_eq!(h.clear_target(BLUE), 0);
+    assert_eq!(
+        h.update_surface_region_hr(&bb_src, &rect(0, 0, 64, 64), &bb, (200, 100)),
+        0,
+        "UpdateSurface into the back buffer",
+    );
+    assert_eq!(
+        h.read_pixel(232, 132),
+        GREEN,
+        "back buffer inside the region"
+    );
+    assert_eq!(
+        h.read_pixel(150, 50),
+        BLUE,
+        "back buffer outside the region"
+    );
+
+    let (hr, _) = h.check_device_multi_sample_type(
+        D3DFMT_A8R8G8B8,
+        1,
+        mtld3d_types::D3DMULTISAMPLE_4_SAMPLES,
+    );
+    if hr == D3D_OK {
+        let ms = h.create_render_target_ms(
+            (64, 64),
+            D3DFMT_A8R8G8B8,
+            (mtld3d_types::D3DMULTISAMPLE_4_SAMPLES, 0),
+        );
+        assert_eq!(
+            h.update_surface_hr(&src, &ms),
+            D3DERR_INVALIDCALL,
+            "a multisampled destination",
+        );
+    }
+}
+
+#[test]
+fn stretch_rect_into_a_texture_level_is_visible_to_get_dc() {
+    // A StretchRect into a render-target texture's level writes that level's
+    // Metal texture alone, while a GetDC on the level's surface builds its DIB
+    // over the texture's CPU staging, so the DC has to take the read back the
+    // claim on the level makes a LockRect take. The lock seeds the staging with
+    // a colour the blit never writes, so a DC that skips the read back reads
+    // green where the blit left red.
+    const SIZE: u32 = 64;
+    const TEXELS: usize = (SIZE * SIZE) as usize;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let src = h.create_render_target(SIZE, SIZE, D3DFMT_A8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, RED), D3D_OK, "fill the source red");
+    let dst = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    {
+        let mut locked = dst.lock_rect(0, 0);
+        locked.write_u32(&[GREEN; TEXELS]);
+    }
+    let level = dst.surface_level(0);
+    assert_eq!(
+        h.stretch_rect(&src, &level, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect from a render target into a texture level",
+    );
+
+    let dc = level.dc();
+    let last = (SIZE - 1).cast_signed();
+    for (x, y, name) in [(0, 0, "first texel"), (last, last, "last texel")] {
+        assert_eq!(
+            dc.get_pixel(x, y),
+            RED_COLORREF,
+            "the DC reads the blit's {name}"
+        );
+    }
+    assert_eq!(dc.release(), 0, "ReleaseDC");
+}
+
+#[test]
+fn get_dc_on_a_default_offscreen_plain_rejects_while_it_is_locked() {
+    // The plain's LockRect is recorded on the level-0 staging of the texture it
+    // owns, not on the surface shell, so GetDC has to consult the texture to
+    // see it. Rejected the same way a texture level's own surface is.
+    const SIZE: u32 = 16;
+    let sentinel = 0xdead_beef_usize as *mut core::ffi::c_void;
+    let h = Harness::new();
+    let plain = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    {
+        let _locked = plain.lock_rect(0);
+        let (hr, out) = plain.get_dc(sentinel);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "GetDC while the plain's LockRect is outstanding must return INVALIDCALL"
+        );
+        assert_eq!(
+            out, sentinel,
+            "a rejected GetDC must not write through the out HDC"
+        );
+    }
+    let dc = plain.dc();
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+}
+
+#[test]
+fn get_dc_on_a_default_offscreen_plain_round_trips_through_gdi() {
+    // The classic GDI-on-a-surface case: a game draws text or an overlay into
+    // a DEFAULT offscreen plain and copies the result somewhere. The plain's
+    // pixels live in the level-0 staging of the texture it owns, so the DC
+    // covers that store and reads the ColorFill that came before it, and what
+    // GDI drew through the DC survives ReleaseDC in both directions the
+    // surface can be read: a LockRect of the same staging, and a StretchRect
+    // into the back buffer, which reads the level's Metal texture instead.
+    //
+    // GDI paints a block and every probe stays well inside its colour: under
+    // a `render.scale` the "1:1" StretchRect lands in a back buffer rasterized
+    // smaller and the read-back resolves it up again, and a lone pixel does
+    // not survive that pair (it comes back as a blend of itself and its
+    // neighbours). An interior pixel of a block does, at any scale.
+    const SIZE: u32 = 64;
+    const BLOCK: i32 = 32;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    // GDI knows no alpha: SetPixel stores the three colour bytes and leaves
+    // the fourth at zero, so the pixel comes back as red with no alpha.
+    const GDI_RED: u32 = 0x00FF_0000;
+    let h = Harness::new();
+    let plain = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.color_fill_hr(&plain, GREEN),
+        D3D_OK,
+        "ColorFill the plain green"
+    );
+
+    let dc = plain.dc();
+    assert_eq!(
+        dc.get_pixel(32, 32),
+        GREEN_COLORREF,
+        "the DC reads the fill the plain holds",
+    );
+    dc.fill_block(BLOCK, RED_COLORREF);
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+
+    {
+        let locked = plain.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let px = locked.as_u32((pitch_px * SIZE) as usize);
+        assert_eq!(
+            px[(10 * pitch_px + 10) as usize],
+            GDI_RED,
+            "LockRect reads what GDI drew through the DC",
+        );
+        assert_eq!(
+            px[(48 * pitch_px + 48) as usize],
+            GREEN,
+            "and the fill everywhere GDI left alone",
+        );
+    }
+
+    let bb = h.render_target(0);
+    let rect = (0, 0, SIZE.cast_signed(), SIZE.cast_signed());
+    assert_eq!(
+        h.stretch_rect_rects(&plain, rect, &bb, rect, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 StretchRect from the plain into the back buffer",
+    );
+    // The back buffer is X8R8G8B8, so only its three colour channels carry a
+    // defined value; compare on those alone.
+    assert_rgb_close(
+        h.read_pixel(10, 10),
+        GDI_RED,
+        0,
+        "GDI's block reaches the back buffer",
+    );
+    assert_rgb_close(
+        h.read_pixel(48, 48),
+        GREEN,
+        0,
+        "and so does the fill around it",
+    );
+}
+
+#[test]
+fn stretch_rect_into_a_cube_face_is_visible_to_that_face_get_dc() {
+    // A StretchRect into a cube face's surface writes that face's slice of the
+    // cube's Metal texture and never its CPU staging, so a GetDC on the face has
+    // to read that face back. Face 0 is filled red and face 3 is blitted green:
+    // a claim without a face dimension leaves face 3's staging stale, and a
+    // destination slice without a face lands the blit on face 0.
+    const EDGE: u32 = 64;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let src = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.color_fill_hr(&src, GREEN),
+        D3D_OK,
+        "fill the source green"
+    );
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(
+        h.stretch_rect(&src, &face3, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect from a render target into a cube face",
+    );
+
+    let last = (EDGE - 1).cast_signed();
+    let dc = face3.dc();
+    for (x, y, name) in [(0, 0, "first texel"), (last, last, "last texel")] {
+        assert_eq!(
+            dc.get_pixel(x, y),
+            GREEN_COLORREF,
+            "face 3's DC reads the blit's {name}"
+        );
+    }
+    assert_eq!(dc.release(), 0, "ReleaseDC on face 3");
+    // A cube map's faces share one DC lock, so face 0 is readable only once
+    // face 3's device context is gone.
+    let dc = face0.dc();
+    assert_eq!(
+        dc.get_pixel(0, 0),
+        RED_COLORREF,
+        "the blit into face 3 left face 0 alone"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC on face 0");
+}
+
+#[test]
+fn stretch_rect_out_of_a_cube_face_reads_that_face() {
+    // A 1:1 same-format StretchRect replays as a blit copy, which names a
+    // source slice as well as a destination one, so a cube source has to read
+    // the face the call named. Faces 0 and 3 carry different colours and the
+    // destination is a plain 2D render target, so a copy pinned to slice 0
+    // answers with face 0's fill instead of face 3's.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(h.color_fill_hr(&face3, GREEN), D3D_OK, "fill face 3 green");
+
+    let dst = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.color_fill_hr(&dst, BLUE),
+        D3D_OK,
+        "fill the destination blue"
+    );
+    assert_eq!(
+        h.stretch_rect(&face3, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect out of a cube face",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &dst, 1, 1),
+        GREEN,
+        "the copy read face 3 rather than face 0",
+    );
+}
+
+/// Bind `cube`, sample it across the back buffer along `direction`, return the centre pixel.
+///
+/// The direction is constant across the quad, so every pixel reads the one cube
+/// face that direction names and the face's own orientation drops out. The
+/// three-component texcoord `VolumeVertex` carries is the direction the
+/// fixed-function cube lookup takes.
+fn sample_cube_face(h: &Harness, cube: &CubeTexture<'_>, direction: (f32, f32, f32)) -> u32 {
+    assert_eq!(h.set_cube_texture(0, cube), 0, "bind the cube");
+    h.select_texture_stage(0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler state");
+    }
+    // D3DFVF_TEXCOORDSIZE3(0) is bit 16.
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1 | 0x0001_0000),
+        0,
+        "SetFVF with a three-component texcoord"
+    );
+    let vertex = |x: f32, y: f32| VolumeVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u: direction.0,
+        v: direction.1,
+        w: direction.2,
+    };
+    let quad = [
+        vertex(-1.0, 1.0),
+        vertex(1.0, 1.0),
+        vertex(-1.0, -1.0),
+        vertex(1.0, 1.0),
+        vertex(1.0, -1.0),
+        vertex(-1.0, -1.0),
+    ];
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "cube sample draw"
+        );
+    });
+    let pixel = h.read_pixel(320, 240);
+    assert_eq!(h.clear_texture(0), 0, "unbind the cube");
+    pixel
+}
+
+#[test]
+fn scaling_stretch_rect_into_a_cube_face_writes_that_face() {
+    // A scaling StretchRect runs the render quad, which attaches the
+    // destination as a colour target: a cube destination has to attach the face
+    // the call named as the attachment's slice, or the quad lands on face 0.
+    // Face 0 is filled red and a 32x32 green source is scaled onto face 3, so a
+    // quad without a face reads green where face 0's own fill belongs.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let src = h.create_render_target(EDGE / 2, EDGE / 2, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        h.color_fill_hr(&src, GREEN),
+        D3D_OK,
+        "fill the source green"
+    );
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(
+        h.stretch_rect(&src, &face3, D3DTEXF_POINT),
+        D3D_OK,
+        "scaling StretchRect from a render target into a cube face",
+    );
+
+    assert_eq!(
+        sample_cube_face(&h, &cube, (0.0, -1.0, 0.0)),
+        GREEN,
+        "face 3 carries the scaled blit",
+    );
+    assert_eq!(
+        sample_cube_face(&h, &cube, (1.0, 0.0, 0.0)),
+        RED,
+        "the blit into face 3 left face 0 alone",
+    );
+}
+
+#[test]
+fn scaling_stretch_rect_out_of_a_cube_face_reads_that_face() {
+    // The render quad's fragment function samples a 2D texture, so a cube
+    // source reaches it as a view of the face the call named. Bound as a cube
+    // it samples face 0 instead, so face 0 and face 2 are filled differently
+    // and the blit out of face 2 must carry face 2's colour.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face2 = cube.surface(2, 0);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(h.color_fill_hr(&face2, BLUE), D3D_OK, "fill face 2 blue");
+
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.clear_target(BLACK), 0, "clear the back buffer");
+    assert_eq!(
+        h.stretch_rect(&face2, &backbuffer, D3DTEXF_POINT),
+        D3D_OK,
+        "scaling StretchRect from a cube face onto the back buffer",
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLUE,
+        "the blit sampled face 2, not face 0",
+    );
+}
+
+#[test]
+fn stretch_rect_between_two_cube_faces_copies_face_to_face() {
+    // Both surfaces of a copy inside one cube map resolve to the same Metal
+    // texture, so the route is picked inside that texture: two faces are two
+    // slices and the same rect on each names different texels, which is a real
+    // copy the blit encoder runs in place. A route blind to the faces reads the
+    // pair as one rect copied onto itself and skips the call, and a copy pinned
+    // to slice 0 lands on face 0. Face 1 is green, face 3 is red, and the full
+    // face is copied 1 to 1.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face1 = cube.surface(1, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face1, GREEN), D3D_OK, "fill face 1 green");
+    assert_eq!(h.color_fill_hr(&face3, RED), D3D_OK, "fill face 3 red");
+    assert_eq!(
+        h.stretch_rect(&face1, &face3, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 same-format StretchRect from one cube face onto another",
+    );
+
+    assert_eq!(
+        read_surface_pixel(&h, &face3, 1, 1),
+        GREEN,
+        "face 3 carries face 1's colour",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &face1, 1, 1),
+        GREEN,
+        "the source face is left as it was",
+    );
+}
+
+#[test]
+fn scaling_stretch_rect_between_two_cube_faces_copies_face_to_face() {
+    // The scaling form of the same pair stages through a scratch texture, since
+    // the render quad cannot sample the texture it draws into. Both halves of
+    // that detour carry a face: the copy out reads the source face and the quad
+    // attaches the destination face. Face 1 is green and face 3 is red, and the
+    // whole of face 1 lands in face 3's top-left quarter.
+    const EDGE: u32 = 64;
+    const HALF: i32 = (EDGE / 2).cast_signed();
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face1 = cube.surface(1, 0);
+    let face3 = cube.surface(3, 0);
+    assert_eq!(h.color_fill_hr(&face1, GREEN), D3D_OK, "fill face 1 green");
+    assert_eq!(h.color_fill_hr(&face3, RED), D3D_OK, "fill face 3 red");
+    assert_eq!(
+        h.stretch_rect_rects(
+            &face1,
+            (0, 0, EDGE.cast_signed(), EDGE.cast_signed()),
+            &face3,
+            (0, 0, HALF, HALF),
+            D3DTEXF_POINT,
+        ),
+        D3D_OK,
+        "scaling StretchRect from one cube face onto another",
+    );
+
+    assert_eq!(
+        read_surface_pixel(&h, &face3, 1, 1),
+        GREEN,
+        "the scaled copy landed in face 3, carrying face 1's colour",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &face3, EDGE - 2, EDGE - 2),
+        RED,
+        "and left the rest of face 3 alone",
+    );
+}
+
+#[test]
+fn color_fill_of_a_cube_face_reaches_that_face_alone() {
+    // ColorFill on a cube face's surface runs a render pass over that face's
+    // slice and leaves the face's CPU staging untouched, so the GetDC that reads
+    // it back has to name the same face. Two faces are filled different colours:
+    // a fill without a face writes both into face 0, and a DC without the claim
+    // reads the staging neither fill reached.
+    const EDGE: u32 = 32;
+    const BLUE_COLORREF: u32 = 0x00FF_0000;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face2 = cube.surface(2, 0);
+    let face5 = cube.surface(5, 0);
+    assert_eq!(h.color_fill_hr(&face2, BLUE), D3D_OK, "fill face 2 blue");
+    assert_eq!(h.color_fill_hr(&face5, RED), D3D_OK, "fill face 5 red");
+
+    let dc = face2.dc();
+    assert_eq!(
+        dc.get_pixel(1, 1),
+        BLUE_COLORREF,
+        "face 2 keeps its own fill"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC on face 2");
+    let dc = face5.dc();
+    assert_eq!(
+        dc.get_pixel(1, 1),
+        RED_COLORREF,
+        "face 5 keeps its own fill"
+    );
+    assert_eq!(dc.release(), 0, "ReleaseDC on face 5");
+}
+
+#[test]
+fn color_fill_render_target_overwrites_earlier_draws() {
+    // ColorFill on a render target is ordered against the draws around it: it
+    // wipes what the frame already drew, and the draw after it blends against
+    // the fill colour rather than against what the fill replaced.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture bound");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(h.clear_target(BLACK), 0, "clear RT black");
+
+    // An opaque red triangle over the whole target, which the fill must erase.
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fullscreen_triangle(RED)),
+        0,
+        "pre-fill draw",
+    );
+    assert_eq!(h.end_scene(), 0);
+
+    assert_eq!(h.color_fill_hr(&rt_surface, BLUE), D3D_OK, "ColorFill blue");
+
+    // A half-transparent red triangle blended over the fill.
+    for (state, value) in [
+        (D3DRS_ALPHABLENDENABLE, 1),
+        (D3DRS_SRCBLEND, D3DBLEND_SRCALPHA),
+        (D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA),
+    ] {
+        assert_eq!(h.set_render_state(state, value), 0, "blend state");
+    }
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fullscreen_triangle(0x80FF_0000)),
+        0,
+        "blended draw",
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(
+        h.set_render_state(D3DRS_ALPHABLENDENABLE, 0),
+        0,
+        "blend off"
+    );
+
+    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&rt_surface, &sysmem),
+        0,
+        "read the render target back",
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let idx = (32 * pitch_px + 32) as usize;
+    let center = Rgba8::from_pixel(locked.as_u32(idx + 1)[idx]);
+    assert!(
+        (96..=160).contains(&center.r) && center.g < 40 && (96..=160).contains(&center.b),
+        "half-alpha red over the blue fill, got {center:?}",
+    );
+}
+
+#[test]
+fn scaled_stretch_rect_into_a_texture_level_is_visible_to_lock_rect() {
+    // A scaling StretchRect cannot go through Metal's blit encoder, so it
+    // renders the source onto a quad covering the destination's render-target
+    // texture level, writing that level's Metal texture alone. A LockRect on
+    // the level reads CPU staging, so it has to take the read back the claim on
+    // the level makes. The lock seeds the staging with a colour the quad never
+    // writes, so a lock that skips the read back reads green where the quad
+    // left red.
+    const SIZE: u32 = 32;
+    let h = Harness::new();
+    let src = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    assert_eq!(h.color_fill_hr(&src, RED), D3D_OK, "fill the source red");
+    let dst = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    {
+        let mut locked = dst.lock_rect(0, 0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![GREEN; (pitch_px * SIZE) as usize]);
+    }
+    let level = dst.surface_level(0);
+    assert_eq!(
+        h.stretch_rect(&src, &level, D3DTEXF_POINT),
+        D3D_OK,
+        "64x64 render target into a 32x32 render-target texture level",
+    );
+
+    let locked = dst.lock_rect(0, D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let texels = locked.as_u32((pitch_px * SIZE) as usize);
+    for (x, y, name) in [(0, 0, "first texel"), (SIZE - 1, SIZE - 1, "last texel")] {
+        assert_eq!(
+            texels[(y * pitch_px + x) as usize],
+            RED,
+            "the lock reads the scaled copy's {name}"
+        );
+    }
+}
+
+#[test]
+fn cross_format_stretch_rect_into_a_texture_level_is_visible_to_lock_rect() {
+    // Same-size but cross-format, which the blit encoder cannot convert, so it
+    // takes the same render quad a scale does and the same claim has to follow.
+    // The R5G6B5 source is a DEFAULT offscreen plain, whose Metal format
+    // differs from the A8R8G8B8 destination's.
+    const SIZE: u32 = 32;
+    const RED_565: u16 = 0xF800;
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(SIZE, SIZE, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        let pitch_px = locked.pitch().cast_unsigned() / 2;
+        locked.write(&vec![RED_565; (pitch_px * SIZE) as usize]);
+    }
+    let dst = h.create_texture(
+        SIZE,
+        SIZE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    {
+        let mut locked = dst.lock_rect(0, 0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![GREEN; (pitch_px * SIZE) as usize]);
+    }
+    let level = dst.surface_level(0);
+    assert_eq!(
+        h.stretch_rect(&src, &level, D3DTEXF_POINT),
+        D3D_OK,
+        "R5G6B5 offscreen plain into an A8R8G8B8 render-target texture level",
+    );
+
+    let locked = dst.lock_rect(0, D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let texels = locked.as_u32((pitch_px * SIZE) as usize);
+    for (x, y, name) in [(0, 0, "first texel"), (SIZE - 1, SIZE - 1, "last texel")] {
+        assert_eq!(
+            texels[(y * pitch_px + x) as usize],
+            RED,
+            "the lock reads the converted copy's {name}"
+        );
+    }
+}
+
+#[test]
+fn color_fill_lockable_render_target_is_visible_to_lock_rect() {
+    // A lockable CreateRenderTarget surface serves LockRect out of CPU staging
+    // while ColorFill paints its Metal texture, so the lock has to read the
+    // texture back: the whole-surface fill, then a sub-rect that leaves the
+    // rest of the surface on the colour the fill before it left.
+    let h = Harness::new();
+    let rt = h.create_lockable_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let read = |x: u32, y: u32| {
+        let locked = rt.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * 64) as usize)[(y * pitch_px + x) as usize]
+    };
+
+    assert_eq!(
+        h.color_fill_hr(&rt, GREEN),
+        D3D_OK,
+        "whole-surface ColorFill"
+    );
+    assert_eq!(read(32, 32), GREEN, "LockRect reads the fill colour");
+
+    assert_eq!(
+        h.color_fill_rect_hr(&rt, (16, 16, 48, 48), BLUE),
+        D3D_OK,
+        "sub-rect ColorFill",
+    );
+    assert_eq!(read(32, 32), BLUE, "inside the filled sub-rect");
+    assert_eq!(read(16, 16), BLUE, "the sub-rect's top-left corner");
+    assert_eq!(read(47, 47), BLUE, "the sub-rect's bottom-right corner");
+    assert_eq!(
+        read(8, 8),
+        GREEN,
+        "outside the sub-rect keeps the first fill"
+    );
+    assert_eq!(read(48, 48), GREEN, "one pixel past the sub-rect");
+}
+
+#[test]
+fn draw_into_a_lockable_render_target_is_visible_to_lock_rect() {
+    // Same contract for the other GPU writer of a lockable CreateRenderTarget
+    // surface: a Clear and a draw land in its Metal texture, and the LockRect
+    // that follows reports them rather than the staging they never touched.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let rt = h.create_lockable_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let read = |x: u32, y: u32| {
+        let locked = rt.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * 64) as usize)[(y * pitch_px + x) as usize]
+    };
+
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the lockable RT");
+    assert_eq!(h.clear_target(GREEN), 0, "clear it green");
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore the backbuffer");
+    assert_eq!(read(32, 32), GREEN, "LockRect reads the clear colour");
+
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the lockable RT again");
+    draw_fill(&h, RED);
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore the backbuffer");
+    assert_eq!(read(32, 32), RED, "LockRect reads the drawn colour");
+}
+
+#[test]
+fn get_dc_on_a_lockable_render_target_round_trips_through_the_gpu() {
+    // GetDC hands out a DIB over the same CPU staging LockRect serves, so it
+    // owes the surface the same coherence in both directions: the DC shows
+    // what the GPU painted before it, and what GDI draws into the DC reaches
+    // the colour texture at ReleaseDC.
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    let rt = h.create_lockable_render_target(64, 64, D3DFMT_A8R8G8B8);
+
+    assert_eq!(h.color_fill_hr(&rt, GREEN), D3D_OK, "ColorFill green");
+    let dc = rt.dc();
+    assert_eq!(
+        dc.get_pixel(32, 32),
+        GREEN_COLORREF,
+        "the DC reads the fill the GPU painted, not the staging under it",
+    );
+    assert_eq!(
+        dc.set_pixel(10, 10, RED_COLORREF),
+        RED_COLORREF,
+        "SetPixel into the DC stores the colour it was handed",
+    );
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+
+    // GDI knows no alpha: SetPixel stores the three colour bytes and leaves
+    // the fourth at zero, so the pixel comes back as red with no alpha.
+    assert_eq!(
+        read_surface_pixel(&h, &rt, 10, 10),
+        0x00FF_0000,
+        "what GDI drew into the DC reaches the colour texture",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &rt, 32, 32),
+        GREEN,
+        "the pixels GDI left alone still hold the fill",
+    );
+}
+
+#[test]
+fn get_dc_on_an_odd_width_16_bit_lockable_render_target_reaches_the_last_row() {
+    // A row of an odd number of 2-byte pixels is not a whole number of
+    // dwords, and GDI steps a DIB by the row length rounded up to four bytes.
+    // The staging the DC wraps has to carry that same stride, or every row the
+    // DC reads starts two bytes late and the last one falls out of the buffer
+    // entirely: its pixels read as black and GDI's own drawing into it never
+    // reaches the colour texture.
+    const W: u32 = 33;
+    const H: u32 = 4;
+    const GREEN_565: u16 = 0x07E0;
+    const RED_565: u16 = 0xF800;
+    const GREEN_COLORREF: u32 = 0x0000_FF00;
+    const RED_COLORREF: u32 = 0x0000_00FF;
+    let h = Harness::new();
+    // A device without Metal's packed 16-bit pixel formats does not advertise
+    // them as render targets and rejects the create to match, which leaves
+    // nothing to hold a DC over. That contract is pinned in `expand16`.
+    if h.check_device_format(
+        D3DFMT_X8R8G8B8,
+        D3DUSAGE_RENDERTARGET,
+        mtld3d_types::D3DRTYPE_SURFACE,
+        D3DFMT_R5G6B5,
+    ) != D3D_OK
+    {
+        assert_ne!(
+            h.create_render_target_hr(W, H, D3DFMT_R5G6B5),
+            D3D_OK,
+            "a 16-bit render target is rejected where the caps deny it"
+        );
+        return;
+    }
+    let rt = h.create_lockable_render_target(W, H, D3DFMT_R5G6B5);
+    assert_eq!(h.color_fill_hr(&rt, GREEN), D3D_OK, "ColorFill green");
+
+    let last_x = (W - 1).cast_signed();
+    let last_y = (H - 1).cast_signed();
+    let dc = rt.dc();
+    assert_eq!(
+        dc.get_pixel(last_x, last_y),
+        GREEN_COLORREF,
+        "the last pixel of the last row is inside the DIB the DC wraps",
+    );
+    assert_eq!(
+        dc.set_pixel(last_x, last_y, RED_COLORREF),
+        RED_COLORREF,
+        "SetPixel stores full-scale channels exactly in a 5-6-5 DIB",
+    );
+    assert_eq!(dc.release(), D3D_OK, "ReleaseDC");
+
+    let locked = rt.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() as usize / 2;
+    let px = locked.as_u16(pitch_px * H as usize);
+    let last_row = pitch_px * (H as usize - 1);
+    assert_eq!(
+        px[last_row + W as usize - 1],
+        RED_565,
+        "what GDI drew into the last pixel reached the colour texture",
+    );
+    assert_eq!(
+        px[last_row], GREEN_565,
+        "the rest of the last row still holds the fill",
+    );
+    assert_eq!(px[0], GREEN_565, "so does the first row");
+}
+
+#[test]
+fn a_back_buffer_sized_lockable_render_target_keeps_its_reported_extent() {
+    // A lockable render target created at the back buffer's own size takes the
+    // scale like any other, since a depth-stencil of that size does too and the
+    // pair has to rasterize on one grid. What stays at the reported extent is
+    // its CPU staging: the read-back that fills it resolves the texture up and
+    // the upload that pushes it back resamples down, so every path that binds,
+    // fills, reads or writes it addresses the far corner the reported extent
+    // has. Runs at any `render.scale`: the coordinates are the reported ones,
+    // and every probe is on a flat fill a resample reproduces exactly.
+    let h = Harness::new();
+    let (w, height) = h.dims();
+    let bb = h.render_target(0);
+    let rt = h.create_lockable_render_target(w, height, D3DFMT_A8R8G8B8);
+    let read = |x: u32, y: u32| {
+        let locked = rt.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.as_u32((pitch_px * height) as usize)[(y * pitch_px + x) as usize]
+    };
+
+    // Bound as a render target: the clear covers the whole texture, so the far
+    // corner carries the clear colour rather than whatever the create left.
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the lockable RT");
+    assert_eq!(h.clear_target(GREEN), 0, "clear it green");
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore the backbuffer");
+    assert_eq!(read(0, 0), GREEN, "the clear reaches the first pixel");
+    assert_eq!(
+        read(w - 1, height - 1),
+        GREEN,
+        "the clear reaches the last pixel"
+    );
+
+    // Filled on the GPU: the read-back that serves LockRect covers the same
+    // extent, pixel for pixel and with no resample in between.
+    assert_eq!(h.color_fill_hr(&rt, RED), D3D_OK, "whole-surface ColorFill");
+    assert_eq!(read(0, 0), RED, "the fill reaches the first pixel");
+    assert_eq!(
+        read(w - 1, height - 1),
+        RED,
+        "the fill reaches the last pixel"
+    );
+
+    // Written on the CPU: the unlock upload covers the same extent again, and
+    // `GetRenderTargetData` reads the colour texture back to prove it landed.
+    {
+        let mut locked = rt.lock_rect(0);
+        locked.write_u32(&vec![BLUE; (w * height) as usize]);
+    }
+    assert_eq!(
+        read_surface_pixel(&h, &rt, 0, 0),
+        BLUE,
+        "the upload reaches the first pixel of the colour texture"
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &rt, w - 1, height - 1),
+        BLUE,
+        "the upload reaches the last pixel of the colour texture"
+    );
+}
+
+/// Two lockable render targets written in one frame each keep their own write.
+///
+/// Each is locked with `D3DLOCK_DISCARD`, which reads nothing back, so the two
+/// writes go out in one submission: red into A, then green into B. At the
+/// back buffer's size both take a `render.scale` below one and resample on the
+/// way in, and A must still read red.
+#[test]
+fn two_lockable_render_targets_written_in_one_frame_keep_their_own_writes() {
+    let h = Harness::new();
+    let (w, height) = h.dims();
+    let a = h.create_lockable_render_target(w, height, D3DFMT_A8R8G8B8);
+    let b = h.create_lockable_render_target(w, height, D3DFMT_A8R8G8B8);
+    for (rt, color) in [(&a, RED), (&b, GREEN)] {
+        let mut locked = rt.lock_rect(D3DLOCK_DISCARD);
+        locked.write_u32(&vec![color; (w * height) as usize]);
+    }
+    let pixels = read_back(&h, &a, (w, height), D3DFMT_A8R8G8B8);
+    assert_eq!(
+        pixels[(height / 2 * w + w / 2) as usize],
+        RED,
+        "A holds its own write"
+    );
+    let pixels = read_back(&h, &b, (w, height), D3DFMT_A8R8G8B8);
+    assert_eq!(
+        pixels[(height / 2 * w + w / 2) as usize],
+        GREEN,
+        "B holds its own write"
+    );
+}
+
+/// A lock write into a lockable render target lands over a draw earlier in the frame.
+///
+/// The draw fills the target red, then a `D3DLOCK_DISCARD` lock, which reads
+/// nothing back, writes it green with no flush between them. D3D9 orders the
+/// write after the draw, so the target reads green. The target is the back
+/// buffer's size, so a `render.scale` leg takes the resampled write.
+#[test]
+fn a_lock_write_into_a_lockable_render_target_lands_over_an_earlier_draw() {
+    let h = Harness::new();
+    let (w, height) = h.dims();
+    let bb = h.render_target(0);
+    let rt = h.create_lockable_render_target(w, height, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the lockable RT");
+    draw_fill(&h, RED);
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore the backbuffer");
+    {
+        let mut locked = rt.lock_rect(D3DLOCK_DISCARD);
+        locked.write_u32(&vec![GREEN; (w * height) as usize]);
+    }
+    let pixels = read_back(&h, &rt, (w, height), D3DFMT_A8R8G8B8);
+    for (x, y) in [(0, 0), (w / 2, height / 2), (w - 1, height - 1)] {
+        assert_eq!(
+            pixels[(y * w + x) as usize],
+            GREEN,
+            "texel ({x}, {y}): the write over the draw"
+        );
+    }
+}
+
+/// A `ColorFill` into an autogen-mipmap render target regenerates its chain.
+///
+/// The fill lands on level 0 through the GPU path, so the lower levels have
+/// to be rebuilt from it before the next sample reads them.
+#[test]
+fn color_fill_autogen_render_target_regenerates_the_mip_chain() {
+    // The runtime owns a D3DUSAGE_AUTOGENMIPMAP texture's mip chain, so a
+    // ColorFill into level 0 regenerates it. Seed the chain red through a
+    // render into the texture, fill level 0 green, then sample a level the
+    // fill never touched: it reads green once the fill regenerates, red while
+    // the chain is stale.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+
+    // Seed: render red into the texture. Unbinding it regenerates the chain,
+    // so every level holds red before the fill.
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    assert_eq!(h.clear_target(RED), 0, "clear RT red");
+    draw_fill(&h, RED);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    assert_eq!(
+        h.color_fill_hr(&rt_surface, GREEN),
+        D3D_OK,
+        "ColorFill green"
+    );
+
+    sample_mip_level_4(&h, &rt);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.g > 200 && center.r < 40 && center.b < 40,
+        "the small mip carries the fill colour, got {center:?}"
+    );
+}
+
+/// A rejected `Reset` regenerates the chain of an autogen render target it unbinds.
+///
+/// The `Reset` returns render target 0 to the back buffer, and an autogen
+/// texture leaving render target 0 rebuilds its lower levels from level 0,
+/// as `SetRenderTarget` does. The chain is seeded red, level 0 is cleared
+/// green while bound, and the texture, a held `D3DPOOL_DEFAULT` resource,
+/// rejects the `Reset`; the small level then reads green, red while stale.
+#[test]
+fn rejected_reset_regenerates_a_bound_autogen_render_target() {
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_AUTOGENMIPMAP,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    {
+        let backbuffer = h.render_target(0);
+        assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+        assert_eq!(h.clear_target(RED), 0, "clear RT red");
+        assert_eq!(
+            h.set_render_target(0, &backbuffer),
+            0,
+            "unbinding regenerates the chain red"
+        );
+    }
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT again");
+    assert_eq!(h.clear_target(GREEN), 0, "clear level 0 green");
+    assert_eq!(
+        h.reset(640, 480),
+        D3DERR_INVALIDCALL,
+        "the held texture rejects the Reset"
+    );
+    let rt0 = h.render_target(0);
+    assert_ne!(rt0.as_ptr(), rt_surface.as_ptr(), "RT0 left the texture");
+    drop(rt0);
+
+    sample_mip_level_4(&h, &rt);
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.g > 200 && center.r < 40 && center.b < 40,
+        "the small mip carries level 0's green, got {center:?}"
+    );
+    drop(rt_surface);
+    drop(rt);
+    assert_eq!(h.reset(640, 480), D3D_OK, "Reset once the texture is gone");
+}
+
+/// Draw the 4x4 level of the 64x64 `rt` over the middle of a black render target 0.
+///
+/// MAXMIPLEVEL is the most detailed level the sampler may use, so the draw
+/// cannot read a more detailed level instead. Leaves the scene ended.
+pub fn sample_mip_level_4(h: &Harness, rt: &Texture<'_>) {
+    assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer black");
+    assert_eq!(h.set_texture(0, rt), 0, "bind the filled texture");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MIPFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAXMIPLEVEL, 4),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF TEX1"
+    );
+    let quad = [
+        TexturedVertex {
+            x: -0.5,
+            y: 0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 0.5,
+            y: 0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: 0.5,
+            y: 0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 0.0,
+        },
+        TexturedVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 1.0,
+            v: 1.0,
+        },
+        TexturedVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+            color: WHITE,
+            u: 0.0,
+            v: 1.0,
+        },
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample the regenerated mip"
+    );
+    assert_eq!(h.end_scene(), 0);
+}
+
+#[test]
+fn surface_ops_contracts() {
+    let h = Harness::new();
+    let bb = h.back_buffer(0);
+    // ColorFill on a standalone colour surface (the implicit backbuffer) fills
+    // its live colour texture and succeeds.
+    assert_eq!(
+        h.color_fill_hr(&bb, RED),
+        D3D_OK,
+        "ColorFill on the standalone backbuffer succeeds"
+    );
+    // GetRenderTargetData / GetFrontBufferData require a D3DPOOL_SYSTEMMEM
+    // destination; a DEFAULT-pool backbuffer dst is rejected.
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &bb),
+        D3DERR_INVALIDCALL,
+        "GetRenderTargetData rejects a non-SYSTEMMEM dst",
+    );
+    assert_eq!(
+        h.get_front_buffer_data_hr(&bb),
+        D3DERR_INVALIDCALL,
+        "GetFrontBufferData rejects a non-SYSTEMMEM dst",
+    );
+    // D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH and D3DPOOL_DEFAULT offscreen plain
+    // surfaces are supported; MANAGED is not.
+    assert_eq!(
+        h.create_offscreen_plain_surface_hr(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT),
+        0,
+        "CreateOffscreenPlainSurface(D3DPOOL_DEFAULT) succeeds",
+    );
+    assert_eq!(
+        h.create_offscreen_plain_surface_hr(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED),
+        D3DERR_INVALIDCALL,
+        "CreateOffscreenPlainSurface(D3DPOOL_MANAGED) is rejected",
+    );
+}
+
+#[test]
+fn create_render_target_default_pool_reports_desc() {
+    // CreateRenderTarget yields a D3DPOOL_DEFAULT surface that reports
+    // D3DUSAGE_RENDERTARGET; a D3DPOOL_DEFAULT offscreen-plain surface reports
+    // no usage. Both are GPU-resident (pool DEFAULT = 0).
+    let h = Harness::new();
+
+    let rt = h.create_render_target(64, 48, D3DFMT_A8R8G8B8);
+    let (hr, desc) = rt.desc();
+    assert_eq!(hr, 0, "render-target GetDesc");
+    assert_eq!(desc.pool, D3DPOOL_DEFAULT, "render target is DEFAULT pool");
+    assert_eq!(
+        desc.usage, D3DUSAGE_RENDERTARGET,
+        "render target reports D3DUSAGE_RENDERTARGET"
+    );
+    assert_eq!((desc.width, desc.height), (64, 48), "render-target dims");
+    assert_eq!(desc.format, D3DFMT_A8R8G8B8, "render-target format");
+
+    let off = h.create_offscreen_plain_surface(64, 48, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT);
+    let (hr, desc) = off.desc();
+    assert_eq!(hr, 0, "offscreen-plain GetDesc");
+    assert_eq!(
+        desc.pool, D3DPOOL_DEFAULT,
+        "offscreen-plain is DEFAULT pool"
+    );
+    assert_eq!(desc.usage, 0, "offscreen-plain reports no usage flags");
+}
+
+#[test]
+fn create_render_target_rgba32f_succeeds() {
+    // D3DFMT_A32B32G32R32F (128-bit float) is a renderable Metal format
+    // (MTLPixelFormatRGBA32Float); CreateRenderTarget must accept it. A NULL
+    // return would fault a subsequent SetRenderTarget.
+    let h = Harness::new();
+    let rt = h.create_render_target(64, 48, D3DFMT_A32B32G32R32F);
+    let (hr, desc) = rt.desc();
+    assert_eq!(hr, 0, "RGBA32F render-target GetDesc");
+    assert_eq!(desc.pool, D3DPOOL_DEFAULT, "render target is DEFAULT pool");
+    assert_eq!(
+        desc.usage, D3DUSAGE_RENDERTARGET,
+        "reports RENDERTARGET usage"
+    );
+    assert_eq!(
+        desc.format, D3DFMT_A32B32G32R32F,
+        "RGBA32F format round-trips"
+    );
+}
+
+#[test]
+fn create_render_target_rgba16f_succeeds() {
+    // D3DFMT_A16B16G16R16F is the half-float HDR scene target D3D9 engines
+    // ask for (MTLPixelFormatRGBA16Float). CreateRenderTarget must accept it,
+    // and GetDesc must report the format back unsubstituted.
+    let h = Harness::new();
+    let rt = h.create_render_target(64, 48, D3DFMT_A16B16G16R16F);
+    let (hr, desc) = rt.desc();
+    assert_eq!(hr, 0, "RGBA16F render-target GetDesc");
+    assert_eq!(desc.pool, D3DPOOL_DEFAULT, "render target is DEFAULT pool");
+    assert_eq!(
+        desc.usage, D3DUSAGE_RENDERTARGET,
+        "reports RENDERTARGET usage"
+    );
+    assert_eq!(
+        desc.format, D3DFMT_A16B16G16R16F,
+        "RGBA16F format round-trips"
+    );
+}
+
+/// Decode IEEE-754 binary16 bits into an `f32`.
+///
+/// Covers zero, subnormals and normals — everything a `[0, 1]` colour
+/// read-back can produce.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = i32::from((bits >> 10) & 0x1f);
+    let mantissa = f32::from(bits & 0x03ff) / 1024.0;
+    if exponent == 0 {
+        sign * mantissa * 2.0_f32.powi(-14)
+    } else {
+        sign * (1.0 + mantissa) * 2.0_f32.powi(exponent - 15)
+    }
+}
+
+#[test]
+fn render_into_rgba16f_target_round_trips() {
+    // Draw a known diffuse colour into a half-float render target and read it
+    // back: the create, the colour attachment, and the read-back blit all have
+    // to agree on RGBA16Float. This is the shape an engine's HDR scene pass
+    // uses before it tone-maps down to the 8-bit backbuffer.
+    let h = Harness::new();
+    let backbuffer = h.render_target(0);
+    let rt = h.create_render_target(64, 64, D3DFMT_A16B16G16R16F);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind half-float RT");
+    assert_eq!(h.clear_target(0), 0, "clear RT to 0");
+    // 0xFF804020 → R = 0x80/255, G = 0x40/255, B = 0x20/255.
+    draw_fill_at_z(&h, 0xFF80_4020, 0.5);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_A16B16G16R16F, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &sysmem),
+        0,
+        "GetRenderTargetData half-float RT → SYSTEMMEM"
+    );
+    let lanes = {
+        let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+        let pitch = usize::try_from(locked.pitch()).expect("non-negative pitch");
+        // One texel is four halves; sample the middle of the surface.
+        let texel = 32 * pitch / 2 + 32 * 4;
+        let halves = locked.as_u16(texel + 4);
+        [
+            f16_to_f32(halves[texel]),
+            f16_to_f32(halves[texel + 1]),
+            f16_to_f32(halves[texel + 2]),
+            f16_to_f32(halves[texel + 3]),
+        ]
+    };
+    let expected = [
+        f32::from(0x80u8) / 255.0,
+        f32::from(0x40u8) / 255.0,
+        f32::from(0x20u8) / 255.0,
+        1.0,
+    ];
+    for (lane, (got, want)) in lanes.into_iter().zip(expected).enumerate() {
+        assert!(
+            (got - want).abs() < 0.01,
+            "half-float RT lane {lane} should hold {want}; got {got}"
+        );
+    }
+}
+
+#[test]
+fn lock_rect_on_a_non_lockable_render_target_is_rejected() {
+    // `CreateRenderTarget` with `Lockable == FALSE` is a GPU-only colour
+    // surface with no CPU bytes behind it, so D3D9 answers every `LockRect` of
+    // it with `INVALIDCALL`, read-only locks included, and `UnlockRect` with no
+    // lock held answers the same. Reading such a target back is what
+    // `GetRenderTargetData` is for. The same surface created lockable locks.
+    let h = Harness::new();
+    let rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    for flags in [0, D3DLOCK_READONLY] {
+        let (hr, bits_null) = rt.lock_rect_probe(flags);
+        assert_eq!(
+            hr, D3DERR_INVALIDCALL,
+            "LockRect(flags={flags:#x}) on a non-lockable render target must be rejected"
+        );
+        assert!(
+            !bits_null,
+            "a rejected LockRect must leave the caller's D3DLOCKED_RECT untouched"
+        );
+        assert_eq!(
+            rt.unlock_rect(),
+            D3DERR_INVALIDCALL,
+            "UnlockRect with no lock held must be rejected"
+        );
+    }
+
+    let lockable = h.create_lockable_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let (hr, bits_null) = lockable.lock_rect_probe(D3DLOCK_READONLY);
+    assert_eq!(hr, D3D_OK, "a lockable render target still locks");
+    assert!(!bits_null, "an accepted LockRect hands back a pointer");
+    assert_eq!(
+        lockable.unlock_rect(),
+        D3D_OK,
+        "UnlockRect closes the lockable render target's lock"
+    );
+}
+
+#[test]
+fn lock_rect_on_a_half_float_render_target_reads_at_its_own_pitch() {
+    // A lockable render target's staging is a host-visible store like any
+    // other: it is sized, filled from the GPU and reported at the row pitch its
+    // own format asks for. A half-float target is eight bytes per texel, so a
+    // store laid out at four bytes per texel reports half the stride its rows
+    // are really at and asks the read-back for a copy narrower than one row of
+    // the source.
+    const W: u32 = 64;
+    const H: u32 = 64;
+    const LANES_PER_TEXEL: usize = 4;
+    // 0xFF804020: R = 0x80/255, G = 0x40/255, B = 0x20/255, A = 1.
+    const FILL: u32 = 0xFF80_4020;
+    let h = Harness::new();
+    let backbuffer = h.render_target(0);
+    let rt = h.create_lockable_render_target(W, H, D3DFMT_A16B16G16R16F);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind half-float RT");
+    assert_eq!(h.clear_target(FILL), 0, "clear the half-float RT");
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    let locked = rt.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("non-negative pitch");
+    assert_eq!(
+        pitch,
+        W as usize * 8,
+        "a half-float row is eight bytes per texel wide",
+    );
+    let lanes_per_row = pitch / 2;
+    let lanes = locked.as_u16(lanes_per_row * H as usize);
+    let expected = [
+        f32::from(0x80u8) / 255.0,
+        f32::from(0x40u8) / 255.0,
+        f32::from(0x20u8) / 255.0,
+        1.0,
+    ];
+    for (label, texel) in [
+        ("first texel of the first row", 0),
+        (
+            "last texel of the last row",
+            lanes_per_row * (H as usize - 1) + (W as usize - 1) * LANES_PER_TEXEL,
+        ),
+    ] {
+        for (lane, want) in expected.into_iter().enumerate() {
+            let got = f16_to_f32(lanes[texel + lane]);
+            assert!(
+                (got - want).abs() < 0.01,
+                "{label} lane {lane} should hold {want}; got {got}",
+            );
+        }
+    }
+}
+
+#[test]
+fn render_to_default_pool_target_round_trips() {
+    // A DEFAULT-pool render target can be bound, drawn into, and is then a valid
+    // GetRenderTargetData source into a SYSTEMMEM surface — i.e. create_color_target
+    // produces a real, renderable, readable Metal texture that SetRenderTarget and
+    // the readback blit both resolve via metal_color_handle. Metal validation is on
+    // under `make test`, so a malformed RT attachment would abort the draw.
+    //
+    // Nothing inside the frame samples the offscreen RT, so only the read-back
+    // note keeps its colour store; the pixel assert at the end pins that.
+    const TEAL: u32 = 0xFF00_8080;
+    let h = Harness::new();
+    // Capture the implicit backbuffer so we can restore RT0 before `rt` drops.
+    let bb = h.render_target(0);
+
+    let rt = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind DEFAULT RT");
+    assert_eq!(h.clear_target(TEAL), 0, "clear RT teal");
+    assert_eq!(h.clear_texture(0), 0, "no texture for the fill draw");
+    // Lighting defaults on; a lit vertex with no lights would come out
+    // black instead of its diffuse colour.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    // Emit the diffuse colour directly so the fill does not depend on a bound
+    // texture.
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let fill = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: TEAL,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: TEAL,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: TEAL,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fill),
+        0,
+        "RT fill draw"
+    );
+    // Restore the backbuffer: finalises the RT pass and avoids the device
+    // retaining a dangling pointer to `rt` after it drops.
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore backbuffer RT");
+
+    assert_eq!(
+        read_surface_pixel(&h, &rt, 32, 32),
+        TEAL,
+        "the drawn-into DEFAULT RT reads back its fill colour"
+    );
+}
+
+#[test]
+fn stretch_rect_between_default_pool_targets() {
+    // 1:1 same-format StretchRect between two DEFAULT render targets: a
+    // standalone colour surface works as both src and dst, and a Clear issued
+    // on the source right before the copy lands first, as D3D9 ordered it.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+
+    let src = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    let dst = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_target(0, &src), 0, "bind src");
+    assert_eq!(h.clear_target(GREEN), 0, "clear src green");
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        0,
+        "1:1 same-format StretchRect between DEFAULT RTs",
+    );
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore backbuffer");
+    assert_eq!(
+        read_surface_pixel(&h, &dst, 32, 32),
+        GREEN,
+        "the copy reads the source after its pending clear"
+    );
+}
+
+/// Read one pixel of `surface` as `0xAARRGGBB` through `GetRenderTargetData`.
+fn read_surface_pixel(h: &Harness, surface: &mtld3d_tests::Surface<'_>, x: u32, y: u32) -> u32 {
+    let (hr, desc) = surface.desc();
+    assert_eq!(hr, 0, "GetDesc for read_surface_pixel");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(surface, &sysmem),
+        0,
+        "GetRenderTargetData for read_surface_pixel"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let idx = (y * pitch_px + x) as usize;
+    locked.as_u32(idx + 1)[idx]
+}
+
+/// The distinct pixel values on `surface`, ascending, at most `CAP` + 1.
+///
+/// The whole-extent counterpart of [`read_surface_pixel`], for the questions
+/// a sample of one pixel cannot answer: a single row or column that differs
+/// from the rest shows up as a second entry. The cap is what keeps a failure
+/// reportable: a surface of recycled contents holds thousands of distinct
+/// values, and every caller only needs to see that more than one is there.
+fn surface_colors(h: &Harness, surface: &mtld3d_tests::Surface<'_>) -> Vec<u32> {
+    const CAP: usize = 8;
+    let (hr, desc) = surface.desc();
+    assert_eq!(hr, 0, "GetDesc for surface_colors");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(surface, &sysmem),
+        0,
+        "GetRenderTargetData for surface_colors"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let pixels = locked.as_u32((desc.height * pitch_px) as usize);
+    let mut colors = std::collections::BTreeSet::new();
+    for y in 0..desc.height {
+        for x in 0..desc.width {
+            colors.insert(pixels[(y * pitch_px + x) as usize]);
+            if colors.len() > CAP {
+                return colors.into_iter().collect();
+            }
+        }
+    }
+    colors.into_iter().collect()
+}
+
+/// Draw a full-target triangle in `color` through the diffuse channel.
+pub fn draw_fill(h: &Harness, color: u32) {
+    // Lighting defaults on and would replace the diffuse with black.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture for the fill draw");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let fill = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fill),
+        0,
+        "fill draw"
+    );
+}
+
+#[test]
+fn stretch_rect_from_rendered_target_survives_present() {
+    // Render into an offscreen RT, copy it to the backbuffer, Present. Nothing
+    // samples the RT, so its last-use store is the optimiser's to elide; the
+    // copy reads it from device memory after the pass, so the store must
+    // stay. Observed on the next frame, which only reads the persistent
+    // backbuffer back.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let rt = h.create_render_target(640, 480, D3DFMT_A8R8G8B8);
+
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind RT");
+    assert_eq!(h.clear_target(RED), 0, "clear RT red");
+    draw_fill(&h, GREEN);
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore backbuffer");
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(
+        h.stretch_rect(&rt, &bb, D3DTEXF_NONE),
+        0,
+        "StretchRect RT -> backbuffer"
+    );
+    assert_eq!(h.present(), 0, "Present");
+
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the backbuffer holds the RT's rendered content after Present"
+    );
+}
+
+#[test]
+fn stretch_rect_into_a_target_with_a_pending_clear_keeps_the_copy() {
+    // Clear(backbuffer) with no pass open, then copy a rendered RT into the
+    // backbuffer: D3D9 ordered the clear first, so the copy wins.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let rt = h.create_render_target(640, 480, D3DFMT_A8R8G8B8);
+
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind RT");
+    assert_eq!(h.clear_target(RED), 0, "clear RT red");
+    draw_fill(&h, GREEN);
+    assert_eq!(h.set_render_target(0, &bb), 0, "restore backbuffer");
+    assert_eq!(h.clear_target(BLACK), 0, "clear backbuffer black");
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(
+        h.stretch_rect(&rt, &bb, D3DTEXF_NONE),
+        0,
+        "StretchRect RT -> backbuffer"
+    );
+
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the copy lands after the backbuffer clear"
+    );
+}
+
+#[test]
+fn get_render_target_data_reads_backbuffer() {
+    // The conformance read-back chain: render a known colour, then
+    // GetRenderTarget(0) → CreateOffscreenPlainSurface(SYSTEMMEM) →
+    // GetRenderTargetData → LockRect, and confirm the locked pixel decodes to
+    // the rendered colour. Distinct R/G/B in the fill colour catches any channel
+    // swizzle in the blit/lock path. (This is the chain `Harness::read_pixel`
+    // itself runs; here we drive it explicitly to assert the lock layout.)
+    const ORANGE: u32 = 0xFFFF_8000;
+    let h = Harness::new();
+    assert_eq!(h.clear_target(ORANGE), 0, "clear backbuffer orange");
+    assert_eq!(h.present(), 0, "present");
+
+    let bb = h.render_target(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &sysmem),
+        0,
+        "GetRenderTargetData backbuffer → SYSTEMMEM",
+    );
+
+    let (x, y) = (320u32, 240u32);
+    let pixel = {
+        let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let idx = (y * pitch_px + x) as usize;
+        locked.as_u32(idx + 1)[idx]
+    };
+
+    // The locked pixel decodes to the rendered orange (R≈255, G≈128, B≈0).
+    let c = Rgba8::from_pixel(pixel);
+    assert!(
+        c.r > 200 && c.g > 100 && c.g < 160 && c.b < 40,
+        "read-back decodes to orange, got {c:?}",
+    );
+}
+
+#[test]
+fn get_render_target_data_writes_rows_at_the_reported_pitch() {
+    // An odd width in a 16-bit format is where the tight row stride and the
+    // one `LockRect` reports part company: 33 R5G6B5 texels are 66 bytes, and
+    // a linear system-memory surface reports 68, the next four-byte boundary.
+    // The read-back writes its rows at the reported stride, so row n starts
+    // where the lock reads it and the last row's tail is written too. At the
+    // tight stride row n would land 2n bytes early (row 1 ending in row 2's
+    // first texel) and the last row's last texels would keep whatever the
+    // backing already held.
+    const W: u32 = 33;
+    const H: u32 = 4;
+    // `W * 2` rounded up to the next four-byte boundary, in bytes and in lanes.
+    const PITCH: usize = 68;
+    const LANES: usize = PITCH / 2 * H as usize;
+    // BLUE and GREEN in B5G6R5 (`B[0..5] G[5..11] R[11..16]`).
+    const BLUE_565: u16 = 0x001F;
+    const GREEN_565: u16 = 0x07E0;
+    const SENTINEL: u16 = 0xAAAA;
+
+    let h = Harness::new();
+    // A device without Metal's packed 16-bit pixel formats does not advertise
+    // them as render targets and rejects the create to match, which leaves
+    // nothing to read back. That contract is pinned in `expand16`.
+    if h.check_device_format(
+        D3DFMT_X8R8G8B8,
+        D3DUSAGE_RENDERTARGET,
+        mtld3d_types::D3DRTYPE_SURFACE,
+        D3DFMT_R5G6B5,
+    ) != D3D_OK
+    {
+        assert_ne!(
+            h.create_render_target_hr(W, H, D3DFMT_R5G6B5),
+            D3D_OK,
+            "a 16-bit render target is rejected where the caps deny it"
+        );
+        return;
+    }
+    let backbuffer = h.render_target(0);
+    let rt = h.create_render_target(W, H, D3DFMT_R5G6B5);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind the R5G6B5 target");
+    assert_eq!(h.clear_target(BLUE), 0, "clear the R5G6B5 target blue");
+    let stripe = D3DRECT {
+        x1: 0,
+        y1: 1,
+        x2: 33,
+        y2: 2,
+    };
+    assert_eq!(h.clear_target_rects(GREEN, &[stripe]), 0, "row 1 green");
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    let sysmem = h.create_offscreen_plain_surface(W, H, D3DFMT_R5G6B5, D3DPOOL_SYSTEMMEM);
+    // Seed the backing so a byte the read-back never writes reads back as
+    // something no clear colour produces; the create leaves it uninitialised.
+    {
+        let mut seed = sysmem.lock_rect(0);
+        assert_eq!(
+            usize::try_from(seed.pitch()).expect("non-negative pitch"),
+            PITCH,
+            "LockRect reports the four-byte-rounded pitch"
+        );
+        seed.write(&[SENTINEL; LANES]);
+    }
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &sysmem),
+        0,
+        "GetRenderTargetData R5G6B5 RT → SYSTEMMEM",
+    );
+
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let lanes = locked.as_u16(LANES);
+    let texel = |x: usize, y: usize| lanes[y * (PITCH / 2) + x];
+    assert_eq!(texel(0, 1), GREEN_565, "row 1 starts green");
+    assert_eq!(
+        texel(32, 1),
+        GREEN_565,
+        "row 1 ends green, not row 2's blue"
+    );
+    assert_eq!(
+        texel(32, 3),
+        BLUE_565,
+        "the last row's last texel is written"
+    );
+}
+
+#[test]
+fn get_render_target_data_fills_a_system_memory_texture_level() {
+    // D3D9 takes any system-memory surface as the destination, and a title
+    // that screenshots or feeds a reflection reads the back buffer into a
+    // level of a D3DPOOL_SYSTEMMEM texture rather than into an offscreen
+    // plain surface. Both CPU-only pools qualify.
+    const TEAL: u32 = 0xFF00_8080;
+    let h = Harness::new();
+    assert_eq!(h.clear_target(TEAL), 0, "clear backbuffer teal");
+    assert_eq!(h.present(), 0, "present");
+
+    let bb = h.render_target(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+
+    for (pool, name) in [
+        (D3DPOOL_SYSTEMMEM, "D3DPOOL_SYSTEMMEM"),
+        (D3DPOOL_SCRATCH, "D3DPOOL_SCRATCH"),
+    ] {
+        let texture = h.create_texture(desc.width, desc.height, 1, 0, D3DFMT_A8R8G8B8, pool);
+        let level = texture.surface_level(0);
+        assert_eq!(
+            h.get_render_target_data_hr(&bb, &level),
+            0,
+            "GetRenderTargetData backbuffer → {name} texture level",
+        );
+        let pixel = {
+            let locked = level.lock_rect(D3DLOCK_READONLY);
+            let pitch_px = locked.pitch().cast_unsigned() / 4;
+            let idx = (240 * pitch_px + 320) as usize;
+            locked.as_u32(idx + 1)[idx]
+        };
+        // The locked pixel decodes to the cleared teal (R=0, G=B≈128).
+        let c = Rgba8::from_pixel(pixel);
+        assert!(
+            c.r < 40 && c.g > 100 && c.g < 160 && c.b > 100 && c.b < 160,
+            "{name} level decodes to teal, got {c:?}",
+        );
+    }
+}
+
+#[test]
+fn get_render_target_data_of_a_texture_level_sees_a_pending_cpu_write() {
+    // A level of a non-dynamic DEFAULT-pool texture is lockable here, so a
+    // render-target texture level can carry a CPU write that no bind has
+    // uploaded yet. `GetRenderTargetData` reads that level on the GPU and
+    // never looks at its staging, so the pending upload has to be scheduled
+    // ahead of the read; without that the read hands back the GPU content the
+    // write was meant to replace.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let level = rt.surface_level(0);
+    // Seed the Metal texture with a colour the read-back can be caught
+    // returning; a level nothing has written has no Metal texture to read.
+    assert_eq!(h.color_fill_hr(&level, RED), D3D_OK, "seed the level red");
+    // Close the frame the fill was queued in. An upload leads the frame it is
+    // scheduled in, so a write flushed into the fill's own frame would land
+    // under the fill rather than over it, and the read would be right for the
+    // wrong reason.
+    assert_eq!(h.present(), 0, "submit the fill");
+    {
+        let mut locked = rt.lock_rect(0, 0);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        locked.write_u32(&vec![GREEN; (pitch_px * 64) as usize]);
+    }
+    assert_eq!(
+        read_surface_pixel(&h, &level, 32, 32),
+        GREEN,
+        "the read-back carries the write the lock left pending, not the fill under it"
+    );
+}
+
+#[test]
+fn get_front_buffer_data_fills_a_system_memory_texture_level() {
+    // Same destination rule on the front-buffer read; the source is the
+    // presented image rather than a caller-named render target.
+    const PURPLE: u32 = 0xFF80_0080;
+    let h = Harness::new();
+    assert_eq!(h.clear_target(PURPLE), 0, "clear backbuffer purple");
+    assert_eq!(h.present(), 0, "present");
+
+    let (hr, desc) = h.render_target(0).desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+    let texture = h.create_texture(
+        desc.width,
+        desc.height,
+        1,
+        0,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    let level = texture.surface_level(0);
+    assert_eq!(
+        h.get_front_buffer_data_hr(&level),
+        0,
+        "GetFrontBufferData → SYSTEMMEM texture level",
+    );
+    let pixel = {
+        let locked = level.lock_rect(D3DLOCK_READONLY);
+        let pitch_px = locked.pitch().cast_unsigned() / 4;
+        let idx = (240 * pitch_px + 320) as usize;
+        locked.as_u32(idx + 1)[idx]
+    };
+    // The locked pixel decodes to the cleared purple (R=B≈128, G=0).
+    let c = Rgba8::from_pixel(pixel);
+    assert!(
+        c.r > 100 && c.r < 160 && c.g < 40 && c.b > 100 && c.b < 160,
+        "front-buffer level decodes to purple, got {c:?}",
+    );
+}
+
+#[test]
+fn readback_rejects_a_destination_that_is_not_the_source_in_system_memory() {
+    // The destination rules are D3D9's: a system-memory surface with the
+    // source's extent and format. A level of a GPU-resident texture, and a
+    // system-memory destination of another size, are both INVALIDCALL rather
+    // than a copy of whatever fits.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "backbuffer GetDesc");
+
+    let managed = h.create_texture(
+        desc.width,
+        desc.height,
+        1,
+        0,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_MANAGED,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &managed.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "a D3DPOOL_MANAGED level is not a system-memory destination",
+    );
+
+    let small = h.create_texture(64, 64, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &small.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "a smaller destination is rejected, not filled with a scaled copy",
+    );
+    assert_eq!(
+        h.get_front_buffer_data_hr(&small.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "GetFrontBufferData applies the same extent rule",
+    );
+
+    let wrong_format = h.create_texture(
+        desc.width,
+        desc.height,
+        1,
+        0,
+        D3DFMT_R5G6B5,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&bb, &wrong_format.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "a destination with another byte layout is rejected, not converted",
+    );
+}
+
+/// `GetRenderTargetData` compares the D3D formats, not the storage behind them.
+///
+/// `R8G8B8` is stored as BGRA8, the storage an `X8R8G8B8` render target has,
+/// but its system-memory surface lays out three bytes a texel, so the four-byte
+/// rows of the target do not fit it. D3D9 rejects the pair, and the
+/// destination keeps its bytes. `X8R8G8B8` into `A8R8G8B8` stays accepted:
+/// the two differ only in what the fourth byte means, and every read-back of
+/// the harness reads the `X8R8G8B8` back buffer that way.
+#[test]
+fn get_render_target_data_compares_d3d_formats() {
+    const SENTINEL: u8 = 0x5A;
+    let h = Harness::new();
+    let rt = h.create_render_target(100, 100, D3DFMT_X8R8G8B8);
+    assert_eq!(h.color_fill_hr(&rt, 0xFF11_2233), 0);
+    let packed = h.create_offscreen_plain_surface(100, 100, D3DFMT_R8G8B8, D3DPOOL_SYSTEMMEM);
+    let pitch = {
+        let mut locked = packed.lock_rect(0);
+        let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+        locked.write(&vec![SENTINEL; pitch * 100]);
+        pitch
+    };
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &packed),
+        D3DERR_INVALIDCALL,
+        "X8R8G8B8 into an R8G8B8 surface",
+    );
+    let level = h.create_texture(100, 100, 1, 0, D3DFMT_R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &level.surface_level(0)),
+        D3DERR_INVALIDCALL,
+        "X8R8G8B8 into an R8G8B8 texture level",
+    );
+    assert!(
+        packed
+            .lock_rect(D3DLOCK_READONLY)
+            .as_u8(pitch * 100)
+            .iter()
+            .all(|&b| b == SENTINEL),
+        "the rejected read-back left the destination's bytes alone",
+    );
+    for format in [D3DFMT_X8R8G8B8, D3DFMT_A8R8G8B8] {
+        let sysmem = h.create_offscreen_plain_surface(100, 100, format, D3DPOOL_SYSTEMMEM);
+        assert_eq!(
+            h.get_render_target_data_hr(&rt, &sysmem),
+            0,
+            "X8R8G8B8 into {format:#x}",
+        );
+        let pixel = sysmem.lock_rect(D3DLOCK_READONLY).as_u32(1)[0];
+        assert_eq!(
+            pixel & 0x00FF_FFFF,
+            0x0011_2233,
+            "{format:#x}: the filled colour"
+        );
+    }
+}
+
+/// A GPU copy into an `R8G8B8` offscreen plain locks back at three bytes a texel.
+///
+/// The surface's Metal storage is BGRA8, so a `LockRect` after a `StretchRect`
+/// into it reads four-byte texels back from the GPU. They have to land in the
+/// three-byte rows the lock reports, every row at its own pitch.
+#[test]
+fn stretch_rect_into_an_r8g8b8_plain_locks_back_three_bytes_a_texel() {
+    const SIDE: u32 = 100;
+    let texel = |x: u32, y: u32| [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 0x77];
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(SIDE, SIDE, D3DFMT_R8G8B8, D3DPOOL_DEFAULT);
+    let dst = h.create_offscreen_plain_surface(SIDE, SIDE, D3DFMT_R8G8B8, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        let bytes: Vec<u8> = (0..SIDE)
+            .flat_map(|y| (0..SIDE).flat_map(move |x| texel(x, y)))
+            .collect();
+        locked.write_u8_rect(3 * SIDE as usize, SIDE as usize, &bytes);
+    }
+    assert_eq!(h.stretch_rect(&src, &dst, D3DTEXF_NONE), 0, "R8G8B8 1:1");
+    let locked = dst.lock_rect(D3DLOCK_READONLY);
+    let pitch = usize::try_from(locked.pitch()).expect("positive pitch");
+    let bytes = locked.as_u8(pitch * SIDE as usize);
+    for y in [0, 2, 57, SIDE - 1] {
+        let row = &bytes[y as usize * pitch..][..3 * SIDE as usize];
+        let expected: Vec<u8> = (0..SIDE).flat_map(|x| texel(x, y)).collect();
+        assert_eq!(row, expected.as_slice(), "row {y}");
+    }
+}
+
+#[test]
+fn set_render_target_resets_viewport_and_scissor() {
+    // D3D9: SetRenderTarget(0, rt) snaps the viewport and scissor rect to the
+    // new target's full dimensions, overriding any rect set beforehand. The
+    // harness device is 640x480.
+    let h = Harness::new();
+
+    let default_scissor = h.scissor_rect();
+    assert_eq!(
+        (default_scissor.x2, default_scissor.y2),
+        (640, 480),
+        "default scissor covers the full backbuffer",
+    );
+
+    let rt = h.create_texture(
+        128,
+        128,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+
+    // Bind the 128x128 RT: viewport + scissor follow it.
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind RT");
+    let vp = h.viewport();
+    assert_eq!((vp.width, vp.height), (128, 128), "viewport follows RT");
+    let sc = h.scissor_rect();
+    assert_eq!(
+        (sc.x1, sc.y1, sc.x2, sc.y2),
+        (0, 0, 128, 128),
+        "scissor follows RT",
+    );
+
+    // A custom viewport + scissor, then a re-bind of the same RT, resets both.
+    assert_eq!(
+        h.set_viewport(&D3DVIEWPORT9 {
+            x: 10,
+            y: 20,
+            width: 30,
+            height: 40,
+            min_z: 0.25,
+            max_z: 0.75,
+        }),
+        0,
+        "custom viewport",
+    );
+    assert_eq!(
+        h.set_scissor_rect(&D3DRECT {
+            x1: 50,
+            y1: 60,
+            x2: 70,
+            y2: 80,
+        }),
+        0,
+        "custom scissor",
+    );
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "re-bind RT");
+    let vp = h.viewport();
+    assert_eq!(
+        (vp.x, vp.y, vp.width, vp.height),
+        (0, 0, 128, 128),
+        "re-bind resets the custom viewport",
+    );
+    let sc = h.scissor_rect();
+    assert_eq!(
+        (sc.x1, sc.y1, sc.x2, sc.y2),
+        (0, 0, 128, 128),
+        "re-bind resets the custom scissor",
+    );
+}
+
+#[test]
+fn sample_float_texture_into_float_rt_round_trips() {
+    // Render a float-texture sample into a custom A32B32G32R32F render target,
+    // then read it back. The sample, the float texture, and the float-RT
+    // readback each work in isolation; this test guards their combination.
+    const W: u32 = 200;
+
+    let h = Harness::new();
+    let tex = h.create_texture(W, W, 1, 0, D3DFMT_A32B32G32R32F, D3DPOOL_MANAGED);
+    {
+        let lr = tex.lock_rect(0, 0);
+        let pitch = usize::try_from(lr.pitch()).expect("non-negative pitch");
+        let base = lr.bits_ptr();
+        let dim = f32::from(u16::try_from(W).expect("W < 65536"));
+        for y in 0..W {
+            let fy = f32::from(u16::try_from(y).expect("y < 65536")) / dim;
+            for x in 0..W {
+                let fx = f32::from(u16::try_from(x).expect("x < 65536")) / dim;
+                let px = [fx, fy, 0.0_f32, 1.0_f32];
+                let off = y as usize * pitch + x as usize * 16;
+                // SAFETY: `off` is in-bounds of the locked region (y<W, x<W, pitch>=W*16).
+                let dst = unsafe { base.add(off) };
+                // SAFETY: `dst` is valid for the 16 bytes of one float4 texel.
+                unsafe { core::ptr::copy_nonoverlapping(px.as_ptr().cast::<u8>(), dst, 16) };
+            }
+        }
+    }
+
+    let backbuffer = h.render_target(0);
+    let rt = h.create_render_target(256, 256, D3DFMT_A32B32G32R32F);
+    assert_eq!(h.set_render_target(0, &rt), 0, "bind float RT");
+    assert_eq!(h.clear_target(0), 0, "clear RT to 0");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.set_texture(0, &tex), 0, "bind float texture");
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        0
+    );
+    assert_eq!(
+        h.set_texture_stage_state(0, D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        0
+    );
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+
+    let v = |x: f32, y: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: 0,
+        u: 0.5,
+        v: 0.25,
+    };
+    let quad = [
+        v(-1.0, 1.0),
+        v(1.0, 1.0),
+        v(-1.0, -1.0),
+        v(1.0, 1.0),
+        v(1.0, -1.0),
+        v(-1.0, -1.0),
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "RT sample draw"
+    );
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    let sysmem =
+        h.create_offscreen_plain_surface(256, 256, D3DFMT_A32B32G32R32F, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &sysmem),
+        0,
+        "GetRenderTargetData float RT → SYSTEMMEM"
+    );
+    let (cx, cy) = (128usize, 128usize);
+    let (r, g) = {
+        let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+        let pitch_u32 = locked.pitch().cast_unsigned() as usize / 4;
+        let idx = cy * pitch_u32 + cx * 4;
+        let px = locked.as_u32(idx + 4);
+        (f32::from_bits(px[idx]), f32::from_bits(px[idx + 1]))
+    };
+    assert!(
+        (r - 0.5).abs() < 0.05 && (g - 0.25).abs() < 0.05,
+        "float RT sample of (0.5,0.25) should be ~(0.5,0.25); got ({r},{g})"
+    );
+}
+
+/// Draw a full-cover triangle in `color` at clip-space depth `z`.
+fn draw_fill_at_z(h: &Harness, color: u32, z: f32) {
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_LIGHTING, 0),
+        0,
+        "lighting off"
+    );
+    assert_eq!(h.clear_texture(0), 0, "no texture for the fill draw");
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_DIFFUSE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_DIFFUSE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    let fill = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z,
+            color,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z,
+            color,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z,
+            color,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fill),
+        0,
+        "fill draw"
+    );
+}
+
+#[test]
+fn depth_survives_a_mid_frame_readback_flush() {
+    // A readback taken between two depth-tested draw groups forces a mid-frame
+    // flush (NO_PRESENT). The depth surface the first group wrote must survive
+    // it: the far second group is gated LESS against the primed near depth and
+    // must fail. Before the fix the flush elided the depth store (Rule B) and
+    // reset first-use (Rule A), so the far group tested against discarded
+    // depth. The colour side is deterministic here: the near group's green is
+    // the surviving pixel iff depth held.
+    let h = Harness::with_depth();
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth",
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "z on");
+
+    // Near group: green, writes depth 0.25.
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "zwrite on");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL),
+        0,
+        "zfunc lessequal"
+    );
+    draw_fill_at_z(&h, GREEN, 0.25);
+
+    // Force a mid-frame flush between the groups (readback of the backbuffer).
+    let _ = h.read_pixel(0, 0);
+
+    // Far group: red at 0.75, gated LESS. 0.75 < 0.25 is false, so it must
+    // fail against the primed depth and leave green in place.
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0, "zwrite off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS),
+        0,
+        "zfunc less"
+    );
+    draw_fill_at_z(&h, RED, 0.75);
+
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.present(), 0, "Present");
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the far group failed depth against the primed near depth that survived the flush",
+    );
+}
+
+/// Assert each RGB channel of `got` is within `tolerance` of `expected` (alpha ignored).
+fn assert_rgb_close(got: u32, expected: u32, tolerance: i32, context: &str) {
+    let channel = |c: u32, shift: u32| i32::try_from((c >> shift) & 0xff).unwrap_or(0);
+    let close = [16, 8, 0]
+        .iter()
+        .all(|&shift| (channel(got, shift) - channel(expected, shift)).abs() <= tolerance);
+    assert!(
+        close,
+        "{context}: got {got:#010x}, expected {expected:#08x} (tolerance {tolerance})"
+    );
+}
+
+#[test]
+fn stretch_rect_decodes_packed_yuv_into_the_backbuffer() {
+    // A 4x1 DEFAULT offscreen-plain YUV surface holding the macropixel under
+    // test plus a neutral filler, StretchRect'd with POINT onto the 640x480
+    // backbuffer (a scaling blit, so the render quad does the decode). The
+    // left half of the target shows pixel 0, the right half pixel 1. Expected
+    // colours are the reference values desktop drivers produce for these
+    // macropixels; drivers disagree on the exact Y'CbCr convention, hence the
+    // tolerance of 18.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let cases: [(u32, &str, u32, u32, u32); 8] = [
+        (D3DFMT_UYVY, "UYVY", 0x4cff_4c54, 0x00ff_0000, 0x00ff_0000),
+        (D3DFMT_UYVY, "UYVY", 0x0080_0080, 0x0000_0000, 0x0000_0000),
+        (D3DFMT_UYVY, "UYVY", 0xff80_ff80, 0x00ff_ffff, 0x00ff_ffff),
+        (D3DFMT_UYVY, "UYVY", 0xff00_0000, 0x0000_8700, 0x004b_ff1c),
+        (D3DFMT_YUY2, "YUY2", 0x4cff_4c54, 0x000b_8b00, 0x00b6_ffa3),
+        (D3DFMT_YUY2, "YUY2", 0x0080_0080, 0x0000_ff00, 0x0000_ff00),
+        (D3DFMT_YUY2, "YUY2", 0xff80_ff80, 0x00ff_00ff, 0x00ff_00ff),
+        (D3DFMT_YUY2, "YUY2", 0x1c6b_1cff, 0x006d_ff45, 0x0000_d500),
+    ];
+    for (format, name, input, left, right) in cases {
+        let surface = h.create_offscreen_plain_surface(4, 1, format, D3DPOOL_DEFAULT);
+        {
+            let mut locked = surface.lock_rect(0);
+            locked.write(&[input, 0x0080_0080u32]);
+        }
+        assert_eq!(
+            h.clear_target(BLACK),
+            0,
+            "clear before {name} {input:#010x}"
+        );
+        assert_eq!(
+            h.stretch_rect(&surface, &bb, D3DTEXF_POINT),
+            D3D_OK,
+            "StretchRect {name} {input:#010x} onto the backbuffer"
+        );
+        // Each source pixel covers a 160 px band of the target; probe the
+        // middle of the first two so a reading stays clear of the colour
+        // boundary between them, where a resolved frame drifts further than
+        // the convention tolerance allows.
+        assert_rgb_close(
+            h.read_pixel(80, 240),
+            left,
+            18,
+            &format!("{name} {input:#010x} pixel 0"),
+        );
+        assert_rgb_close(
+            h.read_pixel(240, 240),
+            right,
+            18,
+            &format!("{name} {input:#010x} pixel 1"),
+        );
+    }
+}
+
+#[test]
+fn stretch_rect_decodes_packed_yuv_into_an_offscreen_plain_surface() {
+    // A 1:1 YUV -> X8R8G8B8 copy into an offscreen-plain destination has no
+    // GPU path (the 1:1 blit cannot convert and the quad needs a render
+    // target), so the CPU converter decodes the macropixels; a later lock of
+    // the destination reads the converted pixels.
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 1, D3DFMT_UYVY, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        // Pixels 0/1: red; pixels 2/3: white.
+        locked.write(&[0x4cff_4c54u32, 0xff80_ff80]);
+    }
+    let dst = h.create_offscreen_plain_surface(4, 1, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "1:1 UYVY -> X8R8G8B8 into an offscreen-plain surface"
+    );
+    let locked = dst.lock_rect(D3DLOCK_READONLY);
+    let px = locked.as_u32(4);
+    assert_rgb_close(px[0], 0x00ff_0000, 18, "pixel 0");
+    assert_rgb_close(px[1], 0x00ff_0000, 18, "pixel 1");
+    assert_rgb_close(px[2], 0x00ff_ffff, 18, "pixel 2");
+    assert_rgb_close(px[3], 0x00ff_ffff, 18, "pixel 3");
+}
+
+/// `StretchRect` refuses a `YUY2` and `UYVY` pair.
+///
+/// The two share their storage but order luma and chroma differently, and
+/// `CheckDeviceFormatConversion` answers no for the pair, so a copy of the
+/// bytes would hand the destination the source's order. The destination keeps
+/// its bytes; a copy into the same format still goes through.
+#[test]
+fn stretch_rect_refuses_a_packed_yuv_pair_of_two_formats() {
+    let h = Harness::new();
+    let fill = |surface: &Surface<'_>, bytes: [u8; 4]| {
+        surface
+            .lock_rect(0)
+            .write_u8_rect(32, 16, &bytes.repeat(16 * 8));
+    };
+    let yuy2 = h.create_offscreen_plain_surface(16, 16, D3DFMT_YUY2, D3DPOOL_DEFAULT);
+    let uyvy = h.create_offscreen_plain_surface(16, 16, D3DFMT_UYVY, D3DPOOL_DEFAULT);
+    fill(&yuy2, [0x10, 0x20, 0x30, 0x40]);
+    fill(&uyvy, [0x80, 0x80, 0x80, 0x80]);
+    for (src, dst, name) in [
+        (&yuy2, &uyvy, "YUY2 -> UYVY"),
+        (&uyvy, &yuy2, "UYVY -> YUY2"),
+    ] {
+        assert_eq!(
+            h.stretch_rect(src, dst, D3DTEXF_NONE),
+            D3DERR_INVALIDCALL,
+            "{name}"
+        );
+    }
+    assert_eq!(
+        uyvy.lock_rect(D3DLOCK_READONLY).as_u8(4),
+        &[0x80; 4],
+        "the refused copy left the UYVY surface alone",
+    );
+    let other = h.create_offscreen_plain_surface(16, 16, D3DFMT_YUY2, D3DPOOL_DEFAULT);
+    assert_eq!(
+        h.stretch_rect(&yuy2, &other, D3DTEXF_NONE),
+        0,
+        "YUY2 -> YUY2"
+    );
+    assert_eq!(
+        other.lock_rect(D3DLOCK_READONLY).as_u8(4),
+        &[0x10, 0x20, 0x30, 0x40],
+        "the same-format copy",
+    );
+}
+
+/// A converting `StretchRect` out of a source level larger than the destination.
+///
+/// The CPU converter takes a source rectangle and a destination origin, so the
+/// extent it writes has to come from what both levels hold rather than from the
+/// source alone: a 4x1 source feeding a 2x1 destination is the pair whose
+/// unclipped extent would run the row loop past the destination staging.
+#[test]
+fn stretch_rect_converts_a_sub_rect_into_a_smaller_offscreen_surface() {
+    let h = Harness::new();
+    let src = h.create_offscreen_plain_surface(4, 1, D3DFMT_UYVY, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        // Pixels 0/1: red; pixels 2/3: white.
+        locked.write(&[0x4cff_4c54u32, 0xff80_ff80]);
+    }
+    let dst = h.create_offscreen_plain_surface(2, 1, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    let rect = D3DRECT {
+        x1: 2,
+        y1: 0,
+        x2: 4,
+        y2: 1,
+    };
+    assert_eq!(
+        h.stretch_rect_region_hr(&src, &rect, &dst, D3DTEXF_NONE),
+        D3D_OK,
+        "UYVY sub-rect -> X8R8G8B8 into a smaller offscreen-plain surface"
+    );
+    let locked = dst.lock_rect(D3DLOCK_READONLY);
+    let px = locked.as_u32(2);
+    assert_rgb_close(px[0], 0x00ff_ffff, 18, "pixel 0");
+    assert_rgb_close(px[1], 0x00ff_ffff, 18, "pixel 1");
+}
+
+/// The two planar 4:2:0 YUV formats, with the names the assertions print.
+const PLANAR_FORMATS: [(u32, &str); 2] = [(D3DFMT_YV12, "YV12"), (D3DFMT_NV12, "NV12")];
+
+/// Byte the planar helpers leave in row padding, which no plane of a test image uses.
+const PLANAR_PADDING: u8 = 0x07;
+
+/// Four `(Y, U, V)` samples with the `0x00RRGGBB` each decodes to.
+///
+/// Pure red, green and blue and a dark green. U and V differ in every one of
+/// them, so a plane exchange (`YV12`) or an interleave exchange (`NV12`) turns
+/// red into blue instead of passing.
+const PLANAR_COLOURS: [((u8, u8, u8), u32); 4] = [
+    ((0x51, 0x5a, 0xf0), 0x00ff_0000),
+    ((0x91, 0x36, 0x22), 0x0000_ff01),
+    ((0x29, 0xf0, 0x6e), 0x0000_00ff),
+    ((0x40, 0x40, 0x40), 0x0000_8400),
+];
+
+/// Index into [`PLANAR_COLOURS`] of chroma block `(cx, cy)` of the four-colour pattern.
+///
+/// Every block differs from its horizontal and its vertical neighbours, so a
+/// chroma sample that covers more or less than its 2x2 luma block shows.
+const fn planar_pattern_index(cx: usize, cy: usize) -> usize {
+    (cx + 2 * cy) % PLANAR_COLOURS.len()
+}
+
+/// The colour the four-colour pattern decodes to at luma texel `(x, y)`.
+const fn planar_pattern_colour(x: usize, y: usize) -> u32 {
+    PLANAR_COLOURS[planar_pattern_index(x / 2, y / 2)].1
+}
+
+/// The locked bytes of a planar surface, every plane laid out from the pitch.
+///
+/// The pitch is the width rounded up to four bytes. `YV12` stores a V plane
+/// then a U plane, each of `ceil(height / 2)` rows striding half the pitch;
+/// `NV12` one plane of that many rows striding the pitch, U then V. `index`
+/// names the [`PLANAR_COLOURS`] entry of a chroma block, and every luma texel
+/// of the block takes the same entry's luma.
+fn planar_bytes(
+    format: u32,
+    (width, height): (usize, usize),
+    index: impl Fn(usize, usize) -> usize,
+) -> Vec<u8> {
+    let pitch = width.next_multiple_of(4);
+    let chroma_rows = height.div_ceil(2);
+    let mut bytes = vec![PLANAR_PADDING; pitch * (height + chroma_rows)];
+    for y in 0..height {
+        for x in 0..width {
+            bytes[y * pitch + x] = PLANAR_COLOURS[index(x / 2, y / 2)].0.0;
+        }
+    }
+    let chroma = pitch * height;
+    for cy in 0..chroma_rows {
+        for cx in 0..width.div_ceil(2) {
+            let (_, u, v) = PLANAR_COLOURS[index(cx, cy)].0;
+            if format == D3DFMT_YV12 {
+                let half = pitch / 2;
+                bytes[chroma + cy * half + cx] = v;
+                bytes[chroma + chroma_rows * half + cy * half + cx] = u;
+            } else {
+                bytes[chroma + cy * pitch + 2 * cx] = u;
+                bytes[chroma + cy * pitch + 2 * cx + 1] = v;
+            }
+        }
+    }
+    bytes
+}
+
+/// Create a `D3DPOOL_DEFAULT` planar plain, check its lock pitch and write `bytes` to it.
+fn planar_surface<'h>(
+    h: &'h Harness,
+    (format, name): (u32, &str),
+    (width, height): (usize, usize),
+    bytes: &[u8],
+) -> Surface<'h> {
+    let surface = h.create_offscreen_plain_surface(
+        u32::try_from(width).expect("test width"),
+        u32::try_from(height).expect("test height"),
+        format,
+        D3DPOOL_DEFAULT,
+    );
+    let mut locked = surface.lock_rect(0);
+    assert_eq!(
+        usize::try_from(locked.pitch()).expect("positive pitch"),
+        width.next_multiple_of(4),
+        "{name} {width}x{height} locks at the width rounded up to four bytes"
+    );
+    locked.write(bytes);
+    drop(locked);
+    surface
+}
+
+/// Read the whole back buffer once: its pixels row by row, and its width.
+fn read_back_buffer(h: &Harness) -> (Vec<u32>, usize) {
+    let rt = h.render_target(0);
+    let (hr, desc) = rt.desc();
+    assert_eq!(hr, D3D_OK, "back buffer desc");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(&rt, &sysmem),
+        D3D_OK,
+        "GetRenderTargetData of the back buffer"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+    let (width, height) = (desc.width as usize, desc.height as usize);
+    let mut pixels = Vec::with_capacity(width * height);
+    for row in locked.as_u32(pitch_px * height).chunks_exact(pitch_px) {
+        pixels.extend_from_slice(&row[..width]);
+    }
+    (pixels, width)
+}
+
+/// A planar plain locks at the 4-byte-aligned width and keeps every byte of every plane.
+///
+/// The span a lock exposes is the luma rows plus `ceil(height / 2)` rows of
+/// chroma at the same pitch. Writing all of it and reading it back under
+/// `D3DLOCK_READONLY` walks the whole allocation, row padding included, which
+/// is what an allocation sized for the luma plane alone would not survive.
+#[test]
+fn planar_yuv_plain_locks_at_the_aligned_width_and_keeps_every_plane() {
+    let h = Harness::new();
+    for (format, name) in PLANAR_FORMATS {
+        let mut sizes = vec![(20usize, 16usize), (22, 16), (21, 16), (2, 2)];
+        if format == D3DFMT_NV12 {
+            sizes.extend([(20, 15), (5, 3), (1, 1)]);
+        }
+        for (width, height) in sizes {
+            let pitch = width.next_multiple_of(4);
+            let span = pitch * (height + height.div_ceil(2));
+            let bytes: Vec<u8> = (0..span)
+                .map(|i| u8::try_from((i * 7 + 3) % 251).expect("below 251"))
+                .collect();
+            let surface = planar_surface(&h, (format, name), (width, height), &bytes);
+            let (hr, desc) = surface.desc();
+            assert_eq!(hr, D3D_OK, "{name} GetDesc");
+            assert_eq!(
+                (
+                    desc.format,
+                    desc.width as usize,
+                    desc.height as usize,
+                    desc.pool
+                ),
+                (format, width, height, D3DPOOL_DEFAULT),
+                "{name} {width}x{height} reports its logical extent"
+            );
+            for flags in [D3DLOCK_READONLY, D3DLOCK_NOOVERWRITE, 0] {
+                let locked = surface.lock_rect(flags);
+                assert_eq!(
+                    usize::try_from(locked.pitch()).expect("positive pitch"),
+                    pitch,
+                    "{name} {width}x{height} pitch under flags {flags:#x}"
+                );
+                assert_eq!(
+                    locked.as_u8(span),
+                    bytes.as_slice(),
+                    "{name} {width}x{height} planes under flags {flags:#x}"
+                );
+            }
+            // A discarding lock still hands out the whole span.
+            let mut locked = surface.lock_rect(D3DLOCK_DISCARD);
+            locked.write(&bytes);
+            drop(locked);
+            assert_eq!(
+                surface.lock_rect(D3DLOCK_READONLY).as_u8(span),
+                bytes.as_slice(),
+                "{name} {width}x{height} planes after a discarding lock"
+            );
+        }
+    }
+}
+
+/// A planar lock rect aligns to the 2x2 chroma block, and a locked plain refuses a second lock.
+#[test]
+fn planar_yuv_lock_rects_align_to_the_chroma_block() {
+    let h = Harness::new();
+    for (format, name) in PLANAR_FORMATS {
+        let bytes: Vec<u8> = (0..20 * 24)
+            .map(|i| u8::try_from((i * 7 + 3) % 251).expect("below 251"))
+            .collect();
+        let surface = planar_surface(&h, (format, name), (20, 16), &bytes);
+        for rect in [[1, 0, 3, 2], [0, 1, 2, 3], [2, 2, 5, 4], [2, 2, 4, 5]] {
+            assert_eq!(
+                surface.lock_rect_partial_probe(&rect, 0),
+                (D3DERR_INVALIDCALL, false),
+                "{name} rect {rect:?} is off the 2x2 grid and leaves the out struct alone"
+            );
+        }
+        {
+            let locked = surface.lock_rect_partial(&[2, 2, 6, 4], D3DLOCK_READONLY);
+            assert_eq!(locked.pitch(), 20, "{name} aligned rect keeps the pitch");
+            // The rect starts at luma texel (2, 2) of the first plane.
+            assert_eq!(locked.as_u8(1)[0], bytes[2 * 20 + 2], "{name} rect origin");
+            assert_eq!(
+                surface.lock_rect_probe(0),
+                (D3DERR_INVALIDCALL, false),
+                "{name} second lock of a locked plain"
+            );
+        }
+        assert_eq!(
+            surface.lock_rect(D3DLOCK_READONLY).as_u8(bytes.len()),
+            bytes.as_slice(),
+            "{name} planes unchanged by the refused locks"
+        );
+    }
+}
+
+/// A planar source decodes through the render quad with V and U read from their own planes.
+///
+/// Each reference sample fills a 20x16 surface that is stretched over the
+/// whole back buffer. The expected colours are the reduced-range BT.601 values
+/// desktop drivers produce, held within 2: one for the convention and one for
+/// the float decode. Red is asserted by channel as well, since exchanged
+/// chroma reads blue.
+#[test]
+fn stretch_rect_decodes_planar_yuv_into_the_backbuffer() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    for (format, name) in PLANAR_FORMATS {
+        for (index, &((y, u, v), expected)) in PLANAR_COLOURS.iter().enumerate() {
+            let bytes = planar_bytes(format, (20, 16), |_, _| index);
+            let surface = planar_surface(&h, (format, name), (20, 16), &bytes);
+            assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name} {index}");
+            assert_eq!(
+                h.stretch_rect(&surface, &bb, D3DTEXF_POINT),
+                D3D_OK,
+                "StretchRect {name} ({y:#x}, {u:#x}, {v:#x}) onto the backbuffer"
+            );
+            let (pixels, width) = read_back_buffer(&h);
+            for (px, py) in [(80, 60), (560, 60), (320, 240), (80, 420), (560, 420)] {
+                assert_rgb_close(
+                    pixels[py * width + px],
+                    expected,
+                    2,
+                    &format!("{name} ({y:#x}, {u:#x}, {v:#x}) at ({px}, {py})"),
+                );
+            }
+            if index == 0 {
+                let centre = pixels[240 * width + 320];
+                assert!(
+                    (centre >> 16) & 0xff > 0xf0 && centre & 0xff < 0x10,
+                    "{name}: red decoded as {centre:#010x}, U and V are exchanged"
+                );
+            }
+        }
+    }
+}
+
+/// A planar source copied 1:1 into an offscreen plain is decoded on the CPU.
+///
+/// Every texel of the destination is read, at three widths: 20, whose pitch is
+/// the width; 22, whose pitch of 24 puts half the pitch (12) one byte past
+/// half the width (11), so a reader addressing `YV12` chroma rows by the
+/// extent shears them; and 21, whose last column is half a chroma block.
+#[test]
+fn stretch_rect_decodes_planar_yuv_into_an_offscreen_plain_surface() {
+    let h = Harness::new();
+    for (format, name) in PLANAR_FORMATS {
+        for (width, height) in [(20usize, 16usize), (22, 16), (21, 16)] {
+            let bytes = planar_bytes(format, (width, height), planar_pattern_index);
+            let src = planar_surface(&h, (format, name), (width, height), &bytes);
+            let dst = h.create_offscreen_plain_surface(
+                u32::try_from(width).expect("test width"),
+                u32::try_from(height).expect("test height"),
+                D3DFMT_X8R8G8B8,
+                D3DPOOL_DEFAULT,
+            );
+            assert_eq!(
+                h.stretch_rect(&src, &dst, D3DTEXF_NONE),
+                D3D_OK,
+                "1:1 {name} {width}x{height} -> X8R8G8B8 into an offscreen plain"
+            );
+            let locked = dst.lock_rect(D3DLOCK_READONLY);
+            let pitch_px = usize::try_from(locked.pitch()).expect("positive pitch") / 4;
+            let px = locked.as_u32(pitch_px * height);
+            for y in 0..height {
+                for x in 0..width {
+                    assert_rgb_close(
+                        px[y * pitch_px + x],
+                        planar_pattern_colour(x, y),
+                        1,
+                        &format!("{name} {width}x{height} at ({x}, {y})"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// One chroma sample covers exactly its 2x2 luma block on both `StretchRect` paths.
+///
+/// An 8x8 source carries the four-colour pattern. The CPU path is read texel
+/// by texel. The GPU path is read scaled 16x, at the centre of every source
+/// texel, and agrees with the CPU path within 1. At the identity
+/// `render.scale` it is also read 1:1, texel by texel.
+#[test]
+fn planar_yuv_chroma_covers_its_two_by_two_luma_block() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    for (format, name) in PLANAR_FORMATS {
+        let bytes = planar_bytes(format, (8, 8), planar_pattern_index);
+        let src = planar_surface(&h, (format, name), (8, 8), &bytes);
+
+        let cpu = h.create_offscreen_plain_surface(8, 8, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+        assert_eq!(
+            h.stretch_rect(&src, &cpu, D3DTEXF_NONE),
+            D3D_OK,
+            "{name} 1:1 into an offscreen plain"
+        );
+        let cpu_pixels: Vec<u32> = {
+            let locked = cpu.lock_rect(D3DLOCK_READONLY);
+            assert_eq!(locked.pitch(), 32, "8 texels of 4 bytes");
+            locked.as_u32(64).to_vec()
+        };
+        for (i, &got) in cpu_pixels.iter().enumerate() {
+            let (x, y) = (i % 8, i / 8);
+            assert_rgb_close(
+                got,
+                planar_pattern_colour(x, y),
+                1,
+                &format!("{name} CPU at ({x}, {y})"),
+            );
+        }
+
+        assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name}");
+        assert_eq!(
+            h.stretch_rect_rects(&src, (0, 0, 8, 8), &bb, (0, 0, 128, 128), D3DTEXF_POINT),
+            D3D_OK,
+            "{name} scaled 16x onto the backbuffer"
+        );
+        let (pixels, width) = read_back_buffer(&h);
+        for y in 0..8 {
+            for x in 0..8 {
+                let got = pixels[(16 * y + 8) * width + 16 * x + 8];
+                assert_rgb_close(
+                    got,
+                    planar_pattern_colour(x, y),
+                    2,
+                    &format!("{name} GPU 16x at ({x}, {y})"),
+                );
+                assert_rgb_close(
+                    got,
+                    cpu_pixels[y * 8 + x],
+                    1,
+                    &format!("{name} GPU against CPU at ({x}, {y})"),
+                );
+            }
+        }
+
+        // Single-pixel resolution: only what the identity scale rasterizes.
+        if mtld3d_tests::render_scale_is_identity() {
+            assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name} 1:1");
+            assert_eq!(
+                h.stretch_rect_rects(&src, (0, 0, 8, 8), &bb, (200, 200, 208, 208), D3DTEXF_POINT),
+                D3D_OK,
+                "{name} 1:1 onto the backbuffer"
+            );
+            let (pixels, width) = read_back_buffer(&h);
+            for y in 0..8 {
+                for x in 0..8 {
+                    assert_rgb_close(
+                        pixels[(200 + y) * width + 200 + x],
+                        planar_pattern_colour(x, y),
+                        2,
+                        &format!("{name} GPU 1:1 at ({x}, {y})"),
+                    );
+                }
+            }
+            assert_rgb_close(
+                pixels[199 * width + 199],
+                MAGENTA,
+                0,
+                &format!("{name} GPU 1:1 leaves the texel outside the rect"),
+            );
+        }
+    }
+}
+
+/// Odd widths and an odd `NV12` height decode on the GPU with pitch-relative chroma.
+///
+/// The image is red left of a split and blue right of it, exchanged in the
+/// lower half. A fragment decode that strides `YV12` chroma rows by half the
+/// width instead of half the pitch drifts one block left per row, which the
+/// probes in the leftmost block of the lower rows read as the other colour.
+/// 5x3 has a pitch of 8, below the linear-texture alignment of every GPU, so
+/// its upload takes the padded repack.
+#[test]
+fn stretch_rect_decodes_planar_yuv_of_odd_sizes_on_the_gpu() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let cases = [
+        (PLANAR_FORMATS[0], (22usize, 16usize)),
+        (PLANAR_FORMATS[1], (22, 16)),
+        (PLANAR_FORMATS[0], (21, 16)),
+        (PLANAR_FORMATS[1], (21, 16)),
+        (PLANAR_FORMATS[1], (21, 15)),
+        (PLANAR_FORMATS[1], (5, 3)),
+    ];
+    for ((format, name), (width, height)) in cases {
+        let (blocks_x, blocks_y) = (width.div_ceil(2), height.div_ceil(2));
+        let (split_x, split_y) = (blocks_x / 2, blocks_y.div_ceil(2));
+        // Red is entry 0 and blue entry 2.
+        let index = |cx: usize, cy: usize| {
+            if (cx < split_x) == (cy < split_y) {
+                0
+            } else {
+                2
+            }
+        };
+        let bytes = planar_bytes(format, (width, height), index);
+        let src = planar_surface(&h, (format, name), (width, height), &bytes);
+        assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name}");
+        assert_eq!(
+            h.stretch_rect(&src, &bb, D3DTEXF_POINT),
+            D3D_OK,
+            "{name} {width}x{height} onto the backbuffer"
+        );
+        let (pixels, bb_width) = read_back_buffer(&h);
+        for cy in 0..blocks_y {
+            for cx in [0, split_x] {
+                // The centre of the block's first luma texel, which every
+                // block has whatever the parity of the extent.
+                let px = (4 * cx + 1) * 640 / (2 * width);
+                let py = (4 * cy + 1) * 480 / (2 * height);
+                assert_rgb_close(
+                    pixels[py * bb_width + px],
+                    PLANAR_COLOURS[index(cx, cy)].1,
+                    2,
+                    &format!("{name} {width}x{height} block ({cx}, {cy}) at ({px}, {py})"),
+                );
+            }
+        }
+    }
+}
+
+/// A planar source rect with an odd origin keeps its chroma blocks, and the copy stays in its rect.
+///
+/// The source rect starts at (3, 1), inside a chroma block in both directions.
+/// On the GPU it is scaled into the middle of the back buffer; on the CPU it
+/// is copied 1:1 into the middle of an offscreen plain. Both leave what is
+/// outside the destination rect as it was.
+#[test]
+fn stretch_rect_of_a_planar_yuv_sub_rect_with_an_odd_origin() {
+    const FILLER: u32 = 0xFF12_3456;
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    for (format, name) in PLANAR_FORMATS {
+        let bytes = planar_bytes(format, (8, 8), planar_pattern_index);
+        let src = planar_surface(&h, (format, name), (8, 8), &bytes);
+
+        assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name}");
+        assert_eq!(
+            h.stretch_rect_rects(&src, (3, 1, 7, 5), &bb, (160, 120, 480, 360), D3DTEXF_POINT),
+            D3D_OK,
+            "{name} sub-rect scaled into the middle of the backbuffer"
+        );
+        let (pixels, width) = read_back_buffer(&h);
+        for row in 0..4 {
+            for col in 0..4 {
+                let (px, py) = (160 + 80 * col + 40, 120 + 60 * row + 30);
+                assert_rgb_close(
+                    pixels[py * width + px],
+                    planar_pattern_colour(3 + col, 1 + row),
+                    2,
+                    &format!("{name} GPU source texel ({}, {})", 3 + col, 1 + row),
+                );
+            }
+        }
+        for (px, py) in [(80, 60), (320, 60), (560, 420), (80, 240), (560, 240)] {
+            assert_rgb_close(
+                pixels[py * width + px],
+                MAGENTA,
+                2,
+                &format!("{name} GPU outside the destination rect at ({px}, {py})"),
+            );
+        }
+
+        let dst = h.create_offscreen_plain_surface(8, 8, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+        {
+            let mut locked = dst.lock_rect(0);
+            locked.write(&[FILLER; 64]);
+        }
+        assert_eq!(
+            h.stretch_rect_rects(&src, (3, 1, 7, 5), &dst, (2, 3, 6, 7), D3DTEXF_NONE),
+            D3D_OK,
+            "{name} sub-rect 1:1 into the middle of an offscreen plain"
+        );
+        let locked = dst.lock_rect(D3DLOCK_READONLY);
+        let px = locked.as_u32(64);
+        for y in 0..8usize {
+            for x in 0..8usize {
+                if (2..6).contains(&x) && (3..7).contains(&y) {
+                    assert_rgb_close(
+                        px[y * 8 + x],
+                        planar_pattern_colour(x + 1, y - 2),
+                        1,
+                        &format!("{name} CPU at ({x}, {y})"),
+                    );
+                } else {
+                    assert_eq!(px[y * 8 + x], FILLER, "{name} CPU outside at ({x}, {y})");
+                }
+            }
+        }
+    }
+}
+
+/// `D3DTEXF_LINEAR` filters planar luma and leaves planar chroma a step.
+///
+/// A 4x2 source scaled over the back buffer puts its two middle luma texel
+/// centres at x = 240 and x = 400, either side of a black-to-white luma edge
+/// at x = 320. LINEAR ramps between the two centres, so the edge reads a grey
+/// and a point a quarter of the way along is already lit; POINT keeps both
+/// sides of the edge pure. A chroma edge at the same place stays a step under
+/// LINEAR: 20 pixels either side of it the hue is still the block's own.
+#[test]
+fn stretch_rect_filters_planar_yuv_luma_and_not_chroma() {
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    for (format, name) in PLANAR_FORMATS {
+        // Luma edge over neutral chroma: (0x10, 0x80, 0x80) is black and
+        // (0xeb, 0x80, 0x80) white.
+        let mut bytes = vec![0x80u8; 4 * 3];
+        for row in 0..2 {
+            bytes[row * 4..row * 4 + 4].copy_from_slice(&[0x10, 0x10, 0xeb, 0xeb]);
+        }
+        let ramp = planar_surface(&h, (format, name), (4, 2), &bytes);
+        for (filter, label) in [(D3DTEXF_LINEAR, "LINEAR"), (D3DTEXF_POINT, "POINT")] {
+            assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name} {label}");
+            assert_eq!(
+                h.stretch_rect(&ramp, &bb, filter),
+                D3D_OK,
+                "{name} luma edge, {label}"
+            );
+            let (pixels, width) = read_back_buffer(&h);
+            let green_at = |px: usize| (pixels[240 * width + px] >> 8) & 0xff;
+            if filter == D3DTEXF_LINEAR {
+                assert!(
+                    (0x40..0xc0).contains(&green_at(320)),
+                    "{name} LINEAR: the luma edge reads {:#x} halfway between the texel centres",
+                    green_at(320)
+                );
+                assert!(
+                    (0x20..0x70).contains(&green_at(280)) && (0x90..0xe0).contains(&green_at(360)),
+                    "{name} LINEAR: the ramp reads {:#x} and {:#x} a quarter in from either centre",
+                    green_at(280),
+                    green_at(360)
+                );
+            } else {
+                // 40 pixels either side of the edge, clear of it at any scale.
+                assert_rgb_close(
+                    pixels[240 * width + 280],
+                    0,
+                    2,
+                    &format!("{name} POINT left"),
+                );
+                assert_rgb_close(
+                    pixels[240 * width + 360],
+                    0x00ff_ffff,
+                    2,
+                    &format!("{name} POINT right"),
+                );
+            }
+            assert_rgb_close(
+                pixels[240 * width + 80],
+                0,
+                2,
+                &format!("{name} {label} black"),
+            );
+            assert_rgb_close(
+                pixels[240 * width + 560],
+                0x00ff_ffff,
+                2,
+                &format!("{name} {label} white"),
+            );
+        }
+
+        // Chroma edge: red left, blue right.
+        let bytes = planar_bytes(format, (4, 2), |cx, _| if cx == 0 { 0 } else { 2 });
+        let edge = planar_surface(&h, (format, name), (4, 2), &bytes);
+        assert_eq!(
+            h.clear_target(MAGENTA),
+            0,
+            "clear before {name} chroma edge"
+        );
+        assert_eq!(
+            h.stretch_rect(&edge, &bb, D3DTEXF_LINEAR),
+            D3D_OK,
+            "{name} chroma edge, LINEAR"
+        );
+        let (pixels, width) = read_back_buffer(&h);
+        // Luma differs across the edge too and is filtered, so only the hue is
+        // held: left of the edge no blue, right of it no red.
+        let left = pixels[240 * width + 170];
+        let right = pixels[240 * width + 470];
+        assert!(
+            (left >> 16) & 0xff > 0xf0 && left & 0xff < 0x10,
+            "{name}: left of the chroma edge reads {left:#010x}"
+        );
+        assert!(
+            right & 0xff > 0xf0 && (right >> 16) & 0xff < 0x10,
+            "{name}: right of the chroma edge reads {right:#010x}"
+        );
+        let near_left = pixels[240 * width + 300];
+        let near_right = pixels[240 * width + 340];
+        assert!(
+            near_left & 0xff < (near_left >> 16) & 0xff,
+            "{name}: 20 pixels left of the chroma edge reads {near_left:#010x}"
+        );
+        assert!(
+            near_right & 0xff > (near_right >> 16) & 0xff,
+            "{name}: 20 pixels right of the chroma edge reads {near_right:#010x}"
+        );
+    }
+}
+
+/// A planar plain is a `StretchRect` source only, and every refused call leaves its target alone.
+///
+/// Refused: a planar destination (from a colour plain, from a render target
+/// and from another planar plain), a scaled copy into an offscreen plain,
+/// `UpdateSurface` into a planar plain, and `GetDC`. `ColorFill` succeeds and
+/// fills nothing, as it does for the packed YUV formats. The planar surface's
+/// planes and the colour destination's texels are compared after each call,
+/// and the source still decodes afterwards.
+#[test]
+fn planar_yuv_plain_refuses_every_write_and_keeps_its_planes() {
+    const FILLER: u32 = 0xFF12_3456;
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let colour = h.create_offscreen_plain_surface(20, 16, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    {
+        let mut locked = colour.lock_rect(0);
+        locked.write(&[FILLER; 20 * 16]);
+    }
+    let sysmem = h.create_offscreen_plain_surface(20, 16, D3DFMT_X8R8G8B8, D3DPOOL_SYSTEMMEM);
+    {
+        let mut locked = sysmem.lock_rect(0);
+        locked.write(&[FILLER; 20 * 16]);
+    }
+    let small = h.create_offscreen_plain_surface(10, 8, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT);
+    {
+        let mut locked = small.lock_rect(0);
+        locked.write(&[FILLER; 10 * 8]);
+    }
+    for (format, name) in PLANAR_FORMATS {
+        let bytes = planar_bytes(format, (20, 16), |_, _| 0);
+        let planar = planar_surface(&h, (format, name), (20, 16), &bytes);
+        let other = planar_surface(&h, (format, name), (20, 16), &bytes);
+
+        assert_eq!(
+            h.stretch_rect(&colour, &planar, D3DTEXF_NONE),
+            D3DERR_INVALIDCALL,
+            "{name}: a colour plain into a planar plain"
+        );
+        assert_eq!(
+            h.stretch_rect(&bb, &planar, D3DTEXF_NONE),
+            D3DERR_INVALIDCALL,
+            "{name}: a render target into a planar plain"
+        );
+        assert_eq!(
+            h.stretch_rect(&other, &planar, D3DTEXF_NONE),
+            D3DERR_INVALIDCALL,
+            "{name}: a planar plain into a planar plain"
+        );
+        assert_eq!(
+            h.update_surface_hr(&sysmem, &planar),
+            D3DERR_INVALIDCALL,
+            "{name}: UpdateSurface into a planar plain"
+        );
+        assert_eq!(
+            h.color_fill_hr(&planar, RED ^ 0x00ff_ffff),
+            D3D_OK,
+            "{name}: ColorFill succeeds and fills nothing"
+        );
+        let sentinel = core::ptr::dangling_mut::<core::ffi::c_void>();
+        assert_eq!(
+            planar.get_dc(sentinel),
+            (D3DERR_INVALIDCALL, sentinel),
+            "{name}: GetDC is refused and leaves the HDC slot alone"
+        );
+        assert_eq!(
+            planar.lock_rect(D3DLOCK_READONLY).as_u8(bytes.len()),
+            bytes.as_slice(),
+            "{name}: planes unchanged by the refused writes and the fill"
+        );
+
+        assert_eq!(
+            h.stretch_rect(&planar, &small, D3DTEXF_LINEAR),
+            D3DERR_INVALIDCALL,
+            "{name}: a scaled copy into an offscreen plain"
+        );
+        assert_eq!(
+            small.lock_rect(D3DLOCK_READONLY).as_u32(10 * 8),
+            [FILLER; 10 * 8].as_slice(),
+            "{name}: the refused scaled copy left its destination alone"
+        );
+
+        // The source still decodes, to the red it held before the fill.
+        assert_eq!(h.clear_target(MAGENTA), 0, "clear before {name}");
+        assert_eq!(
+            h.stretch_rect(&planar, &bb, D3DTEXF_POINT),
+            D3D_OK,
+            "{name}: decode after the refused calls"
+        );
+        assert_rgb_close(
+            h.read_pixel(320, 240),
+            PLANAR_COLOURS[0].1,
+            2,
+            &format!("{name}: decode after the refused calls"),
+        );
+    }
+    assert_eq!(
+        colour.lock_rect(D3DLOCK_READONLY).as_u32(20 * 16),
+        [FILLER; 20 * 16].as_slice(),
+        "the colour plain was only ever a source"
+    );
+}
+
+#[test]
+fn stretch_rect_converts_r5g6b5_into_x8r8g8b8() {
+    // CheckDeviceFormatConversion(R5G6B5, X8R8G8B8) answers S_OK; the scaling
+    // render quad is the path that makes it true. Each 16-bit source pixel
+    // covers a 160-pixel band of the backbuffer.
+    let h = Harness::new();
+    let bb = h.render_target(0);
+    let src = h.create_offscreen_plain_surface(4, 1, D3DFMT_R5G6B5, D3DPOOL_DEFAULT);
+    {
+        let mut locked = src.lock_rect(0);
+        locked.write(&[0xf800u16, 0x07e0, 0x001f, 0xffff]);
+    }
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.stretch_rect(&src, &bb, D3DTEXF_POINT),
+        D3D_OK,
+        "R5G6B5 -> X8R8G8B8 scaling StretchRect"
+    );
+    assert_eq!(h.read_pixel(80, 240), RED, "pixel 0 is red");
+    assert_eq!(h.read_pixel(240, 240), GREEN, "pixel 1 is green");
+    assert_eq!(h.read_pixel(400, 240), BLUE, "pixel 2 is blue");
+    assert_eq!(h.read_pixel(560, 240), WHITE, "pixel 3 is white");
+}
+
+/// A depth texture with a mip chain: a level binds as the depth attachment.
+///
+/// An engine's depth pyramid renders depth into successive levels through
+/// `GetSurfaceLevel(n)`. Level 1 of a 1280x960 chain is the back buffer's size,
+/// so it is bound beside the back buffer and a farther draw after a nearer one
+/// must lose the depth test in that level.
+#[test]
+fn depth_texture_mip_level_binds_as_depth_attachment() {
+    let h = Harness::new();
+    let depth_tex = h.create_texture(
+        1280,
+        960,
+        2,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    assert_eq!(depth_tex.level_count(), 2, "both levels created");
+    let (hr, desc) = depth_tex.level_desc(1);
+    assert_eq!(hr, 0, "GetLevelDesc(1)");
+    assert_eq!(
+        (desc.width, desc.height),
+        (640, 480),
+        "level 1 is half the base level"
+    );
+
+    let depth_surf = depth_tex.surface_level(1);
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "color target");
+    assert_eq!(
+        h.set_depth_stencil_surface(&depth_surf),
+        0,
+        "bind level 1 as the depth attachment"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, mtld3d_types::D3DCMP_LESSEQUAL),
+        0
+    );
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    // Lighting defaults on and the vertices carry no normal, which would
+    // light every draw black; the test reads the vertex colour.
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_LIGHTING, 0), 0);
+
+    let tri = |z: f32, color: u32| {
+        [
+            PosColorVertex {
+                x: -1.0,
+                y: 3.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 3.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+        ]
+    };
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri(0.3, RED)),
+        0,
+        "near draw"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri(0.7, GREEN)),
+        0,
+        "far draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.r > 200 && center.g < 40,
+        "the far draw loses the depth test in level 1, got {center:?}"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+}
+
+#[test]
+fn resz_resolve_copies_bound_depth_into_the_stage0_texture() {
+    resz_resolve_to_texture(D3DUSAGE_DEPTHSTENCIL);
+}
+
+#[test]
+fn resz_resolve_copies_bound_depth_into_a_plain_depth_texture() {
+    resz_resolve_to_texture(0);
+}
+
+#[test]
+fn resz_resolve_preserves_the_noautogen_depth_fallback() {
+    resz_resolve_to_texture(D3DUSAGE_AUTOGENMIPMAP);
+}
+
+fn resz_resolve_to_texture(destination_usage: u32) {
+    // The RESZ hack: SetRenderState(POINTSIZE, 0x7fa05000) resolves the
+    // bound depth-stencil into the depth texture at stage 0. Engines on the
+    // matching vendor path use it as their only depth hand-off, so support
+    // is probed via the RESZ pseudo-format and must answer D3D_OK.
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            mtld3d_types::D3DUSAGE_RENDERTARGET,
+            mtld3d_types::D3DRTYPE_SURFACE,
+            mtld3d_types::D3DFMT_RESZ,
+        ),
+        0,
+        "RESZ pseudo-format probe answers available"
+    );
+
+    let depth_src = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let depth_dst = h.create_texture(640, 480, 1, destination_usage, D3DFMT_INTZ, D3DPOOL_DEFAULT);
+    let backbuffer = h.render_target(0);
+
+    // Pass 1: write depth 0.25 into the source through the FF pipeline.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(h.set_depth_stencil_surface(&depth_src.surface_level(0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &occluder),
+        0,
+        "depth write draw"
+    );
+
+    // The resolve: destination at stage 0, then the magic POINTSIZE write.
+    assert_eq!(h.set_texture(0, &depth_dst), 0, "bind resolve destination");
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_POINTSIZE, 0x7fa0_5000),
+        0
+    );
+
+    if destination_usage & D3DUSAGE_AUTOGENMIPMAP != 0 {
+        depth_dst.generate_mip_sub_levels();
+    }
+
+    // Pass 2: sample the DESTINATION; only the resolve can have filled it.
+    let ps = h.create_pixel_shader(&PS_SAMPLE_DEPTH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.clear_depth_stencil_surface(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-0.5, 0.5, 0.0, 0.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+        v(0.5, 0.5, 1.0, 0.0),
+        v(0.5, -0.5, 1.0, 1.0),
+        v(-0.5, -0.5, 0.0, 1.0),
+    ];
+    for programmable in [false, true] {
+        if programmable {
+            assert_eq!(h.set_pixel_shader(&ps), 0);
+        } else {
+            assert_eq!(h.clear_pixel_shader(), 0);
+            h.select_texture_stage(0);
+        }
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(h.clear_target(BLACK), 0);
+        assert_eq!(
+            h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample the resolved copy"
+        );
+        assert_eq!(h.end_scene(), 0);
+        assert_eq!(h.present(), 0);
+
+        let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+        assert!(
+            (48..=90).contains(&center.r) && (48..=90).contains(&center.g),
+            "the resolved depth (0.25) samples back as dark gray, programmable={programmable}, got {center:?}"
+        );
+    }
+
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.clear_texture(0), 0);
+}
+
+#[test]
+fn resz_resolve_keeps_the_depth_gradient_under_a_render_scale() {
+    // The RESZ round trip out of the pair that has to rasterize on one grid: a
+    // lockable render target created at the reported back-buffer size, with a
+    // depth-stencil surface of that size bound beside it. The scale is pinned
+    // here so the pair runs at it in every test run rather than only in the
+    // scaled sweep.
+    //
+    // A gradient rather than one flat depth, because that is what separates
+    // the two spaces: depth written on one grid and sampled on another comes
+    // back multiplied by the ratio between them, which a constant cannot show.
+    // Depth runs 0 at the left edge to 1 at the right, so the value sampled
+    // back at column x is x / 640 whatever the frame is rasterized at.
+    let h = Harness::create(&HarnessConfig {
+        config_entries: "render.scale=0.75",
+        ..HarnessConfig::default()
+    });
+
+    let depth_dst = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    let lockable_rt = h.create_lockable_render_target(640, 480, D3DFMT_A8R8G8B8);
+    let depth_surface = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+
+    // Pass 1: write the gradient into the depth surface through the FF pipeline.
+    assert_eq!(h.set_render_target(0, &lockable_rt), 0);
+    assert_eq!(h.set_depth_stencil_surface(&depth_surface), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let ramp = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: x.mul_add(0.5, 0.5),
+        color: WHITE,
+    };
+    let gradient = [
+        ramp(-1.0, 1.0),
+        ramp(1.0, 1.0),
+        ramp(-1.0, -1.0),
+        ramp(1.0, 1.0),
+        ramp(1.0, -1.0),
+        ramp(-1.0, -1.0),
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &gradient),
+        0,
+        "depth gradient draw"
+    );
+
+    // The resolve: destination at stage 0, then the magic POINTSIZE write.
+    assert_eq!(h.set_texture(0, &depth_dst), 0, "bind resolve destination");
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_POINTSIZE, 0x7fa0_5000),
+        0
+    );
+
+    // Pass 2: sample the resolve destination across the whole frame, into the
+    // back buffer, which is what `read_pixel` reads.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    let ps = h.create_pixel_shader(&PS_SAMPLE_DEPTH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.clear_depth_stencil_surface(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let quad = [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+        0,
+        "sample the resolved copy"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // Columns well inside the frame, so neither the resolve back up to the
+    // reported resolution nor point sampling can move a probe across a
+    // meaningful step of the ramp.
+    for x in [80_u32, 240, 400, 560] {
+        let expected = (x * 255 + 320) / 640;
+        let got = Rgba8::from_pixel(h.read_pixel(x, 240));
+        assert!(
+            got.r.abs_diff(u8::try_from(expected).unwrap_or(255)) <= 4,
+            "the resolved depth at column {x} samples back as {expected}, got {got:?}"
+        );
+    }
+
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.clear_texture(0), 0);
+}
+
+/// `ps_3_0`: sample s0 at the interpolated texcoord, write it to oDepth.
+///
+/// `dcl_2d s0; dcl_texcoord0 v0; texld r0, v0, s0; mov oC0, c0; mov
+/// oDepth, r0.x;` — the depth-restore shape a deferred engine uses to
+/// copy scene depth into the persistent depth buffer for its late
+/// (sprite/alpha) pass. `oDepth` is register type `DEPTHOUT` (9).
+#[rustfmt::skip]
+const PS_RESTORE_DEPTH: [u32; 21] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0005, 0x900F_0000,              // dcl_texcoord0 v0
+    0x0500_0051, 0xA00F_0000,                           // def c0,
+    0x0000_0000, 0x0000_0000, 0x0000_0000, 0x0000_0000, //   0, 0, 0, 0
+    0x0300_0042, 0x800F_0000, 0x90E4_0000, 0xA0E4_0800, // texld r0, v0, s0
+    0x0200_0001, 0x9001_0800, 0x8000_0000,              // mov oDepth, r0.x
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn odepth_restore_feeds_a_later_sprite_z_test() {
+    // The deferred late-pass depth hand-off: scene depth lives in an INTZ
+    // texture; a full-screen draw with color writes OFF, stencil REPLACE,
+    // ZFUNC=ALWAYS and z-write ON copies it into the bound depth buffer by
+    // writing oDepth per pixel; sprites drawn afterwards z-test LESSEQUAL
+    // against the restored values. A sprite behind restored near geometry
+    // must be occluded; over restored far background it must show.
+    let h = Harness::with_depth();
+    let scene_depth = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    let implicit = h.depth_stencil_surface().expect("implicit depth");
+
+    // Pass 1: scene depth into the INTZ texture — cleared 1.0, an occluder
+    // quad at 0.25 over the LEFT half.
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(
+        h.set_depth_stencil_surface(&scene_depth.surface_level(0)),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let left_occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left_occluder),
+        0,
+        "scene occluder"
+    );
+
+    // Pass 2: back to the implicit depth buffer, cleared to 0.1 (a value
+    // that hides the sprite everywhere if the restore does not land), then
+    // the restore draw: full-screen, color writes off, stencil REPLACE,
+    // ZFUNC=ALWAYS + z-write, PS samples the INTZ and writes oDepth.
+    assert_eq!(h.set_depth_stencil_surface(&implicit), 0);
+    assert_eq!(h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, RED, 0.1, 0), 0);
+    let ps = h.create_pixel_shader(&PS_RESTORE_DEPTH);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_texture(0, &scene_depth), 0, "bind INTZ");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILENABLE, 1), 0);
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_STENCILFUNC, D3DCMP_ALWAYS),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILREF, 7), 0);
+    assert_eq!(
+        h.set_render_state(
+            mtld3d_types::D3DRS_STENCILPASS,
+            mtld3d_types::D3DSTENCILOP_REPLACE
+        ),
+        0
+    );
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let full = [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full),
+        0,
+        "depth-restore draw"
+    );
+
+    // Pass 3: color writes back on, stencil off, a green sprite quad at
+    // z=0.6 z-tested LESSEQUAL against the restored depth.
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0xF),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILENABLE, 0), 0);
+    assert_eq!(h.clear_pixel_shader(), 0);
+    assert_eq!(h.clear_texture(0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    let sprite = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.6,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.6,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.6,
+            color: GREEN,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &sprite),
+        0,
+        "late sprite draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    // Left half: restored 0.25 occludes the 0.6 sprite → red clear shows.
+    // Right half: restored 1.0 lets it through → green. A stale 0.1 buffer
+    // (restore never landed) reads red on BOTH sides.
+    assert_eq!(
+        h.read_pixel(160, 240),
+        RED,
+        "sprite occluded where the restore copied near depth"
+    );
+    assert_eq!(
+        h.read_pixel(480, 240),
+        GREEN,
+        "sprite visible where the restore copied far depth"
+    );
+}
+
+/// `ps_3_0`: sample s0 at texcoord, write it to BOTH oC0 and oDepth.
+#[rustfmt::skip]
+const PS_RESTORE_DEPTH_VIS: [u32; 18] = [
+    0xFFFF_0300,                                        // ps_3_0
+    0x0200_001F, 0x9000_0000, 0xA00F_0800,              // dcl_2d s0
+    0x0200_001F, 0x8000_0005, 0x900F_0000,              // dcl_texcoord0 v0
+    0x0300_0042, 0x800F_0000, 0x90E4_0000, 0xA0E4_0800, // texld r0, v0, s0
+    0x0200_0001, 0x800F_0800, 0x8000_0000,              // mov oC0, r0.x
+    0x0200_0001, 0x9001_0800, 0x8000_0000,              // mov oDepth, r0.x
+    0x0000_FFFF,                                        // end
+];
+
+#[test]
+fn odepth_restore_probe_shows_the_sampled_depth() {
+    // Diagnosis twin of `odepth_restore_feeds_a_later_sprite_z_test`: same
+    // sample, color writes ON, painting the sampled INTZ value as
+    // grayscale. Left half must be dark (0.25), right half white (1.0).
+    let h = Harness::with_depth();
+    let scene_depth = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    let implicit = h.depth_stencil_surface().expect("implicit depth");
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(
+        h.set_depth_stencil_surface(&scene_depth.surface_level(0)),
+        0
+    );
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    let left_occluder = [
+        PosColorVertex {
+            x: -1.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: 1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.25,
+            color: WHITE,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left_occluder),
+        0
+    );
+
+    let _ = &implicit;
+    assert_eq!(h.clear_depth_stencil_surface(), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.clear_target(RED), 0);
+    let ps = h.create_pixel_shader(&PS_RESTORE_DEPTH_VIS);
+    assert_eq!(h.set_pixel_shader(&ps), 0);
+    assert_eq!(h.set_texture(0, &scene_depth), 0);
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0);
+    }
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1), 0);
+    let v = |x: f32, y: f32, u: f32, vv: f32| TexturedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: WHITE,
+        u,
+        v: vv,
+    };
+    let full = [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ];
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full), 0);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    let left = Rgba8::from_pixel(h.read_pixel(160, 240));
+    let right = Rgba8::from_pixel(h.read_pixel(480, 240));
+    assert!(
+        (48..=90).contains(&left.r),
+        "left half painted with sampled 0.25, got {left:?}"
+    );
+    assert!(
+        right.r > 220,
+        "right half painted with sampled 1.0, got {right:?}"
+    );
+}
+
+#[test]
+fn intz_carries_a_working_stencil_plane() {
+    // INTZ is the sampleable twin of D24S8 and carries its stencil: a
+    // deferred engine REPLACE-writes material/sky ids into the stencil of
+    // the same buffer it later samples raw depth from, then gates late
+    // draws on stencil EQUAL/NOTEQUAL. With a stencil-less mapping those
+    // gates silently pass everywhere.
+    let h = Harness::with_depth();
+    let intz = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(h.set_depth_stencil_surface(&intz.surface_level(0)), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+    assert_eq!(
+        h.clear(
+            D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | mtld3d_types::D3DCLEAR_STENCIL,
+            BLACK,
+            1.0,
+            0
+        ),
+        0
+    );
+
+    // Mark stencil = 7 over the left half (color writes off).
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILENABLE, 1), 0);
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_STENCILFUNC, D3DCMP_ALWAYS),
+        0
+    );
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILREF, 7), 0);
+    assert_eq!(
+        h.set_render_state(
+            mtld3d_types::D3DRS_STENCILPASS,
+            mtld3d_types::D3DSTENCILOP_REPLACE
+        ),
+        0
+    );
+    let left = |z: f32, color: u32| {
+        [
+            PosColorVertex {
+                x: -1.0,
+                y: 1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 0.0,
+                y: 1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 0.0,
+                y: 1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 0.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+        ]
+    };
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &left(0.5, WHITE)),
+        0,
+        "stencil mark draw"
+    );
+
+    // Full-screen green quad gated on stencil EQUAL 7: left half only.
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0xF),
+        0
+    );
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_STENCILFUNC, mtld3d_types::D3DCMP_EQUAL),
+        0
+    );
+    assert_eq!(
+        h.set_render_state(
+            mtld3d_types::D3DRS_STENCILPASS,
+            mtld3d_types::D3DSTENCILOP_KEEP
+        ),
+        0
+    );
+    let cover = [
+        PosColorVertex {
+            x: -1.0,
+            y: 3.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 3.0,
+            y: -1.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -1.0,
+            y: -1.0,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &cover),
+        0,
+        "stencil-gated draw"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_eq!(
+        h.read_pixel(160, 240),
+        GREEN,
+        "stencil EQUAL 7 passes where the mark landed"
+    );
+    assert_eq!(
+        h.read_pixel(480, 240),
+        BLACK,
+        "stencil EQUAL 7 rejects the unmarked half"
+    );
+
+    assert_eq!(h.set_render_state(mtld3d_types::D3DRS_STENCILENABLE, 0), 0);
+}
+
+/// `depth.aliasSameSize`: a same-size depth-stencil bind inherits contents.
+///
+/// Engines of the D3D9 era rely on equal-size depth-stencil surfaces
+/// sharing one physical driver allocation: they render scene depth with
+/// one depth texture bound, then bind a *different* same-size depth
+/// texture and z-test against the scene depth through it, with no copy
+/// anywhere in the API stream. With the option on, rebinding texture A
+/// after rendering into texture B must make A's z-test see B's contents.
+#[test]
+fn same_size_depth_bind_inherits_contents_when_aliased() {
+    let h = Harness::create(&HarnessConfig {
+        depth_format: Some(D3DFMT_D24S8),
+        config_entries: "depth.aliasSameSize=true",
+        ..HarnessConfig::default()
+    });
+    let a = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let b = h.create_texture(
+        640,
+        480,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &backbuffer), 0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESSEQUAL), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+
+    let half = |x0: f32, x1: f32, z: f32| {
+        let v = |x: f32, y: f32| PosColorVertex {
+            x,
+            y,
+            z,
+            color: WHITE,
+        };
+        [
+            v(x0, 1.0),
+            v(x1, 1.0),
+            v(x0, -1.0),
+            v(x1, 1.0),
+            v(x1, -1.0),
+            v(x0, -1.0),
+        ]
+    };
+
+    assert_eq!(h.begin_scene(), 0);
+    // Depth A: left half occluded at 0.25, right half stays at the clear.
+    assert_eq!(h.set_depth_stencil_surface(&a.surface_level(0)), 0);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0
+    );
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0),
+        0
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &half(-1.0, 0.0, 0.25)),
+        0,
+        "occluder into depth A"
+    );
+    // Depth B: cleared (killing the A→B carry), right half occluded at 0.25.
+    assert_eq!(h.set_depth_stencil_surface(&b.surface_level(0)), 0);
+    assert_eq!(h.clear(D3DCLEAR_ZBUFFER, BLACK, 1.0, 0), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &half(0.0, 1.0, 0.25)),
+        0,
+        "occluder into depth B"
+    );
+    // Rebind A with no clear: the carry must hand it B's contents (right
+    // blocked at 0.25, left back at 1.0), not leave its own.
+    assert_eq!(h.set_depth_stencil_surface(&a.surface_level(0)), 0);
+    assert_eq!(
+        h.set_render_state(mtld3d_types::D3DRS_COLORWRITEENABLE, 0xF),
+        0
+    );
+    let full = |z: f32, color: u32| {
+        let v = |x: f32, y: f32| PosColorVertex { x, y, z, color };
+        [
+            v(-1.0, 1.0),
+            v(1.0, 1.0),
+            v(-1.0, -1.0),
+            v(1.0, 1.0),
+            v(1.0, -1.0),
+            v(-1.0, -1.0),
+        ]
+    };
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &full(0.5, GREEN)),
+        0,
+        "z-tested full-screen quad"
+    );
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0);
+
+    assert_eq!(
+        h.read_pixel(160, 240),
+        GREEN,
+        "left half passes: the inherited depth is clear there"
+    );
+    assert_eq!(
+        h.read_pixel(480, 240),
+        BLACK,
+        "right half fails: the inherited depth carries B's occluder"
+    );
+}
+
+/// A depth-stencil surface created and released once per frame, 64 times over.
+///
+/// Each `CreateDepthStencilSurface` surface owns a Metal depth texture, and
+/// the device holds the surface alive while it is bound, so the texture is
+/// released one frame after the application drops its own reference: the
+/// binding of the next surface is what finalizes the previous one, while the
+/// frame that drew against it is still in flight. `make test` runs with
+/// `MTL_DEBUG_LAYER` on, so a destroy that lands before that frame retires
+/// aborts the process instead of reading freed storage. Every iteration also
+/// depth-tests through its own fresh surface, which fails if a retire took a
+/// texture the next binding still needed.
+#[test]
+fn depth_stencil_surfaces_released_across_frames_stay_sound() {
+    const ROUNDS: u32 = 64;
+
+    let h = Harness::new();
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), 0);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0);
+
+    let quad = |z: f32, color: u32| {
+        [
+            PosColorVertex {
+                x: -1.0,
+                y: 3.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: 3.0,
+                y: -1.0,
+                z,
+                color,
+            },
+            PosColorVertex {
+                x: -1.0,
+                y: -1.0,
+                z,
+                color,
+            },
+        ]
+    };
+    let near = quad(0.25, GREEN);
+    let far = quad(0.75, RED);
+
+    for round in 0..ROUNDS {
+        let ds = h.create_depth_stencil_surface(640, 480, D3DFMT_D24S8);
+        let (hr, desc) = ds.desc();
+        assert_eq!(hr, 0, "round {round}: created surface describes");
+        assert_eq!(
+            (desc.width, desc.height),
+            (640, 480),
+            "round {round}: extent"
+        );
+        assert_eq!(
+            h.set_depth_stencil_surface(&ds),
+            0,
+            "round {round}: bind the fresh depth surface"
+        );
+        assert_eq!(
+            h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+            0,
+            "round {round}: clear colour and depth"
+        );
+        assert_eq!(h.begin_scene(), 0);
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &near), 0);
+        assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &far), 0);
+        assert_eq!(h.end_scene(), 0);
+        // Read back on the first, a middle and the last round: the depth test
+        // has to keep working on every fresh texture, and the readback is a
+        // GPU sync, which is what lets the retention queue drain.
+        if round == 0 || round == ROUNDS / 2 || round == ROUNDS - 1 {
+            assert_eq!(
+                h.read_pixel(320, 240),
+                GREEN,
+                "round {round}: the near quad owns the pixel, so the fresh \
+                 depth surface cleared and tested"
+            );
+        }
+        assert_eq!(h.present(), 0, "round {round}: present");
+        // Dropping the surface here leaves the device's binding as its last
+        // reference; the next round's bind releases it and queues the retire.
+    }
+
+    // Unbind so the final surface retires while the device is still live,
+    // then prove the device still renders with no depth attachment at all.
+    assert_eq!(h.clear_depth_stencil_surface(), 0, "unbind depth-stencil");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0);
+    assert_eq!(h.clear(D3DCLEAR_TARGET, BLACK, 1.0, 0), 0);
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &far), 0);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(
+        h.read_pixel(320, 240),
+        RED,
+        "the device renders after every depth surface has retired"
+    );
+}
+
+#[test]
+fn get_render_target_data_from_a_cube_face_reads_that_face() {
+    // The source surface names one subresource of the cube's Metal texture, so
+    // the read-back has to blit that face and that mip rather than the
+    // texture's first slice. Faces 0 and 3 carry different colours and the mip
+    // chain puts a third on face 3's level 1, so a read pinned to slice 0
+    // answers the face-3 reads with face 0's content.
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    let cube = h.create_cube_texture_owned(
+        EDGE,
+        2,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let face0 = cube.surface(0, 0);
+    let face3 = cube.surface(3, 0);
+    let face3_mip1 = cube.surface(3, 1);
+    assert_eq!(h.color_fill_hr(&face0, RED), D3D_OK, "fill face 0 red");
+    assert_eq!(h.color_fill_hr(&face3, GREEN), D3D_OK, "fill face 3 green");
+    assert_eq!(
+        h.color_fill_hr(&face3_mip1, BLUE),
+        D3D_OK,
+        "fill face 3 level 1 blue"
+    );
+
+    assert_eq!(
+        read_surface_pixel(&h, &face3, 1, 1),
+        GREEN,
+        "GetRenderTargetData reads face 3 rather than face 0"
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &face3_mip1, 1, 1),
+        BLUE,
+        "GetRenderTargetData reads face 3's level 1 rather than face 0's"
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &face0, 1, 1),
+        RED,
+        "face 0 still reads its own fill"
+    );
+}
+
+#[test]
+fn a_fresh_render_target_starts_black() {
+    // A render target reaches the application with its pixels already
+    // defined. Nothing uploads one, so the pixels a draw does not cover are
+    // whatever creation left there, and a title that composites a target in
+    // full while only ever drawing part of it puts those on screen. D3D9
+    // leaves the contents formally undefined, but the surfaces real drivers
+    // hand out read as black, and titles are built against that.
+    //
+    // Painting targets and releasing them first gives the allocator blocks
+    // with known contents to hand back, which makes an undefined target
+    // read as the previous one's magenta rather than as black. It makes the
+    // difference likely to show, not certain: allocator reuse is not part of
+    // the contract this test checks.
+    const EDGE: u32 = 256;
+    let h = Harness::new();
+    for _ in 0..4 {
+        let painted = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+        assert_eq!(h.color_fill_hr(&painted, MAGENTA), D3D_OK, "paint a target");
+        // Read it back before it retires: the fill has to have reached the
+        // texture for its memory to carry magenta into the next create.
+        assert_eq!(
+            read_surface_pixel(&h, &painted, 0, 0),
+            MAGENTA,
+            "the painted target holds its fill",
+        );
+        drop(painted);
+        // A released target's texture retires on a frame boundary, so its
+        // memory is only back with the allocator once a frame has gone by.
+        h.render_once(BLACK, |_| {});
+    }
+
+    let fresh = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        surface_colors(&h, &fresh),
+        vec![FRESH],
+        "a freshly created render target is zeroed over its whole extent",
+    );
+}
+
+#[test]
+fn a_fresh_render_target_texture_starts_black() {
+    // The `CreateTexture(D3DUSAGE_RENDERTARGET)` half of
+    // `a_fresh_render_target_starts_black`, which reaches Metal through the
+    // batched texture create rather than the standalone colour-target thunk.
+    // Its mip chain is part of the claim: a game samples a level the draws
+    // never rendered into, so every level starts defined, not only level 0.
+    const EDGE: u32 = 256;
+    const LEVELS: u32 = 3;
+    let h = Harness::new();
+    for _ in 0..4 {
+        let painted = h.create_texture(
+            EDGE,
+            EDGE,
+            LEVELS,
+            D3DUSAGE_RENDERTARGET,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_DEFAULT,
+        );
+        for level in 0..LEVELS {
+            let surface = painted.surface_level(level);
+            assert_eq!(
+                h.color_fill_hr(&surface, MAGENTA),
+                D3D_OK,
+                "paint a render-target texture level",
+            );
+            assert_eq!(
+                read_surface_pixel(&h, &surface, 0, 0),
+                MAGENTA,
+                "the painted level holds its fill",
+            );
+        }
+        drop(painted);
+        h.render_once(BLACK, |_| {});
+    }
+
+    let fresh = h.create_texture(
+        EDGE,
+        EDGE,
+        LEVELS,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    for level in 0..LEVELS {
+        assert_eq!(
+            surface_colors(&h, &fresh.surface_level(level)),
+            vec![FRESH],
+            "level {level} of a freshly created render-target texture is zeroed",
+        );
+    }
+}
+
+#[test]
+fn a_fresh_render_target_cube_starts_black_on_every_face_and_mip() {
+    const EDGE: u32 = 64;
+    const LEVELS: u32 = 3;
+    let h = Harness::new();
+    // Seed released cube allocations at the same shape as the fresh target.
+    // Read each fill back before release so the GPU has written every face
+    // and mip. Reuse is optional, but any reused pixels must be cleared.
+    for _ in 0..4 {
+        let painted = h.create_cube_texture_owned(
+            EDGE,
+            LEVELS,
+            D3DUSAGE_RENDERTARGET,
+            D3DFMT_A8R8G8B8,
+            D3DPOOL_DEFAULT,
+        );
+        for face in 0..6 {
+            for level in 0..LEVELS {
+                let surface = painted.surface(face, level);
+                assert_eq!(h.color_fill_hr(&surface, MAGENTA), D3D_OK);
+                assert_eq!(
+                    surface_colors(&h, &surface),
+                    vec![MAGENTA],
+                    "seed face {face}, level {level}",
+                );
+            }
+        }
+        drop(painted);
+        h.render_once(BLACK, |_| {});
+    }
+
+    let fresh = h.create_cube_texture_owned(
+        EDGE,
+        LEVELS,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    for face in 0..6 {
+        for level in 0..LEVELS {
+            assert_eq!(
+                surface_colors(&h, &fresh.surface(face, level)),
+                vec![FRESH],
+                "fresh face {face}, level {level} is transparent black over its whole extent",
+            );
+        }
+    }
+}
+
+#[test]
+fn a_render_target_row_no_draw_covers_reads_black() {
+    // The shape the defect takes in a title: bind a render target, draw over
+    // part of it, composite the whole thing. Whatever the draw misses is
+    // never written by anything, so the contents the allocation arrived with
+    // are what the composite samples and puts on screen.
+    const EDGE: u32 = 256;
+    let h = Harness::new();
+    // Leave magenta behind for the allocator, so an undefined row is
+    // visibly not black rather than passing on a zeroed block.
+    for _ in 0..4 {
+        let painted = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+        assert_eq!(h.color_fill_hr(&painted, MAGENTA), D3D_OK, "paint a target");
+        assert_eq!(
+            read_surface_pixel(&h, &painted, 0, 0),
+            MAGENTA,
+            "the painted target holds its fill",
+        );
+        drop(painted);
+        h.render_once(BLACK, |_| {});
+    }
+
+    let rt = h.create_texture(
+        EDGE,
+        EDGE,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let rt_surface = rt.surface_level(0);
+    let backbuffer = h.render_target(0);
+
+    // Bound but never cleared: a `Clear` here would define the row the draw
+    // misses, which is the whole question.
+    assert_eq!(h.set_render_target(0, &rt_surface), 0, "bind the RT");
+    // Row 0 sits outside the viewport, so a full-target triangle cannot reach
+    // it however the rasterizer rounds. Set after the bind, which snaps it.
+    let viewport = D3DVIEWPORT9 {
+        x: 0,
+        y: 1,
+        width: EDGE,
+        height: EDGE - 1,
+        min_z: 0.0,
+        max_z: 1.0,
+    };
+    assert_eq!(h.set_viewport(&viewport), 0, "viewport excluding row 0");
+    assert_eq!(h.begin_scene(), 0);
+    draw_fill(&h, GREEN);
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(
+        h.set_render_target(0, &backbuffer),
+        0,
+        "restore the backbuffer"
+    );
+
+    assert_eq!(
+        read_surface_pixel(&h, &rt_surface, EDGE / 2, 1),
+        GREEN,
+        "the rows the draw covers hold the draw",
+    );
+    assert_eq!(
+        read_surface_pixel(&h, &rt_surface, EDGE / 2, 0),
+        FRESH,
+        "the row no draw covers reads zeroed, not what the allocation held",
+    );
+    assert_eq!(
+        surface_colors(&h, &rt_surface),
+        vec![FRESH, GREEN],
+        "the target holds the draw and the creation clear, nothing else",
+    );
+}
+
+#[test]
+fn front_buffer_readback_accepts_the_implicit_swapchain_entry_point() {
+    let h = Harness::new();
+    assert_eq!(h.clear_target(MAGENTA), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+    let (_, desc) = h.render_target(0).desc();
+    let readback = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(h.get_front_buffer_data_hr(&readback), D3D_OK);
+    {
+        let mut lock = readback.lock_rect(0);
+        lock.write_u32_rect(
+            desc.width as usize,
+            desc.height as usize,
+            &vec![GREEN; (desc.width * desc.height) as usize],
+        );
+    }
+    assert_eq!(
+        h.implicit_swapchain().front_buffer_data(Some(&readback)),
+        D3D_OK
+    );
+    let lock = readback.lock_rect(D3DLOCK_READONLY);
+    let idx = ((desc.height / 2) * (lock.pitch().cast_unsigned() / 4) + desc.width / 2) as usize;
+    assert_eq!(
+        lock.as_u32(idx + 1)[idx] & 0x00ff_ffff,
+        MAGENTA & 0x00ff_ffff
+    );
+}
+
+#[test]
+fn front_buffer_readback_rejects_invalid_device_swapchain_indices() {
+    let h = Harness::new();
+    assert_eq!(h.clear_target(MAGENTA), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+    let (_, desc) = h.render_target(0).desc();
+    let readback = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    for index in [1, u32::MAX] {
+        {
+            let mut lock = readback.lock_rect(0);
+            lock.write_u32_rect(
+                desc.width as usize,
+                desc.height as usize,
+                &vec![GREEN; (desc.width * desc.height) as usize],
+            );
+        }
+        assert_eq!(
+            h.get_front_buffer_data_index_hr(index, &readback),
+            D3DERR_INVALIDCALL
+        );
+        let lock = readback.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(
+            lock.as_u32(1)[0],
+            GREEN,
+            "rejected read leaves the destination untouched"
+        );
+    }
+}
+
+#[test]
+fn front_buffer_readback_preserves_rejected_destinations_and_references() {
+    let h = Harness::new();
+    assert_eq!(h.clear_target(MAGENTA), D3D_OK);
+    assert_eq!(h.present(), D3D_OK);
+    let before = h.device_refcount();
+    let chain = h.implicit_swapchain();
+    assert_eq!(h.device_refcount(), before + 1);
+    let (_, desc) = h.render_target(0).desc();
+    for (width, height, format, pool) in [
+        (desc.width, desc.height, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED),
+        (32, 16, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM),
+        (desc.width, desc.height, D3DFMT_A8B8G8R8, D3DPOOL_SYSTEMMEM),
+    ] {
+        let texture = h.create_texture(width, height, 1, 0, format, pool);
+        {
+            let mut lock = texture.lock_rect(0, 0);
+            lock.write_u32_rect(
+                width as usize,
+                height as usize,
+                &vec![GREEN; (width * height) as usize],
+            );
+        }
+        let surface = texture.surface_level(0);
+        let held = h.device_refcount();
+        assert_eq!(chain.front_buffer_data(Some(&surface)), D3DERR_INVALIDCALL);
+        assert_eq!(h.device_refcount(), held);
+        let lock = surface.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(lock.as_u32(1)[0], GREEN);
+    }
+    let dst = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    {
+        let mut lock = dst.lock_rect(0);
+        lock.write_u32_rect(
+            desc.width as usize,
+            desc.height as usize,
+            &vec![GREEN; (desc.width * desc.height) as usize],
+        );
+    }
+    assert_eq!(chain.front_buffer_data(None), D3DERR_INVALIDCALL);
+    assert_eq!(chain.front_buffer_data_null_this(&dst), D3DERR_INVALIDCALL);
+    let additional = h.additional_swapchain();
+    assert_eq!(additional.front_buffer_data(Some(&dst)), D3DERR_INVALIDCALL);
+    assert_eq!(
+        h.get_front_buffer_data_index_hr(1, &dst),
+        D3DERR_INVALIDCALL
+    );
+    {
+        let lock = dst.lock_rect(D3DLOCK_READONLY);
+        assert_eq!(lock.as_u32(1)[0], GREEN);
+    }
+    drop(additional);
+    drop(dst);
+    drop(chain);
+    assert_eq!(h.device_refcount(), before);
+}
+
+#[test]
+fn front_buffer_readback_held_swapchain_tracks_reset_and_msaa() {
+    for samples in [
+        mtld3d_types::D3DMULTISAMPLE_NONE,
+        mtld3d_types::D3DMULTISAMPLE_2_SAMPLES,
+    ] {
+        let h = Harness::create(&HarnessConfig {
+            multi_sample_type: samples,
+            ..HarnessConfig::default()
+        });
+        let chain = h.implicit_swapchain();
+        for (width, height, color) in [(640, 480, MAGENTA), (320, 240, BLUE)] {
+            assert_eq!(h.reset(width, height), D3D_OK);
+            assert_eq!(h.clear_target(color), D3D_OK);
+            assert_eq!(h.present(), D3D_OK);
+            let texture = h.create_texture(width, height, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+            let surface = texture.surface_level(0);
+            let held = h.device_refcount();
+            assert_eq!(chain.front_buffer_data(Some(&surface)), D3D_OK);
+            assert_eq!(h.device_refcount(), held);
+            {
+                let lock = surface.lock_rect(D3DLOCK_READONLY);
+                let idx = ((height / 2) * (lock.pitch().cast_unsigned() / 4) + width / 2) as usize;
+                assert_eq!(lock.as_u32(idx + 1)[idx] & 0x00ff_ffff, color & 0x00ff_ffff);
+            }
+        }
+    }
+}
+
+/// `ColorFill` of a signed DEFAULT offscreen plain writes the nearest nonnegative codes.
+///
+/// Each row is a colour with the R, G, B, A codes it lands on at eight and at
+/// sixteen bits, stored as U, V, W, Q. The whole-surface fill replaces every
+/// seeded byte and the sub-rect fill leaves the seed around it.
+#[test]
+fn signed_colorfill_writes_nearest_codes_whole_and_partial() {
+    use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_V8U8, D3DFMT_V16U16};
+    let h = Harness::new();
+    let cases = [
+        (0x0000_0000u32, [0, 0, 0, 0], [0, 0, 0, 0]),
+        (
+            0xffff_ffffu32,
+            [127, 127, 127, 127],
+            [32767, 32767, 32767, 32767],
+        ),
+        (
+            0x8040_c0ffu32,
+            [32, 96, 127, 64],
+            [8224, 24672, 32767, 16448],
+        ),
+        (
+            0xdead_beefu32,
+            [86, 95, 119, 111],
+            [22230, 24415, 30711, 28527],
+        ),
+        (0x0101_0101u32, [0, 0, 0, 0], [128, 128, 128, 128]),
+        (
+            0x7f7f_7f7fu32,
+            [63, 63, 63, 63],
+            [16319, 16319, 16319, 16319],
+        ),
+        (
+            0x8080_8080u32,
+            [64, 64, 64, 64],
+            [16448, 16448, 16448, 16448],
+        ),
+        (
+            0xfefe_fefeu32,
+            [127, 127, 127, 127],
+            [32639, 32639, 32639, 32639],
+        ),
+        (0xff00_0000u32, [0, 0, 0, 127], [0, 0, 0, 32767]),
+        (0x00ff_0000u32, [127, 0, 0, 0], [32767, 0, 0, 0]),
+        (0x0000_ff00u32, [0, 127, 0, 0], [0, 32767, 0, 0]),
+        (0x0000_00ffu32, [0, 0, 127, 0], [0, 0, 32767, 0]),
+    ];
+    for (format, bytes_per_pixel) in [
+        (D3DFMT_V8U8, 2),
+        (D3DFMT_V16U16, 4),
+        (D3DFMT_Q8W8V8U8, 4),
+        (D3DFMT_Q16W16V16U16, 8),
+        (D3DFMT_A8R8G8B8, 4),
+    ] {
+        let surface = h.create_offscreen_plain_surface(5, 3, format, D3DPOOL_DEFAULT);
+        for (color, narrow, wide) in cases {
+            let expected = match format {
+                D3DFMT_Q16W16V16U16 => wide.iter().flat_map(|v: &u16| v.to_le_bytes()).collect(),
+                D3DFMT_V16U16 => wide[..2]
+                    .iter()
+                    .flat_map(|v: &u16| v.to_le_bytes())
+                    .collect(),
+                D3DFMT_A8R8G8B8 => color.to_le_bytes().to_vec(),
+                _ => narrow[..bytes_per_pixel].to_vec(),
+            };
+            for partial in [false, true] {
+                {
+                    let mut locked = surface.lock_rect(0);
+                    let len = usize::try_from(locked.pitch()).unwrap() * 3;
+                    locked.write(&vec![0xa5u8; len]);
+                }
+                let hr = if partial {
+                    h.color_fill_rect_hr(&surface, (1, 1, 4, 2), color)
+                } else {
+                    h.color_fill_hr(&surface, color)
+                };
+                assert_eq!(hr, D3D_OK);
+                let locked = surface.lock_rect(D3DLOCK_READONLY);
+                let pitch = usize::try_from(locked.pitch()).unwrap();
+                let bytes = locked.as_u8(pitch * 3);
+                for y in 0..3 {
+                    for x in 0..5 {
+                        let offset = y * pitch + x * bytes_per_pixel;
+                        let untouched = vec![0xa5; bytes_per_pixel];
+                        let wanted = if !partial || (y == 1 && (1..4).contains(&x)) {
+                            &expected
+                        } else {
+                            &untouched
+                        };
+                        assert_eq!(
+                            &bytes[offset..offset + bytes_per_pixel],
+                            wanted,
+                            "format {format}, color {color:#x}, partial {partial}, pixel {x},{y}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// `ColorFill` rejects a signed surface outside DEFAULT offscreen plain and writes nothing.
+#[test]
+fn signed_colorfill_rejects_other_surfaces_without_writing() {
+    use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_V8U8, D3DFMT_V16U16};
+    let h = Harness::new();
+    for format in [
+        D3DFMT_V8U8,
+        D3DFMT_V16U16,
+        D3DFMT_Q8W8V8U8,
+        D3DFMT_Q16W16V16U16,
+    ] {
+        for pool in [D3DPOOL_SYSTEMMEM, D3DPOOL_SCRATCH] {
+            let surface = h.create_offscreen_plain_surface(4, 3, format, pool);
+            let len = {
+                let mut locked = surface.lock_rect(0);
+                let len = usize::try_from(locked.pitch()).unwrap() * 3;
+                locked.write(&vec![0xa5u8; len]);
+                len
+            };
+            for hr in [
+                h.color_fill_hr(&surface, 0xdead_beef),
+                h.color_fill_rect_hr(&surface, (1, 1, 3, 2), 0xdead_beef),
+            ] {
+                assert_eq!(hr, D3DERR_INVALIDCALL, "format {format}, pool {pool}");
+            }
+            assert_eq!(
+                surface.lock_rect(D3DLOCK_READONLY).as_u8(len),
+                vec![0xa5u8; len],
+                "format {format}, pool {pool}: a rejected fill wrote"
+            );
+        }
+        let texture = h.create_texture(4, 4, 1, 0, format, D3DPOOL_MANAGED);
+        let len = {
+            let mut locked = texture.lock_rect(0, 0);
+            let len = usize::try_from(locked.pitch()).unwrap() * 4;
+            locked.write(&vec![0xa5u8; len]);
+            len
+        };
+        assert_eq!(
+            h.color_fill_hr(&texture.surface_level(0), 0xdead_beef),
+            D3DERR_INVALIDCALL,
+            "format {format}, MANAGED texture level"
+        );
+        assert_eq!(
+            texture.lock_rect(0, D3DLOCK_READONLY).as_u8(len),
+            vec![0xa5u8; len],
+            "format {format}: a rejected fill wrote the MANAGED level"
+        );
+        let texture = h.create_texture(4, 4, 1, 0, format, D3DPOOL_DEFAULT);
+        assert_eq!(
+            h.color_fill_hr(&texture.surface_level(0), 0xdead_beef),
+            D3DERR_INVALIDCALL,
+            "format {format}, DEFAULT texture level"
+        );
+    }
+}
+
+/// A signed `ColorFill` reaches the Metal texture, whole and as a sub-rect over it.
+///
+/// The filled surface is copied into an A8R8G8B8 render target, which samples
+/// it, and the target is read back before the source is locked again.
+#[test]
+fn signed_colorfill_upload_reaches_gpu_sampling() {
+    use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_Q16W16V16U16, D3DFMT_V8U8, D3DFMT_V16U16};
+    let h = Harness::new();
+    for format in [
+        D3DFMT_V8U8,
+        D3DFMT_V16U16,
+        D3DFMT_Q8W8V8U8,
+        D3DFMT_Q16W16V16U16,
+        D3DFMT_A8R8G8B8,
+    ] {
+        let source = h.create_offscreen_plain_surface(5, 3, format, D3DPOOL_DEFAULT);
+        let target = h.create_render_target(5, 3, D3DFMT_A8R8G8B8);
+        let readback = h.create_offscreen_plain_surface(5, 3, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+        {
+            let mut locked = source.lock_rect(0);
+            let len = usize::try_from(locked.pitch()).unwrap() * 3;
+            locked.write(&vec![0xa5u8; len]);
+        }
+        for partial in [false, true] {
+            let hr = if partial {
+                h.color_fill_rect_hr(&source, (1, 1, 4, 2), 0xdead_beef)
+            } else {
+                h.color_fill_hr(&source, 0x8040_c0ff)
+            };
+            assert_eq!(hr, D3D_OK);
+            assert_eq!(h.stretch_rect(&source, &target, D3DTEXF_NONE), D3D_OK);
+            assert_eq!(h.get_render_target_data_hr(&target, &readback), D3D_OK);
+            let locked = readback.lock_rect(D3DLOCK_READONLY);
+            let pitch = usize::try_from(locked.pitch()).unwrap() / 4;
+            let pixels = locked.as_u32(pitch * 3);
+            for y in 0..3 {
+                for x in 0..5 {
+                    let expected = if partial && y == 1 && (1..4).contains(&x) {
+                        0xdead_beef
+                    } else {
+                        0x8040_c0ff
+                    };
+                    for shift in [0, 8, 16, 24] {
+                        // Only a stored lane carries the fill: the two-lane
+                        // formats are probed on red and green alone.
+                        if matches!(format, D3DFMT_V8U8 | D3DFMT_V16U16) && !matches!(shift, 8 | 16)
+                        {
+                            continue;
+                        }
+                        let actual = (pixels[y * pitch + x] >> shift) & 255;
+                        let wanted = (expected >> shift) & 255;
+                        assert!(
+                            actual.abs_diff(wanted) <= 1,
+                            "format {format}, partial {partial}, pixel {x},{y}, channel {shift}: {actual} != {wanted}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Read one pixel of a 64x64 `A8R8G8B8` render target through `GetRenderTargetData`.
+fn target_pixel(h: &Harness, target: &Surface<'_>, x: u32, y: u32) -> u32 {
+    let sysmem = h.create_offscreen_plain_surface(64, 64, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(target, &sysmem),
+        D3D_OK,
+        "read the render target back",
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let idx = (y * pitch_px + x) as usize;
+    locked.as_u32(idx + 1)[idx]
+}
+
+/// Clear a render target and draw over all of it in `color`, then finish the frame.
+///
+/// Nothing samples or reads the target in this frame, so the next frame is the
+/// first to see what it holds.
+fn fill_target_and_present(h: &Harness, target: &Surface<'_>, color: u32) {
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture for the fill");
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(h.set_render_target(0, target), 0, "bind the target");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(h.clear_target(BLACK), 0, "clear the target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &fullscreen_triangle(color)),
+        0,
+        "fill the target",
+    );
+    assert_eq!(
+        h.set_render_target(0, &backbuffer),
+        0,
+        "restore the backbuffer"
+    );
+    assert_eq!(h.clear_target(BLACK), 0, "clear the backbuffer");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0, "end the frame that drew the target");
+}
+
+#[test]
+fn render_target_texture_sampled_only_in_the_next_frame_keeps_its_contents() {
+    // A texture rendered in one frame and first sampled in the next, the way a
+    // UI caches a model portrait: D3D9 keeps render-target contents across
+    // Present, so the sample shows the fill.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    fill_target_and_present(&h, &rt.surface_level(0), RED);
+
+    for (state, value) in [
+        (D3DTSS_COLOROP, D3DTOP_SELECTARG1),
+        (D3DTSS_COLORARG1, D3DTA_TEXTURE),
+        (D3DTSS_ALPHAOP, D3DTOP_SELECTARG1),
+        (D3DTSS_ALPHAARG1, D3DTA_TEXTURE),
+    ] {
+        assert_eq!(h.set_texture_stage_state(0, state, value), 0, "TSS");
+    }
+    assert_eq!(h.set_texture(0, &rt), 0, "bind the rendered texture");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF TEX1"
+    );
+    let quad = textured_fullscreen_quad();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &quad),
+            0,
+            "sample the texture a frame after it was drawn"
+        );
+    });
+
+    let center = Rgba8::from_pixel(h.read_pixel(320, 240));
+    assert!(
+        center.r > 200 && center.g < 40 && center.b < 40,
+        "the sample shows last frame's fill, got {center:?}"
+    );
+    assert_eq!(h.clear_texture(0), 0, "unbind the texture");
+}
+
+#[test]
+fn render_target_surface_read_only_in_the_next_frame_keeps_its_contents() {
+    // A standalone render target drawn in one frame and read back in the
+    // next: the read sees the draw, whatever frame boundary sits between.
+    let h = Harness::new();
+    let target = h.create_render_target(64, 64, D3DFMT_A8R8G8B8);
+    fill_target_and_present(&h, &target, GREEN);
+
+    let pixel = Rgba8::from_pixel(target_pixel(&h, &target, 32, 32));
+    assert!(
+        pixel.g > 200 && pixel.r < 40 && pixel.b < 40,
+        "the read-back shows last frame's fill, got {pixel:?}"
+    );
+}
+
+#[test]
+fn uncleared_draw_into_a_render_target_texture_keeps_last_frames_pixels() {
+    // Frame 1 fills the target blue. Frame 2 draws a small green triangle
+    // into it under a viewport covering the whole target, with no clear.
+    // D3D9 keeps what frame 1 left everywhere the triangle does not reach.
+    let h = Harness::new();
+    let rt = h.create_texture(
+        64,
+        64,
+        1,
+        D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_DEFAULT,
+    );
+    let surface = rt.surface_level(0);
+    fill_target_and_present(&h, &surface, BLUE);
+
+    let small = [
+        PosColorVertex {
+            x: -0.25,
+            y: 0.25,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 0.25,
+            y: -0.25,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -0.25,
+            y: -0.25,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    let backbuffer = h.render_target(0);
+    assert_eq!(h.set_render_target(0, &surface), 0, "bind the target again");
+    assert_eq!(h.begin_scene(), 0);
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &small),
+        0,
+        "draw over part of last frame's contents"
+    );
+    assert_eq!(
+        h.set_render_target(0, &backbuffer),
+        0,
+        "restore the backbuffer"
+    );
+    assert_eq!(h.clear_target(BLACK), 0, "clear the backbuffer");
+    assert_eq!(h.end_scene(), 0);
+    assert_eq!(h.present(), 0, "end the second frame");
+
+    let corner = Rgba8::from_pixel(target_pixel(&h, &surface, 2, 2));
+    assert!(
+        corner.b > 200 && corner.r < 40 && corner.g < 40,
+        "outside the triangle the target keeps frame 1's blue, got {corner:?}"
+    );
+    let inside = Rgba8::from_pixel(target_pixel(&h, &surface, 28, 36));
+    assert!(
+        inside.g > 200 && inside.r < 40 && inside.b < 40,
+        "inside the triangle the target shows the green draw, got {inside:?}"
+    );
+}
+
+/// The first back buffer of `chain`, as a reference that is not tied to the swap chain's.
+///
+/// D3D9 keeps a swap chain alive for as long as its back buffer is referenced,
+/// so a test may release the swap chain first; the harness wrapper's lifetime
+/// would forbid exactly that.
+fn detached_back_buffer<'h>(chain: &SwapChain<'h>) -> Surface<'h> {
+    let borrowed = chain.back_buffer();
+    let raw = borrowed.as_ptr();
+    core::mem::forget(borrowed);
+    Surface::from_raw(raw)
+}
+
+/// An additional swap chain's back buffer stays usable after the swap chain's last release.
+///
+/// The back buffer pins its swap chain while the application holds it, so
+/// releasing the swap chain first leaves both alive, the back buffer still
+/// describing itself and naming its swap chain as its container. The back
+/// buffer is a `D3DPOOL_DEFAULT` resource the application holds, so `Reset`
+/// refuses until it goes; its release then returns the device reference its
+/// first reference took, and the device count ends where it started.
+#[test]
+fn an_additional_swap_chain_back_buffer_outlives_the_swap_chain_release() {
+    let h = Harness::new();
+    let (width, height) = h.dims();
+    let before = h.device_refcount();
+    let chain = h.additional_swapchain();
+    let back_buffer = detached_back_buffer(&chain);
+    drop(chain);
+
+    let (hr, desc) = back_buffer.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc on the held back buffer");
+    assert_eq!((desc.width, desc.height), (width, height));
+    let (hr, container, _) = back_buffer.get_container(&IID_IDIRECT3DSWAPCHAIN9);
+    assert_eq!(hr, D3D_OK, "the back buffer still names its swap chain");
+    assert!(!container.is_null());
+    assert_eq!(
+        h.reset(width, height),
+        D3DERR_INVALIDCALL,
+        "Reset refuses while the application holds the back buffer"
+    );
+
+    drop(back_buffer);
+    assert_eq!(
+        h.device_refcount(),
+        before,
+        "the back buffer's release returns the device reference it took"
+    );
+    assert_eq!(
+        h.reset(width, height),
+        D3D_OK,
+        "Reset succeeds once the back buffer is gone"
+    );
+}
+
+/// What a test does with the device once a bound back buffer's swap chain is released.
+#[derive(Debug)]
+enum AfterRelease {
+    /// `GetRenderTarget(0)` hands the bound back buffer back.
+    GetRenderTarget,
+    /// `SetRenderTarget(0, implicit)` drops the device's binding.
+    SetRenderTarget,
+    /// `Reset` drops the binding as it restores render target 0.
+    Reset,
+}
+
+/// A bound additional swap chain back buffer survives the application releasing it and its chain.
+///
+/// The device's binding is a reference of its own, so the swap chain and its
+/// back buffer survive the application's last releases of the two, and
+/// `GetRenderTarget` hands the back buffer back alive. Replacing the binding,
+/// directly or through `Reset`, releases the swap chain with its back buffer,
+/// and the device count is back where it started: every device reference and
+/// `Reset` blocker the back buffer took was returned.
+#[test]
+fn a_bound_additional_swap_chain_back_buffer_survives_the_application_releases() {
+    for after in [
+        AfterRelease::GetRenderTarget,
+        AfterRelease::SetRenderTarget,
+        AfterRelease::Reset,
+    ] {
+        let h = Harness::new();
+        let (width, height) = h.dims();
+        let before = h.device_refcount();
+        {
+            let chain = h.additional_swapchain();
+            let back_buffer = chain.back_buffer();
+            assert_eq!(
+                h.set_render_target(0, &back_buffer),
+                D3D_OK,
+                "{after:?}: bind the back buffer"
+            );
+        }
+        match after {
+            AfterRelease::GetRenderTarget => {
+                let bound = h.render_target(0);
+                let (hr, desc) = bound.desc();
+                assert_eq!(hr, D3D_OK, "{after:?}: GetDesc on the bound back buffer");
+                assert_eq!((desc.width, desc.height), (width, height));
+                let (hr, container, _) = bound.get_container(&IID_IDIRECT3DSWAPCHAIN9);
+                assert_eq!(
+                    hr, D3D_OK,
+                    "{after:?}: the bound back buffer names its swap chain"
+                );
+                assert!(!container.is_null());
+                drop(bound);
+                let implicit = h.back_buffer(0);
+                assert_eq!(h.set_render_target(0, &implicit), D3D_OK);
+            }
+            AfterRelease::SetRenderTarget => {
+                let implicit = h.back_buffer(0);
+                assert_eq!(h.set_render_target(0, &implicit), D3D_OK);
+            }
+            AfterRelease::Reset => {
+                assert_eq!(
+                    h.reset(width, height),
+                    D3D_OK,
+                    "{after:?}: the device's own binding does not block Reset"
+                );
+            }
+        }
+        assert_eq!(
+            h.device_refcount(),
+            before,
+            "{after:?}: the device count is back where it started"
+        );
+        assert_eq!(
+            h.reset(width, height),
+            D3D_OK,
+            "{after:?}: a later Reset succeeds"
+        );
+    }
+}

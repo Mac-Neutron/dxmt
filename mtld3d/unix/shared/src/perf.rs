@@ -1,0 +1,506 @@
+//! Cross-linkage-unit perf-tracking primitives.
+//!
+//! Houses the runtime gate (`PERF_TRACKING_ENABLED` cached from
+//! `RUST_LOG=mtld3d::perf=info`) and the state-agnostic RAII timers
+//! (`CycleSetTimer`, `CycleAddTimer`, and `NanosSetTimer` for a duration
+//! that crosses the boundary), all used by `d3d9.dll` PE-side
+//! AND `mtld3d.so` unix-side. Each cdylib that links `mtld3d-shared`
+//! statically gets its own static instance, which matches each cdylib's
+//! own `env_logger` filter cache.
+//!
+//! State-dependent perf (e.g. `ApiTimer` which buckets cycles into
+//! `ApiPerfState`, the per-frame summary aggregator `PerfWindow`, the
+//! `Summary` renderer) lives in `mtld3d-core::perf` because it's tied
+//! to PE-side D3D9 state and has no unix-side analog.
+//!
+//! ## Compile-time gate
+//!
+//! Under `cfg(not(perf_tracking))` (i.e. `make` without `PERF=1`), the
+//! gate helpers become `const fn` returning `false`, both timer structs
+//! become unit structs with `const fn` no-op constructors and no `Drop`,
+//! and the statics + the latch fn vanish. LLVM then dead-code-eliminates
+//! every `let _t = CycleSetTimer::start(...)` call site to literal zero
+//! bytes after thin-LTO inlining.
+
+#[cfg(perf_tracking)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(perf_tracking)]
+use log::{Level, log_enabled};
+use strum::EnumCount;
+
+#[cfg(perf_tracking)]
+use crate::tsc::rdtsc;
+
+/// Fixed-layout output storage that performs no initialization without PERF.
+///
+/// The PE caller initializes its fallback before a thunk in a PERF build, so
+/// a native build without PERF can leave the output untouched. A disabled PE
+/// caller never reads the payload, including when the native build writes it.
+/// Only the two scalar timing records use this boundary wrapper.
+#[repr(transparent)]
+pub struct TimingOutput<T>(core::mem::MaybeUninit<T>);
+
+impl<T: Default> TimingOutput<T> {
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub fn new() -> Self {
+        Self(core::mem::MaybeUninit::new(T::default()))
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(core::mem::MaybeUninit::uninit())
+    }
+
+    /// Publish a native measurement.
+    #[cfg(perf_tracking)]
+    pub const fn write(&mut self, value: T) {
+        self.0.write(value);
+    }
+
+    /// Leave the reserved bytes untouched in a disabled build.
+    #[cfg(not(perf_tracking))]
+    pub fn write(&mut self, value: T) {
+        let _ = (self, value);
+    }
+
+    /// Consume a caller-owned output initialized before the thunk.
+    #[cfg(perf_tracking)]
+    #[must_use]
+    pub const fn into_inner(self) -> T {
+        // SAFETY: this runtime's constructor initializes T before crossing
+        // the boundary; native writes only replace it with another valid T.
+        // The field is private, so safe callers cannot bypass initialization.
+        unsafe { self.0.assume_init() }
+    }
+
+    /// Synthesize zero durations without reading the reserved bytes.
+    #[cfg(not(perf_tracking))]
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        T::default()
+    }
+}
+
+impl<T: Default> Default for TimingOutput<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Native shader compilation durations returned to the caller in nanoseconds.
+///
+/// Zero means unmeasured; `TimingOutput` preserves layout in non-PERF builds.
+#[repr(C)]
+pub struct ShaderTimings {
+    pub preparation_ns: u64,
+    pub library_ns: u64,
+    pub function_ns: u64,
+}
+
+impl ShaderTimings {
+    /// Clear native scratch only when instrumentation exists in this build.
+    pub const fn reset(&mut self) {
+        if cfg!(perf_tracking) {
+            *self = Self::new();
+        }
+    }
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            preparation_ns: 0,
+            library_ns: 0,
+            function_ns: 0,
+        }
+    }
+}
+
+impl Default for ShaderTimings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Native pipeline creation durations returned in nanoseconds.
+///
+/// Preparation excludes the synchronous Metal pipeline build.
+#[repr(C)]
+pub struct PipelineTimings {
+    pub preparation_ns: u64,
+    pub build_ns: u64,
+}
+
+impl PipelineTimings {
+    /// Clear native scratch only when instrumentation exists in this build.
+    pub const fn reset(&mut self) {
+        if cfg!(perf_tracking) {
+            *self = Self::new();
+        }
+    }
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            preparation_ns: 0,
+            build_ns: 0,
+        }
+    }
+}
+
+impl Default for PipelineTimings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A device's command buffers by what they carry, as the GPU-time counters name them.
+///
+/// Indexes [`SubmitTimings::gpu`] and the unix-side accumulator behind it.
+#[derive(EnumCount)]
+#[repr(u32)]
+pub enum CommandBufferRole {
+    /// The frame's render passes, and its leading blits when it has no upload buffer.
+    Frame = 0,
+    /// The frame's uploads, committed ahead of its frame buffer.
+    Upload,
+    /// The presenter's copy or resample of the back buffer into the drawable.
+    Present,
+}
+
+/// GPU execution time of one role's command buffers, in nanoseconds.
+///
+/// `ns` sums `GPUEndTime - GPUStartTime` over `buffers` command buffers.
+/// Buffers of one queue can overlap on the GPU, so sums of different roles
+/// add up to more than the wall time the GPU was busy.
+#[repr(C)]
+pub struct GpuBusy {
+    pub ns: u64,
+    pub buffers: u32,
+    pub pad0: u32,
+}
+
+impl GpuBusy {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            ns: 0,
+            buffers: 0,
+            pad0: 0,
+        }
+    }
+}
+
+impl Default for GpuBusy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Where one `SubmitFrame` spent its time, in nanoseconds; all zero without PERF.
+///
+/// The three CPU spans split the submit thread's encode and commit. The GPU
+/// entries are the command buffers of this device that completed since the
+/// previous submission reported, whichever frame they belong to, so each
+/// completion is reported exactly once.
+#[repr(C)]
+pub struct SubmitTimings {
+    /// Encoding the frame-leading blits, in whichever buffer carries them.
+    pub leading_blits_ns: u64,
+    /// Replaying every pass descriptor, upload and draw, including each pass's own blits.
+    pub passes_ns: u64,
+    /// Installing the frame buffer's completion handler and committing both buffers.
+    pub commit_ns: u64,
+    /// Indexed by [`CommandBufferRole`].
+    pub gpu: [GpuBusy; CommandBufferRole::COUNT],
+}
+
+impl SubmitTimings {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            leading_blits_ns: 0,
+            passes_ns: 0,
+            commit_ns: 0,
+            gpu: [const { GpuBusy::new() }; CommandBufferRole::COUNT],
+        }
+    }
+}
+
+impl Default for SubmitTimings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Cached `log_enabled!(target: "mtld3d::perf", Level::Info)` result.
+///
+/// Latched once at logger init via `init_tracking_enabled`. Read on the
+/// hot path of every `ApiTimer` / `CycleSetTimer` / `CycleAddTimer`
+/// construction — a single `Relaxed` atomic load instead of the
+/// `env_logger` filter walk that `log_enabled!` would run per call.
+///
+/// Latched at `Info` so `PERF=1` builds print the 2-second summary by
+/// default — the gate already requires an opt-in build, so the runtime
+/// cost is paid only by users who explicitly asked for the dashboard.
+/// Silence with `RUST_LOG=mtld3d::perf=warn`.
+#[cfg(perf_tracking)]
+static PERF_TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Cached `log_enabled!(target: "mtld3d::d3d9::passes", Level::Trace)` result.
+///
+/// Drives `bump_pair_stats` and the per-pass / present-texture /
+/// per-pair dump emitted from `log_frame_summary`. Lives next to the
+/// perf gate because the pair dump is computed from the same per-frame
+/// state the perf window aggregates.
+#[cfg(perf_tracking)]
+static PAIR_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Latch `PERF_TRACKING_ENABLED` and `PAIR_STATS_ENABLED` from `RUST_LOG`.
+///
+/// Call once per cdylib after `env_logger::try_init` — each cdylib has its
+/// own `log` statics, so the cache is per-runtime. `d3d9.dll` calls this
+/// from `init_logger`; `mtld3d.so` calls it from `init_logger_handler`.
+#[cfg(perf_tracking)]
+pub fn init_tracking_enabled() {
+    let on = log_enabled!(target: "mtld3d::perf", Level::Info);
+    PERF_TRACKING_ENABLED.store(on, Ordering::Relaxed);
+    let passes_on = log_enabled!(target: "mtld3d::d3d9::passes", Level::Trace);
+    PAIR_STATS_ENABLED.store(passes_on, Ordering::Relaxed);
+}
+
+/// Compile-time no-op when `cfg(not(perf_tracking))`.
+///
+/// The entire perf infrastructure was elided at build time, so there is
+/// nothing to latch.
+#[cfg(not(perf_tracking))]
+#[inline]
+pub const fn init_tracking_enabled() {}
+
+/// Caller-side `ApiTimer` / `CycleSetTimer` / `CycleAddTimer` gate.
+///
+/// Under `cfg(perf_tracking)`: `Relaxed` `AtomicBool` load + branch
+/// (~1 ns per call when perf is off at runtime), avoiding both per-call
+/// rdtsc and the `env_logger` filter walk that bare `log_enabled!` would do.
+///
+/// Under `cfg(not(perf_tracking))`: `const fn` returning `false`, letting
+/// LLVM DCE every `if perf_enabled() { … }` branch at build time.
+#[cfg(perf_tracking)]
+#[inline]
+pub fn perf_enabled() -> bool {
+    PERF_TRACKING_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(not(perf_tracking))]
+#[inline]
+#[must_use]
+pub const fn perf_enabled() -> bool {
+    false
+}
+
+/// Gate for `bump_pair_stats` and the `mtld3d::d3d9::passes=trace` dump.
+///
+/// Same shape as [`perf_enabled`]: one cached `Relaxed` load under
+/// `cfg(perf_tracking)`, a `const fn` returning `false` otherwise.
+#[cfg(perf_tracking)]
+#[inline]
+pub fn pair_stats_enabled() -> bool {
+    PAIR_STATS_ENABLED.load(Ordering::Relaxed)
+}
+
+#[cfg(not(perf_tracking))]
+#[inline]
+#[must_use]
+pub const fn pair_stats_enabled() -> bool {
+    false
+}
+
+/// RAII guard for once-per-frame measurements that **overwrite** a `*mut u64` field.
+///
+/// Present stall, encoder op cycles, encoder submit cycles, unix-side
+/// `drawable_wait`.
+///
+/// Null-check + perf-enabled gate so callers don't hand-roll
+/// `let t0 = rdtsc(); …; *target = rdtsc() - t0;`.
+#[cfg(perf_tracking)]
+pub struct CycleSetTimer {
+    start: u64,
+    target: *mut u64,
+    enabled: bool,
+}
+
+#[cfg(not(perf_tracking))]
+pub struct CycleSetTimer;
+
+impl CycleSetTimer {
+    #[cfg(perf_tracking)]
+    pub fn start(target: *mut u64) -> Self {
+        let enabled = !target.is_null() && perf_enabled();
+        let start = if enabled { rdtsc() } else { 0 };
+        Self {
+            start,
+            target,
+            enabled,
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[inline]
+    #[must_use]
+    pub const fn start(_target: *mut u64) -> Self {
+        Self
+    }
+}
+
+#[cfg(perf_tracking)]
+impl Drop for CycleSetTimer {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let elapsed = rdtsc() - self.start;
+        // SAFETY: `target` was bound to a `&mut u64` field of `DeviceInner`
+        // for this timer's lifetime via the `start` constructor; the borrow
+        // outlives this Drop.
+        unsafe {
+            *self.target = elapsed;
+        }
+    }
+}
+
+// Empty Drop under `not(perf_tracking)` so call sites doing
+// `drop(timer)` to bracket a sub-scope don't fire `clippy::drop_non_drop`.
+// LLVM DCEs the empty drop body after inlining.
+#[cfg(not(perf_tracking))]
+impl Drop for CycleSetTimer {
+    fn drop(&mut self) {}
+}
+
+/// RAII guard for sub-scope measurements that accumulate into a `*mut u64`.
+///
+/// Used by the visibility-query `waitUntilCompleted` block inside an outer
+/// `ApiTimer`, plus the Draw-internal snapshot/`push_op` breakdown timers.
+/// Same null-check + perf-enabled gate as [`CycleSetTimer`].
+#[cfg(perf_tracking)]
+pub struct CycleAddTimer {
+    start: u64,
+    target: *mut u64,
+    enabled: bool,
+}
+
+#[cfg(not(perf_tracking))]
+pub struct CycleAddTimer;
+
+impl CycleAddTimer {
+    #[cfg(perf_tracking)]
+    pub fn start(target: *mut u64) -> Self {
+        let enabled = !target.is_null() && perf_enabled();
+        let start = if enabled { rdtsc() } else { 0 };
+        Self {
+            start,
+            target,
+            enabled,
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[inline]
+    #[must_use]
+    pub const fn start(_target: *mut u64) -> Self {
+        Self
+    }
+}
+
+#[cfg(perf_tracking)]
+impl Drop for CycleAddTimer {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let elapsed = rdtsc() - self.start;
+        // SAFETY: caller-provided `target` points into a counter slot that
+        // lives for the timer's lifetime (start construction ties `target`
+        // to the borrow on the owning struct).
+        let current = unsafe { *self.target };
+        // SAFETY: same invariant as the load above.
+        unsafe { *self.target = current.wrapping_add(elapsed) };
+    }
+}
+
+// Empty Drop under `not(perf_tracking)` so call sites doing
+// `drop(timer)` to bracket a sub-scope don't fire `clippy::drop_non_drop`.
+// LLVM DCEs the empty drop body after inlining.
+#[cfg(not(perf_tracking))]
+impl Drop for CycleAddTimer {
+    fn drop(&mut self) {}
+}
+
+/// RAII guard that **overwrites** a `*mut u64` field with elapsed nanoseconds.
+///
+/// The cycle timers measure with the counter of whichever linkage unit runs
+/// them, so their output only means something inside that unit: each
+/// calibrates its own Hz, and an arm64 `.so` reads `CNTVCT_EL0` while the PE
+/// side reads an emulated `rdtsc` at a different rate. A duration that crosses
+/// the PE/unix boundary therefore travels as nanoseconds, measured here off the
+/// monotonic clock (no calibration, so no first-call sleep on the measuring
+/// thread) and converted back into the reader's own cycles by
+/// [`crate::tsc::ns_to_cycles`].
+///
+/// Same null-check plus perf-enabled gate as [`CycleSetTimer`]; the clock reads
+/// cost more than `rdtsc`, so use this for once-per-frame waits and cold
+/// shader/pipeline builds, not per-draw cache hits.
+#[cfg(perf_tracking)]
+pub struct NanosSetTimer {
+    /// `None` when the gate is off, so a disabled timer reads no clock at all.
+    start: Option<std::time::Instant>,
+    target: *mut u64,
+}
+
+#[cfg(not(perf_tracking))]
+pub struct NanosSetTimer;
+
+impl NanosSetTimer {
+    #[cfg(perf_tracking)]
+    pub fn start(target: *mut u64) -> Self {
+        Self {
+            start: (!target.is_null() && perf_enabled()).then(std::time::Instant::now),
+            target,
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    #[inline]
+    #[must_use]
+    pub const fn start(_target: *mut u64) -> Self {
+        Self
+    }
+}
+
+#[cfg(perf_tracking)]
+impl Drop for NanosSetTimer {
+    fn drop(&mut self) {
+        let Some(start) = self.start else {
+            return;
+        };
+        // Saturating rather than `expect`: a `u64` of nanoseconds covers 584
+        // years, so the clamp is unreachable, and a perf timer must never be
+        // the thing that panics a frame.
+        let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        // SAFETY: `target` was bound to a `&mut u64` field for this timer's
+        // lifetime via the `start` constructor; the borrow outlives this Drop.
+        unsafe {
+            *self.target = elapsed;
+        }
+    }
+}
+
+// Empty Drop under `not(perf_tracking)`, as above.
+#[cfg(not(perf_tracking))]
+impl Drop for NanosSetTimer {
+    fn drop(&mut self) {}
+}
+
+#[cfg(test)]
+mod tests;

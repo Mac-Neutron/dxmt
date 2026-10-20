@@ -1,0 +1,1151 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    # A release is a `v*` tag, and it runs the `release` job alone: see the
+    # comment above that job for why the matrix does not run a second time.
+    tags: ['v*']
+  pull_request:
+  # The Intel image's legs, which pull requests do not run (see the comment
+  # above the build job), every night against main.
+  schedule:
+    - cron: '17 3 * * *'
+  # So a branch can be run through the whole matrix before it has a PR, or
+  # only through the Intel legs, or only through the runner probe at the
+  # bottom.
+  workflow_dispatch:
+    inputs:
+      probe_only:
+        description: Run only the probe-metal job.
+        type: boolean
+        default: false
+      intel_only:
+        description: >-
+          Run only the build and the Intel image's e2e and conformance legs,
+          as the nightly run does.
+        type: boolean
+        default: false
+      record_intel_baseline:
+        description: >-
+          Re-record the Intel image's conformance legs into baseline.txt and
+          upload the file, instead of gating on it.
+        type: boolean
+        default: false
+      e2e_filter:
+        description: >-
+          Run only the end-to-end tests whose id contains one of these
+          whitespace-separated patterns (e.g. `stencil msaa::`).
+        type: string
+        default: ''
+      e2e_log:
+        description: The RUST_LOG filter for end-to-end processes (empty keeps the default).
+        type: string
+        default: ''
+      conformance_repeat:
+        description: >-
+          Run one conformance subtest this many times on every conformance
+          job instead of gating, with every run's raw output and the layer's
+          debug log uploaded (the way to catch a subtest that dies one run
+          in a few).
+        type: string
+        default: ''
+      conformance_only:
+        description: The subtest a `conformance_repeat` dispatch runs.
+        type: choice
+        options: [device, visual, stateblock, d3d9ex]
+        default: device
+
+permissions:
+  contents: read
+
+concurrency:
+  # PR updates share a group so a new head cancels the superseded run. Main
+  # uses one group per run: cancel-in-progress=false alone still lets a new
+  # pending run replace an older pending run. Keep every main result for
+  # comparison across commits; the nightly runs on main too, so it gets one
+  # group per run as well. Probe-only and Intel-only dispatches have groups of
+  # their own.
+  group: ci-${{ github.ref }}-${{ inputs.probe_only && 'probe' || inputs.intel_only && 'intel' || 'full' }}-${{ github.ref == 'refs/heads/main' && github.run_id || 'shared' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Everything a run depends on that is not in the tree is pinned here, so a green
+# main cannot turn red without a commit: both toolchains, the one cargo tool a
+# build needs, and the nextest binary the unit tests run under. All are plain
+# Makefile variables that float for a developer, and every
+# cargo line in the Makefile names its toolchain with rustup's `+` syntax. The
+# MSVC CRT and Windows SDK versions are pinned in the Makefile instead, beside
+# the xwin call that consumes them.
+env:
+  # Two wine-build Wines, one per image, and the Makefile reads its mode from
+  # the one it is given: macos-26 runs the arm64 Wine (the arm64 mode, which
+  # builds, lints, tests and bundles the ARM64X build, legs i686 and arm64x),
+  # macos-15 runs the x86_64 Wine under Rosetta and macos-15-intel runs it
+  # natively (the x86_64 mode, legs i686 and x86_64). Every job passes its
+  # image's Wine to the prepare or runner action as `wine`; build, check and
+  # release run on macos-26.
+  #
+  # The x86_64 release has two bounds. It is cx-26.3.0-2 or later, the first
+  # bundle without MoltenVK: with the library, win32u's display-device
+  # enumeration created a Vulkan instance at every prefix boot, and on the
+  # Intel image's paravirtual device Metal aborted inside explorer.exe, so no
+  # prefix booted there. It is older than cx-26.3.0-8, which needs macOS 26
+  # and so would not run on the macos-15 and Intel images.
+  WINE_RELEASE_X86_64: cx-26.3.0-7
+  # The arm64 Wine, a full bundle: the runtime, the link libraries of every PE
+  # architecture and Wine's own test binaries under lib/wine/tests, with the
+  # VERSION file naming the Wine they came from. It needs macOS 26.4 or later
+  # (its ntdll.so and winebuild), so macos-26 alone runs it. arm64-11.19-2 or
+  # later, the first whose winebuild writes hybrid placeholders, which the
+  # install requires.
+  WINE_RELEASE_ARM64: arm64-11.19-2
+  # The llvm-mingw release the ARM64X build links its CRT from (20260826 or
+  # newer) with the release's own `lld-link` (LLD 23 or newer; 20261006
+  # carries 23.1.3). The Makefile checks both.
+  LLVM_MINGW_RELEASE: '20261006'
+  RUST_STABLE: 1.99.0
+  RUST_NIGHTLY: nightly-2026-10-11
+  CARGO_TOOLS: xwin@0.10.0
+  NEXTEST_VERSION: 0.9.148
+
+# The shape: two machines compile, everything else replays. `build` makes the
+# stage every test leg installs and runs from, so the suites fan out over
+# machines that carry no toolchain, the slow Intel image included, and no
+# compile happens twice. `check` runs every lint, doc and unit leg as steps of
+# one job, with the cheap checks first for earlier feedback. A tag push runs
+# only `release`, which reads the result the same commit already got on main.
+jobs:
+  # Everything a test machine needs, built once on the fast image in the
+  # arm64 mode: the i686, x86_64 and ARM64X builds, both unix `.so` builds,
+  # the e2e test binaries of both PE arches, and the e2e and conformance
+  # runners for both host arches, so one stage serves macos-26's arm64 legs
+  # and the x86_64 legs of macos-15 and the Intel image. Primes the caches the
+  # check job restores too.
+  #
+  # It also decides, once for both test matrices, which images they run on.
+  # A pull request runs the two arm64 images and gates on them. The Intel
+  # image's paravirtual GPU hangs, and reads multisampled results wrong, on
+  # its own often enough that a pull request could not get a green Intel leg
+  # in several attempts, so its legs run every night on main (the `schedule`
+  # trigger) and on a dispatch with `intel_only`, which run that image alone,
+  # and a release waits for a green one (CONTRIBUTING.md, "Cutting a
+  # release"). A push to main and any other dispatch run all three images.
+  build:
+    if: ${{ !inputs.probe_only && !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    outputs:
+      runners: ${{ (github.event_name == 'schedule' || inputs.intel_only) && '["macos-15-intel"]' || github.event_name == 'pull_request' && '["macos-26","macos-15"]' || '["macos-26","macos-15","macos-15-intel"]' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # BUILD_ID, which names the build inside every binary, comes from
+          # `git describe --tags`.
+          fetch-tags: true
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine: arm64
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
+          llvm-mingw-release: ${{ env.LLVM_MINGW_RELEASE }}
+          prime: 'true'
+      - run: make stage
+      - uses: actions/upload-artifact@v7
+        with:
+          name: stage
+          path: windows/target/mtld3d-stage.tar
+          retention-days: 3
+          if-no-files-found: error
+
+  # The gates that need a toolchain but no GPU, one step each so a red step
+  # names itself, and every step runs whatever the ones before it did: a run
+  # is meant to show everything that is wrong at once, not the first thing.
+  # `pe` gates the MSVC SDK and the Wine SDK: clippy and rustdoc run build
+  # scripts, so snmalloc-sys (and zstd-sys, for the e2e test crate and the
+  # disk-cache doc run) need the xwin headers and the archiver, and
+  # windows/shim's build script reads Wine's libwinecrt0.a.
+  # The nightly and Intel-only runs are about the Intel legs alone, so they
+  # leave this job out.
+  check:
+    if: ${{ !inputs.probe_only && !inputs.intel_only && github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-tags: true
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine: arm64
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
+          llvm-mingw-release: ${{ env.LLVM_MINGW_RELEASE }}
+      - name: fmt-check
+        run: make fmt-check
+      - name: audit
+        if: ${{ !cancelled() }}
+        run: make audit
+      - name: test-isolation
+        if: ${{ !cancelled() }}
+        run: make test-isolation
+      - name: test-e2e-discovery
+        if: ${{ !cancelled() }}
+        run: make test-e2e-discovery
+      - name: doc-unix
+        if: ${{ !cancelled() }}
+        run: make doc-unix
+      - name: doc-windows
+        if: ${{ !cancelled() }}
+        run: make doc-windows
+      - name: clippy-pe-x86_64
+        if: ${{ !cancelled() }}
+        run: make clippy-pe-x86_64
+      - name: clippy-pe-i686
+        if: ${{ !cancelled() }}
+        run: make clippy-pe-i686
+      # The two halves of the ARM64X build, linted in the arm64 mode, which
+      # this image's arm64 Wine selects.
+      - name: clippy-pe-arm64x
+        if: ${{ !cancelled() }}
+        run: make clippy-pe-arm64x
+      - name: clippy-native
+        if: ${{ !cancelled() }}
+        run: make clippy-native
+      - name: clippy-perf
+        if: ${{ !cancelled() }}
+        run: make clippy-perf
+      - name: test-unit
+        if: ${{ !cancelled() }}
+        run: make test-unit
+      - name: test-unit-perf
+        if: ${{ !cancelled() }}
+        run: make test-unit-perf
+
+  # The end-to-end suite: the staged test binaries, run by the pinned Wine
+  # against a Metal device, one leg per image and PE arch. The image's Wine
+  # sets the Makefile's mode and so the build the x86_64 binaries run
+  # against: the ARM64X build under macos-26's arm64 Wine
+  # (`test-e2e-arm64x`), the x86_64 build under the x86_64 Wine of macos-15
+  # and the Intel image (`test-e2e-x86_64`). The `arch` axis keeps naming the test
+  # binaries, so the job and artifact names stay as they were; LEG is the
+  # Makefile's name for the leg. macos-26 runs one more, `aarch64`: the
+  # native ARM64 test binaries against the ARM64X build's ARM64 half
+  # (`test-e2e-arm64`), which only the arm64 Wine runs. It is an `include`
+  # entry rather than an axis value, as the scaled leg below is, so the other
+  # images grow no leg they cannot run.
+  #
+  # Three images: the newest macOS on arm64, the oldest macOS mtld3d supports
+  # on arm64, and the Intel image, whose paravirtual device has no unified
+  # memory, no packed 16-bit formats and a 256-byte linear texture alignment,
+  # so it runs the real Intel/AMD code paths with the strict Managed-memory
+  # semantics. That image runs under `INTEL=1`: the device already gives three
+  # of the four Intel answers, and the fourth, 32-bit float filtering, is the
+  # one a real Intel/AMD Mac's driver denies and this paravirtual device does
+  # not, so the forced key is what makes the image stand in for the hardware.
+  # On an Apple-family image the forced answers are a local tool (`make test
+  # INTEL=1`) and do not run here. Every image that runs gates its run; which
+  # images run on which event is decided by the build job (see the comment
+  # above it).
+  #
+  # One more leg runs the whole suite at `render.scale = 0.75`: the back
+  # buffer rasterized smaller than the resolution D3D9 reports and resolved
+  # back up by MetalFX. Every coordinate the suite asserts on is in the
+  # reported space, so that leg is the evidence that the logical and render
+  # spaces stay separate; a test that needs single-pixel resolution asks
+  # `render_scale_is_identity()` and pins its exact shape at the identity
+  # alone. One leg, not a dimension: the code that keeps the two spaces apart
+  # is arch- and OS-independent, so a second scaled leg would cost a whole
+  # suite run for nothing. 0.75 is the documented sweep value; 0.5 and the
+  # non-dividing 0.67 stay local tools (`make test SCALE=<n>`). The `scale`
+  # axis carries one empty value (the identity run) so the `include` entry,
+  # whose scale differs, becomes its own combination: an include whose keys
+  # all fit an existing combination is folded into it instead, and that
+  # would turn the macos-26/i686 identity leg into the scaled one. The
+  # include is there only when macos-26 is among the runners, so a run of the
+  # Intel image alone does not grow a macos-26 leg. The job name is spelled
+  # out so the empty value does not show in it.
+  # A green leg takes two to four minutes, four Wine processes included. The
+  # budget is a multiple of that, not of the worst case the runner's watchdog
+  # can produce: a process that faults and leaves Wine's debugger holding the
+  # pipes costs the watchdog period twice over, and a leg where every process
+  # does so would run the whole hour under the old budget while saying nothing
+  # a shorter one does not.
+  e2e:
+    name: e2e (${{ matrix.runner }}, ${{ matrix.arch }}${{ matrix.scale && format(', scale {0}', matrix.scale) || '' }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.build.outputs.runners) }}
+        arch: [i686, x86_64]
+        scale: [""]
+        include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","scale":"0.75"},{"runner":"macos-26","arch":"aarch64"}]' || '[]') }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/runner
+        with:
+          wine: ${{ matrix.runner == 'macos-26' && 'arm64' || 'x86_64' }}
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
+      # One test at a time (`JOBS=1`, against the Makefile's default of four):
+      # concurrent device creation aborts or hangs on the paravirtual GPU
+      # these images have. The whole suite is reported rather than the first
+      # failure, and a test that is only slow there gets four minutes before
+      # it counts as a hang. A dispatch with `e2e_filter` narrows the run.
+      # The layer's log of every test process, and the whole stderr of every
+      # process that died with tests unaccounted for, go under the runner's
+      # temp directory, where the step below picks them up, rather than beside
+      # the test binary. The layer's log of such a process is moved to
+      # `.layer-log` there, out of the layer's ten-newest retention, so the
+      # account of the death is in the artifact however many processes ran
+      # after it. The job log carries only what reached stdout: the
+      # PASS/FAIL lines, the panic messages and the tail of stderr the runner
+      # prints. What the command buffers reported is in the layer's log, and
+      # that is what tells a runner whose GPU reads back black on every test
+      # from a regression in the commits since the last green run. The
+      # directory keeps the ten newest of each kind, so a leg that restarts
+      # more than ten processes hands back its last ten; a runner fault
+      # persists, so those carry it.
+      # A leg the driver reports a GPU hang on ends with the runner's
+      # `e2e: GPU HANG in <binary>` line and exit code 3, which make turns
+      # into its own 2, so the step keeps the runner's stdout and looks for
+      # that line. When it is there the step raises a `GPU hang` error
+      # annotation, the marker rerun-gpu-hangs.yml reads (see the conformance
+      # step below for why the answer is a fresh machine).
+      - run: |
+          set -o pipefail
+          if ! make test-e2e-$LEG STAGE="$STAGE" JOBS=1 TIMEOUT=120 FAIL_FAST=0 INTEL=${{ matrix.runner == 'macos-15-intel' && '1' || '' }} SCALE="${{ matrix.scale }}" FILTER="$E2E_FILTER" LOG_DIR="$LOG_DIR" | tee "$RUNNER_TEMP/e2e-stdout.txt"; then
+            if grep -q '^e2e: GPU HANG in ' "$RUNNER_TEMP/e2e-stdout.txt"; then
+              echo "::error title=GPU hang::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short and has no verdict. A run whose every failed job says this is re-run once on fresh machines by rerun-gpu-hangs.yml; past that, re-run the failed jobs by hand: gh run rerun ${{ github.run_id }} --failed"
+            fi
+            exit 1
+          fi
+        env:
+          LEG: ${{ matrix.arch == 'i686' && 'i686' || matrix.arch == 'aarch64' && 'arm64' || (matrix.runner == 'macos-26' && 'arm64x' || 'x86_64') }}
+          E2E_FILTER: ${{ inputs.e2e_filter }}
+          RUST_LOG: ${{ inputs.e2e_log }}
+          LOG_DIR: ${{ runner.temp }}
+      # `always()`, as for the conformance output below: a diverging leg is
+      # the one whose logs are worth reading, and a leg cut off by its budget
+      # ends cancelled, not failed. A leg that dies before any process logs a
+      # line has nothing to upload, and that must not turn one red into two.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-logs-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.scale && format('-scale-{0}', matrix.scale) || '' }}
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/*.stderr
+            ${{ runner.temp }}/*.layer-log
+            ${{ runner.temp }}/*.process-log
+          retention-days: 14
+          if-no-files-found: ignore
+      # The job budget is twenty minutes. Include five minutes of bounded
+      # pre-job context without changing the test command or its result.
+      - name: Collect e2e system log
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 2
+        run: |
+          output="$RUNNER_TEMP/e2e-system"
+          mkdir -p "$output"
+          interval_end=$(date +%s)
+          interval_start=$((interval_end - 25 * 60))
+          predicate='process == "kernel" OR process == "WindowServer" OR subsystem CONTAINS[c] "GPU" OR subsystem CONTAINS[c] "IOAccel" OR subsystem CONTAINS[c] "IOSurface" OR subsystem CONTAINS[c] "AppleParavirt" OR senderImagePath CONTAINS[c] "GPU" OR senderImagePath CONTAINS[c] "IOAccel" OR senderImagePath CONTAINS[c] "IOSurface" OR senderImagePath CONTAINS[c] "AppleParavirt"'
+          {
+            printf 'interval_start_epoch=%s\n' "$interval_start"
+            printf 'interval_end_epoch=%s\n' "$interval_end"
+            printf 'timezone=UTC\n'
+            printf 'predicate=%s\n' "$predicate"
+            printf 'state=started\n'
+          } > "$output/collection-status.txt"
+          set +e
+          sudo -n /usr/bin/log show \
+            --start "@$interval_start" \
+            --end "@$interval_end" \
+            --style compact \
+            --timezone UTC \
+            --info \
+            --debug \
+            --predicate "$predicate" \
+            > "$output/system.log" \
+            2> "$output/collection.stderr"
+          collector_status=$?
+          {
+            printf 'exit_code=%s\n' "$collector_status"
+            printf 'state=completed\n'
+          } >> "$output/collection-status.txt"
+          exit "$collector_status"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: e2e-system-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.scale && format('-scale-{0}', matrix.scale) || '' }}
+          path: ${{ runner.temp }}/e2e-system
+          retention-days: 14
+          if-no-files-found: warn
+
+  # Wine's own d3d9_test.exe against our staged builtin, per-site counts diffed
+  # against unix/conformance/baseline.txt. One arch per runner process, and not
+  # part of `make test`: many subtests fail by design, so this gates on a
+  # regression rather than on zero failures. The per-subtest budget is raised
+  # from its 180 s default because the GPU here is paravirtual, and a subtest
+  # killed for taking too long is reported as a crash; a subtest the GPU
+  # hangs under never reaches it (see the step below).
+  # This gates on the same baseline the local runs use, in both directions:
+  # a count above its pin is a regression, a count below it is a stale
+  # baseline (also fatal, see CONFORMANCE.md). The desktop-mode sites that
+  # fail on a real Mac because macdrv rejects the tests' mode changes read
+  # zero on this display; those carry the `ceiling` class, whose pin is a
+  # cross-environment maximum. Baseline keys are per Wine: macos-26 runs the
+  # arm64 Wine and reads `i686-arm64` and `arm64x` (the `x86_64` matrix value
+  # runs `conformance-arm64x` there, LEG below); macos-15 runs the x86_64 Wine
+  # and reads `i686` and `x86_64`, and the Intel image their `@mac2` forms.
+  # A key baseline.txt has no entries for fails the leg with the runner's
+  # line naming it and `make conformance-baseline`.
+  # The Intel image runs the `intel` variant for the reason given above the
+  # e2e legs, and its GPU family gives it its own entries, `<arch>+intel@mac2`,
+  # which only it can record (the step below does, on request). On an
+  # Apple-family image that variant (`make conformance-intel`) is a local tool
+  # and does not run here. One more leg runs the `scale` variant, the suite
+  # at `render.scale = 0.75`, against its own `<arch>+scale` entries: the
+  # counterpart of the scaled e2e leg, on the same image and arch, and one
+  # leg for the same reason.
+  # The `variant` axis carries one empty value (the native run) so the
+  # `include` entry becomes its own combination rather than being folded into
+  # the macos-26/i686 native leg, and the include is there only when macos-26
+  # is among the runners, as for the e2e legs; the job name is spelled out so
+  # the empty value does not show in it.
+  # A green leg takes four to six minutes; the longest single subtest on the
+  # Intel image stays under four, which is what the per-subtest budget below
+  # is sized against. A `conformance_repeat` dispatch runs one subtest twenty
+  # times and legitimately needs the old hour.
+  conformance:
+    name: conformance (${{ matrix.runner }}, ${{ matrix.arch }}${{ matrix.variant && format(', {0}', matrix.variant) || '' }})
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: ${{ inputs.conformance_repeat && 60 || 20 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ${{ fromJSON(needs.build.outputs.runners) }}
+        arch: [i686, x86_64]
+        variant: [""]
+        include: ${{ fromJSON(contains(fromJSON(needs.build.outputs.runners), 'macos-26') && '[{"runner":"macos-26","arch":"i686","variant":"scale"}]' || '[]') }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/runner
+        with:
+          wine: ${{ matrix.runner == 'macos-26' && 'arm64' || 'x86_64' }}
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
+      # Every leg runs one build of Wine's d3d9 tests, the arm64 Wine
+      # release's, since the baseline names a site by its file:line and the
+      # x86_64 Wine ships another build. macos-26 runs that Wine and finds
+      # them in its own tree; the x86_64-Wine images take the release's
+      # lib/wine/tests alone, cached by the pin, and name it in WINE_TESTS.
+      - name: Restore the arm64 Wine release's tests
+        id: wine-tests
+        if: matrix.runner != 'macos-26'
+        uses: actions/cache@v6
+        with:
+          path: ~/wine-tests
+          key: wine-tests-${{ env.WINE_RELEASE_ARM64 }}
+      - name: The arm64 Wine release's tests
+        if: matrix.runner != 'macos-26'
+        run: |
+          if [ '${{ steps.wine-tests.outputs.cache-hit }}' != true ]; then
+            mkdir -p "$HOME/wine-tests"
+            curl -fsSL -o "$RUNNER_TEMP/wine-arm64.tar.xz" \
+              "https://github.com/athei/wine-build/releases/download/$WINE_RELEASE_ARM64/wine-$WINE_RELEASE_ARM64-macos-arm64.tar.xz"
+            tar -xJf "$RUNNER_TEMP/wine-arm64.tar.xz" -C "$HOME/wine-tests" --strip-components 4 wine/lib/wine/tests
+            rm -f "$RUNNER_TEMP/wine-arm64.tar.xz"
+          fi
+          echo "WINE_TESTS=$HOME/wine-tests" >> "$GITHUB_ENV"
+      # The Intel image reads and, on a `record_intel_baseline` dispatch,
+      # writes the `<arch>+intel@mac2` entries: the only machine of that GPU
+      # family is a runner, so its counts are recorded here and committed from
+      # the artifact below (each arch's file carries its own leg; the merge is
+      # leg-scoped, so the two sections are copied in side by side).
+      # The paravirtual GPU hangs now and then under a long subtest: the
+      # driver reports kIOAccelCommandBufferCallbackErrorHang on the test
+      # process's stderr, every later command buffer is ignored, and the GPU
+      # stays that way for the rest of the machine's life (a second attempt
+      # on the same runner hung again, in the next subtest's fresh process).
+      # The runner reads that line as it arrives, stops the subtest and ends
+      # the leg with its `conformance: GPU HANG in <leg>/<subtest>` line and
+      # exit code 3, so the hang costs seconds rather than the subtest's
+      # budget; what is left for this step is to say what the failure means.
+      # A regression never looks like that, and the machine will not recover,
+      # so the answer is a re-run of the failed jobs, which lands on a fresh
+      # runner, not another attempt here. make turns the 3 into its own 2, so
+      # the step keeps the runner's stdout and looks for that line, and when
+      # it is there raises the `GPU hang` error annotation that
+      # rerun-gpu-hangs.yml reads to do that re-run once.
+      # A `conformance_repeat` dispatch runs one subtest that many times in
+      # place of the gate, on every job, and leaves the reading to the
+      # artifact: each run's raw output ends with how the process ended, and
+      # the layer's debug log sits beside it.
+      - run: |
+          set -o pipefail
+          if [ -n "$CONFORMANCE_REPEAT" ]; then
+            make conformance-isolate ONLY="$CONFORMANCE_ONLY" ARCH="$LEG" REPEAT="$CONFORMANCE_REPEAT" VARIANT=${{ matrix.runner == 'macos-15-intel' && 'intel' || matrix.variant || 'native' }} LOG=debug STAGE="$STAGE"
+            exit
+          fi
+          if ! make conformance-${{ matrix.runner == 'macos-15-intel' && (inputs.record_intel_baseline && 'baseline-intel-' || 'intel-') || (matrix.variant && format('{0}-', matrix.variant)) || '' }}$LEG STAGE="$STAGE" | tee "$RUNNER_TEMP/conformance-stdout.txt"; then
+            if grep -q '^conformance: GPU HANG in ' "$RUNNER_TEMP/conformance-stdout.txt"; then
+              echo "::error title=GPU hang::this runner's GPU hung and stays hung for the rest of the job, so the leg was cut short and has no verdict; not a regression when the other conformance jobs are green. A run whose every failed job says this is re-run once on fresh machines by rerun-gpu-hangs.yml; past that, re-run the failed jobs by hand: gh run rerun ${{ github.run_id }} --failed"
+            fi
+            exit 1
+          fi
+        env:
+          LEG: ${{ matrix.arch == 'i686' && 'i686' || (matrix.runner == 'macos-26' && 'arm64x' || 'x86_64') }}
+          MTLD3D_CONFORMANCE_TIMEOUT_SECS: "600"
+          # Every subtest's full output, which is what carries the
+          # `Got <actual>, expected <expected>` values behind each site. The
+          # job's own log reduces to per-site counts, and counts alone cannot
+          # say why this environment diverges.
+          MTLD3D_CONFORMANCE_RAW_DIR: ${{ runner.temp }}/conformance-raw
+          CONFORMANCE_REPEAT: ${{ inputs.conformance_repeat }}
+          CONFORMANCE_ONLY: ${{ inputs.conformance_only }}
+
+      # The system log of the job's span, into the raw directory so the raw
+      # artifact below carries it. A subtest can hang with its process
+      # waiting on a main-thread request that never finished, after AppKit
+      # swallowed an Objective-C exception on the main thread; the sample
+      # the runner takes shows the wait, and the system log is where AppKit
+      # reports a swallowed exception, if it logs it there and does not
+      # redact it. Every error and fault of the `wine` processes, and any of
+      # their lines that names an exception, is kept beside the kernel and
+      # GPU lines the e2e step collects, so a hung leg and a GPU fault both
+      # carry their account. The span is the job budget plus five minutes of
+      # context; like the e2e step, it runs whatever the outcome and its own
+      # failure fails nothing. Reading 25 minutes takes 74 to 81 s on the
+      # Intel image, so a repeat run's 65 minutes gets five minutes rather
+      # than two: `log show` reads forward, and a cut would lose the end of
+      # the span, where a hang is. A d3d9ex run takes under a minute and a
+      # half there, so twenty of them with one hanging for its 600 s budget
+      # take about 40 minutes, and these five still fit the repeat job's 60.
+      - name: Collect conformance system log
+        if: always()
+        continue-on-error: true
+        timeout-minutes: ${{ inputs.conformance_repeat && 5 || 2 }}
+        run: |
+          output="$RUNNER_TEMP/conformance-raw/system"
+          mkdir -p "$output"
+          interval_end=$(date +%s)
+          interval_start=$((interval_end - SPAN_MINUTES * 60))
+          predicate='process == "kernel" OR process == "WindowServer" OR subsystem CONTAINS[c] "GPU" OR subsystem CONTAINS[c] "IOAccel" OR subsystem CONTAINS[c] "IOSurface" OR subsystem CONTAINS[c] "AppleParavirt" OR senderImagePath CONTAINS[c] "GPU" OR senderImagePath CONTAINS[c] "IOAccel" OR senderImagePath CONTAINS[c] "IOSurface" OR senderImagePath CONTAINS[c] "AppleParavirt" OR (process == "wine" AND (messageType == error OR messageType == fault OR eventMessage CONTAINS[c] "exception"))'
+          {
+            printf 'interval_start_epoch=%s\n' "$interval_start"
+            printf 'interval_end_epoch=%s\n' "$interval_end"
+            printf 'timezone=UTC\n'
+            printf 'predicate=%s\n' "$predicate"
+            printf 'state=started\n'
+          } > "$output/collection-status.txt"
+          set +e
+          sudo -n /usr/bin/log show \
+            --start "@$interval_start" \
+            --end "@$interval_end" \
+            --style compact \
+            --timezone UTC \
+            --info \
+            --debug \
+            --predicate "$predicate" \
+            > "$output/system.log" \
+            2> "$output/collection.stderr"
+          collector_status=$?
+          {
+            printf 'exit_code=%s\n' "$collector_status"
+            printf 'state=completed\n'
+          } >> "$output/collection-status.txt"
+          exit "$collector_status"
+        env:
+          SPAN_MINUTES: ${{ inputs.conformance_repeat && 65 || 25 }}
+
+      # `always()`, because a diverging run is exactly the one whose output is
+      # worth reading, and the job reports failure whenever it diverges.
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: conformance-raw-${{ matrix.runner }}-${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) || '' }}
+          path: ${{ runner.temp }}/conformance-raw
+          retention-days: 14
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v7
+        if: ${{ inputs.record_intel_baseline && matrix.runner == 'macos-15-intel' }}
+        with:
+          name: baseline-mac2-${{ matrix.arch }}
+          path: unix/conformance/baseline.txt
+          retention-days: 14
+          if-no-files-found: error
+
+  # A `v*` tag is a release, and the tag push runs this job on its own. The
+  # matrix is not run a second time: the gate here is main's own run at this
+  # exact commit, which is the same tree, so re-running it would cost half an
+  # hour to learn what merging the commit already established. What this job
+  # adds is the work a release used to take by hand, where each step was only
+  # as reliable as whoever remembered it.
+  #
+  # The tag has to agree with the version both workspaces carry, or the shipped
+  # DLLs name a release nobody published: every binary stamps `git describe`,
+  # so the production bundle is built here, after the tag exists.
+  #
+  # It drafts and stops: the body it creates is empty because the notes are
+  # written by hand, and the maintainer publishes. CONTRIBUTING.md carries the
+  # procedure around this job.
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: macos-26
+    # Long, because the step below waits for main's run when the tag was pushed
+    # on the heels of the commit.
+    timeout-minutes: 60
+    permissions:
+      # The draft, and the query for main's run.
+      contents: write
+      actions: read
+    steps:
+      # No fetch-tags here: a tag run's checkout fetches the tag it runs for,
+      # which is the one tag `git describe` needs for the stamp, so every
+      # other tag would only add to the fetch.
+      - uses: actions/checkout@v7
+      # The toolchain first, since every make target needs the WINE_SDK the
+      # prepare action sets; then the version check, so a tag that disagrees
+      # with the manifests is answered before the wait for main's run and the
+      # bundle build below.
+      - uses: ./.github/actions/prepare
+        with:
+          pe: 'true'
+          wine: arm64
+          wine-release-arm64: ${{ env.WINE_RELEASE_ARM64 }}
+          wine-release-x86_64: ${{ env.WINE_RELEASE_X86_64 }}
+          llvm-mingw-release: ${{ env.LLVM_MINGW_RELEASE }}
+      - name: version-check
+        env:
+          TAG: ${{ github.ref_name }}
+        run: make version-check TAG="$TAG"
+      # The gate that replaces re-running the matrix. A run that has not
+      # finished is waited on, since main is pushed and tagged in one sitting;
+      # a run that never appears means the tag names a commit that never landed
+      # on main, which no amount of waiting fixes, so that gets a short grace
+      # and then a verdict.
+      - name: The ci run for this commit on main is green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          missing=0
+          for _ in $(seq 90); do
+            read -r status conclusion url <<<"$(gh run list --workflow ci.yml \
+              --commit "$GITHUB_SHA" --event push --branch main --limit 1 \
+              --json status,conclusion,url \
+              --jq '.[] | "\(.status) \(.conclusion) \(.url)"')"
+            if [ -z "$status" ]; then
+              missing=$((missing + 1))
+              if [ "$missing" -gt 10 ]; then
+                echo "::error::no ci run on main for $GITHUB_SHA: this tag names a commit that never landed there"
+                exit 1
+              fi
+              echo "no ci run for $GITHUB_SHA on main yet"
+            elif [ "$status" = completed ]; then
+              if [ "$conclusion" != success ]; then
+                echo "::error::$url concluded $conclusion, so this commit is not a release"
+                exit 1
+              fi
+              echo "$url is green"
+              exit 0
+            else
+              echo "$url is $status"
+            fi
+            sleep 30
+          done
+          echo "::error::main's ci run for $GITHUB_SHA had not finished after 45 minutes; re-run this job once it has"
+          exit 1
+      # PROD=1 is this target's default, so the archives carry the production
+      # profile, and the target verifies that every binary in them is stamped
+      # with the tag before it writes either one. This image's arm64 Wine puts
+      # the Makefile in its arm64 mode, so the bundle carries the ARM64X pair
+      # (wine/aarch64-windows and native/aarch64-windows) beside the x86 builds.
+      - name: bundle
+        run: make bundle
+      # Re-running the job after a failed upload finds the draft it already
+      # made and replaces the assets, rather than failing on a tag that has a
+      # release.
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" --clobber \
+              windows/target/mtld3d.tar.xz windows/target/mtld3d-debug.tar.xz
+          else
+            gh release create "$TAG" --draft --title "$TAG" --notes "" \
+              windows/target/mtld3d.tar.xz windows/target/mtld3d-debug.tar.xz
+          fi
+          echo "Drafted $TAG with both archives. Write the notes, then publish:" >> "$GITHUB_STEP_SUMMARY"
+          echo '`gh release edit '"$TAG"' --draft=false --latest`' >> "$GITHUB_STEP_SUMMARY"
+
+  # Manual only: what a hosted macOS runner exposes to Metal, on every image
+  # the matrices above use. The OS, the device, and the capability bits
+  # mtld3d branches on, then a clear pass, the pinned Wine booting a prefix,
+  # and the one texture format the Mac2 family lacks. Run it before adding a
+  # runner label to the matrices, since an image without a Metal device
+  # cannot run the e2e or conformance legs at all, and the newest arm64 image
+  # is in the list as the reference every other row is read against. An
+  # `intel_only` dispatch leaves it out.
+  probe-metal:
+    if: github.event_name == 'workflow_dispatch' && !inputs.intel_only
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-26, macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Host
+        run: |
+          sw_vers
+          uname -m
+          sysctl -n machdep.cpu.brand_string
+          sysctl -n hw.memsize
+          xcodebuild -version || true
+          # Whether the runner has a GUI session: the Mac driver needs one.
+          launchctl managername || true
+          id -un; who || true
+      - name: Displays and GPUs
+        run: system_profiler SPDisplaysDataType || true
+      - name: Metal device
+        run: |
+          cat > "$RUNNER_TEMP/probe.swift" <<'EOF'
+          import Metal
+          let all = MTLCopyAllDevices()
+          print("MTLCopyAllDevices: \(all.count)")
+          for d in all { print("  \(d.name)") }
+          guard let d = MTLCreateSystemDefaultDevice() else {
+              print("MTLCreateSystemDefaultDevice: nil")
+              exit(3)
+          }
+          print("default device: \(d.name)")
+          print("registryID: \(d.registryID)")
+          print("hasUnifiedMemory: \(d.hasUnifiedMemory)")
+          print("isLowPower: \(d.isLowPower) isHeadless: \(d.isHeadless) isRemovable: \(d.isRemovable)")
+          print("supportsFamily apple2: \(d.supportsFamily(.apple2)) apple7: \(d.supportsFamily(.apple7)) mac2: \(d.supportsFamily(.mac2)) metal3: \(d.supportsFamily(.metal3))")
+          print("supports32BitFloatFiltering: \(d.supports32BitFloatFiltering)")
+          print("supports32BitMSAA: \(d.supports32BitMSAA)")
+          print("minimumLinearTextureAlignment bgra8: \(d.minimumLinearTextureAlignment(for: .bgra8Unorm))")
+          for n in [2, 4, 8] { print("supportsTextureSampleCount \(n): \(d.supportsTextureSampleCount(n))") }
+          print("recommendedMaxWorkingSetSize: \(d.recommendedMaxWorkingSetSize)")
+          print("maxBufferLength: \(d.maxBufferLength)")
+          guard let queue = d.makeCommandQueue() else { print("makeCommandQueue: nil"); exit(4) }
+          let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 64, height: 64, mipmapped: false)
+          desc.usage = [.shaderRead, .renderTarget]
+          guard let tex = d.makeTexture(descriptor: desc) else { print("makeTexture bgra8: nil"); exit(5) }
+          let managed = d.makeBuffer(length: 4096, options: [.storageModeManaged])
+          print("managed buffer: \(managed != nil)")
+          let sd = MTLSamplerDescriptor()
+          sd.sAddressMode = .clampToBorderColor
+          sd.tAddressMode = .clampToBorderColor
+          sd.borderColor = .opaqueWhite
+          print("border sampler: \(d.makeSamplerState(descriptor: sd) != nil)")
+          let cb = queue.makeCommandBuffer()!
+          let rp = MTLRenderPassDescriptor()
+          rp.colorAttachments[0].texture = tex
+          rp.colorAttachments[0].loadAction = .clear
+          rp.colorAttachments[0].storeAction = .store
+          rp.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 0, blue: 0, alpha: 1)
+          let enc = cb.makeRenderCommandEncoder(descriptor: rp)!
+          enc.endEncoding()
+          // A Managed texture on a device without unified memory holds the
+          // GPU's write in VRAM until a synchronize brings it across.
+          let blit = cb.makeBlitCommandEncoder()!
+          blit.synchronize(resource: tex)
+          blit.endEncoding()
+          cb.commit()
+          cb.waitUntilCompleted()
+          print("clear pass status: \(cb.status.rawValue) error: \(String(describing: cb.error))")
+          var px = [UInt8](repeating: 0, count: 4)
+          tex.getBytes(&px, bytesPerRow: 256, from: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0)
+          print("pixel after clear (bgra): \(px)")
+          EOF
+          swift "$RUNNER_TEMP/probe.swift"
+      # The pinned Wine bundle itself: the loader, then a registry write that
+      # boots a fresh prefix, capped by an alarm rather than left to wineboot's
+      # five-minute timer, since where a boot fails it fails within seconds,
+      # and the processes a failed boot leaves behind reaped outright, since
+      # one caught in Wine's fault loop survives `wineserver -k`. The
+      # environment is the Makefile's: without the mscoree/mshtml overrides a
+      # fresh prefix tries to install Wine Mono and Gecko.
+      - name: Wine
+        env:
+          WINEDLLOVERRIDES: mscoree,mshtml=
+          WINEMSYNC: "1"
+          WINEDEBUG: "-all"
+        run: |
+          set +e
+          mkdir -p "$HOME/wine-sdk"
+          # The Wine this image's legs run: the arm64 one on macos-26, the
+          # x86_64 one on macos-15 and the Intel image.
+          if [ '${{ matrix.runner }}' = macos-26 ]; then
+            tag="$WINE_RELEASE_ARM64" asset=arm64 cpu=aarch64
+          else
+            tag="$WINE_RELEASE_X86_64" asset=x86_64 cpu=x86_64
+          fi
+          curl -fsSL -o "$RUNNER_TEMP/wine.tar.xz" \
+            "https://github.com/athei/wine-build/releases/download/$tag/wine-$tag-macos-$asset.tar.xz"
+          tar -xJf "$RUNNER_TEMP/wine.tar.xz" -C "$HOME/wine-sdk"
+          W="$HOME/wine-sdk/wine/bin/wine"
+          capped() { perl -e 'alarm shift; exec @ARGV' "$@"; }
+          file "$W"
+          "$W" --version
+          otool -l "$HOME/wine-sdk/wine/lib/wine/$cpu-unix/ntdll.so" | grep -A4 'LC_BUILD_VERSION' | head -6
+          ls "$HOME/wine-sdk/wine/lib/external"
+          echo "== prefix boot"
+          WINEPREFIX="$RUNNER_TEMP/pfx" WINEDEBUG=+seh capped 240 "$W" reg add 'HKCU\Software\Wine\Probe' /v x /t REG_SZ /d y /f > "$RUNNER_TEMP/boot.log" 2>&1
+          echo "boot: reg add exit $?"
+          grep -aq EXCEPTION_WINE_ASSERTION "$RUNNER_TEMP/boot.log" && echo "boot: a process aborted (assertion in the trace)"
+          grep -av 'handle_syscall_fault' "$RUNNER_TEMP/boot.log" | grep -aE 'err:|seh:dispatch_exception' | head -20
+          WINEPREFIX="$RUNNER_TEMP/pfx" capped 60 "$W" cmd /c ver 2>&1 | grep -a Windows
+          ls "$RUNNER_TEMP/pfx/drive_c/windows/system32" 2>/dev/null | wc -l | sed 's/^/system32 entries: /'
+          pkill -9 -f "$HOME/wine-sdk" 2>/dev/null || true
+      # A view that only reorders channels is how the formats without an
+      # alpha lane read alpha as one; a device that hands one back but samples
+      # through the base texture's lanes is what the swizzle sites in the
+      # conformance baseline look like.
+      - name: Swizzle and sRGB texture views
+        run: |
+          cat > "$RUNNER_TEMP/views.swift" <<'EOF'
+          import Metal
+          guard let d = MTLCreateSystemDefaultDevice() else { print("no device"); exit(3) }
+          let src = """
+          #include <metal_stdlib>
+          using namespace metal;
+          kernel void probe(texture2d<float> t [[texture(0)]], device float4 *out [[buffer(0)]]) {
+              constexpr sampler s(coord::pixel, filter::nearest);
+              out[0] = t.sample(s, float2(0.5, 0.5));
+          }
+          """
+          let lib = try! d.makeLibrary(source: src, options: nil)
+          let pso = try! d.makeComputePipelineState(function: lib.makeFunction(name: "probe")!)
+          let queue = d.makeCommandQueue()!
+          func sample(_ t: MTLTexture) -> [Float] {
+              let out = d.makeBuffer(length: 16, options: [.storageModeShared])!
+              let cb = queue.makeCommandBuffer()!
+              let enc = cb.makeComputeCommandEncoder()!
+              enc.setComputePipelineState(pso)
+              enc.setTexture(t, index: 0)
+              enc.setBuffer(out, offset: 0, index: 0)
+              enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+              enc.endEncoding()
+              cb.commit(); cb.waitUntilCompleted()
+              return Array(UnsafeBufferPointer(start: out.contents().assumingMemoryBound(to: Float.self), count: 4))
+          }
+          for usePFV in [false, true] {
+              let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: 1, height: 1, mipmapped: false)
+              desc.usage = usePFV ? [.shaderRead, .pixelFormatView] : [.shaderRead]
+              desc.storageMode = .private
+              let tex = d.makeTexture(descriptor: desc)!
+              let staging = d.makeBuffer(bytes: [UInt8(255), 64, 32, 0], length: 4, options: [.storageModeShared])!
+              let cb = queue.makeCommandBuffer()!
+              let blit = cb.makeBlitCommandEncoder()!
+              blit.copy(from: staging, sourceOffset: 0, sourceBytesPerRow: 4, sourceBytesPerImage: 4, sourceSize: MTLSize(width: 1, height: 1, depth: 1), to: tex, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+              blit.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("pixelFormatView usage:", usePFV)
+              print("  base sample:", sample(tex))
+              let sw = MTLTextureSwizzleChannels(red: .red, green: .green, blue: .blue, alpha: .one)
+              if let view = tex.makeTextureView(pixelFormat: .rgba8Unorm, textureType: .type2D, levels: 0..<1, slices: 0..<1, swizzle: sw) {
+                  print("  swizzle view: created, swizzle alpha =", view.swizzle.alpha.rawValue, "sample:", sample(view))
+              } else {
+                  print("  swizzle view: nil")
+              }
+              if let view = tex.makeTextureView(pixelFormat: .rgba8Unorm_srgb) {
+                  print("  srgb view: created, sample:", sample(view))
+              } else {
+                  print("  srgb view: nil")
+              }
+          }
+          EOF
+          swift "$RUNNER_TEMP/views.swift" || echo "views probe failed with exit $?"
+      # The depth-side features the e2e suite leans on, each measured on its
+      # own: a 16-bit depth attachment, a fragment-less depth write under a
+      # scissor with the colour write mask off, a multisample depth resolve,
+      # and a point wider than one pixel.
+      - name: Depth, scissor, resolve and point probes
+        run: |
+          cat > "$RUNNER_TEMP/depth.swift" <<'EOF'
+          import Metal
+          guard let d = MTLCreateSystemDefaultDevice() else { print("no device"); exit(3) }
+          let src = """
+          #include <metal_stdlib>
+          using namespace metal;
+          struct V { float4 pos [[position]]; float psize [[point_size]]; };
+          vertex V tri(uint vid [[vertex_id]], constant float &z [[buffer(0)]]) {
+              float2 p = float2(float((vid << 1u) & 2u) * 2.0 - 1.0, float(vid & 2u) * 2.0 - 1.0);
+              V v; v.pos = float4(p, z, 1.0); v.psize = 1.0; return v;
+          }
+          vertex V pt(uint vid [[vertex_id]]) { V v; v.pos = float4(0, 0, 0.5, 1); v.psize = 15.0; return v; }
+          fragment float4 solid(constant float4 &c [[buffer(0)]]) { return c; }
+          """
+          let lib = try! d.makeLibrary(source: src, options: nil)
+          let queue = d.makeCommandQueue()!
+          func tex(_ f: MTLPixelFormat, _ w: Int, _ h: Int, samples: Int = 1) -> MTLTexture {
+              let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: f, width: w, height: h, mipmapped: false)
+              desc.usage = [.renderTarget, .shaderRead]; desc.storageMode = .private
+              if samples > 1 { desc.textureType = .type2DMultisample; desc.sampleCount = samples }
+              return d.makeTexture(descriptor: desc)!
+          }
+          func pso(_ vs: String, fs: String?, color: MTLPixelFormat, depth: MTLPixelFormat, writeColor: Bool, samples: Int = 1) -> MTLRenderPipelineState {
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: vs)
+              p.fragmentFunction = fs.map { lib.makeFunction(name: $0)! }
+              p.colorAttachments[0].pixelFormat = color
+              if !writeColor { p.colorAttachments[0].writeMask = [] }
+              p.depthAttachmentPixelFormat = depth
+              p.rasterSampleCount = samples
+              return try! d.makeRenderPipelineState(descriptor: p)
+          }
+          func dss(write: Bool) -> MTLDepthStencilState {
+              let s = MTLDepthStencilDescriptor(); s.depthCompareFunction = .lessEqual; s.isDepthWriteEnabled = write
+              return d.makeDepthStencilState(descriptor: s)!
+          }
+          func readback(_ t: MTLTexture, bpp: Int) -> [UInt8] {
+              let buf = d.makeBuffer(length: t.width * t.height * bpp, options: [.storageModeShared])!
+              let cb = queue.makeCommandBuffer()!; let b = cb.makeBlitCommandEncoder()!
+              b.copy(from: t, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: t.width, height: t.height, depth: 1), to: buf, destinationOffset: 0, destinationBytesPerRow: t.width * bpp, destinationBytesPerImage: t.width * t.height * bpp)
+              b.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              return Array(UnsafeBufferPointer(start: buf.contents().assumingMemoryBound(to: UInt8.self), count: t.width * t.height * bpp))
+          }
+          func px(_ bytes: [UInt8], _ w: Int, _ x: Int, _ y: Int) -> [UInt8] { Array(bytes[(y * w + x) * 4 ..< (y * w + x) * 4 + 4]) }
+          let W = 16, H = 16
+          // 1. Depth16Unorm vs Depth32Float: clear 1.0, draw a triangle at z=0.5 (lessEqual) in red over a blue clear.
+          for df in [MTLPixelFormat.depth16Unorm, .depth32Float] {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(df, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .store
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso("tri", fs: "solid", color: .rgba8Unorm, depth: df, writeColor: true)); e.setDepthStencilState(dss(write: true))
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("depth \(df.rawValue == 250 ? "16" : "32") draw at 0.5 over clear 1.0, centre pixel:", px(readback(c, bpp: 4), W, 8, 8), "(want red)")
+          }
+          // 2. Fragment-less depth write under a scissor, colour write mask off: left half to z=0, then a red triangle at 0.5.
+          do {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 1, blue: 0, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .store
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso("tri", fs: nil, color: .rgba8Unorm, depth: .depth32Float, writeColor: false)); e.setDepthStencilState(dss(write: true))
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W / 2, height: H))
+              var zv: Float = 0.0; e.setVertexBytes(&zv, length: 4, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W, height: H))
+              e.setRenderPipelineState(pso("tri", fs: "solid", color: .rgba8Unorm, depth: .depth32Float, writeColor: true)); e.setDepthStencilState(dss(write: false))
+              zv = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              let b = readback(c, bpp: 4)
+              print("fragment-less scissored depth write: left pixel", px(b, W, 2, 8), "(want green: depth 0 rejects the red), right pixel", px(b, W, 13, 8), "(want red: depth 1 accepts)")
+          }
+          // 3. Multisample depth resolve: 4x depth cleared to 0.25, resolve with sample0, read the resolved depth.
+          do {
+              let ms = tex(.depth32Float, W, H, samples: 4); let rs = tex(.depth32Float, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.depthAttachment.texture = ms; rp.depthAttachment.resolveTexture = rs; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 0.25; rp.depthAttachment.storeAction = .multisampleResolve; rp.depthAttachment.depthResolveFilter = .sample0
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!; e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("command buffer status after the depth resolve:", cb.status.rawValue, "error:", String(describing: cb.error))
+              let b = readback(rs, bpp: 4)
+              let v = b.withUnsafeBytes { $0.load(fromByteOffset: (8 * W + 8) * 4, as: Float.self) }
+              print("multisample depth resolve, resolved centre depth:", v, "(want 0.25)")
+          }
+          // 5. A depth plane nothing cleared: loaded DontCare on its first use, then a draw at 0.5 under lessEqual.
+          for df in [MTLPixelFormat.depth32Float_stencil8, .depth32Float] {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(df, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .dontCare; rp.depthAttachment.storeAction = .store
+              if df == .depth32Float_stencil8 { rp.stencilAttachment.texture = z; rp.stencilAttachment.loadAction = .dontCare; rp.stencilAttachment.storeAction = .store }
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso("tri", fs: "solid", color: .rgba8Unorm, depth: df, writeColor: true)); e.setDepthStencilState(dss(write: true))
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("uncleared depth (\(df == .depth32Float ? "D32F" : "D32F_S8"), DontCare load), draw at 0.5 lessEqual, centre pixel:", px(readback(c, bpp: 4), W, 8, 8), "(red = the plane read as far, blue = as near)")
+          }
+          // 6. The clear-quad shape on a combined depth-stencil attachment: viewport set, scissor to the
+          //    left half, a fragment-less pipeline that declares the stencil format, depth always/write,
+          //    then a red triangle at 0.5 under lessEqual over the full attachment. Once without and once
+          //    with an empty fragment function.
+          let src2 = """
+          #include <metal_stdlib>
+          using namespace metal;
+          fragment void nothing() {}
+          """
+          let lib2 = try! d.makeLibrary(source: src2, options: nil)
+          for withFragment in [false, true] {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float_stencil8, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 1, blue: 0, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .store
+              rp.stencilAttachment.texture = z; rp.stencilAttachment.loadAction = .dontCare; rp.stencilAttachment.storeAction = .store
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri")
+              p.fragmentFunction = withFragment ? lib2.makeFunction(name: "nothing") : nil
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm; p.colorAttachments[0].writeMask = []
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              let quad = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let pc = MTLRenderPipelineDescriptor()
+              pc.vertexFunction = lib.makeFunction(name: "tri"); pc.fragmentFunction = lib.makeFunction(name: "solid")
+              pc.colorAttachments[0].pixelFormat = .rgba8Unorm
+              pc.depthAttachmentPixelFormat = .depth32Float_stencil8; pc.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              let cover = try! d.makeRenderPipelineState(descriptor: pc)
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setViewport(MTLViewport(originX: 0, originY: 0, width: Double(W), height: Double(H), znear: 0, zfar: 1))
+              e.setRenderPipelineState(quad); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W / 2, height: H))
+              var zv: Float = 0.0; e.setVertexBytes(&zv, length: 4, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+              e.setScissorRect(MTLScissorRect(x: 0, y: 0, width: W, height: H))
+              e.setRenderPipelineState(cover); e.setDepthStencilState(dss(write: false))
+              zv = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              let b = readback(c, bpp: 4)
+              print("clear-quad shape on D32F_S8 (\(withFragment ? "empty fragment function" : "no fragment function")): left", px(b, W, 2, 8), "(want green) right", px(b, W, 13, 8), "(want red)")
+          }
+          // 7. A drawn multisample depth, resolved: 4x colour+depth pass cleared to 1.0, a triangle at 0.5
+          //    under always/write, store multisampleResolve on depth (sample0), then read the resolved depth.
+          do {
+              let msc = tex(.rgba8Unorm, W, H, samples: 4); let rsc = tex(.rgba8Unorm, W, H)
+              let ms = tex(.depth32Float_stencil8, W, H, samples: 4); let rs = tex(.depth32Float_stencil8, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = msc; rp.colorAttachments[0].resolveTexture = rsc; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].storeAction = .multisampleResolve
+              rp.depthAttachment.texture = ms; rp.depthAttachment.resolveTexture = rs; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .multisampleResolve; rp.depthAttachment.depthResolveFilter = .sample0
+              rp.stencilAttachment.texture = ms; rp.stencilAttachment.loadAction = .dontCare; rp.stencilAttachment.storeAction = .dontCare
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri"); p.fragmentFunction = lib.makeFunction(name: "solid")
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              p.rasterSampleCount = 4
+              let pso4 = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso4); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              print("command buffer status after the drawn depth resolve:", cb.status.rawValue, "error:", String(describing: cb.error))
+              let buf = d.makeBuffer(length: W * H * 4, options: [.storageModeShared])!
+              let cb2 = queue.makeCommandBuffer()!; let bl = cb2.makeBlitCommandEncoder()!
+              bl.copy(from: rs, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: W, height: H, depth: 1), to: buf, destinationOffset: 0, destinationBytesPerRow: W * 4, destinationBytesPerImage: W * H * 4, options: [.depthFromDepthStencil])
+              bl.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
+              let v = buf.contents().load(fromByteOffset: (8 * W + 8) * 4, as: Float.self)
+              print("drawn multisample depth resolve (D32F_S8), resolved centre depth:", v, "(want 0.5)")
+          }
+          // 8. A multisample depth stored by one pass and resolved by the next: pass A draws at 0.5 and
+          //    stores; pass B loads it with no colour attachment and no draw, store storeAndMultisampleResolve.
+          do {
+              let msc = tex(.rgba8Unorm, W, H, samples: 4)
+              let ms = tex(.depth32Float_stencil8, W, H, samples: 4); let rs = tex(.depth32Float_stencil8, W, H)
+              let a = MTLRenderPassDescriptor()
+              a.colorAttachments[0].texture = msc; a.colorAttachments[0].loadAction = .clear; a.colorAttachments[0].storeAction = .dontCare
+              a.depthAttachment.texture = ms; a.depthAttachment.loadAction = .clear; a.depthAttachment.clearDepth = 1.0; a.depthAttachment.storeAction = .store
+              a.stencilAttachment.texture = ms; a.stencilAttachment.loadAction = .dontCare; a.stencilAttachment.storeAction = .store
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri"); p.fragmentFunction = lib.makeFunction(name: "solid")
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              p.rasterSampleCount = 4
+              let pso4 = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let cb = queue.makeCommandBuffer()!
+              let e = cb.makeRenderCommandEncoder(descriptor: a)!
+              e.setRenderPipelineState(pso4); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
+              let b2 = MTLRenderPassDescriptor()
+              b2.depthAttachment.texture = ms; b2.depthAttachment.resolveTexture = rs; b2.depthAttachment.loadAction = .load; b2.depthAttachment.storeAction = .storeAndMultisampleResolve; b2.depthAttachment.depthResolveFilter = .sample0
+              b2.stencilAttachment.texture = ms; b2.stencilAttachment.loadAction = .load; b2.stencilAttachment.storeAction = .store
+              let e2 = cb.makeRenderCommandEncoder(descriptor: b2)!; e2.endEncoding()
+              cb.commit(); cb.waitUntilCompleted()
+              print("command buffer status after the cross-pass depth resolve:", cb.status.rawValue, "error:", String(describing: cb.error))
+              let buf = d.makeBuffer(length: W * H * 4, options: [.storageModeShared])!
+              let cb2 = queue.makeCommandBuffer()!; let bl = cb2.makeBlitCommandEncoder()!
+              bl.copy(from: rs, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: W, height: H, depth: 1), to: buf, destinationOffset: 0, destinationBytesPerRow: W * 4, destinationBytesPerImage: W * H * 4, options: [.depthFromDepthStencil])
+              bl.endEncoding(); cb2.commit(); cb2.waitUntilCompleted()
+              let v = buf.contents().load(fromByteOffset: (8 * W + 8) * 4, as: Float.self)
+              print("cross-pass multisample depth resolve (stored, then loaded and resolved), centre:", v, "(want 0.5)")
+          }
+          // 9. A resolve target loaded as an attachment by the next encoder of the same command buffer:
+          //    pass P stores the destination at 1.0, pass A draws a multisample depth at 0.5, pass B resolves
+          //    it into the destination, pass C loads the destination and draws red at 0.75 under less.
+          //    Red means the load saw 1.0 (the resolve was not seen), blue means it saw 0.5.
+          for withBlit in [false, true] {
+              let msc = tex(.rgba8Unorm, W, H, samples: 4); let c = tex(.rgba8Unorm, W, H)
+              let ms = tex(.depth32Float_stencil8, W, H, samples: 4); let rs = tex(.depth32Float_stencil8, W, H)
+              let cb = queue.makeCommandBuffer()!
+              let pp = MTLRenderPassDescriptor()
+              pp.depthAttachment.texture = rs; pp.depthAttachment.loadAction = .clear; pp.depthAttachment.clearDepth = 1.0; pp.depthAttachment.storeAction = .store
+              pp.stencilAttachment.texture = rs; pp.stencilAttachment.loadAction = .clear; pp.stencilAttachment.storeAction = .store
+              cb.makeRenderCommandEncoder(descriptor: pp)!.endEncoding()
+              let a = MTLRenderPassDescriptor()
+              a.colorAttachments[0].texture = msc; a.colorAttachments[0].loadAction = .clear; a.colorAttachments[0].storeAction = .dontCare
+              a.depthAttachment.texture = ms; a.depthAttachment.loadAction = .clear; a.depthAttachment.clearDepth = 1.0; a.depthAttachment.storeAction = .store
+              a.stencilAttachment.texture = ms; a.stencilAttachment.loadAction = .dontCare; a.stencilAttachment.storeAction = .store
+              let p = MTLRenderPipelineDescriptor()
+              p.vertexFunction = lib.makeFunction(name: "tri"); p.fragmentFunction = lib.makeFunction(name: "solid")
+              p.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p.depthAttachmentPixelFormat = .depth32Float_stencil8; p.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              p.rasterSampleCount = 4
+              let pso4 = try! d.makeRenderPipelineState(descriptor: p)
+              let always = MTLDepthStencilDescriptor(); always.depthCompareFunction = .always; always.isDepthWriteEnabled = true
+              let e = cb.makeRenderCommandEncoder(descriptor: a)!
+              e.setRenderPipelineState(pso4); e.setDepthStencilState(d.makeDepthStencilState(descriptor: always)!)
+              var zv: Float = 0.5; e.setVertexBytes(&zv, length: 4, index: 0); var col: [Float] = [1, 0, 0, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e.endEncoding()
+              let b2 = MTLRenderPassDescriptor()
+              b2.depthAttachment.texture = ms; b2.depthAttachment.resolveTexture = rs; b2.depthAttachment.loadAction = .load; b2.depthAttachment.storeAction = .storeAndMultisampleResolve; b2.depthAttachment.depthResolveFilter = .sample0
+              b2.stencilAttachment.texture = ms; b2.stencilAttachment.loadAction = .load; b2.stencilAttachment.storeAction = .store
+              cb.makeRenderCommandEncoder(descriptor: b2)!.endEncoding()
+              if withBlit { let bl = cb.makeBlitCommandEncoder()!; bl.endEncoding() }
+              let cc = MTLRenderPassDescriptor()
+              cc.colorAttachments[0].texture = c; cc.colorAttachments[0].loadAction = .clear; cc.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); cc.colorAttachments[0].storeAction = .store
+              cc.depthAttachment.texture = rs; cc.depthAttachment.loadAction = .load; cc.depthAttachment.storeAction = .store
+              cc.stencilAttachment.texture = rs; cc.stencilAttachment.loadAction = .load; cc.stencilAttachment.storeAction = .store
+              let p1 = MTLRenderPipelineDescriptor()
+              p1.vertexFunction = lib.makeFunction(name: "tri"); p1.fragmentFunction = lib.makeFunction(name: "solid")
+              p1.colorAttachments[0].pixelFormat = .rgba8Unorm
+              p1.depthAttachmentPixelFormat = .depth32Float_stencil8; p1.stencilAttachmentPixelFormat = .depth32Float_stencil8
+              let pso1 = try! d.makeRenderPipelineState(descriptor: p1)
+              let less = MTLDepthStencilDescriptor(); less.depthCompareFunction = .less; less.isDepthWriteEnabled = false
+              let e3 = cb.makeRenderCommandEncoder(descriptor: cc)!
+              e3.setRenderPipelineState(pso1); e3.setDepthStencilState(d.makeDepthStencilState(descriptor: less)!)
+              zv = 0.75; e3.setVertexBytes(&zv, length: 4, index: 0); e3.setFragmentBytes(&col, length: 16, index: 0)
+              e3.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); e3.endEncoding()
+              cb.commit(); cb.waitUntilCompleted()
+              print("resolve target loaded by the next encoder (\(withBlit ? "blit encoder between" : "no encoder between")):", px(readback(c, bpp: 4), W, 8, 8), "(blue = resolve seen, red = stale 1.0)")
+          }
+          // 4. A 15 px point at the centre: the pixel 5 px to the right must be covered.
+          do {
+              let c = tex(.rgba8Unorm, W, H); let z = tex(.depth32Float, W, H)
+              let rp = MTLRenderPassDescriptor()
+              rp.colorAttachments[0].texture = c; rp.colorAttachments[0].loadAction = .clear; rp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 1, alpha: 1); rp.colorAttachments[0].storeAction = .store
+              rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = .clear; rp.depthAttachment.clearDepth = 1.0; rp.depthAttachment.storeAction = .store
+              let cb = queue.makeCommandBuffer()!; let e = cb.makeRenderCommandEncoder(descriptor: rp)!
+              e.setRenderPipelineState(pso("pt", fs: "solid", color: .rgba8Unorm, depth: .depth32Float, writeColor: true)); e.setDepthStencilState(dss(write: true))
+              var col: [Float] = [1, 1, 1, 1]; e.setFragmentBytes(&col, length: 16, index: 0)
+              e.drawPrimitives(type: .point, vertexStart: 0, vertexCount: 1); e.endEncoding(); cb.commit(); cb.waitUntilCompleted()
+              let b = readback(c, bpp: 4)
+              print("15 px point: centre", px(b, W, 8, 8), "5 px right", px(b, W, 13, 8), "(want white, white)")
+          }
+          EOF
+          swift "$RUNNER_TEMP/depth.swift" || echo "depth probe failed with exit $?"
+      - name: Packed 16-bit texture (Apple-family only; expected to abort on Mac2)
+        run: |
+          cat > "$RUNNER_TEMP/packed.swift" <<'EOF'
+          import Metal
+          guard let d = MTLCreateSystemDefaultDevice() else { print("no device"); exit(3) }
+          let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .b5g6r5Unorm, width: 16, height: 16, mipmapped: false)
+          print("b5g6r5 texture: \(d.makeTexture(descriptor: desc) != nil)")
+          EOF
+          swift "$RUNNER_TEMP/packed.swift" || echo "packed 16-bit create failed with exit $?"

@@ -1,0 +1,411 @@
+//! Single source of truth for D3D9 → Metal depth/stencil-state translation.
+//!
+//! Mirrors `sampler_state` but for the depth/stencil test: one
+//! `DepthStencilSnapshot` drives both the cache `DepthStencilKey` and the
+//! native `DepthStencilDescription`, so a render state the
+//! classifier calls Consumed cannot reach one consumer and not the other.
+//! Per-field unit tests assert that mutating any snapshot field produces a
+//! different key.
+
+use std::fmt;
+
+use mtld3d_shared::mtl::{CompareFunc, StencilOp};
+use mtld3d_types::{
+    D3DCMP_ALWAYS, D3DRS_CCW_STENCILFAIL, D3DRS_CCW_STENCILFUNC, D3DRS_CCW_STENCILPASS,
+    D3DRS_CCW_STENCILZFAIL, D3DRS_STENCILENABLE, D3DRS_STENCILFAIL, D3DRS_STENCILFUNC,
+    D3DRS_STENCILMASK, D3DRS_STENCILPASS, D3DRS_STENCILWRITEMASK, D3DRS_STENCILZFAIL,
+    D3DRS_TWOSIDEDSTENCILMODE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE, D3DSTENCILOP_KEEP,
+    D3DSTENCILOP_REPLACE, RENDER_STATE_COUNT,
+};
+
+use crate::convert::{d3d_to_metal_cmp, d3d_to_metal_stencil_op};
+
+/// Packed-bits key for the depth-stencil state cache.
+///
+/// Lossless compression of the depth test plus both stencil faces into a
+/// single u64; see `key_from_snapshot` for the layout.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DepthStencilKey(u64);
+
+impl fmt::LowerHex for DepthStencilKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, f)
+    }
+}
+
+impl DepthStencilKey {
+    /// Inner u64.
+    ///
+    /// Used as the descriptor-side label payload at `CreateDepthStencilState`
+    /// thunk time.
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+/// One face of the D3D9 stencil test, as raw `D3DCMP_*` / `D3DSTENCILOP_*` values.
+///
+/// D3D9 stores these as DWORDs but every value is a small enum, so the
+/// snapshot narrows them to `u8` and stays cheap to carry per draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct StencilFaceState {
+    pub func: u8,
+    pub fail_op: u8,
+    pub depth_fail_op: u8,
+    pub pass_op: u8,
+}
+
+/// Stencil mask width the attachment can actually observe.
+///
+/// The only stencil format in play is `Depth32Float_Stencil8`, so mask bits
+/// above the low 8 cannot change the test result.
+pub const STENCIL_MASK_BITS: u32 = 0xFF;
+
+/// `D3DCMP_ALWAYS` / `D3DSTENCILOP_KEEP` at the snapshot's narrow width.
+///
+/// Literals rather than casts so the surrounding `const` items stay free of
+/// truncating `as`; the asserts pin them to the ABI constants.
+const CMP_ALWAYS: u8 = 8;
+const OP_KEEP: u8 = 1;
+const OP_REPLACE: u8 = 3;
+const _: () = assert!(CMP_ALWAYS as u32 == D3DCMP_ALWAYS);
+const _: () = assert!(OP_KEEP as u32 == D3DSTENCILOP_KEEP);
+const _: () = assert!(OP_REPLACE as u32 == D3DSTENCILOP_REPLACE);
+
+/// The D3D9 default face: always compare, never modify.
+///
+/// What the fixed-state constructors below give both faces.
+const KEEP_FACE: StencilFaceState = StencilFaceState {
+    func: CMP_ALWAYS,
+    fail_op: OP_KEEP,
+    depth_fail_op: OP_KEEP,
+    pass_op: OP_KEEP,
+};
+
+/// Writes the reference to every fragment, whatever the depth test did.
+const REPLACE_FACE: StencilFaceState = StencilFaceState {
+    func: CMP_ALWAYS,
+    fail_op: OP_REPLACE,
+    depth_fail_op: OP_REPLACE,
+    pass_op: OP_REPLACE,
+};
+
+/// Input view of the render states that select an `MTLDepthStencilState`.
+///
+/// Raw D3D values preserve 1:1 fidelity with the game input. Both
+/// `key_from_snapshot` and `description_from_snapshot` translate them through the
+/// same `convert` helpers, so a state can never be keyed as one thing and
+/// built as another. `D3DRS_STENCILREF` is absent by
+/// design: Metal carries the reference value on the encoder
+/// (`setStencilReferenceValue`), not on the state object, so folding it in
+/// here would mint a distinct Metal object per reference value.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(4))]
+pub struct DepthStencilSnapshot {
+    pub depth_enable: u8,
+    pub depth_write: u8,
+    pub depth_func: u8,
+    pub stencil_enable: u8,
+    pub front: StencilFaceState,
+    /// Back face, already resolved against `D3DRS_TWOSIDEDSTENCILMODE`.
+    ///
+    /// D3D9 applies the `D3DRS_CCW_STENCIL*` states only while two-sided mode
+    /// is on; with it off both faces take the front-face states.
+    pub back: StencilFaceState,
+    /// `D3DRS_STENCILMASK`, as the game set it.
+    ///
+    /// Kept full-width because the D3D9 masks are unbounded DWORDs, unlike
+    /// the enum-valued states. `key_from_snapshot` and `description_from_snapshot`
+    /// both apply `STENCIL_MASK_BITS`, so the key and the Metal object are
+    /// still built from one value.
+    pub read_mask: u32,
+    /// `D3DRS_STENCILWRITEMASK`, as the game set it.
+    pub write_mask: u32,
+}
+
+// Written out rather than derived because the encoder compares each draw's
+// snapshot with the previous one: the derived compare tests every byte with
+// a branch, while `snapshot_words` reads the 20 bytes as three words.
+impl PartialEq for DepthStencilSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        snapshot_words(self) == snapshot_words(other)
+    }
+}
+
+impl Eq for DepthStencilSnapshot {}
+
+impl DepthStencilSnapshot {
+    /// Depth and stencil both inert.
+    ///
+    /// The state for a helper draw that must leave the attachment untouched.
+    #[must_use]
+    pub const fn inert() -> Self {
+        Self {
+            depth_enable: 0,
+            depth_write: 0,
+            depth_func: CMP_ALWAYS,
+            stencil_enable: 0,
+            front: KEEP_FACE,
+            back: KEEP_FACE,
+            read_mask: 0,
+            write_mask: 0,
+        }
+    }
+
+    /// Depth written unconditionally, stencil inert: the depth clear quad.
+    #[must_use]
+    pub const fn depth_overwrite() -> Self {
+        Self {
+            depth_enable: 1,
+            depth_write: 1,
+            ..Self::inert()
+        }
+    }
+
+    /// Stencil overwritten with the reference, depth untouched.
+    ///
+    /// The state for the stencil clear quad.
+    ///
+    /// MSL cannot export a stencil value, so the clear writes through the
+    /// stencil operation instead: compare `Always` and `Replace` on every
+    /// outcome, with the clear value supplied as the encoder's stencil
+    /// reference. `read_mask` is irrelevant under an always-true compare.
+    #[must_use]
+    pub const fn stencil_overwrite() -> Self {
+        Self {
+            stencil_enable: 1,
+            front: REPLACE_FACE,
+            back: REPLACE_FACE,
+            read_mask: 0,
+            write_mask: STENCIL_MASK_BITS,
+            ..Self::inert()
+        }
+    }
+
+    /// Depth and stencil both overwritten: the combined `Clear(ZBUFFER | STENCIL)` quad.
+    ///
+    /// `depth_overwrite` and `stencil_overwrite` in one state, so a mid-frame
+    /// clear of both planes is a single draw.
+    #[must_use]
+    pub const fn depth_stencil_overwrite() -> Self {
+        Self {
+            depth_enable: 1,
+            depth_write: 1,
+            ..Self::stencil_overwrite()
+        }
+    }
+
+    /// Drop the stencil test when the bound attachment carries no stencil plane.
+    ///
+    /// An app can leave `D3DRS_STENCILENABLE` set from an earlier pass and then
+    /// bind a depth-only surface (D16 / D24X8 / D32). A stencil-enabled
+    /// `MTLDepthStencilState` against a render pass with no stencil attachment
+    /// is a Metal validation failure.
+    #[must_use]
+    pub const fn gated_on_stencil_attachment(mut self, attachment_has_stencil: bool) -> Self {
+        if !attachment_has_stencil {
+            self.stencil_enable = 0;
+        }
+        self
+    }
+
+    /// Whether a draw under this state reads or writes the depth plane.
+    ///
+    /// `D3DRS_ZENABLE` alone does not decide it: a test that always passes
+    /// with `D3DRS_ZWRITEENABLE` off reads no depth value and changes none,
+    /// the state `WoW` draws its interface and glow passes with.
+    #[must_use]
+    pub fn uses_depth(&self) -> bool {
+        self.depth_enable != 0
+            && (self.depth_write != 0
+                || d3d_to_metal_cmp(u32::from(self.depth_func)) != CompareFunc::Always)
+    }
+}
+
+/// Build a `DepthStencilSnapshot` from the device's render-state array.
+///
+/// The enum-valued states come through [`crate::render_state::enum_value`], so
+/// a game value outside a state's enum space reads as that state's D3D9
+/// default rather than as a byte of it.
+#[must_use]
+pub fn snapshot_from_state(rs: &[u32; RENDER_STATE_COUNT]) -> DepthStencilSnapshot {
+    let enum_rs = |state: u32| crate::render_state::enum_value(rs, state);
+    let front = StencilFaceState {
+        func: enum_rs(D3DRS_STENCILFUNC),
+        fail_op: enum_rs(D3DRS_STENCILFAIL),
+        depth_fail_op: enum_rs(D3DRS_STENCILZFAIL),
+        pass_op: enum_rs(D3DRS_STENCILPASS),
+    };
+    let back = if rs[D3DRS_TWOSIDEDSTENCILMODE as usize] == 0 {
+        front
+    } else {
+        StencilFaceState {
+            func: enum_rs(D3DRS_CCW_STENCILFUNC),
+            fail_op: enum_rs(D3DRS_CCW_STENCILFAIL),
+            depth_fail_op: enum_rs(D3DRS_CCW_STENCILZFAIL),
+            pass_op: enum_rs(D3DRS_CCW_STENCILPASS),
+        }
+    };
+    DepthStencilSnapshot {
+        depth_enable: u8::from(rs[D3DRS_ZENABLE as usize] != 0),
+        depth_write: u8::from(rs[D3DRS_ZWRITEENABLE as usize] != 0),
+        depth_func: enum_rs(D3DRS_ZFUNC),
+        stencil_enable: u8::from(rs[D3DRS_STENCILENABLE as usize] != 0),
+        front,
+        back,
+        read_mask: rs[D3DRS_STENCILMASK as usize],
+        write_mask: rs[D3DRS_STENCILWRITEMASK as usize],
+    }
+}
+
+/// Pack a snapshot into the depth/stencil cache key.
+///
+/// Layout (u64 low-to-high):
+/// - 0      `depth_enable`
+/// - 1      `depth_write`
+/// - 2..4   `depth_func`
+/// - 5      `stencil_enable`
+/// - 6..17  front face (`func`, `fail_op`, `depth_fail_op`, `pass_op`, 3 bits each)
+/// - 18..29 back face, same order
+/// - 30..37 `read_mask`
+/// - 38..45 `write_mask`
+///
+/// The enum fields are packed after translation, not as the raw D3D values.
+/// `SetRenderState` takes any DWORD, and two values that differ only above the
+/// field width would otherwise share a key while translating to different
+/// Metal enums, so the second state to arrive would be served the first one's
+/// object.
+///
+/// Each disabled test folds its own fields to zero. Without that, every
+/// (write, func) combination behind `depth_enable == 0` would be a distinct
+/// key aliasing the one Metal object the unix side builds for disabled depth,
+/// and teardown would release it once per key.
+#[must_use]
+pub fn key_from_snapshot(s: &DepthStencilSnapshot) -> DepthStencilKey {
+    let mut bits = 0u64;
+    if s.depth_enable != 0 {
+        bits |= 1
+            | u64::from(s.depth_write != 0) << 1
+            | ((d3d_to_metal_cmp(u32::from(s.depth_func)) as u64) << 2);
+    }
+    if s.stencil_enable != 0 {
+        bits |= 1 << 5
+            | (pack_face(s.front) << 6)
+            | (pack_face(s.back) << 18)
+            | (u64::from(s.read_mask & STENCIL_MASK_BITS) << 30)
+            | (u64::from(s.write_mask & STENCIL_MASK_BITS) << 38);
+    }
+    DepthStencilKey(bits)
+}
+
+fn pack_face(f: StencilFaceState) -> u64 {
+    (d3d_to_metal_cmp(u32::from(f.func)) as u64)
+        | ((d3d_to_metal_stencil_op(u32::from(f.fail_op)) as u64) << 3)
+        | ((d3d_to_metal_stencil_op(u32::from(f.depth_fail_op)) as u64) << 6)
+        | ((d3d_to_metal_stencil_op(u32::from(f.pass_op)) as u64) << 9)
+}
+
+/// Translated operations for one native stencil face.
+///
+/// Copy permits value-based Metal descriptor construction; equality checks pin
+/// the front/back resolution rules in the existing snapshot tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StencilFaceDescription {
+    pub compare_func: CompareFunc,
+    pub stencil_fail_op: StencilOp,
+    pub depth_fail_op: StencilOp,
+    pub pass_op: StencilOp,
+}
+
+/// Resolved native stencil inputs, present only when stencil testing is enabled.
+pub struct StencilDescription {
+    pub front: StencilFaceDescription,
+    pub back: StencilFaceDescription,
+    pub read_mask: u32,
+    pub write_mask: u32,
+}
+
+/// Resolved native depth/stencil inputs, independent of device and output ownership.
+pub struct DepthStencilDescription {
+    pub depth_compare_func: CompareFunc,
+    pub depth_write_enable: bool,
+    pub stencil: Option<StencilDescription>,
+    pub id: u64,
+}
+
+/// Translate a snapshot into native depth/stencil inputs.
+#[must_use]
+pub fn description_from_snapshot(
+    s: &DepthStencilSnapshot,
+    key: DepthStencilKey,
+) -> DepthStencilDescription {
+    let depth_compare_func = d3d_to_metal_cmp(u32::from(s.depth_func));
+    let front = face_params(s.front);
+    let back = face_params(s.back);
+    DepthStencilDescription {
+        depth_compare_func: if s.depth_enable != 0 {
+            depth_compare_func
+        } else {
+            CompareFunc::Always
+        },
+        depth_write_enable: s.depth_enable != 0 && s.depth_write != 0,
+        stencil: (s.stencil_enable != 0).then_some(StencilDescription {
+            front,
+            back,
+            read_mask: s.read_mask & STENCIL_MASK_BITS,
+            write_mask: s.write_mask & STENCIL_MASK_BITS,
+        }),
+        id: key.raw(),
+    }
+}
+
+fn face_params(f: StencilFaceState) -> StencilFaceDescription {
+    StencilFaceDescription {
+        compare_func: d3d_to_metal_cmp(u32::from(f.func)),
+        stencil_fail_op: d3d_to_metal_stencil_op(u32::from(f.fail_op)),
+        depth_fail_op: d3d_to_metal_stencil_op(u32::from(f.depth_fail_op)),
+        pass_op: d3d_to_metal_stencil_op(u32::from(f.pass_op)),
+    }
+}
+
+/// The 20 bytes of a snapshot as three words, in layout order; equal words mean equal snapshots.
+///
+/// The destructuring names every field, so a field added later fails to
+/// compile here instead of escaping the compare.
+fn snapshot_words(snapshot: &DepthStencilSnapshot) -> [u64; 3] {
+    let DepthStencilSnapshot {
+        depth_enable,
+        depth_write,
+        depth_func,
+        stencil_enable,
+        front,
+        back,
+        read_mask,
+        write_mask,
+    } = snapshot;
+    [
+        u64::from(*depth_enable)
+            | u64::from(*depth_write) << 8
+            | u64::from(*depth_func) << 16
+            | u64::from(*stencil_enable) << 24
+            | u64::from(face_word(*front)) << 32,
+        u64::from(face_word(*back)) | u64::from(*read_mask) << 32,
+        u64::from(*write_mask),
+    ]
+}
+
+/// One stencil face as a word, in layout order.
+const fn face_word(face: StencilFaceState) -> u32 {
+    let StencilFaceState {
+        func,
+        fail_op,
+        depth_fail_op,
+        pass_op,
+    } = face;
+    u32::from_le_bytes([func, fail_op, depth_fail_op, pass_op])
+}
+
+#[cfg(test)]
+mod tests;

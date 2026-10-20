@@ -1,0 +1,197 @@
+//! Size, alignment and field-offset checks for live PE/Unix records.
+//!
+//! Native-only descriptions have no cross-target layout contract. Pass flag
+//! tests also preserve ordinary and volume attachment encodings.
+
+use super::{
+    BufferCreateDesc, DestroyResourcesBulkParams, ExtraColorDesc, LoadAction, MetalHandle,
+    PassDescriptor, StoreAction, TextureCreateDesc,
+};
+
+#[test]
+fn buffer_param_layouts_match_wow64() {
+    // All thunk params must be 8-byte aligned and contain only u32/u64
+    // fields so 32-bit PE and 64-bit Unix agree on layout.
+    assert_eq!(core::mem::align_of::<BufferCreateDesc>(), 8);
+    assert_eq!(core::mem::align_of::<DestroyResourcesBulkParams>(), 8);
+
+    // Sizes: sum of fields with repr(C, align(8)) padding:
+    //   BufferCreateDesc           = 8 + 8 + 8 + 4 + 4     = 32
+    //   DestroyResourcesBulkParams = 4 + 4 + 8 + 4 + 4     = 24
+    assert_eq!(core::mem::size_of::<BufferCreateDesc>(), 32);
+    assert_eq!(core::mem::size_of::<DestroyResourcesBulkParams>(), 24);
+}
+
+#[test]
+fn attach_metal_layer_layout() {
+    use super::AttachMetalLayerParams;
+    // 2*u64 + 2*u32 + 2*u64 + 2*u32 + 1*u32 + 1*ColorSpacePolicy
+    // + 2*u32 + 1*u64 + 1*SoftwareCursorPolicy + 1*u32 + 2*u64
+    // = 16 + 8 + 16 + 8 + 4 + 4 + 8 + 8 + 4 + 4 + 16 = 96 (the 4-byte
+    // fields pair up on both sides of each u64, so nothing needs a pad).
+    assert_eq!(core::mem::align_of::<AttachMetalLayerParams>(), 8);
+    assert_eq!(core::mem::size_of::<AttachMetalLayerParams>(), 96);
+    assert_eq!(
+        core::mem::offset_of!(AttachMetalLayerParams, client_surface_request_ptr),
+        88
+    );
+}
+
+#[test]
+fn present_client_surface_layout() {
+    use super::PresentClientSurfaceParams;
+    // 1*MetalHandle + 1*ClientSurfaceRequest + 1*u32 pad = 8 + 4 + 4 = 16
+    assert_eq!(core::mem::align_of::<PresentClientSurfaceParams>(), 8);
+    assert_eq!(core::mem::size_of::<PresentClientSurfaceParams>(), 16);
+    assert_eq!(
+        core::mem::offset_of!(PresentClientSurfaceParams, reasons),
+        8
+    );
+}
+
+#[test]
+fn set_cursor_overlay_layout() {
+    use super::SetCursorOverlayParams;
+    // 2*u64 + 7*u32 + 1*CursorOverlayFlags + 1*MetalHandle = 16 + 28 + 4 + 8 = 56
+    assert_eq!(core::mem::align_of::<SetCursorOverlayParams>(), 8);
+    assert_eq!(core::mem::size_of::<SetCursorOverlayParams>(), 56);
+    assert_eq!(
+        core::mem::offset_of!(SetCursorOverlayParams, view_handle),
+        48
+    );
+}
+
+#[test]
+fn open_log_layout() {
+    use super::OpenLogParams;
+    // 2*u64 + 4*u32 = 16 + 16 = 32
+    assert_eq!(core::mem::align_of::<OpenLogParams>(), 8);
+    assert_eq!(core::mem::size_of::<OpenLogParams>(), 32);
+}
+
+#[test]
+fn blit_texture_to_buffer_layout() {
+    use super::BlitTextureToBufferParams;
+    // 3*u64 (handles) + 2*u64 (dst ptr/len) + 10*u32
+    // = 24 + 16 + 40 = 80, a multiple of the align-8.
+    assert_eq!(core::mem::align_of::<BlitTextureToBufferParams>(), 8);
+    assert_eq!(core::mem::size_of::<BlitTextureToBufferParams>(), 96);
+}
+
+#[test]
+fn present_sync_param_layouts_match_wow64() {
+    use super::SetPresentWaitPolicyParams;
+    // 8 record_handle + 4 policy + 4 pad0 = 16
+    assert_eq!(core::mem::align_of::<SetPresentWaitPolicyParams>(), 8);
+    assert_eq!(core::mem::size_of::<SetPresentWaitPolicyParams>(), 16);
+}
+
+#[test]
+fn create_command_queue_layout_matches_wow64() {
+    use super::CreateCommandQueueParams;
+    // 8 device_handle + 8 record_handle + 4 unified_memory
+    // + 4 min_linear_texture_align + 8 gate_file_ptr + 4 gate_file_len
+    // + 4 present_debug = 40
+    assert_eq!(core::mem::align_of::<CreateCommandQueueParams>(), 8);
+    assert_eq!(core::mem::size_of::<CreateCommandQueueParams>(), 40);
+    assert_eq!(
+        core::mem::offset_of!(CreateCommandQueueParams, gate_file_ptr),
+        24
+    );
+    assert_eq!(
+        core::mem::offset_of!(CreateCommandQueueParams, present_debug),
+        36
+    );
+}
+
+#[test]
+fn frame_param_layouts_match_wow64() {
+    assert_eq!(core::mem::align_of::<PassDescriptor>(), 8);
+    assert_eq!(core::mem::align_of::<TextureCreateDesc>(), 8);
+
+    // PassDescriptor: 6 * u64 + 16 * u32 + 3 * ExtraColorDesc = 48 + 64 + 96 = 208.
+    assert_eq!(core::mem::size_of::<PassDescriptor>(), 208);
+    // ExtraColorDesc: 8 texture + 8 resolve + 4 subresource + 4 load + 4 store
+    // + 4 reserved = 32.
+    assert_eq!(core::mem::size_of::<ExtraColorDesc>(), 32);
+
+    // TextureCreateDesc:
+    //   8 tex_id
+    //   + 4 width + 4 height + 4 depth + 4 levels (16)
+    //   + 4 pixel_format + 4 storage_mode + 4 flags + 4 swizzle_r (16)
+    //   + 4 swizzle_g + 4 swizzle_b + 4 swizzle_a + 4 usage_flags (16)
+    //   = 56
+    assert_eq!(core::mem::size_of::<TextureCreateDesc>(), 56);
+}
+
+#[test]
+fn pass_descriptor_flags_preserve_ordinary_pass_bytes() {
+    assert_eq!(PassDescriptor::pack_flags(false, 0, 0, 0), 0);
+    assert_eq!(PassDescriptor::pack_flags(true, 0, 0, 0), 1);
+    assert_eq!(
+        PassDescriptor::pack_flags(true, 5, 9, 3),
+        1 | (5 << 1) | (9 << 12) | (3 << 16)
+    );
+    assert_eq!(core::mem::size_of::<PassDescriptor>(), 208);
+}
+
+/// A blit-only descriptor carrying `pass_flags`, for reading the flags back.
+fn pass_with_flags(pass_flags: u32) -> PassDescriptor {
+    PassDescriptor {
+        color_texture: MetalHandle::NULL,
+        color_resolve_texture: MetalHandle::NULL,
+        depth_texture: MetalHandle::NULL,
+        commands_ptr: 0,
+        visibility_result_buffer: MetalHandle::NULL,
+        leading_blits_ptr: 0,
+        color_load_action: LoadAction::DontCare,
+        color_store_action: StoreAction::DontCare,
+        clear_r: 0,
+        clear_g: 0,
+        clear_b: 0,
+        clear_a: 0,
+        depth_load_action: LoadAction::DontCare,
+        depth_store_action: StoreAction::DontCare,
+        depth_clear_value: 0,
+        stencil_load_action: LoadAction::DontCare,
+        stencil_store_action: StoreAction::DontCare,
+        stencil_clear_value: 0,
+        command_count: 0,
+        leading_blits_count: 0,
+        pass_flags,
+        reserved: 0,
+        extra_color: [ExtraColorDesc::NONE; 3],
+    }
+}
+
+#[test]
+fn pass_descriptor_flags_round_trip_every_volume_depth_plane() {
+    // An upload pass writes one volume depth plane per pass, up to
+    // `MaxVolumeExtent` (2048) planes deep.
+    assert_eq!(PassDescriptor::MAX_COLOR_SLICE, 2047);
+    for slice in [0, 7, 8, 9, 15, 255, 256, 2047] {
+        let pass = pass_with_flags(PassDescriptor::pack_flags(true, slice, 15, 15));
+        assert_eq!(pass.color_slice(), slice);
+        assert_eq!(pass.color_level(), 15);
+        assert_eq!(pass.depth_level(), 15);
+        assert!(pass.leading_blits_need_encoder());
+        let pass = pass_with_flags(PassDescriptor::pack_flags(false, slice, 0, 0));
+        assert_eq!(pass.color_slice(), slice);
+        assert_eq!((pass.color_level(), pass.depth_level()), (0, 0));
+        assert!(!pass.leading_blits_need_encoder());
+    }
+}
+
+#[test]
+fn depth_transfer_layouts_match_wow64() {
+    use super::BlitTextureToBufferParams;
+    assert_eq!(core::mem::size_of::<BlitTextureToBufferParams>(), 96);
+    assert_eq!(
+        core::mem::offset_of!(BlitTextureToBufferParams, stencil_offset),
+        8
+    );
+    assert_eq!(
+        core::mem::offset_of!(BlitTextureToBufferParams, record_handle),
+        16
+    );
+}

@@ -1,0 +1,1703 @@
+//! Unit tests for the texture-staging decisions.
+//!
+//! Several cases per arm of `decide_lock_action`: flag priority, the uncontended shortcut,
+//! `D3DLOCK_DISCARD` where it is honoured (a whole-mip Lock of a default-pool texture) and
+//! where it is dropped (a partial Lock, the managed and system-memory pools), and whole-mip
+//! renames preserving whichever pool the texture is in. A partial Lock under a reader follows
+//! the staging-write rule: in place only under an unseen upload of the frame being recorded,
+//! which one case pins against every combination of the facts, and an unaligned compressed
+//! rect always preserves, since the encoder widens its read to the whole mip.
+//! `D3DLOCK_NOOVERWRITE` is no texture lock flag, and one case pins that adding it never
+//! changes a verdict. The `honoured_lock_flags` cases pin the DISCARD conditions on their own
+//! and the NOOVERWRITE drop on every lock. The `texture_lock_offset`
+//! cases pin block-row arithmetic: a pixel-row index times a block-row pitch runs past the end.
+//! The `staging_droppable_class` cases walk the pool, usage and shape combinations, since every
+//! class outside the one that releases is a level whose only copy of some byte is the staging.
+//! The `decide_staging_write` cases walk every combination of the write facts and pin the frame
+//! rule on its own. The `staging_lazy_class` cases pin that only a default-pool 2D
+//! render-target texture starts without staging. The `snapshot_box` cases pin the box
+//! offset, block rows and pitch alignment and the boxes left to the staging, and the
+//! `copy_rows` cases the strides and the bounds a copy refuses.
+
+use std::sync::Arc;
+
+use mtld3d_types::{D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM};
+
+use super::*;
+use crate::{
+    page_box::{PageBox, PageBoxRead},
+    upload_recovery::{MAX_REISSUE_ATTEMPTS, UploadFate, UploadRecoveryQueue},
+};
+
+const DEFAULT_FLAGS: u32 = 0;
+const NO_USAGE: u32 = 0;
+const RETIRED_SEQ: u64 = 10;
+const IN_FLIGHT_SEQ: u64 = 20;
+const COHERENT: u64 = 15;
+
+// 256×256 mip in pixel coords; uncompressed unless overridden.
+const MIP_W: u32 = 256;
+const MIP_H: u32 = 256;
+const RECOVERY_BYTES: usize = 4 * 4 * 4;
+const RECOVERY_SHAPE: MipShape = MipShape {
+    mip_w: 4,
+    mip_h: 4,
+    block_w: 1,
+    block_h: 1,
+};
+
+fn recovery_staging(value: u8) -> Arc<PageBox> {
+    let mut backing = PageBox::new_zeroed(RECOVERY_BYTES);
+    // SAFETY: the unique allocation holds RECOVERY_BYTES initialized bytes.
+    unsafe { backing.as_mut_ptr().write_bytes(value, RECOVERY_BYTES) };
+    Arc::new(backing)
+}
+
+fn recovery_bytes(backing: &PageBox) -> Vec<u8> {
+    // SAFETY: the test initializes every logical byte and accesses them serially.
+    unsafe { std::slice::from_raw_parts(backing.as_ptr(), RECOVERY_BYTES) }.to_vec()
+}
+
+/// The write facts of pages an upload of an earlier frame may still read, or none.
+fn readers(has_readers: bool) -> StagingWrite {
+    let mut write = StagingWrite::empty();
+    write.set(StagingWrite::HAS_READERS, has_readers);
+    write
+}
+
+fn write_retired_staging(backing: &mut Arc<PageBox>, original_seq: u64, retired: u64) {
+    let contended = is_in_flight(original_seq, retired) || backing.has_readers();
+    let action = decide_lock_action(
+        &readers(contended),
+        0,
+        D3DPOOL_MANAGED,
+        None,
+        RECOVERY_SHAPE,
+    );
+    if let LockAction::FreshBox { preserve } = action {
+        assert_eq!(preserve, PreserveKind::Cpu);
+        let mut fresh = PageBox::new_zeroed(RECOVERY_BYTES);
+        // SAFETY: distinct initialized allocations with equal logical lengths.
+        unsafe {
+            std::ptr::copy_nonoverlapping(backing.as_ptr(), fresh.as_mut_ptr(), RECOVERY_BYTES);
+        }
+        assert_eq!(recovery_bytes(&fresh), recovery_bytes(backing));
+        *backing = Arc::new(fresh);
+    }
+    // SAFETY: accesses are serial and this allocation holds RECOVERY_BYTES initialized bytes.
+    unsafe {
+        backing
+            .as_ptr()
+            .cast_mut()
+            .write_bytes(0x22, RECOVERY_BYTES);
+    };
+}
+
+#[test]
+fn failed_upload_preserves_bytes_before_recovery_runs() {
+    let mut backing = recovery_staging(0x11);
+    let mut queue = UploadRecoveryQueue::new();
+    queue.push(1, 5, PageBoxRead::new(Arc::clone(&backing)));
+    write_retired_staging(&mut backing, 5, 5);
+    let entries = queue.settle(5, 5);
+    assert_eq!(entries[0].0, UploadFate::Reissue);
+    assert_eq!(
+        recovery_bytes(entries[0].1.payload().backing()),
+        vec![0x11; RECOVERY_BYTES]
+    );
+}
+
+#[test]
+fn requeued_upload_preserves_bytes_after_original_retirement() {
+    let mut backing = recovery_staging(0x11);
+    let mut queue = UploadRecoveryQueue::new();
+    queue.push(1, 5, PageBoxRead::new(Arc::clone(&backing)));
+    let (fate, entry) = queue.settle(5, 5).pop().expect("one upload");
+    assert_eq!(fate, UploadFate::Reissue);
+    queue.requeue(entry, 6);
+    write_retired_staging(&mut backing, 5, 5);
+    let entries = queue.settle(6, 5);
+    assert_eq!(entries[0].0, UploadFate::Released);
+    assert_eq!(
+        recovery_bytes(entries[0].1.payload().backing()),
+        vec![0x11; RECOVERY_BYTES]
+    );
+}
+
+#[test]
+fn poisoned_newer_upload_preserves_bytes_after_its_successful_retirement() {
+    let mut backing = recovery_staging(0x11);
+    let mut queue = UploadRecoveryQueue::new();
+    queue.push(1, 5, PageBoxRead::new(recovery_staging(0x33)));
+    queue.push(1, 6, PageBoxRead::new(Arc::clone(&backing)));
+    for (fate, entry) in queue.settle(6, 5) {
+        assert_eq!(fate, UploadFate::Reissue);
+        queue.requeue(entry, 7);
+    }
+    write_retired_staging(&mut backing, 6, 6);
+    let entries = queue.settle(7, 5);
+    assert_eq!(
+        recovery_bytes(entries[1].1.payload().backing()),
+        vec![0x11; RECOVERY_BYTES]
+    );
+}
+
+#[test]
+fn successful_but_replayable_upload_preserves_bytes_before_a_later_failure() {
+    let mut backing = recovery_staging(0x11);
+    let mut queue = UploadRecoveryQueue::new();
+    queue.push(1, 5, PageBoxRead::new(Arc::clone(&backing)));
+    write_retired_staging(&mut backing, 5, 5);
+    let entries = queue.settle(6, 6);
+    assert_eq!(entries[0].0, UploadFate::Reissue);
+    assert_eq!(
+        recovery_bytes(entries[0].1.payload().backing()),
+        vec![0x11; RECOVERY_BYTES]
+    );
+}
+
+#[test]
+fn abandoned_unretired_replay_keeps_its_emitted_reader() {
+    let mut backing = recovery_staging(0x11);
+    let mut queue = UploadRecoveryQueue::new();
+    queue.push(1, 1, PageBoxRead::new(Arc::clone(&backing)));
+    let mut seq = 1;
+    for _ in 0..MAX_REISSUE_ATTEMPTS {
+        let (fate, entry) = queue.settle(seq, seq).pop().expect("retry");
+        assert_eq!(fate, UploadFate::Reissue);
+        seq += 1;
+        queue.requeue(entry, seq);
+    }
+    let emitted = PageBoxRead::new(Arc::clone(&backing));
+    let entries = queue.settle(seq - 1, seq);
+    assert_eq!(entries[0].0, UploadFate::Abandoned);
+    drop(entries);
+    write_retired_staging(&mut backing, 1, seq - 1);
+    assert_eq!(
+        recovery_bytes(emitted.backing()),
+        vec![0x11; RECOVERY_BYTES]
+    );
+}
+
+#[test]
+fn declined_replay_keeps_an_earlier_emitted_reader() {
+    let mut backing = recovery_staging(0x11);
+    let mut queue = UploadRecoveryQueue::new();
+    queue.push(1, 5, PageBoxRead::new(Arc::clone(&backing)));
+    let emitted = PageBoxRead::new(Arc::clone(&backing));
+    let entries = queue.settle(4, 5);
+    assert_eq!(entries[0].0, UploadFate::Reissue);
+    drop(entries);
+    write_retired_staging(&mut backing, 5, 5);
+    assert_eq!(
+        recovery_bytes(emitted.backing()),
+        vec![0x11; RECOVERY_BYTES]
+    );
+}
+
+#[test]
+fn acknowledged_upload_reuses_staging_with_a_cached_wrapper() {
+    let mut backing = recovery_staging(0x11);
+    let cached = Arc::clone(&backing);
+    let pointer = backing.as_ptr();
+    let mut queue = UploadRecoveryQueue::new();
+    queue.push(1, 5, PageBoxRead::new(Arc::clone(&backing)));
+    let emitted = PageBoxRead::new(Arc::clone(&backing));
+    drop(queue.settle(5, 0));
+    assert!(backing.has_readers());
+    drop(emitted);
+    assert!(!backing.has_readers());
+    write_retired_staging(&mut backing, 5, 5);
+    assert_eq!(backing.as_ptr(), pointer);
+    assert_eq!(recovery_bytes(&cached), vec![0x22; RECOVERY_BYTES]);
+}
+
+#[test]
+fn replayable_readers_keep_flag_and_partial_lock_contracts() {
+    let backing = recovery_staging(0x11);
+    let _read = PageBoxRead::new(Arc::clone(&backing));
+    assert_eq!(
+        decide_lock_action(
+            &readers(backing.has_readers()),
+            D3DLOCK_READONLY,
+            D3DPOOL_DEFAULT,
+            None,
+            RECOVERY_SHAPE
+        ),
+        LockAction::WriteInPlace
+    );
+    // NOOVERWRITE is no texture lock flag: the lock preserves like a plain one.
+    assert_eq!(
+        decide_lock_action(
+            &readers(backing.has_readers()),
+            D3DLOCK_NOOVERWRITE,
+            D3DPOOL_DEFAULT,
+            None,
+            RECOVERY_SHAPE
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+    assert_eq!(
+        decide_lock_action(
+            &readers(backing.has_readers()),
+            D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            None,
+            RECOVERY_SHAPE
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::None
+        }
+    );
+    assert_eq!(
+        decide_lock_action(
+            &readers(backing.has_readers()),
+            D3DLOCK_DISCARD,
+            D3DPOOL_MANAGED,
+            None,
+            RECOVERY_SHAPE
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+    let partial = Some(DirtyRect {
+        x: 1,
+        y: 1,
+        w: 2,
+        h: 2,
+    });
+    // A replayable reader belongs to no frame being recorded, so a partial
+    // write under it renames like one under an earlier frame's upload.
+    assert_eq!(
+        decide_lock_action(
+            &readers(backing.has_readers()),
+            0,
+            D3DPOOL_MANAGED,
+            partial,
+            RECOVERY_SHAPE
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+    assert_eq!(
+        decide_lock_action(
+            &readers(backing.has_readers()),
+            0,
+            D3DPOOL_MANAGED,
+            partial,
+            MipShape {
+                block_w: 4,
+                block_h: 4,
+                ..RECOVERY_SHAPE
+            }
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+fn rect(x: u32, y: u32, w: u32, h: u32) -> DirtyRect {
+    DirtyRect { x, y, w, h }
+}
+
+fn full() -> DirtyRect {
+    DirtyRect::full(MIP_W, MIP_H)
+}
+
+fn shape(block: (u32, u32)) -> MipShape {
+    MipShape {
+        mip_w: MIP_W,
+        mip_h: MIP_H,
+        block_w: block.0,
+        block_h: block.1,
+    }
+}
+
+fn decide(
+    flags: u32,
+    pool: u32,
+    rect: Option<DirtyRect>,
+    slot: u64,
+    coh: u64,
+    block: (u32, u32),
+) -> LockAction {
+    decide_lock_action(
+        &readers(is_in_flight(slot, coh)),
+        flags,
+        pool,
+        rect,
+        shape(block),
+    )
+}
+
+// ── flag-priority arms (uncompressed) ──
+
+#[test]
+fn readonly_in_place_contended() {
+    assert_eq!(
+        decide(
+            D3DLOCK_READONLY,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn a_contended_nooverwrite_partial_lock_renames_like_a_plain_one() {
+    assert_eq!(
+        decide(
+            D3DLOCK_NOOVERWRITE,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn discard_with_nooverwrite_is_served_as_the_discard() {
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE,
+            D3DPOOL_DEFAULT,
+            None,
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::None
+        }
+    );
+}
+
+#[test]
+fn nooverwrite_never_changes_the_verdict() {
+    // Every pool, rect shape and combination of the write facts, under every
+    // combination of the other known flags: adding NOOVERWRITE decides
+    // exactly what the same lock without it decides.
+    let compressed = shape((4, 4));
+    let shapes = [
+        (None, shape((1, 1)), "whole"),
+        (Some(full()), shape((1, 1)), "whole rect"),
+        (Some(rect(8, 8, 16, 16)), shape((1, 1)), "partial"),
+        (
+            Some(rect(8, 8, 16, 16)),
+            compressed,
+            "compressed on the grid",
+        ),
+        (
+            Some(rect(2, 2, 13, 13)),
+            compressed,
+            "compressed off the grid",
+        ),
+    ];
+    let others = [
+        D3DLOCK_READONLY,
+        D3DLOCK_DISCARD,
+        mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE,
+        mtld3d_types::D3DLOCK_NOSYSLOCK,
+    ];
+    let pools = [
+        D3DPOOL_DEFAULT,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ];
+    for combo in 0u32..1 << others.len() {
+        let flags = others
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| combo & (1 << bit) != 0)
+            .fold(0, |flags, (_, flag)| flags | flag);
+        for pool in pools {
+            for (r, mip, what) in shapes {
+                assert_eq!(
+                    honoured_lock_flags(flags | D3DLOCK_NOOVERWRITE, pool, r, mip),
+                    honoured_lock_flags(flags, pool, r, mip),
+                    "served flags {flags:#x}, pool {pool}, {what}"
+                );
+                for bits in 0..=StagingWrite::all().bits() {
+                    let write = StagingWrite::from_bits_truncate(bits);
+                    assert_eq!(
+                        decide_lock_action(&write, flags | D3DLOCK_NOOVERWRITE, pool, r, mip),
+                        decide_lock_action(&write, flags, pool, r, mip),
+                        "flags {flags:#x}, pool {pool}, {what}, facts {bits:#08b}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ── seq arms ──
+
+#[test]
+fn never_uploaded_in_place() {
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            0,
+            0,
+            (1, 1)
+        ),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn equal_seqs_in_place() {
+    // slot == coh ⇒ retired ⇒ uncontended.
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            COHERENT,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn retired_slot_in_place_even_with_default_flags() {
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            RETIRED_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn uncontended_whole_mip_discard_in_place() {
+    // Nothing reads the staging, so even an honoured DISCARD keeps the box:
+    // the game overwrites it in place and no allocation is needed.
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            None,
+            RETIRED_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::WriteInPlace
+    );
+}
+
+// ── DISCARD arms ──
+
+#[test]
+fn discard_full_mip_contended_freshbox_none() {
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            None,
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::None
+        }
+    );
+}
+
+#[test]
+fn discard_full_rect_contended_freshbox_none() {
+    // An explicit rect spanning the mip is a whole-mip Lock too.
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            Some(full()),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::None
+        }
+    );
+}
+
+#[test]
+fn discard_partial_contended_is_dropped() {
+    // A partial DISCARD cannot be honoured: the bytes outside the rect stay
+    // part of the level, so the Lock is served as a plain partial one, which
+    // under an earlier frame's upload renames with a preserve.
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn discard_compressed_unaligned_freshbox_cpu() {
+    // Dropped DISCARD, then the alignment guard: the encoder's full-mip
+    // fallback reads outside the rect, so the old bytes are carried over.
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            Some(rect(2, 2, 13, 13)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (4, 4)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn discard_whole_mip_managed_contended_freshbox_cpu() {
+    // A managed level is served from its staging for its whole life, so
+    // its DISCARD is dropped and the rename preserves.
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_MANAGED,
+            None,
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn discard_whole_mip_systemmem_contended_freshbox_cpu() {
+    assert_eq!(
+        decide(
+            D3DLOCK_DISCARD,
+            D3DPOOL_SYSTEMMEM,
+            None,
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+// ── whole-mip arms ──
+
+#[test]
+fn whole_mip_default_contended_freshbox_cpu() {
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(full()),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn whole_mip_managed_contended_freshbox_cpu() {
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_MANAGED,
+            Some(full()),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn whole_mip_via_none_rect_freshbox_cpu() {
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            None,
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+// ── partial uncompressed: narrowing arms ──
+
+#[test]
+fn partial_default_under_an_earlier_upload_freshbox_cpu() {
+    // An upload of an earlier frame may be replaying while the game writes,
+    // so the partial write moves to fresh pages carrying the level.
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn partial_managed_under_an_earlier_upload_freshbox_cpu() {
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_MANAGED,
+            Some(rect(8, 8, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+// ── partial compressed: alignment guard arms ──
+
+#[test]
+fn compressed_aligned_partial_under_an_earlier_upload_freshbox_cpu() {
+    // Block-aligned partial (origin and size both multiples of 4): the
+    // encoder would not widen the read, but an earlier frame's upload may
+    // still read the pages, so the write renames.
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (4, 4)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn compressed_aligned_partial_managed_under_an_earlier_upload_freshbox_cpu() {
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_MANAGED,
+            Some(rect(8, 8, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (4, 4)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn compressed_unaligned_origin_freshbox_cpu() {
+    // origin off-grid (2, 2) → encoder fallback → must preserve.
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(2, 2, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (4, 4)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn compressed_unaligned_size_freshbox_cpu() {
+    // size off-grid (13×13) and not reaching mip edge → fallback.
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 13, 13)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (4, 4)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn compressed_unaligned_managed_freshbox_cpu() {
+    // The pool does not change the guard: the encoder fallback reads
+    // outside-rect bytes, uninit there would corrupt the MTLTexture.
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_MANAGED,
+            Some(rect(2, 2, 13, 13)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (4, 4)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn compressed_partial_extends_to_mip_edge_in_place() {
+    // The right-edge clause `r.x + r.w == mip_w` only matters when `r.w`
+    // is not a multiple of `block_w`, which on a power-of-two mip with an
+    // aligned origin needs a mip that is itself not block-aligned, and
+    // such a rect is typically whole-mip, so the earlier whole-mip arm
+    // claims it first. Exercising the clause therefore needs a
+    // non-power-of-two mip and a strictly partial rect, driving the
+    // helper directly so mip_w / mip_h can vary.
+    //
+    // The write is under an unseen upload of this frame, which the partial
+    // arm writes in place, so `WriteInPlace` proves the alignment guard let
+    // the rect through. Under an earlier frame's upload it renames anyway.
+    let unseen = StagingWrite::HAS_READERS.union(StagingWrite::SAME_FRAME);
+    // 6x8 DXT mip, rect (0, 0, 6, 4): width 6 reaches mip_w=6 without
+    // being a multiple of 4 (right-edge clause), height 4 is
+    // block-aligned, and the rect covers only the top half.
+    let right_edge = MipShape {
+        mip_w: 6,
+        mip_h: 8,
+        block_w: 4,
+        block_h: 4,
+    };
+    let top_half = Some(rect(0, 0, 6, 4));
+    assert_eq!(
+        decide_lock_action(
+            &unseen,
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            top_half,
+            right_edge
+        ),
+        LockAction::WriteInPlace,
+        "right-edge tolerance: r.x + r.w == mip_w with r.w % bw != 0"
+    );
+    assert_eq!(
+        decide_lock_action(
+            &readers(true),
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            top_half,
+            right_edge
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        },
+        "an earlier frame's upload renames the aligned rect"
+    );
+    // Height-edge mirror: 8x6 mip, rect covers the left half. r.h=6
+    // reaches mip_h=6 with a non-multiple-of-4 height.
+    assert_eq!(
+        decide_lock_action(
+            &unseen,
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(0, 0, 4, 6)),
+            MipShape {
+                mip_w: 8,
+                mip_h: 6,
+                block_w: 4,
+                block_h: 4,
+            },
+        ),
+        LockAction::WriteInPlace,
+        "bottom-edge tolerance: r.y + r.h == mip_h with r.h % bh != 0"
+    );
+}
+
+// ── the partial arm follows the staging-write rule ──
+
+/// A partial aligned Lock of the 256x256 test mip with `write`'s facts.
+fn partial_lock(write: &StagingWrite) -> LockAction {
+    decide_lock_action(
+        write,
+        DEFAULT_FLAGS,
+        D3DPOOL_MANAGED,
+        Some(rect(0, 0, 129, 112)),
+        shape((1, 1)),
+    )
+}
+
+#[test]
+fn a_partial_lock_without_readers_writes_in_place() {
+    assert_eq!(
+        partial_lock(&StagingWrite::empty()),
+        LockAction::WriteInPlace
+    );
+    assert_eq!(
+        partial_lock(&StagingWrite::SAME_FRAME.union(StagingWrite::OBSERVED)),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn a_partial_lock_under_an_unseen_upload_of_this_frame_writes_in_place() {
+    assert_eq!(
+        partial_lock(&StagingWrite::HAS_READERS.union(StagingWrite::SAME_FRAME)),
+        LockAction::WriteInPlace
+    );
+}
+
+#[test]
+fn a_partial_lock_under_a_seen_upload_of_this_frame_renames() {
+    let seen = StagingWrite::HAS_READERS
+        .union(StagingWrite::SAME_FRAME)
+        .union(StagingWrite::OBSERVED);
+    assert_eq!(
+        partial_lock(&seen),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+    let attached = StagingWrite::HAS_READERS
+        .union(StagingWrite::SAME_FRAME)
+        .union(StagingWrite::ALWAYS_RENAME);
+    assert_eq!(
+        partial_lock(&attached),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn a_partial_lock_under_an_earlier_frames_upload_renames() {
+    assert_eq!(
+        partial_lock(&StagingWrite::HAS_READERS),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn a_whole_level_lock_under_an_unseen_upload_still_preserves() {
+    // The game may read every byte through a whole-level pointer, and
+    // D3D9 hands it the level's contents, so the whole-level arm renames
+    // with a preserve under any reader, as before.
+    assert_eq!(
+        decide_lock_action(
+            &StagingWrite::HAS_READERS.union(StagingWrite::SAME_FRAME),
+            DEFAULT_FLAGS,
+            D3DPOOL_MANAGED,
+            None,
+            shape((1, 1)),
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+#[test]
+fn a_lock_without_readers_writes_in_place_whatever_the_flags_pool_and_rect() {
+    // The lock callers skip `decide_lock_action` when nothing reads the
+    // pages; this pins that the answer they skip is always in place.
+    let compressed = shape((4, 4));
+    let shapes = [
+        (None, shape((1, 1)), "whole"),
+        (Some(full()), shape((1, 1)), "whole rect"),
+        (Some(rect(8, 8, 16, 16)), shape((1, 1)), "partial"),
+        (
+            Some(rect(8, 8, 16, 16)),
+            compressed,
+            "compressed on the grid",
+        ),
+        (
+            Some(rect(2, 2, 13, 13)),
+            compressed,
+            "compressed off the grid",
+        ),
+    ];
+    let known = [
+        D3DLOCK_READONLY,
+        D3DLOCK_NOOVERWRITE,
+        D3DLOCK_DISCARD,
+        mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE,
+    ];
+    let reader_free = [
+        StagingWrite::empty(),
+        StagingWrite::SAME_FRAME
+            .union(StagingWrite::OBSERVED)
+            .union(StagingWrite::ALWAYS_RENAME),
+        StagingWrite::MAPPED.union(StagingWrite::WHOLE_LEVEL),
+    ];
+    for combo in 0u32..1 << known.len() {
+        let flags = known
+            .iter()
+            .enumerate()
+            .filter(|(bit, _)| combo & (1 << bit) != 0)
+            .fold(0, |flags, (_, flag)| flags | flag);
+        for pool in [D3DPOOL_DEFAULT, D3DPOOL_MANAGED, D3DPOOL_SYSTEMMEM] {
+            for (r, mip, what) in shapes {
+                for write in &reader_free {
+                    assert_eq!(
+                        decide_lock_action(write, flags, pool, r, mip),
+                        LockAction::WriteInPlace,
+                        "flags {flags:#x}, pool {pool}, {what}, facts {:#x}",
+                        write.bits()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_partial_arm_matches_the_staging_write_rule_for_every_fact_combination() {
+    // Mapped and whole-level are the Lock's own to decide; every other
+    // fact feeds the staging-write rule unchanged once a reader exists.
+    for bits in 0..=StagingWrite::all().bits() {
+        let write = StagingWrite::from_bits_truncate(bits);
+        let rule_facts = StagingWrite::from_bits_retain(
+            bits & !StagingWrite::MAPPED.union(StagingWrite::WHOLE_LEVEL).bits(),
+        );
+        let expected = if write.contains(StagingWrite::HAS_READERS) {
+            decide_staging_write(&rule_facts)
+        } else {
+            LockAction::WriteInPlace
+        };
+        assert_eq!(partial_lock(&write), expected, "facts {bits:#08b}");
+    }
+}
+
+#[test]
+fn compressed_uncontended_unaligned_in_place() {
+    // No in-flight read to race with — same outcome as today's
+    // code. Encoder will still fall back, but no GPU work is
+    // currently reading the staging.
+    assert_eq!(
+        decide(
+            DEFAULT_FLAGS,
+            D3DPOOL_DEFAULT,
+            Some(rect(2, 2, 13, 13)),
+            RETIRED_SEQ,
+            COHERENT,
+            (4, 4)
+        ),
+        LockAction::WriteInPlace
+    );
+}
+
+// ── unknown bits / hygiene ──
+
+#[test]
+fn unknown_high_bits_pass_through() {
+    let unknown = 0x8000_0000;
+    assert_eq!(
+        decide(
+            unknown | D3DLOCK_DISCARD,
+            D3DPOOL_DEFAULT,
+            None,
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::None
+        }
+    );
+    assert_eq!(
+        decide(
+            unknown,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            IN_FLIGHT_SEQ,
+            COHERENT,
+            (1, 1)
+        ),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+}
+
+// ── honoured_lock_flags ──
+
+#[test]
+fn whole_mip_default_pool_keeps_discard() {
+    let flags = D3DLOCK_DISCARD | mtld3d_types::D3DLOCK_NOSYSLOCK;
+    assert_eq!(
+        honoured_lock_flags(flags, D3DPOOL_DEFAULT, None, shape((1, 1))),
+        flags
+    );
+    assert_eq!(
+        honoured_lock_flags(flags, D3DPOOL_DEFAULT, Some(full()), shape((1, 1))),
+        flags
+    );
+}
+
+#[test]
+fn partial_lock_drops_discard_and_nooverwrite_and_keeps_the_rest() {
+    let flags = D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE | mtld3d_types::D3DLOCK_NOSYSLOCK;
+    assert_eq!(
+        honoured_lock_flags(
+            flags,
+            D3DPOOL_DEFAULT,
+            Some(rect(8, 8, 16, 16)),
+            shape((1, 1))
+        ),
+        mtld3d_types::D3DLOCK_NOSYSLOCK
+    );
+}
+
+#[test]
+fn every_texture_lock_drops_nooverwrite() {
+    for pool in [
+        D3DPOOL_DEFAULT,
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ] {
+        for r in [None, Some(full()), Some(rect(8, 8, 16, 16))] {
+            assert_eq!(
+                honoured_lock_flags(
+                    D3DLOCK_NOOVERWRITE | D3DLOCK_READONLY,
+                    pool,
+                    r,
+                    shape((1, 1))
+                ),
+                D3DLOCK_READONLY,
+                "pool {pool}, rect {r:?}"
+            );
+        }
+    }
+    // A whole-level default-pool DISCARD survives its NOOVERWRITE companion.
+    assert_eq!(
+        honoured_lock_flags(
+            D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE,
+            D3DPOOL_DEFAULT,
+            None,
+            shape((1, 1))
+        ),
+        D3DLOCK_DISCARD
+    );
+}
+
+#[test]
+fn cpu_pools_drop_discard_even_whole_mip() {
+    for pool in [
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ] {
+        assert_eq!(
+            honoured_lock_flags(D3DLOCK_DISCARD, pool, None, shape((1, 1))),
+            DEFAULT_FLAGS,
+            "pool {pool}"
+        );
+    }
+}
+
+#[test]
+fn flags_without_discard_pass_through_unchanged() {
+    let flags = D3DLOCK_READONLY | mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE;
+    assert_eq!(
+        honoured_lock_flags(
+            flags,
+            D3DPOOL_MANAGED,
+            Some(rect(0, 0, 8, 8)),
+            shape((1, 1))
+        ),
+        flags
+    );
+}
+
+#[test]
+fn a_rect_reaching_past_the_mip_is_whole() {
+    // `parse_rect` clamps, so an oversized rect is the whole mip; the
+    // tolerance keeps an unclamped one from being read as partial.
+    assert!(is_whole_mip(
+        Some(rect(0, 0, MIP_W + 8, MIP_H)),
+        shape((1, 1))
+    ));
+    assert!(!is_whole_mip(Some(rect(1, 0, MIP_W, MIP_H)), shape((1, 1))));
+    assert!(!is_whole_mip(
+        Some(rect(0, 0, MIP_W - 1, MIP_H)),
+        shape((1, 1))
+    ));
+}
+
+// ── texture_lock_offset ──
+
+fn off_rect(x: u32, y: u32, w: u32, h: u32) -> DirtyRect {
+    DirtyRect { x, y, w, h }
+}
+
+#[test]
+fn full_mip_lock_returns_zero_offset() {
+    // None rect ⇒ full-mip lock; any pitch / block-shape returns 0.
+    assert_eq!(texture_lock_offset(None, 1024, 1, 1, 4), 0);
+    assert_eq!(texture_lock_offset(None, 2048, 4, 4, 8), 0);
+}
+
+#[test]
+fn uncompressed_offset_matches_pixel_math() {
+    // BGRA8: 1×1 block, 4 bytes per "block" (= 1 pixel). 256-wide mip,
+    // pitch = 1024. Lock at row 5, x=8 → 5*1024 + 8*4 = 5152.
+    let p = 1024;
+    let off = texture_lock_offset(Some(off_rect(8, 5, 16, 16)), p, 1, 1, 4);
+    assert_eq!(off, 5 * 1024 + 8 * 4);
+}
+
+#[test]
+fn dxt1_offset_uses_block_rows_not_pixel_rows() {
+    // 512×512 DXT1 mip: 128×128 blocks, 8 bytes per block, pitch =
+    // 128 × 8 = 1024 bytes per block-row. Total staging = 131072.
+    // Locking pixel-y=128 (= block-row 32) at pixel-x=256 (= block-col
+    // 64) MUST yield offset = 32 * 1024 + 64 * 8 = 33280.
+    //
+    // A pixel-row × block-pitch formula would instead land at
+    // 128 * 1024 = 131072 — exactly the Box's len, i.e. one-past-the-end,
+    // so the game's first write through the Lock pointer runs off the
+    // allocation. Pinning the block-coordinate formula here flips this
+    // test red at that signature.
+    let pitch = 1024; // bytes per block-row for 512-wide DXT1
+    let off = texture_lock_offset(Some(off_rect(256, 128, 256, 64)), pitch, 4, 4, 8);
+    assert_eq!(off, (128 / 4) * 1024 + (256 / 4) * 8);
+    assert_eq!(off, 33280);
+    // Sanity: the Box is 131072 bytes; the Lock window must end
+    // strictly before that to be writable.
+    let staging_len = 131_072;
+    let locked_block_h = 64usize.div_ceil(4);
+    let last_byte = off + locked_block_h * pitch as usize;
+    assert!(last_byte <= staging_len);
+}
+
+#[test]
+fn dxt5_offset_uses_block_rows_not_pixel_rows() {
+    // 256×256 DXT5: 64×64 blocks, 16 bytes per block, pitch = 1024.
+    // Lock at pixel-y=64 (block-row 16), pixel-x=32 (block-col 8) →
+    // 16 * 1024 + 8 * 16 = 16512.
+    let off = texture_lock_offset(Some(off_rect(32, 64, 64, 64)), 1024, 4, 4, 16);
+    assert_eq!(off, (64 / 4) * 1024 + (32 / 4) * 16);
+    assert_eq!(off, 16512);
+}
+
+#[test]
+fn block_aligned_lock_origin_is_unchanged_under_division() {
+    // When pixel coords are exact multiples of the block dims,
+    // `r.y / block_h` and `r.x / block_w` lose nothing — the offset
+    // matches what direct block-coord math would give.
+    let pitch = 2048;
+    let pixel = texture_lock_offset(Some(off_rect(16, 8, 16, 4)), pitch, 4, 4, 16);
+    assert_eq!(pixel, (8 / 4) * 2048 + (16 / 4) * 16);
+}
+
+#[test]
+fn a_plain_lock_of_a_released_level_reads_it_back() {
+    assert!(released_level_lock_needs_readback(DEFAULT_FLAGS));
+    assert!(released_level_lock_needs_readback(D3DLOCK_READONLY));
+    assert!(released_level_lock_needs_readback(D3DLOCK_NOOVERWRITE));
+    assert!(released_level_lock_needs_readback(
+        mtld3d_types::D3DLOCK_NO_DIRTY_UPDATE
+    ));
+}
+
+/// A partial write into an uploaded level is the one write that reads it back.
+#[test]
+fn a_partial_write_into_an_uploaded_released_level_reads_it_back() {
+    assert!(released_level_write_needs_readback(false, true));
+}
+
+#[test]
+fn a_whole_write_or_a_never_uploaded_level_skips_the_readback() {
+    assert!(!released_level_write_needs_readback(true, true));
+    assert!(!released_level_write_needs_readback(true, false));
+    assert!(!released_level_write_needs_readback(false, false));
+}
+
+// ── staging_droppable_class ──
+
+/// The only class that releases: default pool, no usage bit, plain 2D.
+#[test]
+fn plain_default_pool_texture_is_droppable() {
+    assert!(staging_droppable_class(
+        D3DPOOL_DEFAULT,
+        NO_USAGE,
+        TextureFlags::empty(),
+        1
+    ));
+}
+
+#[test]
+fn discard_is_the_only_flag_that_skips_the_readback() {
+    assert!(!released_level_lock_needs_readback(D3DLOCK_DISCARD));
+    // Companion bits ride along with DISCARD without reviving the read.
+    assert!(!released_level_lock_needs_readback(
+        D3DLOCK_DISCARD | D3DLOCK_NOOVERWRITE
+    ));
+    assert!(!released_level_lock_needs_readback(
+        D3DLOCK_DISCARD | mtld3d_types::D3DLOCK_NOSYSLOCK
+    ));
+}
+
+#[test]
+fn lockable_pools_are_never_droppable() {
+    for pool in [
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ] {
+        assert!(
+            !staging_droppable_class(pool, NO_USAGE, TextureFlags::empty(), 1),
+            "pool {pool}"
+        );
+    }
+}
+
+#[test]
+fn lockable_or_gpu_written_usage_is_never_droppable() {
+    for usage in [
+        D3DUSAGE_DYNAMIC,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_DEPTHSTENCIL,
+    ] {
+        assert!(
+            !staging_droppable_class(D3DPOOL_DEFAULT, usage, TextureFlags::empty(), 1),
+            "usage {usage:#x}"
+        );
+    }
+}
+
+/// A volume texture is out of the class at any depth, a single slice included.
+///
+/// `depth` alone does not identify one: `CreateVolumeTexture` with a depth of
+/// 1 is created 2D on both sides, and would otherwise pass the shape test the
+/// way an ordinary 2D texture does.
+#[test]
+fn volume_textures_are_never_droppable() {
+    for depth in [1, 2, 16] {
+        assert!(
+            !staging_droppable_class(
+                D3DPOOL_DEFAULT,
+                NO_USAGE,
+                TextureFlags::VOLUME_TEXTURE,
+                depth
+            ),
+            "depth {depth}"
+        );
+    }
+}
+
+#[test]
+fn cube_offscreen_plain_and_depth_textures_are_never_droppable() {
+    for flag in [
+        TextureFlags::CUBE,
+        TextureFlags::OFFSCREEN_PLAIN,
+        TextureFlags::DEPTH_FORMAT,
+    ] {
+        assert!(
+            !staging_droppable_class(D3DPOOL_DEFAULT, NO_USAGE, flag, 1),
+            "flag {flag:?}"
+        );
+    }
+}
+
+/// A flag the class does not read leaves it alone.
+#[test]
+fn autogen_mipmap_alone_stays_droppable() {
+    assert!(staging_droppable_class(
+        D3DPOOL_DEFAULT,
+        NO_USAGE,
+        TextureFlags::AUTOGEN_MIPMAP,
+        1
+    ));
+}
+
+/// Multi-slice depth still fails the shape test on its own.
+#[test]
+fn multi_slice_depth_is_never_droppable() {
+    assert!(!staging_droppable_class(
+        D3DPOOL_DEFAULT,
+        NO_USAGE,
+        TextureFlags::empty(),
+        4
+    ));
+}
+
+// ── staging_lazy_class ──
+
+/// A default-pool render-target texture starts without staging.
+#[test]
+fn default_pool_render_target_texture_starts_without_staging() {
+    assert!(staging_lazy_class(
+        D3DPOOL_DEFAULT,
+        D3DUSAGE_RENDERTARGET,
+        TextureFlags::empty(),
+        1
+    ));
+    assert!(staging_lazy_class(
+        D3DPOOL_DEFAULT,
+        D3DUSAGE_RENDERTARGET | mtld3d_types::D3DUSAGE_AUTOGENMIPMAP,
+        TextureFlags::AUTOGEN_MIPMAP,
+        1
+    ));
+}
+
+/// A texture the GPU never draws into, or one created outside the default pool, keeps its staging.
+#[test]
+fn only_render_target_usage_in_the_default_pool_starts_without_staging() {
+    for usage in [NO_USAGE, D3DUSAGE_DYNAMIC, D3DUSAGE_DEPTHSTENCIL] {
+        assert!(
+            !staging_lazy_class(D3DPOOL_DEFAULT, usage, TextureFlags::empty(), 1),
+            "usage {usage:#x}"
+        );
+    }
+    for usage in [
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_DYNAMIC,
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL,
+    ] {
+        assert!(
+            !staging_lazy_class(D3DPOOL_DEFAULT, usage, TextureFlags::empty(), 1),
+            "usage {usage:#x}"
+        );
+    }
+    for pool in [
+        D3DPOOL_MANAGED,
+        D3DPOOL_SYSTEMMEM,
+        mtld3d_types::D3DPOOL_SCRATCH,
+    ] {
+        assert!(
+            !staging_lazy_class(pool, D3DUSAGE_RENDERTARGET, TextureFlags::empty(), 1),
+            "pool {pool}"
+        );
+    }
+}
+
+/// Cubes, volumes, offscreen plains and depth formats keep their staging whatever the usage.
+#[test]
+fn render_target_shapes_with_staging_of_their_own_keep_it() {
+    for flag in [
+        TextureFlags::CUBE,
+        TextureFlags::VOLUME_TEXTURE,
+        TextureFlags::OFFSCREEN_PLAIN,
+        TextureFlags::DEPTH_FORMAT,
+    ] {
+        assert!(
+            !staging_lazy_class(D3DPOOL_DEFAULT, D3DUSAGE_RENDERTARGET, flag, 1),
+            "flags {flag:?}"
+        );
+    }
+    assert!(!staging_lazy_class(
+        D3DPOOL_DEFAULT,
+        D3DUSAGE_RENDERTARGET,
+        TextureFlags::empty(),
+        4
+    ));
+}
+
+/// Every combination of the write facts, against the rule spelled out case by case.
+#[test]
+fn staging_write_decision_covers_every_combination() {
+    for bits in 0..=StagingWrite::all().bits() {
+        let write = StagingWrite::from_bits_truncate(bits);
+        let bits = write.bits();
+        let mapped = write.contains(StagingWrite::MAPPED);
+        let readers = write.contains(StagingWrite::HAS_READERS);
+        let same_frame = write.contains(StagingWrite::SAME_FRAME);
+        let observed = write.contains(StagingWrite::OBSERVED);
+        let always = write.contains(StagingWrite::ALWAYS_RENAME);
+        let whole = write.contains(StagingWrite::WHOLE_LEVEL);
+        let in_place = mapped || !readers || (same_frame && !observed && !always);
+        let expected = if in_place {
+            LockAction::WriteInPlace
+        } else if whole {
+            LockAction::FreshBox {
+                preserve: PreserveKind::None,
+            }
+        } else {
+            LockAction::FreshBox {
+                preserve: PreserveKind::Cpu,
+            }
+        };
+        assert_eq!(decide_staging_write(&write), expected, "facts {bits:#08b}");
+    }
+}
+
+/// An unseen upload of the frame being recorded leaves a partial write in place.
+#[test]
+fn staging_write_under_an_unseen_upload_of_this_frame_stays_in_place() {
+    assert_eq!(
+        decide_staging_write(&(StagingWrite::HAS_READERS | StagingWrite::SAME_FRAME)),
+        LockAction::WriteInPlace
+    );
+}
+
+/// An upload of an earlier frame may be replaying, so even an unseen one forces a rename.
+#[test]
+fn staging_write_under_an_earlier_frames_upload_renames() {
+    assert_eq!(
+        decide_staging_write(&StagingWrite::HAS_READERS),
+        LockAction::FreshBox {
+            preserve: PreserveKind::Cpu
+        }
+    );
+    assert_eq!(
+        decide_staging_write(&(StagingWrite::HAS_READERS | StagingWrite::WHOLE_LEVEL)),
+        LockAction::FreshBox {
+            preserve: PreserveKind::None
+        }
+    );
+}
+
+/// A GPU use after this frame's upload forces a rename.
+#[test]
+fn staging_write_under_a_seen_upload_of_this_frame_renames() {
+    for seen in [StagingWrite::OBSERVED, StagingWrite::ALWAYS_RENAME] {
+        let bits = seen.bits();
+        assert_eq!(
+            decide_staging_write(&(StagingWrite::HAS_READERS | StagingWrite::SAME_FRAME | seen)),
+            LockAction::FreshBox {
+                preserve: PreserveKind::Cpu
+            },
+            "seen {bits:#08b}"
+        );
+    }
+}
+
+/// A mapped subresource is written in place whatever else holds.
+#[test]
+fn staging_write_into_a_mapped_subresource_stays_in_place() {
+    assert_eq!(
+        decide_staging_write(&StagingWrite::all()),
+        LockAction::WriteInPlace
+    );
+}
+
+/// Pages no upload reads are written in place.
+#[test]
+fn staging_write_without_readers_stays_in_place() {
+    assert_eq!(
+        decide_staging_write(&(StagingWrite::all().difference(StagingWrite::HAS_READERS))),
+        LockAction::WriteInPlace
+    );
+}
+
+// ── snapshot layout and row copies ──
+
+/// `snapshot_box` on the 256x256 test mip, its staging rows `pitch` bytes apart.
+fn plan(r: DirtyRect, block: (u32, u32), block_bytes: u32, pitch: u32, align: u32) -> SnapshotBox {
+    snapshot_box(r, shape(block), block_bytes, pitch, align)
+}
+
+/// The layout of a box the arena takes, `None` for one it does not.
+fn layout(
+    r: DirtyRect,
+    block: (u32, u32),
+    block_bytes: u32,
+    pitch: u32,
+    align: u32,
+) -> Option<SnapshotLayout> {
+    match plan(r, block, block_bytes, pitch, align) {
+        SnapshotBox::Copy(layout) => Some(layout),
+        SnapshotBox::WholeLevel | SnapshotBox::Declined => None,
+    }
+}
+
+#[test]
+fn a_sprite_box_snapshots_its_rows_at_the_aligned_pitch() {
+    // A 2-byte 79x75 box at the origin of a 1024-byte-pitch level.
+    let l = layout(rect(0, 0, 79, 75), (1, 1), 2, 1024, 16).expect("a partial box");
+    assert_eq!(
+        (l.src_offset, l.row_bytes, l.rows, l.pitch, l.len),
+        (0, 158, 75, 160, 160 * 75)
+    );
+    // The same box where a blit needs a 256-byte row stride.
+    let l = layout(rect(0, 0, 79, 75), (1, 1), 2, 1024, 256).expect("a partial box");
+    assert_eq!((l.pitch, l.len), (256, 256 * 75));
+}
+
+#[test]
+fn an_offset_box_starts_at_its_rows_and_columns_in_the_staging() {
+    // A 24-bit box at (1, 1): the expansion layout keeps a 16-byte pitch.
+    let l = layout(rect(1, 1, 30, 24), (1, 1), 3, 768, 16).expect("a partial box");
+    assert_eq!(
+        (l.src_offset, l.row_bytes, l.rows, l.pitch, l.len),
+        (768 + 3, 90, 24, 96, 96 * 24)
+    );
+}
+
+#[test]
+fn a_dxt_box_counts_block_rows_and_block_bytes() {
+    // One DXT1 block at (4, 4) of a 512-byte-block-row level.
+    let l = layout(rect(4, 4, 4, 4), (4, 4), 8, 512, 16).expect("an aligned block");
+    assert_eq!(
+        (l.src_offset, l.row_bytes, l.rows, l.pitch, l.len),
+        (512 + 8, 8, 1, 16, 16)
+    );
+    // A box reaching the mip's right and bottom edges with a partial block.
+    let edge = MipShape {
+        mip_w: 10,
+        mip_h: 10,
+        block_w: 4,
+        block_h: 4,
+    };
+    let SnapshotBox::Copy(l) = snapshot_box(rect(4, 4, 6, 6), edge, 8, 24, 16) else {
+        panic!("an edge box is copied");
+    };
+    assert_eq!(
+        (l.src_offset, l.row_bytes, l.rows, l.pitch, l.len),
+        (24 + 8, 16, 2, 16, 32)
+    );
+}
+
+#[test]
+fn a_whole_level_box_reads_the_staging_and_is_not_declined() {
+    assert!(matches!(
+        plan(full(), (1, 1), 4, 1024, 16),
+        SnapshotBox::WholeLevel
+    ));
+}
+
+#[test]
+fn off_grid_empty_and_over_a_chunk_boxes_are_declined() {
+    for (r, block, what) in [
+        (
+            rect(2, 2, 4, 4),
+            (4, 4),
+            "a compressed rect off the block grid",
+        ),
+        (rect(0, 0, 0, 4), (1, 1), "an empty rect"),
+        (
+            rect(0, 0, 255, 255),
+            (1, 1),
+            "over a chunk: 255 rows of 2040 bytes",
+        ),
+    ] {
+        let declined = match block {
+            (4, 4) => plan(r, block, 8, 512, 16),
+            _ => plan(r, block, 4 * 2, 2048, 16),
+        };
+        assert!(matches!(declined, SnapshotBox::Declined), "{what}");
+    }
+    assert!(
+        matches!(
+            plan(rect(0, 0, 4, 4), (1, 1), 4, 1024, 0),
+            SnapshotBox::Declined
+        ),
+        "no alignment"
+    );
+}
+
+#[test]
+fn a_large_box_snapshots_whenever_it_fits_a_chunk() {
+    // 200x200 four-byte texels: 800-byte rows, 160 000 bytes on a 16-byte
+    // pitch and 204 800 on a 256-byte one, both under a 256 KiB chunk.
+    let apple = layout(rect(0, 0, 200, 200), (1, 1), 4, 1024, 16).expect("fits a chunk");
+    assert_eq!((apple.pitch, apple.len), (800, 160_000));
+    let intel = layout(rect(0, 0, 200, 200), (1, 1), 4, 1024, 256).expect("fits a chunk");
+    assert_eq!((intel.pitch, intel.len), (1024, 204_800));
+    // 255 rows of 256 texels fill all but one row of a chunk.
+    let edge = layout(rect(0, 0, 256, 255), (1, 1), 4, 1024, 256).expect("fits a chunk");
+    assert_eq!(
+        edge.len as usize,
+        crate::upload_snapshot::SNAPSHOT_MAX_BYTES - 1024
+    );
+    // The largest sprite of the sprite-atlas shape, at either pitch.
+    assert!(layout(rect(0, 0, 129, 112), (1, 1), 4, 1024, 256).is_some());
+}
+
+#[test]
+fn a_layout_fits_only_a_source_that_holds_its_rows() {
+    // Rows of 16 bytes at (4, 4) of a 64-byte-pitch level: the last row
+    // ends at 7 * 64 + 16 + 16 = 480.
+    let l = layout(rect(4, 4, 4, 4), (1, 1), 4, 64, 16).expect("a partial box");
+    assert!(l.fits_source(64, 480));
+    assert!(l.fits_source(64, 1024));
+    assert!(!l.fits_source(64, 479), "one byte short");
+    assert!(!l.fits_source(64, 1), "a placeholder page");
+}
+
+#[test]
+fn copy_rows_moves_each_row_to_its_stride() {
+    let src: Vec<u8> = (0..=255).collect();
+    let mut dst = [0u8; 12];
+    // Two rows of three bytes from offset 5, 16 apart, into rows 6 apart.
+    assert!(copy_rows(&src, 5, 16, &mut dst, 6, 3, 2));
+    assert_eq!(dst, [5, 6, 7, 0, 0, 0, 21, 22, 23, 0, 0, 0]);
+    // No rows copies nothing and succeeds.
+    assert!(copy_rows(&src, 0, 16, &mut dst, 6, 3, 0));
+}
+
+#[test]
+fn copy_rows_refuses_a_row_past_either_end() {
+    let src = [1u8; 32];
+    let mut dst = [0u8; 8];
+    assert!(!copy_rows(&src, 30, 16, &mut dst, 4, 3, 1), "source short");
+    assert!(
+        !copy_rows(&src, 0, 16, &mut dst, 6, 3, 2),
+        "destination short"
+    );
+    assert_eq!(dst, [0; 8], "a refused copy writes nothing");
+}

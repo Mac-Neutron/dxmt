@@ -1,0 +1,134 @@
+//! End-to-end test runner for mtld3d: run and account for the suite's test binaries under Wine.
+//!
+//! Each binary the Makefile hands in runs once, all of its tests on the
+//! number of threads `--jobs` names. Explicit selections are batched to fit
+//! Windows command lines; failures, crashes, hangs and missing results can
+//! cost further processes (see `attribute`). Every path and knob is an
+//! argument; the environment is inherited whole, so the caller owns
+//! `MTLD3D_CONFIG` and the Wine variables.
+//!
+//! Exit code 0 when every selected test passed, 1 when any failed or was
+//! left unrun by a failure, 2 when the runner itself could not do its job,
+//! and 3 when a GPU hang stopped the leg without a verdict.
+//!
+//! Two subcommands, named as the first argument, compare two builds of the
+//! layer on the suite's benchmarks instead (see `bench`): `bench-ab` runs
+//! them against both builds and judges the result, `bench-compare` judges a
+//! directory `bench-ab` left behind. A third, `bench-shape`, checks one
+//! benchmark's frame against a frame a game dumped.
+
+mod attribute;
+mod bench;
+mod binary;
+mod cli;
+mod libtest;
+mod report;
+mod run;
+mod select;
+
+use std::process::ExitCode;
+
+use crate::{
+    attribute::{BinaryOutcome, Launcher as _},
+    binary::{WineLauncher, binary_name},
+    report::{BinaryReport, Tally},
+    select::{selected, skipped, test_id},
+};
+
+/// A leg stopped after the driver reported a GPU hang, with no test verdict.
+const GPU_HANG_EXIT: u8 = 3;
+
+fn main() -> ExitCode {
+    match real_main() {
+        Ok(code) => code,
+        Err(msg) => {
+            eprintln!("e2e: {msg}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn real_main() -> Result<ExitCode, String> {
+    let mut args = std::env::args().skip(1).peekable();
+    match args.peek().map(String::as_str) {
+        Some(bench::AB) => return bench::ab_main(args.skip(1)),
+        Some(bench::COMPARE) => return bench::compare_main(args.skip(1)),
+        Some(bench::SHAPE) => return bench::shape_main(args.skip(1)),
+        _ => {}
+    }
+    let config = cli::parse_args(args)?;
+    let mut tally = Tally::default();
+    let mut stopped_at: Option<String> = None;
+    let mut gpu_hang_at: Option<String> = None;
+    for exe in &config.exes {
+        let name = binary_name(exe);
+        if gpu_hang_at.is_some() {
+            println!("SKIP {name}:: (not run after a GPU hang)");
+            continue;
+        }
+        if stopped_at.is_some() {
+            println!("SKIP {name}:: (not run after a failure)");
+            continue;
+        }
+        let mut launcher = WineLauncher::new(
+            &config.wine,
+            exe,
+            config.log_dir.as_deref(),
+            config.timeout,
+            Box::new(|_| {}),
+        )?
+        .ignored_only(config.ignored);
+        let selection = if config.filter.is_empty() && config.skip.is_empty() {
+            None
+        } else {
+            let names: Vec<String> = launcher
+                .list()?
+                .into_iter()
+                .filter(|test| {
+                    let id = test_id(&name, test);
+                    selected(&id, &config.filter) && !skipped(&id, &config.skip)
+                })
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            Some(names)
+        };
+        let run = attribute::run_binary(
+            &mut launcher,
+            selection,
+            config.jobs,
+            config.fail_fast,
+            &mut BinaryReport {
+                binary: &name,
+                tally: &mut tally,
+            },
+        )?;
+        tally.processes += run.processes;
+        if run.outcome == BinaryOutcome::GpuHang {
+            gpu_hang_at = Some(name);
+        } else if run.failed && config.fail_fast {
+            stopped_at = Some(name);
+        }
+    }
+    if let Some(name) = gpu_hang_at {
+        tally.print_summary();
+        println!("e2e: GPU HANG in {name}; the leg was cut short and has no verdict");
+        return Ok(ExitCode::from(GPU_HANG_EXIT));
+    }
+    if tally.total() == 0 {
+        if config.filter.is_empty() && config.skip.is_empty() {
+            return Err("no binary ran any test".to_owned());
+        }
+        println!("no test matches the filter; nothing to run");
+    }
+    tally.print_summary();
+    if let Some(name) = stopped_at {
+        println!("stopped after the first failure (in {name}); --no-fail-fast runs everything");
+    }
+    Ok(if tally.is_red() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}

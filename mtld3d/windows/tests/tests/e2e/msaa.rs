@@ -1,0 +1,2235 @@
+//! Multisample anti-aliasing: the swap chain, standalone surfaces and the resolve.
+//!
+//! The observable property throughout is coverage. A diagonal edge drawn into a
+//! multisampled target resolves to intermediate pixels along the edge; the same
+//! draw into a single-sampled target has none, every pixel being fully inside
+//! or fully outside. Each test that renders counts those intermediate pixels
+//! along one scanline, so nothing depends on where exactly the rasterizer puts
+//! the edge or on the device's sample positions.
+
+use mtld3d_tests::{
+    Harness, HarnessConfig, Reading, Rgba8, RhwVertex, Surface, Texture, TexturedVertex,
+    assert_or_reread, assert_pixel_eq,
+};
+use mtld3d_types::{
+    D3D_OK, D3DCLEAR_TARGET, D3DCLEAR_ZBUFFER, D3DCMP_ALWAYS, D3DCMP_GREATER, D3DCMP_LESS,
+    D3DERR_INVALIDCALL, D3DERR_NOTAVAILABLE, D3DFMT_A8R8G8B8, D3DFMT_ATOC, D3DFMT_D16,
+    D3DFMT_D24S8, D3DFMT_DXT1, D3DFMT_INTZ, D3DFMT_X8R8G8B8, D3DFVF_DIFFUSE, D3DFVF_TEX1,
+    D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DMULTISAMPLE_2_SAMPLES,
+    D3DMULTISAMPLE_4_SAMPLES, D3DMULTISAMPLE_NONE, D3DMULTISAMPLE_NONMASKABLE, D3DPOOL_DEFAULT,
+    D3DPOOL_SYSTEMMEM, D3DPT_TRIANGLELIST, D3DRS_ADAPTIVETESS_Y, D3DRS_ALPHAFUNC, D3DRS_ALPHAREF,
+    D3DRS_ALPHATESTENABLE, D3DRS_COLORWRITEENABLE, D3DRS_LIGHTING, D3DRS_MULTISAMPLEMASK,
+    D3DRS_POINTSIZE, D3DRS_SRGBWRITEENABLE, D3DRS_ZENABLE, D3DRS_ZFUNC, D3DRS_ZWRITEENABLE,
+    D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_MAGFILTER,
+    D3DSAMP_MINFILTER, D3DSBT_VERTEXSTATE, D3DTADDRESS_CLAMP, D3DTEXF_NONE, D3DTEXF_POINT,
+    D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_RENDERTARGET,
+};
+
+/// Edge of the standalone render targets, small enough to keep the readback cheap.
+pub const RT_SIZE: u32 = 64;
+/// [`RT_SIZE`] as the vertex positions state it.
+const RT_SIZE_F: f32 = 64.0;
+
+const BLACK: u32 = 0xFF00_0000;
+const WHITE: u32 = 0xFFFF_FFFF;
+const BLUE: u32 = 0xFF00_00FF;
+
+/// `ps_2_0`: `mov oC0, c0;`.
+const COVERAGE_PS: [u32; 5] = [
+    0xffff_0200,
+    0x0200_0001,
+    0x000f_0800,
+    0x20e4_0000,
+    0x0000_ffff,
+];
+
+/// A windowed device with the given swap-chain multisample type and depth format.
+fn harness(multi_sample_type: u32, depth_format: Option<u32>) -> Harness {
+    Harness::create(&HarnessConfig {
+        depth_format,
+        multi_sample_type,
+        ..HarnessConfig::default()
+    })
+}
+
+/// The lower-left half of a `width`×`height` target, in `color`, at depth `z`.
+///
+/// The hypotenuse runs corner to corner, so the band of pixels it crosses is
+/// partially covered: exactly the band [`count_intermediate`] counts.
+const fn diagonal(width: f32, height: f32, z: f32, color: u32) -> [RhwVertex; 3] {
+    let (w, h) = (width, height);
+    [
+        RhwVertex {
+            x: 0.0,
+            y: 0.0,
+            z,
+            rhw: 1.0,
+            color,
+        },
+        RhwVertex {
+            x: w,
+            y: 0.0,
+            z,
+            rhw: 1.0,
+            color,
+        },
+        RhwVertex {
+            x: 0.0,
+            y: h,
+            z,
+            rhw: 1.0,
+            color,
+        },
+    ]
+}
+
+/// Arm the fixed-function pipeline for an unlit pre-transformed draw.
+fn arm(h: &Harness) {
+    assert_eq!(h.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+}
+
+/// A pixel that is well inside the triangle, clear of all three of its edges.
+///
+/// Not pixel zero: the triangle's own left edge runs down the target's edge, so
+/// the leftmost column is half covered and resolves to half intensity.
+const INSIDE_X: u32 = 4;
+
+/// Pixels that are neither the background nor the fill.
+///
+/// A single-sampled rasterizer writes every pixel either fully or not at all,
+/// so the count is zero; a multisampled one resolves the partially covered
+/// pixels along the edge to something in between. Reads only the red channel,
+/// which the black-to-white contrast makes the whole signal.
+fn count_intermediate(pixels: &[u32]) -> usize {
+    pixels
+        .iter()
+        .filter(|&&p| {
+            let r = Rgba8::from_pixel(p).r;
+            r > 16 && r < 239
+        })
+        .count()
+}
+
+/// The back buffer's extent as the pre-transformed vertex positions state it.
+///
+/// `f32::from` rather than an `as` cast: the dimensions are u16-range in
+/// practice, and the conversion has to stay exact for the triangle to land on
+/// the target's corners.
+fn back_buffer_extent(h: &Harness) -> (f32, f32) {
+    let (width, height) = h.dims();
+    (
+        f32::from(u16::try_from(width).expect("back-buffer width fits u16")),
+        f32::from(u16::try_from(height).expect("back-buffer height fits u16")),
+    )
+}
+
+/// Read the back buffer's middle scanline.
+///
+/// `StretchRect` into a single-sampled staging target first: D3D9 rejects
+/// `GetRenderTargetData` on a multisampled surface, and the resolve is the
+/// step the application is expected to take instead. Doing it unconditionally
+/// keeps the multisampled and the single-sampled reads on one path.
+fn back_buffer_row(h: &Harness) -> Vec<u32> {
+    let (width, height) = h.dims();
+    let staging = h.create_render_target(width, height, D3DFMT_X8R8G8B8);
+    let back = h.back_buffer(0);
+    assert_eq!(
+        h.stretch_rect(&back, &staging, D3DTEXF_NONE),
+        0,
+        "StretchRect the back buffer into the staging target"
+    );
+    surface_row(h, &staging, (width, height))
+}
+
+/// Read the middle scanline of an `RT_SIZE`-square render target.
+///
+/// The surface must be single-sampled; a multisampled one is resolved with
+/// `StretchRect` first, as D3D9 requires.
+fn render_target_row(h: &Harness, rt: &Surface<'_>) -> Vec<u32> {
+    surface_row(h, rt, (RT_SIZE, RT_SIZE))
+}
+
+/// Read the middle scanline of a single-sampled render target of `size`.
+fn surface_row(h: &Harness, rt: &Surface<'_>, size: (u32, u32)) -> Vec<u32> {
+    let (width, height) = size;
+    let sysmem =
+        h.create_offscreen_plain_surface(width, height, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM);
+    assert_eq!(
+        h.get_render_target_data_hr(rt, &sysmem),
+        0,
+        "GetRenderTargetData"
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_px = locked.pitch().cast_unsigned() / 4;
+    let base = ((height / 2) * pitch_px) as usize;
+    let row = locked.as_u32(base + width as usize);
+    row[base..base + width as usize].to_vec()
+}
+
+/// `StretchRect` `source` into `resolve` and read the middle scanline `accept` has to pass.
+///
+/// For a read whose zero would say nothing about the stage that lost it: a
+/// multisampled pass, the resolve and copy out of it, and one CPU read. A
+/// rejected row is read again through `assert_or_reread`, first with a second
+/// `GetRenderTargetData` of `resolve` into a fresh system-memory surface and
+/// then after a second `StretchRect`, before the test fails with all three.
+#[track_caller]
+fn resolved_row(
+    h: &Harness,
+    source: &Surface<'_>,
+    resolve: &Surface<'_>,
+    context: &str,
+    expected: &str,
+    accept: impl Fn(&[u32]) -> bool,
+) -> Vec<u32> {
+    let (hr, desc) = resolve.desc();
+    assert_eq!(hr, D3D_OK, "GetDesc on the resolve destination");
+    let size = (desc.width, desc.height);
+    let copy_and_read = || {
+        assert_eq!(
+            h.stretch_rect(source, resolve, D3DTEXF_NONE),
+            D3D_OK,
+            "StretchRect into the resolve destination"
+        );
+        surface_row(h, resolve, size)
+    };
+    let reading = |row: &[u32]| Reading::described(show_row(row), accept(row));
+    let row = copy_and_read();
+    assert_or_reread(
+        h,
+        context,
+        expected,
+        &reading(&row),
+        || reading(&surface_row(h, resolve, size)),
+        || reading(&copy_and_read()),
+    );
+    row
+}
+
+/// A scanline for a failure report, as runs of equal pixels.
+///
+/// A row these tests read is a few flat spans and an edge, so the runs keep
+/// every pixel of it; a row with more runs than `SHOWN` is cut there and says so.
+fn show_row(row: &[u32]) -> String {
+    const SHOWN: usize = 24;
+    let runs: Vec<String> = row
+        .chunk_by(|a, b| a == b)
+        .map(|run| format!("{:08x} x{}", run[0], run.len()))
+        .collect();
+    let cut = if runs.len() > SHOWN {
+        format!(", and {} more runs", runs.len() - SHOWN)
+    } else {
+        String::new()
+    };
+    format!(
+        "{} pixels: [{}{cut}]",
+        row.len(),
+        runs[..runs.len().min(SHOWN)].join(", ")
+    )
+}
+
+/// Render the diagonal into `rt`, which must be `RT_SIZE` square.
+fn draw_diagonal_into(h: &Harness, rt: &Surface<'_>) {
+    arm(h);
+    assert_eq!(h.set_render_target(0, rt), 0, "SetRenderTarget");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.clear_target(BLACK), 0, "Clear");
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(RT_SIZE_F, RT_SIZE_F, 0.5, WHITE)
+        ),
+        0,
+        "DrawPrimitiveUP",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+}
+
+// ── CheckDeviceMultiSampleType ──
+
+#[test]
+fn check_device_multi_sample_type_answers_the_device() {
+    let h = Harness::factory_only();
+
+    let (hr, levels) = h.check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, D3DMULTISAMPLE_NONE);
+    assert_eq!(hr, D3D_OK, "NONE is always available");
+    assert_eq!(levels, 1, "a maskable level has exactly one quality level");
+
+    // Metal guarantees a sample count of 4 on every GPU family mtld3d runs on,
+    // so this is an unconditional answer rather than a device-dependent one.
+    let (hr, levels) =
+        h.check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, D3DMULTISAMPLE_4_SAMPLES);
+    assert_eq!(hr, D3D_OK, "4x colour");
+    assert_eq!(levels, 1, "a maskable level has exactly one quality level");
+    assert_eq!(
+        h.check_device_multi_sample_type(D3DFMT_D24S8, 1, D3DMULTISAMPLE_4_SAMPLES)
+            .0,
+        D3D_OK,
+        "4x depth"
+    );
+
+    // NONMASKABLE reports how many rungs its quality ladder has; quality `q`
+    // means `1 << q` samples, so 4x support alone puts the count at three.
+    let (hr, levels) =
+        h.check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, D3DMULTISAMPLE_NONMASKABLE);
+    assert_eq!(hr, D3D_OK, "NONMASKABLE");
+    assert!(
+        levels >= 3,
+        "at least quality 0..2 (1x, 2x, 4x), got {levels}"
+    );
+}
+
+#[test]
+fn check_device_multi_sample_type_rejects_malformed_and_unsupported() {
+    let h = Harness::factory_only();
+
+    // 3 and 15 are inside `D3DMULTISAMPLE_TYPE` but name counts no hardware
+    // offers, so they are merely unavailable; 17 is outside the enumeration
+    // and malformed, as is `D3DFMT_UNKNOWN`.
+    assert_eq!(
+        h.check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, 3).0,
+        D3DERR_NOTAVAILABLE,
+        "3 samples"
+    );
+    assert_eq!(
+        h.check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, 15).0,
+        D3DERR_NOTAVAILABLE,
+        "15 samples"
+    );
+    assert_eq!(
+        h.check_device_multi_sample_type(D3DFMT_X8R8G8B8, 1, 17).0,
+        D3DERR_INVALIDCALL,
+        "17 samples"
+    );
+    assert_eq!(
+        h.check_device_multi_sample_type(0, 1, D3DMULTISAMPLE_NONE)
+            .0,
+        D3DERR_INVALIDCALL,
+        "D3DFMT_UNKNOWN"
+    );
+
+    // A format whose whole point is per-sample readback, and a
+    // block-compressed one that is not renderable at all.
+    assert_eq!(
+        h.check_device_multi_sample_type(D3DFMT_INTZ, 1, D3DMULTISAMPLE_4_SAMPLES)
+            .0,
+        D3DERR_NOTAVAILABLE,
+        "multisampled INTZ"
+    );
+    assert_eq!(
+        h.check_device_multi_sample_type(D3DFMT_DXT1, 1, D3DMULTISAMPLE_2_SAMPLES)
+            .0,
+        D3DERR_NOTAVAILABLE,
+        "multisampled DXT1"
+    );
+    // The same format still answers the "is this usable at all" probe.
+    assert_eq!(
+        h.check_device_multi_sample_type(D3DFMT_INTZ, 1, D3DMULTISAMPLE_NONE)
+            .0,
+        D3D_OK,
+        "single-sampled INTZ"
+    );
+}
+
+// ── Surface creation ──
+
+#[test]
+fn create_render_target_honours_the_multisample_type() {
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let rt = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_X8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let (hr, desc) = rt.desc();
+    assert_eq!(hr, 0, "GetDesc on the multisampled render target");
+    assert_eq!(
+        desc.multi_sample_type, D3DMULTISAMPLE_4_SAMPLES,
+        "GetDesc reports the type the surface was created with"
+    );
+    assert_eq!(desc.multi_sample_quality, 0, "quality round-trips");
+
+    // A lockable multisampled render target has no meaning: the lock is
+    // defined against a single-sample surface.
+    assert_eq!(
+        h.create_render_target_ms_hr(
+            (RT_SIZE, RT_SIZE),
+            D3DFMT_X8R8G8B8,
+            (D3DMULTISAMPLE_4_SAMPLES, 0),
+            1,
+        )
+        .0,
+        D3DERR_INVALIDCALL,
+        "lockable + multisampled"
+    );
+    // A sample count no device can serve is rejected at create time too.
+    assert_eq!(
+        h.create_render_target_ms_hr((RT_SIZE, RT_SIZE), D3DFMT_X8R8G8B8, (3, 0), 0)
+            .0,
+        D3DERR_INVALIDCALL,
+        "3 samples"
+    );
+}
+
+#[test]
+fn create_depth_stencil_surface_honours_the_multisample_type() {
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let (hr, ds) = h.create_depth_stencil_surface_ms_hr(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_D24S8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    assert_eq!(hr, 0, "CreateDepthStencilSurface(4x)");
+    let ds = ds.expect("multisampled depth surface");
+    let (hr, desc) = ds.desc();
+    assert_eq!(hr, 0, "GetDesc on the multisampled depth surface");
+    assert_eq!(
+        desc.multi_sample_type, D3DMULTISAMPLE_4_SAMPLES,
+        "GetDesc reports the type"
+    );
+}
+
+// ── The resolve ──
+
+#[test]
+fn a_single_sampled_render_target_has_no_partial_coverage() {
+    // The control for `multisampled_render_target_resolves_the_edge`: the same
+    // draw with no multisampling writes only fully-covered pixels.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_X8R8G8B8);
+    draw_diagonal_into(&h, &rt);
+    let row = render_target_row(&h, &rt);
+    assert_eq!(
+        count_intermediate(&row),
+        0,
+        "a single-sampled edge is hard: {row:02X?}"
+    );
+}
+
+#[test]
+fn multisampled_render_target_resolves_the_edge() {
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let rt = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_X8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    draw_diagonal_into(&h, &rt);
+
+    // D3D9 makes the application resolve a multisampled surface with
+    // `StretchRect` before reading it back, which is what the resolve fills.
+    let plain = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_X8R8G8B8);
+    assert_eq!(
+        h.get_render_target_data_hr(
+            &rt,
+            &h.create_offscreen_plain_surface(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM)
+        ),
+        D3DERR_INVALIDCALL,
+        "GetRenderTargetData rejects a multisampled source"
+    );
+    assert_eq!(h.stretch_rect(&rt, &plain, D3DTEXF_NONE), 0, "resolve");
+    let row = render_target_row(&h, &plain);
+    assert!(
+        count_intermediate(&row) > 0,
+        "a 4x edge resolves to partial coverage: {row:02X?}"
+    );
+    assert_pixel_eq(
+        row[INSIDE_X as usize],
+        WHITE,
+        "a pixel clear of every edge is fully covered",
+    );
+    assert_pixel_eq(row[RT_SIZE as usize - 1], BLACK, "and the last one is not");
+}
+
+#[test]
+fn a_fresh_multisampled_target_keeps_undrawn_pixels_transparent_black() {
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let back = h.render_target(0);
+    let resolved = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    // Seed both the single-sample backing and the MSAA companion before
+    // retiring them. A resolve readback waits for those writes to reach the
+    // GPU; the next Present lets their textures retire after unbinding.
+    for _ in 0..4 {
+        let painted = h.create_render_target_ms(
+            (RT_SIZE, RT_SIZE),
+            D3DFMT_A8R8G8B8,
+            (D3DMULTISAMPLE_4_SAMPLES, 0),
+        );
+        assert_eq!(h.set_render_target(0, &painted), D3D_OK);
+        assert_eq!(h.clear_target(WHITE), D3D_OK);
+        assert_eq!(h.set_render_target(0, &back), D3D_OK);
+        assert_eq!(h.stretch_rect(&painted, &resolved, D3DTEXF_NONE), D3D_OK);
+        assert!(render_target_row(&h, &resolved).iter().all(|&p| p == WHITE));
+        drop(painted);
+        h.render_once(BLACK, |_| {});
+    }
+
+    let fresh = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    arm(&h);
+    assert_eq!(h.set_render_target(0, &fresh), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    // No Clear: the draw must load the companion's creation contents and
+    // preserve them outside the triangle, including alpha.
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(RT_SIZE_F, RT_SIZE_F, 0.5, BLUE),
+        ),
+        D3D_OK,
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    assert_eq!(h.set_render_target(0, &back), D3D_OK);
+    assert_eq!(h.stretch_rect(&fresh, &resolved, D3DTEXF_NONE), D3D_OK);
+    let row = render_target_row(&h, &resolved);
+    assert_eq!(row[INSIDE_X as usize], BLUE, "the draw reached the target");
+    assert!(
+        row[(RT_SIZE * 3 / 4) as usize..].iter().all(|&p| p == 0),
+        "pixels beyond the triangle stay transparent black after resolve: {row:08X?}",
+    );
+}
+
+#[test]
+fn multisampled_back_buffer_presents_a_resolved_edge() {
+    let h = harness(D3DMULTISAMPLE_4_SAMPLES, None);
+    let bb = h.back_buffer(0);
+    let (hr, desc) = bb.desc();
+    assert_eq!(hr, 0, "GetDesc on the multisampled back buffer");
+    assert_eq!(
+        desc.multi_sample_type, D3DMULTISAMPLE_4_SAMPLES,
+        "the back buffer reports the swap chain's type"
+    );
+    drop(bb);
+
+    let (width_f, height_f) = back_buffer_extent(&h);
+    arm(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(
+                D3DPT_TRIANGLELIST,
+                1,
+                &diagonal(width_f, height_f, 0.5, WHITE)
+            ),
+            0,
+            "DrawPrimitiveUP",
+        );
+    });
+    let row = back_buffer_row(&h);
+    assert!(
+        count_intermediate(&row) > 0,
+        "the presented back buffer carries the resolved edge"
+    );
+}
+
+/// A multisampled device released after an sRGB-write present tears down whole.
+///
+/// A multisampled swap chain carries four implicit colour textures: the
+/// single-sampled base, the multisampled companion the passes render into,
+/// and an sRGB twin view of each, which `D3DRS_SRGBWRITEENABLE` makes the
+/// attachments the frame names. Only the base has a slot on the queue-destroy
+/// thunk, so the other three leave through the bulk release the teardown
+/// issues behind the encoder's GPU-idle wait, the twins ahead of the
+/// companion each holds a retain on. Each round takes a device of its own,
+/// presents `D3DRS_SRGBWRITEENABLE` frames through it, reads the resolved
+/// image back and releases the device, so the teardown runs on a swap chain
+/// whose four textures have all been the attachments of a retired frame.
+///
+/// What this pins: the rounds run to completion, every call answers `D3D_OK`,
+/// the resolved edge comes back, the release reaches a zero refcount, and the
+/// process the suite shares is still alive afterwards. What it cannot pin: a
+/// texture the teardown never releases is a leak the process carries
+/// silently, so the destroy of all four is read from the layer's log
+/// (`RUST_LOG=mtld3d=warn,mtld3d::unix=debug` names every handle at its
+/// create and at its bulk destroy), not from an assertion here.
+#[test]
+fn a_multisampled_device_releases_after_an_srgb_write_present() {
+    const ROUNDS: u32 = 6;
+    const FRAMES: u32 = 2;
+
+    for round in 0..ROUNDS {
+        let h = harness(D3DMULTISAMPLE_4_SAMPLES, None);
+        let (width_f, height_f) = back_buffer_extent(&h);
+        arm(&h);
+        assert_eq!(
+            h.set_render_state(D3DRS_SRGBWRITEENABLE, 1),
+            0,
+            "sRGB write on (round {round})"
+        );
+        for frame in 0..FRAMES {
+            assert_eq!(
+                h.begin_scene(),
+                0,
+                "BeginScene (round {round} frame {frame})"
+            );
+            assert_eq!(
+                h.clear_target(BLACK),
+                0,
+                "Clear (round {round} frame {frame})"
+            );
+            assert_eq!(
+                h.draw_primitive_up(
+                    D3DPT_TRIANGLELIST,
+                    1,
+                    &diagonal(width_f, height_f, 0.5, WHITE)
+                ),
+                0,
+                "DrawPrimitiveUP (round {round} frame {frame})",
+            );
+            assert_eq!(h.end_scene(), 0, "EndScene (round {round} frame {frame})");
+            assert_eq!(h.present(), 0, "Present (round {round} frame {frame})");
+        }
+        // The readback retires the frames before the release, so what the
+        // round exercises is the teardown of a multisampled swap chain rather
+        // than the release of a frame still in flight.
+        let row = back_buffer_row(&h);
+        assert!(
+            count_intermediate(&row) > 0,
+            "the presented back buffer carries the resolved edge (round {round})"
+        );
+        assert_eq!(
+            h.release_device(),
+            0,
+            "the device is fully released (round {round})"
+        );
+    }
+}
+
+#[test]
+fn stretch_rect_resolves_a_multisampled_source() {
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let msaa = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_X8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let plain = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_X8R8G8B8);
+    draw_diagonal_into(&h, &msaa);
+    assert_eq!(
+        h.stretch_rect(&msaa, &plain, D3DTEXF_NONE),
+        0,
+        "StretchRect from a multisampled source"
+    );
+
+    let row = render_target_row(&h, &plain);
+    assert!(
+        count_intermediate(&row) > 0,
+        "the copy carries the resolved edge: {row:02X?}"
+    );
+
+    // The reverse direction spreads each source pixel over every sample, so
+    // the round trip comes back exactly as it went in.
+    let back = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_X8R8G8B8);
+    assert_eq!(
+        h.stretch_rect(&plain, &msaa, D3DTEXF_NONE),
+        0,
+        "StretchRect into a multisampled destination"
+    );
+    assert_eq!(
+        h.stretch_rect(&msaa, &back, D3DTEXF_NONE),
+        0,
+        "and back out"
+    );
+    let round_trip = render_target_row(&h, &back);
+    assert_eq!(
+        round_trip, row,
+        "a copy through a multisampled surface changes nothing"
+    );
+}
+
+#[test]
+fn depth_test_holds_on_a_multisampled_target() {
+    let h = harness(D3DMULTISAMPLE_4_SAMPLES, Some(D3DFMT_D24S8));
+    let (width_f, height_f) = back_buffer_extent(&h);
+    arm(&h);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+
+    // A near white triangle, then the same triangle further away: the second
+    // draw must fail the depth test and leave the first one's pixels, edge
+    // included.
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(width_f, height_f, 0.2, WHITE)
+        ),
+        0,
+        "near draw",
+    );
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(width_f, height_f, 0.8, BLUE)
+        ),
+        0,
+        "far draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.present(), 0, "Present");
+
+    let (width, height) = h.dims();
+    let staging = h.create_render_target(width, height, D3DFMT_X8R8G8B8);
+    resolved_row(
+        &h,
+        &h.back_buffer(0),
+        &staging,
+        "the depth-tested 4x edge resolves and the near draw's white survives the occluded blue",
+        "intermediate pixels along the edge and 0xffffffff at x=4",
+        |row| count_intermediate(row) > 0 && row[INSIDE_X as usize] == WHITE,
+    );
+}
+
+#[test]
+fn a_multisampled_depth_surface_binds_beside_a_multisampled_target() {
+    // A depth surface created at the target's sample count is the pairing
+    // Metal accepts; the draw below would be dropped if the pass had been
+    // rejected for disagreeing attachments.
+    let h = harness(D3DMULTISAMPLE_4_SAMPLES, None);
+    let (width, height) = h.dims();
+    let (width_f, height_f) = back_buffer_extent(&h);
+    let ds = h
+        .create_depth_stencil_surface_ms_hr(
+            (width, height),
+            D3DFMT_D16,
+            (D3DMULTISAMPLE_4_SAMPLES, 0),
+        )
+        .1
+        .expect("multisampled depth surface");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ds),
+        0,
+        "SetDepthStencilSurface(4x)"
+    );
+    arm(&h);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(width_f, height_f, 0.5, WHITE)
+        ),
+        0,
+        "DrawPrimitiveUP",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.present(), 0, "Present");
+
+    let row = back_buffer_row(&h);
+    assert!(
+        count_intermediate(&row) > 0,
+        "the draw reached a 4x colour + 4x depth pass"
+    );
+}
+
+#[test]
+fn a_single_sampled_depth_surface_drops_beside_a_multisampled_target() {
+    // D3D9 leaves the depth-stencil surface bound across `SetRenderTarget`, so
+    // a multisampled target can land beside the single-sampled depth the
+    // device was created with. Metal takes a pass's sample count from its
+    // attachments and rejects one whose attachments disagree, so the pass
+    // drops the depth attachment. Everything else built for that pass has to
+    // agree: a pipeline that still declared a depth format would be rejected
+    // at the draw ("For depth attachment, the renderPipelineState pixelFormat
+    // must be MTLPixelFormatInvalid, as no texture is set"), and the draw
+    // would never reach the target.
+    let h = harness(D3DMULTISAMPLE_NONE, Some(D3DFMT_D24S8));
+    let (width, height) = h.dims();
+    let (width_f, height_f) = back_buffer_extent(&h);
+    let rt = h.create_render_target_ms(
+        (width, height),
+        D3DFMT_X8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    assert_eq!(h.set_render_target(0, &rt), 0, "SetRenderTarget(4x)");
+    arm(&h);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(width_f, height_f, 0.5, WHITE)
+        ),
+        0,
+        "DrawPrimitiveUP",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    let plain = h.create_render_target(width, height, D3DFMT_X8R8G8B8);
+    assert_eq!(h.stretch_rect(&rt, &plain, D3DTEXF_NONE), 0, "resolve");
+    let row = surface_row(&h, &plain, (width, height));
+    assert!(
+        count_intermediate(&row) > 0,
+        "the draw reached the 4x target with depth dropped: {row:02X?}"
+    );
+    assert_pixel_eq(
+        row[INSIDE_X as usize],
+        WHITE,
+        "a pixel clear of every edge carries the draw",
+    );
+}
+
+// ── D3DRS_MULTISAMPLEMASK ──
+
+#[test]
+fn multisample_mask_selects_the_samples_a_draw_writes() {
+    let h = harness(D3DMULTISAMPLE_4_SAMPLES, None);
+    let (width_f, height_f) = back_buffer_extent(&h);
+    arm(&h);
+
+    // Every sample masked out: the draw covers the target but writes nothing.
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.set_render_state(D3DRS_MULTISAMPLEMASK, 0), 0, "mask 0");
+        assert_eq!(
+            d.draw_primitive_up(
+                D3DPT_TRIANGLELIST,
+                1,
+                &diagonal(width_f, height_f, 0.5, WHITE)
+            ),
+            0,
+            "masked draw",
+        );
+    });
+    assert_pixel_eq(
+        back_buffer_row(&h)[INSIDE_X as usize],
+        BLACK,
+        "a fully masked draw writes no sample",
+    );
+
+    // Half the samples: a fully covered pixel resolves to half intensity.
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.set_render_state(D3DRS_MULTISAMPLEMASK, 0b0011),
+            0,
+            "mask 3"
+        );
+        assert_eq!(
+            d.draw_primitive_up(
+                D3DPT_TRIANGLELIST,
+                1,
+                &diagonal(width_f, height_f, 0.5, WHITE)
+            ),
+            0,
+            "half-masked draw",
+        );
+    });
+    let half = Rgba8::from_pixel(back_buffer_row(&h)[INSIDE_X as usize]);
+    assert!(
+        half.r > 16 && half.r < 239,
+        "two of four samples resolve to a partial value, got {half:?}"
+    );
+
+    // The default mask restores the full write.
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.set_render_state(D3DRS_MULTISAMPLEMASK, 0xFFFF_FFFF),
+            0,
+            "default mask"
+        );
+        assert_eq!(
+            d.draw_primitive_up(
+                D3DPT_TRIANGLELIST,
+                1,
+                &diagonal(width_f, height_f, 0.5, WHITE)
+            ),
+            0,
+            "unmasked draw",
+        );
+    });
+    assert_pixel_eq(
+        back_buffer_row(&h)[INSIDE_X as usize],
+        WHITE,
+        "the default mask writes every sample",
+    );
+}
+
+// ── RESZ from a multisampled depth surface ──
+
+/// The depth the RESZ scene writes, and the grey it samples back as.
+const RESZ_DEPTH: f32 = 0.25;
+
+/// One screen-space triangle covering the whole `RT_SIZE` target at depth `z`.
+///
+/// Twice the target's edge in both directions, so every sample of every pixel
+/// is inside it and the depth written is `z` at each of them.
+const fn covering_triangle(z: f32) -> [RhwVertex; 3] {
+    [
+        RhwVertex {
+            x: 0.0,
+            y: 0.0,
+            z,
+            rhw: 1.0,
+            color: WHITE,
+        },
+        RhwVertex {
+            x: RT_SIZE_F * 2.0,
+            y: 0.0,
+            z,
+            rhw: 1.0,
+            color: WHITE,
+        },
+        RhwVertex {
+            x: 0.0,
+            y: RT_SIZE_F * 2.0,
+            z,
+            rhw: 1.0,
+            color: WHITE,
+        },
+    ]
+}
+
+/// A clip-space quad over the whole target with the texture mapped onto it.
+const fn textured_quad() -> [TexturedVertex; 6] {
+    const fn v(x: f32, y: f32, u: f32, tv: f32) -> TexturedVertex {
+        TexturedVertex {
+            x,
+            y,
+            z: 0.5,
+            color: WHITE,
+            u,
+            v: tv,
+        }
+    }
+    [
+        v(-1.0, 1.0, 0.0, 0.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+        v(1.0, 1.0, 1.0, 0.0),
+        v(1.0, -1.0, 1.0, 1.0),
+        v(-1.0, -1.0, 0.0, 1.0),
+    ]
+}
+
+/// Fill `intz` with depth 1.0, so a resolve that never runs is visible.
+fn prime_intz(h: &Harness, rt: &Surface<'_>, intz: &Texture<'_>) {
+    assert_eq!(h.set_render_target(0, rt), 0, "SetRenderTarget(prime)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&intz.surface_level(0)),
+        0,
+        "bind the INTZ level as depth"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear the INTZ to the far plane"
+    );
+}
+
+/// Render depth `RESZ_DEPTH` into `ds` beside `rt`, then RESZ it into `intz`.
+fn resz_into(h: &Harness, rt: &Surface<'_>, ds: &Surface<'_>, intz: &Texture<'_>) {
+    arm(h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_target(0, rt), 0, "SetRenderTarget(scene)");
+    assert_eq!(h.set_depth_stencil_surface(ds), 0, "SetDepthStencilSurface");
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        0,
+        "depth func"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(RESZ_DEPTH)),
+        0,
+        "depth-writing draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    assert_eq!(h.set_texture(0, intz), 0, "bind the RESZ destination");
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "the RESZ magic value"
+    );
+}
+
+/// Sample `intz` over the whole of `rt`, which must be `RT_SIZE` square, and read the middle back.
+///
+/// An INTZ texture answers a fixed-function fetch with the raw stored depth
+/// broadcast to every channel, so the quad reads back as the depth value.
+pub fn sample_intz(h: &Harness, rt: &Surface<'_>, intz: &Texture<'_>) -> u32 {
+    h.select_texture_stage(0);
+    assert_eq!(h.set_render_target(0, rt), 0, "SetRenderTarget(sample)");
+    assert_eq!(
+        h.clear_depth_stencil_surface(),
+        0,
+        "unbind depth so the INTZ is a sampler, not an attachment"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0, "depth test off");
+    assert_eq!(h.set_texture(0, intz), 0, "bind the INTZ as a sampler");
+    for (state, value) in [
+        (D3DSAMP_MINFILTER, D3DTEXF_POINT),
+        (D3DSAMP_MAGFILTER, D3DTEXF_POINT),
+        (D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP),
+        (D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP),
+    ] {
+        assert_eq!(h.set_sampler_state(0, state, value), 0, "sampler state");
+    }
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.clear_target(BLUE), 0, "clear the sample target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &textured_quad()),
+        0,
+        "sample the resolved depth",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    surface_row(h, rt, (RT_SIZE, RT_SIZE))[(RT_SIZE / 2) as usize]
+}
+
+#[test]
+fn resz_resolves_a_multisampled_depth_surface() {
+    // The RESZ hack hands the bound depth-stencil to a single-sampled INTZ
+    // texture. From a multisampled surface that is a resolve, not a copy:
+    // Metal's blit encoder refuses the sample-count change, so a depth
+    // transfer takes sample zero instead. The scene writes one constant
+    // depth, so the multisampled answer and the single-sampled one are the
+    // same value and can be compared directly.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let size = (RT_SIZE, RT_SIZE);
+    let ms = (D3DMULTISAMPLE_4_SAMPLES, 0);
+
+    let ms_rt = h.create_render_target_ms(size, D3DFMT_A8R8G8B8, ms);
+    let ms_ds = h
+        .create_depth_stencil_surface_ms_hr(size, D3DFMT_D24S8, ms)
+        .1
+        .expect("4x depth surface");
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let ss_ds = h.create_depth_stencil_surface(RT_SIZE, RT_SIZE, D3DFMT_D24S8);
+    let resolved_depth = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let copied_depth = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+
+    // Both destinations start at the far plane, so a resolve that never
+    // happens reads back white instead of the scene's depth.
+    prime_intz(&h, &ss_rt, &resolved_depth);
+    prime_intz(&h, &ss_rt, &copied_depth);
+
+    resz_into(&h, &ms_rt, &ms_ds, &resolved_depth);
+    let from_multisampled = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &resolved_depth));
+
+    resz_into(&h, &ss_rt, &ss_ds, &copied_depth);
+    let from_single_sampled = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &copied_depth));
+
+    assert!(
+        from_multisampled.r < 200,
+        "the multisampled resolve ran at all, got {from_multisampled:?}"
+    );
+    assert!(
+        from_multisampled.r.abs_diff(from_single_sampled.r) <= 2,
+        "the resolved depth matches the single-sampled RESZ: \
+         multisampled {from_multisampled:?} vs single-sampled {from_single_sampled:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
+}
+
+#[test]
+fn resz_reads_the_resolved_depth_over_a_render_pass_clear_of_its_destination() {
+    // The INTZ destination is cleared to the far plane by a depth-only Clear
+    // while it is the bound depth surface, so a render pass writes it before
+    // the resolve does. The scene then renders into a 2x target and depth
+    // surface, a draw with colour writes and depth off samples the INTZ
+    // before the resolve, and the RESZ lands inside the same scene. What the
+    // INTZ reads back afterwards is the scene's depth, not that clear.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let size = (RT_SIZE, RT_SIZE);
+    let ms = (D3DMULTISAMPLE_2_SAMPLES, 0);
+    let ms_rt = h.create_render_target_ms(size, D3DFMT_A8R8G8B8, ms);
+    let ms_ds = h
+        .create_depth_stencil_surface_ms_hr(size, D3DFMT_D24S8, ms)
+        .1
+        .expect("2x depth surface");
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let intz = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+
+    assert_eq!(h.set_render_target(0, &ss_rt), 0, "SetRenderTarget(prime)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&intz.surface_level(0)),
+        0,
+        "bind the INTZ level as depth"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, 0, 1.0, 0),
+        0,
+        "depth-only clear of the INTZ to the far plane"
+    );
+
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_target(0, &ms_rt), 0, "SetRenderTarget(scene)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ms_ds),
+        0,
+        "SetDepthStencilSurface(scene)"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        0,
+        "depth func"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(RESZ_DEPTH)),
+        0,
+        "depth-writing draw",
+    );
+
+    // The draw ahead of the resolve samples the INTZ with every write off.
+    assert_eq!(h.set_texture(0, &intz), 0, "bind the RESZ destination");
+    h.select_texture_stage(0);
+    assert_eq!(
+        h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE | D3DFVF_TEX1),
+        0,
+        "SetFVF(dummy)"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), 0, "depth test off");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZWRITEENABLE, 0),
+        0,
+        "depth writes off"
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_COLORWRITEENABLE, 0),
+        0,
+        "colour writes off"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &textured_quad()),
+        0,
+        "dummy draw sampling the INTZ",
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_COLORWRITEENABLE, 0xf),
+        0,
+        "colour writes on"
+    );
+
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "the RESZ magic value"
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    // RESZ_DEPTH is 0.25, which an 8-bit channel reads as 64; the far plane
+    // the clear left would read as 255.
+    let pixel = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &intz));
+    assert!(
+        pixel.r.abs_diff(64) <= 2,
+        "the INTZ holds the resolved scene depth, not its clear: {pixel:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
+}
+
+#[test]
+fn resz_reads_a_depth_clear_with_no_draw_before_it() {
+    // Clear(ZBUFFER) on the bound multisampled depth with no pass open, then
+    // RESZ straight away: the resolve reads the cleared depth, not whatever
+    // the surface held before the clear.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let size = (RT_SIZE, RT_SIZE);
+    let ms = (D3DMULTISAMPLE_2_SAMPLES, 0);
+    let ms_rt = h.create_render_target_ms(size, D3DFMT_A8R8G8B8, ms);
+    let ms_ds = h
+        .create_depth_stencil_surface_ms_hr(size, D3DFMT_D24S8, ms)
+        .1
+        .expect("2x depth surface");
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let intz = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    prime_intz(&h, &ss_rt, &intz);
+
+    assert_eq!(h.set_render_target(0, &ms_rt), 0, "SetRenderTarget(scene)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ms_ds),
+        0,
+        "SetDepthStencilSurface(scene)"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_ZBUFFER, 0, RESZ_DEPTH, 0),
+        0,
+        "clear the multisampled depth, no draw after it"
+    );
+    assert_eq!(h.set_texture(0, &intz), 0, "bind the RESZ destination");
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "the RESZ magic value"
+    );
+
+    // RESZ_DEPTH is 0.25, which an 8-bit channel reads as 64.
+    let pixel = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &intz));
+    assert!(
+        pixel.r.abs_diff(64) <= 2,
+        "the INTZ holds the cleared depth: {pixel:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
+}
+
+#[test]
+fn resz_resolves_the_implicit_multisampled_depth_surface() {
+    // The device's own 4x depth-stencil, never named by
+    // SetDepthStencilSurface: the RESZ still resolves it, as it does an
+    // explicitly bound surface.
+    let h = harness(D3DMULTISAMPLE_4_SAMPLES, Some(D3DFMT_D24S8));
+    let (width, height) = h.dims();
+    let (width_f, height_f) = back_buffer_extent(&h);
+    // Not primed: an INTZ the RESZ never reaches reads 0, which the check already rejects.
+    let intz = h.create_texture(
+        width,
+        height,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+
+    arm(&h);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        0,
+        "depth func"
+    );
+    assert!(h.pump(), "WM_QUIT before render");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    // Twice the back buffer's extent, so its lower-left half covers every sample.
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(width_f * 2.0, height_f * 2.0, RESZ_DEPTH, WHITE)
+        ),
+        0,
+        "depth-writing draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+    assert_eq!(h.set_texture(0, &intz), 0, "bind the RESZ destination");
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000),
+        0,
+        "the RESZ magic value"
+    );
+
+    // RESZ_DEPTH is 0.25, which an 8-bit channel reads as 64.
+    let pixel = Rgba8::from_pixel(sample_intz(&h, &ss_rt, &intz));
+    assert!(
+        pixel.r.abs_diff(64) <= 2,
+        "the INTZ holds the implicit surface's sample zero: {pixel:?}"
+    );
+
+    assert_eq!(h.clear_texture(0), 0, "clear the sampler bind");
+}
+
+// ── StretchRect from a multisampled depth surface ──
+
+#[test]
+fn stretch_rect_resolves_a_multisampled_depth_surface() {
+    // A depth-to-depth StretchRect out of a multisampled surface is a resolve,
+    // not a copy: Metal's blit encoder refuses the sample-count change, so a
+    // depth transfer takes sample zero instead. The destination is observed
+    // through the depth test rather than read back, which D3D9 does not allow
+    // on a depth surface.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let size = (RT_SIZE, RT_SIZE);
+    let ms = (D3DMULTISAMPLE_4_SAMPLES, 0);
+
+    let ms_rt = h.create_render_target_ms(size, D3DFMT_A8R8G8B8, ms);
+    let ms_ds = h
+        .create_depth_stencil_surface_ms_hr(size, D3DFMT_D24S8, ms)
+        .1
+        .expect("4x depth surface");
+    let ss_rt = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let ss_ds = h.create_depth_stencil_surface(RT_SIZE, RT_SIZE, D3DFMT_D24S8);
+
+    // The destination starts at the far plane, so a resolve that never runs
+    // lets the probe draw through and paints the target white.
+    assert_eq!(h.set_render_target(0, &ss_rt), 0, "SetRenderTarget(prime)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ss_ds),
+        0,
+        "SetDepthStencilSurface(prime)"
+    );
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear the destination to the far plane"
+    );
+
+    // Write one constant depth into the multisampled surface.
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_target(0, &ms_rt), 0, "SetRenderTarget(scene)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ms_ds),
+        0,
+        "SetDepthStencilSurface(scene)"
+    );
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), 0, "depth test on");
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), 0, "depth writes");
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_ALWAYS),
+        0,
+        "depth func"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLACK, 1.0, 0),
+        0,
+        "clear colour + depth"
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(RESZ_DEPTH)),
+        0,
+        "depth-writing draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    assert_eq!(
+        h.stretch_rect(&ms_ds, &ss_ds, D3DTEXF_NONE),
+        D3D_OK,
+        "StretchRect the multisampled depth into the single-sampled surface"
+    );
+
+    // Probe the resolved depth: a draw behind it is rejected, so the target
+    // keeps its clear colour. Without the resolve the destination still holds
+    // the far plane and the probe paints over it.
+    assert_eq!(h.set_render_target(0, &ss_rt), 0, "SetRenderTarget(probe)");
+    assert_eq!(
+        h.set_depth_stencil_surface(&ss_ds),
+        0,
+        "SetDepthStencilSurface(probe)"
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS),
+        0,
+        "depth func"
+    );
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(h.clear_target(BLUE), 0, "clear the probe target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(RESZ_DEPTH + 0.25)),
+        0,
+        "probe draw behind the resolved depth",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    assert_pixel_eq(
+        surface_row(&h, &ss_rt, (RT_SIZE, RT_SIZE))[(RT_SIZE / 2) as usize],
+        BLUE,
+        "the resolved depth rejects the draw behind it",
+    );
+}
+
+// ── A clear ordered before a StretchRect resolve ──
+
+/// A triangle over the left quarter of the target, in `color`.
+///
+/// At the middle scanline it reaches a quarter of the way across, so one probe
+/// lands inside it and one well clear of it.
+const fn corner_triangle(color: u32) -> [RhwVertex; 3] {
+    [
+        RhwVertex {
+            x: 0.0,
+            y: 0.0,
+            z: 0.5,
+            rhw: 1.0,
+            color,
+        },
+        RhwVertex {
+            x: RT_SIZE_F / 4.0,
+            y: 0.0,
+            z: 0.5,
+            rhw: 1.0,
+            color,
+        },
+        RhwVertex {
+            x: 0.0,
+            y: RT_SIZE_F,
+            z: 0.5,
+            rhw: 1.0,
+            color,
+        },
+    ]
+}
+
+#[test]
+fn a_clear_before_a_stretch_rect_resolve_does_not_wipe_it() {
+    // Clear(target), render into a multisampled surface, StretchRect it into
+    // the target, then draw over a corner of the target. The clear is ordered
+    // first, so the copy has to survive it: what the last draw does not cover
+    // reads back as the resolved image.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let ms = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let target = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    arm(&h);
+    h.select_diffuse_stage(0);
+
+    assert_eq!(
+        h.set_render_target(0, &target),
+        0,
+        "SetRenderTarget(target)"
+    );
+    assert_eq!(h.clear_target(BLUE), 0, "clear the target");
+
+    assert_eq!(h.set_render_target(0, &ms), 0, "SetRenderTarget(scene)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(scene)");
+    assert_eq!(h.clear_target(BLACK), 0, "clear the multisampled surface");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(0.5)),
+        0,
+        "covering draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene(scene)");
+
+    assert_eq!(
+        h.stretch_rect(&ms, &target, D3DTEXF_NONE),
+        D3D_OK,
+        "StretchRect the multisampled surface into the target"
+    );
+
+    assert_eq!(h.set_render_target(0, &target), 0, "SetRenderTarget(over)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(over)");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &corner_triangle(BLACK)),
+        0,
+        "corner draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene(over)");
+
+    let row = surface_row(&h, &target, (RT_SIZE, RT_SIZE));
+    assert_pixel_eq(row[INSIDE_X as usize], BLACK, "the corner draw landed");
+    assert_pixel_eq(
+        row[(RT_SIZE - 4) as usize],
+        WHITE,
+        "the resolved image survives the clear that was ordered before it",
+    );
+}
+
+#[test]
+fn a_stretch_rect_after_a_clear_resolves_the_cleared_contents() {
+    // Frame one leaves a white multisampled surface resolved into its twin.
+    // Frame two clears it to blue with no draw, copies it out, then draws
+    // into it again. The copy is ordered after the clear, so it reads blue,
+    // not the white the twin held from the frame before.
+    let h = harness(D3DMULTISAMPLE_NONE, None);
+    let ms = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let copy = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    arm(&h);
+    h.select_diffuse_stage(0);
+
+    assert_eq!(h.set_render_target(0, &ms), 0, "SetRenderTarget(first)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(first)");
+    assert_eq!(h.clear_target(BLACK), 0, "clear the first frame");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &covering_triangle(0.5)),
+        0,
+        "covering draw",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene(first)");
+    assert_eq!(h.present(), 0, "Present the first frame");
+
+    assert_eq!(h.set_render_target(0, &ms), 0, "SetRenderTarget(second)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(second)");
+    assert_eq!(h.clear_target(BLUE), 0, "clear with no draw after it");
+    assert_eq!(h.end_scene(), 0, "EndScene(second)");
+    assert_eq!(
+        h.stretch_rect(&ms, &copy, D3DTEXF_NONE),
+        D3D_OK,
+        "StretchRect the cleared surface out"
+    );
+    assert_eq!(h.set_render_target(0, &ms), 0, "SetRenderTarget(over)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene(over)");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &corner_triangle(BLACK)),
+        0,
+        "corner draw after the copy",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene(over)");
+
+    let row = surface_row(&h, &copy, (RT_SIZE, RT_SIZE));
+    assert_pixel_eq(
+        row[INSIDE_X as usize],
+        BLUE,
+        "the draw after the copy does not reach it",
+    );
+    assert_pixel_eq(
+        row[(RT_SIZE - 4) as usize],
+        BLUE,
+        "the copy reads the clear ordered before it",
+    );
+}
+
+fn coverage_pixel(h: &Harness, target: &Surface<'_>, resolve: &Surface<'_>, color: u32) -> u32 {
+    draw_coverage(h, target, color);
+    assert_eq!(h.stretch_rect(target, resolve, D3DTEXF_NONE), D3D_OK);
+    render_target_row(h, resolve)[INSIDE_X as usize]
+}
+
+/// Clear `target` to blue and draw the diagonal over it in `color`.
+fn draw_coverage(h: &Harness, target: &Surface<'_>, color: u32) {
+    assert_eq!(h.set_render_target(0, target), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(h.clear_target(BLUE), D3D_OK);
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(RT_SIZE_F, RT_SIZE_F, 0.5, color)
+        ),
+        D3D_OK
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+}
+
+/// Whether `pixel` is white over blue at a fraction of the samples.
+const fn is_partial_coverage(pixel: u32) -> bool {
+    let c = Rgba8::from_pixel(pixel);
+    c.r > 16 && c.r < 239 && c.r == c.g && c.b == 255
+}
+
+fn assert_partial_coverage(pixel: u32) {
+    assert!(
+        is_partial_coverage(pixel),
+        "fractional white coverage over blue, red equal to green and blue full: {pixel:#010x}"
+    );
+}
+
+#[test]
+fn alpha_to_coverage_probe_is_not_a_resource_format() {
+    let h = Harness::new();
+    assert_eq!(
+        h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_SURFACE, D3DFMT_ATOC),
+        D3D_OK
+    );
+    assert_eq!(
+        h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_TEXTURE, D3DFMT_ATOC),
+        D3DERR_NOTAVAILABLE
+    );
+    assert_eq!(
+        h.check_device_format(
+            D3DFMT_X8R8G8B8,
+            D3DUSAGE_RENDERTARGET,
+            D3DRTYPE_SURFACE,
+            D3DFMT_ATOC
+        ),
+        D3DERR_NOTAVAILABLE
+    );
+    assert_ne!(
+        h.create_render_target_hr(RT_SIZE, RT_SIZE, D3DFMT_ATOC),
+        D3D_OK
+    );
+}
+
+#[test]
+fn alpha_to_coverage_replaces_alpha_test_and_tracks_target_changes() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let single = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let ps = h.create_pixel_shader(&COVERAGE_PS);
+    for programmable in [false, true] {
+        if programmable {
+            assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+            assert_eq!(
+                h.set_pixel_shader_constant_f(0, &[1.0, 1.0, 1.0, 0.5]),
+                D3D_OK
+            );
+        }
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_GREATER), D3D_OK);
+        assert_eq!(h.set_render_state(D3DRS_ALPHAREF, 255), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+            D3D_OK
+        );
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        // A single-sampled target restores the rejecting alpha test without
+        // changing a render state; returning to MSAA restores coverage.
+        assert_eq!(coverage_pixel(&h, &single, &resolve, 0x80ff_ffff), BLUE);
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(h.set_render_state(D3DRS_ADAPTIVETESS_Y, 0), D3D_OK);
+        assert_eq!(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff), BLUE);
+        assert_eq!(
+            h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+            D3D_OK
+        );
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
+        assert_pixel_eq(
+            coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+            0x80ff_ffff,
+            "alpha test off disables coverage",
+        );
+    }
+}
+
+#[test]
+fn alpha_to_coverage_state_blocks_restore_the_extension() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_GREATER), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHAREF, 255), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        D3D_OK
+    );
+    let vertex = h.create_state_block(D3DSBT_VERTEXSTATE);
+    assert_eq!(h.set_render_state(D3DRS_ADAPTIVETESS_Y, 0), D3D_OK);
+    assert_eq!(h.begin_state_block(), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        D3D_OK
+    );
+    let recorded = h.end_state_block();
+    assert_eq!(
+        h.render_state(D3DRS_ADAPTIVETESS_Y),
+        0,
+        "recording does not mutate live state"
+    );
+    for block in [&vertex, &recorded] {
+        assert_eq!(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff), BLUE);
+        assert_eq!(block.apply(), D3D_OK);
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(h.set_render_state(D3DRS_ADAPTIVETESS_Y, 0), D3D_OK);
+    }
+}
+
+#[test]
+fn alpha_to_coverage_endpoints_and_sample_mask_intersect() {
+    coverage_endpoints_and_sample_mask(false);
+}
+
+#[test]
+fn a2m_coverage_endpoints_and_sample_mask() {
+    coverage_endpoints_and_sample_mask(true);
+}
+
+fn coverage_endpoints_and_sample_mask(a2m: bool) {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+    assert_eq!(
+        h.set_render_state(
+            if a2m {
+                D3DRS_POINTSIZE
+            } else {
+                D3DRS_ADAPTIVETESS_Y
+            },
+            if a2m {
+                mtld3d_types::D3DFMT_A2M1
+            } else {
+                D3DFMT_ATOC
+            },
+        ),
+        D3D_OK
+    );
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    assert_eq!(
+        coverage_pixel(&h, &target, &resolve, 0x00ff_ffff),
+        BLUE,
+        "zero alpha covers no sample"
+    );
+    assert_eq!(
+        coverage_pixel(&h, &target, &resolve, WHITE),
+        WHITE,
+        "opaque alpha covers every sample"
+    );
+    assert_eq!(h.set_render_state(D3DRS_MULTISAMPLEMASK, 0), D3D_OK);
+    assert_eq!(
+        coverage_pixel(&h, &target, &resolve, WHITE),
+        BLUE,
+        "sample mask can exclude all coverage"
+    );
+    assert_eq!(h.set_render_state(D3DRS_MULTISAMPLEMASK, 3), D3D_OK);
+    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, WHITE));
+}
+
+#[test]
+fn alpha_to_coverage_gates_depth_writes_with_color_masked_out() {
+    coverage_depth_writes_with_color_masked_out(false);
+}
+
+#[test]
+fn a2m_coverage_depth_writes_with_color_masked_out() {
+    coverage_depth_writes_with_color_masked_out(true);
+}
+
+fn coverage_depth_writes_with_color_masked_out(a2m: bool) {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let (hr, depth) = h.create_depth_stencil_surface_ms_hr(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_D24S8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    assert_eq!(hr, D3D_OK);
+    let depth = depth.expect("multisampled depth");
+    assert_eq!(h.set_depth_stencil_surface(&depth), D3D_OK);
+    assert_eq!(h.set_render_target(0, &target), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 1), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZWRITEENABLE, 1), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ZFUNC, D3DCMP_LESS), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_GREATER), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHAREF, 255), D3D_OK);
+    assert_eq!(
+        h.set_render_state(
+            if a2m {
+                D3DRS_POINTSIZE
+            } else {
+                D3DRS_ADAPTIVETESS_Y
+            },
+            if a2m {
+                mtld3d_types::D3DFMT_A2M1
+            } else {
+                D3DFMT_ATOC
+            },
+        ),
+        D3D_OK
+    );
+    assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 0), D3D_OK);
+    assert_eq!(h.begin_scene(), D3D_OK);
+    assert_eq!(
+        h.clear(D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, BLUE, 1.0, 0),
+        D3D_OK
+    );
+    assert_eq!(
+        h.draw_primitive_up(
+            D3DPT_TRIANGLELIST,
+            1,
+            &diagonal(RT_SIZE_F, RT_SIZE_F, 0.25, 0x80ff_ffff)
+        ),
+        D3D_OK
+    );
+    assert_eq!(h.end_scene(), D3D_OK);
+    resolved_row(
+        &h,
+        &target,
+        &resolve,
+        "color mask keeps every color sample",
+        "0xff0000ff at x=4",
+        |row| row[INSIDE_X as usize] == BLUE,
+    );
+    assert_eq!(h.set_render_state(D3DRS_COLORWRITEENABLE, 15), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+        D3D_OK
+    );
+    // Only the samples the near coverage draw left untouched pass depth.
+    draw_coverage(&h, &target, WHITE);
+    resolved_row(
+        &h,
+        &target,
+        &resolve,
+        "only the samples the near coverage draw left untouched pass depth",
+        "fractional white coverage over blue at x=4, red equal to green and blue full",
+        |row| is_partial_coverage(row[INSIDE_X as usize]),
+    );
+}
+
+#[test]
+fn a2m_latch_survives_numeric_size_and_target_changes() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let single = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let ps = h.create_pixel_shader(&COVERAGE_PS);
+    for programmable in [false, true] {
+        if programmable {
+            assert_eq!(h.set_pixel_shader(&ps), D3D_OK);
+            assert_eq!(
+                h.set_pixel_shader_constant_f(0, &[1.0, 1.0, 1.0, 0.5]),
+                D3D_OK
+            );
+        }
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 0), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(h.render_state(D3DRS_POINTSIZE), 8.0f32.to_bits());
+        assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_ALPHAFUNC, mtld3d_types::D3DCMP_NEVER),
+            D3D_OK
+        );
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(coverage_pixel(&h, &single, &resolve, 0x80ff_ffff), BLUE);
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff), BLUE);
+    }
+}
+
+#[test]
+fn a2m_and_atoc_requests_are_independent() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    for token in [mtld3d_types::D3DFMT_A2M1, mtld3d_types::D3DFMT_A2M0] {
+        assert_eq!(
+            h.check_device_format(D3DFMT_X8R8G8B8, 0, D3DRTYPE_SURFACE, token),
+            D3DERR_NOTAVAILABLE
+        );
+    }
+    assert_eq!(h.set_render_state(D3DRS_ALPHAFUNC, D3DCMP_ALWAYS), D3D_OK);
+    for a2m in [false, true] {
+        assert_eq!(
+            h.set_render_state(
+                D3DRS_POINTSIZE,
+                if a2m {
+                    mtld3d_types::D3DFMT_A2M1
+                } else {
+                    mtld3d_types::D3DFMT_A2M0
+                }
+            ),
+            D3D_OK
+        );
+        for atoc in [true, false] {
+            assert_eq!(
+                h.set_render_state(D3DRS_ADAPTIVETESS_Y, if atoc { D3DFMT_ATOC } else { 0 }),
+                D3D_OK
+            );
+            for alpha_test in [false, true, false] {
+                assert_eq!(
+                    h.set_render_state(D3DRS_ALPHATESTENABLE, u32::from(alpha_test)),
+                    D3D_OK
+                );
+                let pixel = coverage_pixel(&h, &target, &resolve, 0x80ff_ffff);
+                if a2m || atoc && alpha_test {
+                    assert_partial_coverage(pixel);
+                } else {
+                    assert_pixel_eq(pixel, 0x80ff_ffff, "neither request enabled");
+                }
+            }
+        }
+    }
+    assert_eq!(
+        h.set_render_state(D3DRS_ADAPTIVETESS_Y, D3DFMT_ATOC),
+        D3D_OK
+    );
+    assert_eq!(h.set_render_state(D3DRS_ALPHATESTENABLE, 1), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+        D3D_OK
+    );
+    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+}
+
+#[test]
+fn a2m_snapshot_blocks_keep_latch_after_raw_numeric_overwrite() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    for block_type in [
+        mtld3d_types::D3DSBT_ALL,
+        D3DSBT_VERTEXSTATE,
+        mtld3d_types::D3DSBT_PIXELSTATE,
+    ] {
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+            D3D_OK
+        );
+        let block = h.create_state_block(block_type);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        // Same raw DWORD, different hidden latch: Apply must still restore it.
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+            D3D_OK
+        );
+        for _ in 0..2 {
+            assert_eq!(block.apply(), D3D_OK);
+            let pixel = coverage_pixel(&h, &target, &resolve, 0x80ff_ffff);
+            if block_type == mtld3d_types::D3DSBT_PIXELSTATE {
+                assert_pixel_eq(pixel, 0x80ff_ffff, "pixel block leaves A2M disabled");
+            } else {
+                assert_partial_coverage(pixel);
+            }
+        }
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 16.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(block.capture(), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(block.apply(), D3D_OK);
+        let pixel = coverage_pixel(&h, &target, &resolve, 0x80ff_ffff);
+        if block_type == mtld3d_types::D3DSBT_PIXELSTATE {
+            assert_partial_coverage(pixel);
+        } else {
+            assert_pixel_eq(
+                pixel,
+                0x80ff_ffff,
+                "Capture refreshes the latch to disabled",
+            );
+            assert_eq!(h.render_state(D3DRS_POINTSIZE), 16.0f32.to_bits());
+        }
+    }
+}
+
+#[test]
+fn a2m_recorded_capture_retains_component_membership() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    for numeric_after_control in [false, true] {
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(h.begin_state_block(), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        if numeric_after_control {
+            assert_eq!(
+                h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+                D3D_OK
+            );
+        }
+        let block = h.end_state_block();
+        assert_eq!(
+            h.render_state(D3DRS_POINTSIZE),
+            mtld3d_types::D3DFMT_A2M0,
+            "recording leaves live raw state alone"
+        );
+        assert_pixel_eq(
+            coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+            0x80ff_ffff,
+            "recording leaves live latch alone",
+        );
+        assert_eq!(block.apply(), D3D_OK);
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 16.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(block.capture(), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, 16.0f32.to_bits()),
+            D3D_OK
+        );
+        assert_eq!(block.apply(), D3D_OK);
+        assert_eq!(h.render_state(D3DRS_POINTSIZE), 16.0f32.to_bits());
+        assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+    }
+    // A numeric-only recording must not adopt latch membership when Capture
+    // refreshes its raw value from a live A2M1 control token.
+    assert_eq!(h.begin_state_block(), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 8.0f32.to_bits()),
+        D3D_OK
+    );
+    let numeric = h.end_state_block();
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        D3D_OK
+    );
+    assert_eq!(numeric.capture(), D3D_OK);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+        D3D_OK
+    );
+    assert_eq!(numeric.apply(), D3D_OK);
+    assert_eq!(h.render_state(D3DRS_POINTSIZE), mtld3d_types::D3DFMT_A2M1);
+    assert_pixel_eq(
+        coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+        0x80ff_ffff,
+        "raw control token is not captured latch membership",
+    );
+    // The same raw write now does change hidden state and must dirty coverage.
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        D3D_OK
+    );
+    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+}
+
+#[test]
+fn a2m_resz_keeps_latch_and_resolves_depth() {
+    let h = Harness::new();
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let depth = h
+        .create_depth_stencil_surface_ms_hr(
+            (RT_SIZE, RT_SIZE),
+            D3DFMT_D24S8,
+            (D3DMULTISAMPLE_4_SAMPLES, 0),
+        )
+        .1
+        .expect("MSAA depth");
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    let intz = h.create_texture(
+        RT_SIZE,
+        RT_SIZE,
+        1,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DFMT_INTZ,
+        D3DPOOL_DEFAULT,
+    );
+    prime_intz(&h, &resolve, &intz);
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        D3D_OK
+    );
+    resz_into(&h, &target, &depth, &intz);
+    assert_eq!(h.render_state(D3DRS_POINTSIZE), 0x7fa0_5000);
+    let pixel = Rgba8::from_pixel(sample_intz(&h, &resolve, &intz));
+    assert!(
+        pixel.r.abs_diff(64) <= 2,
+        "RESZ retained its depth operation: {pixel:?}"
+    );
+    assert_eq!(h.clear_texture(0), D3D_OK);
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    assert_partial_coverage(coverage_pixel(&h, &target, &resolve, 0x80ff_ffff));
+}
+
+#[test]
+fn a2m_reset_clears_latch_and_numeric_size() {
+    let h = Harness::new();
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, 32.0f32.to_bits()),
+        D3D_OK
+    );
+    assert_eq!(
+        h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+        D3D_OK
+    );
+    assert_eq!(h.reset(640, 480), D3D_OK);
+    assert_eq!(h.render_state(D3DRS_POINTSIZE), 1.0f32.to_bits());
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    assert_pixel_eq(
+        coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+        0x80ff_ffff,
+        "Reset clears A2M independently of raw POINTSIZE",
+    );
+}
+
+#[test]
+fn a2m_recorded_resz_capture_excludes_latch() {
+    let h = Harness::new();
+    arm(&h);
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_render_state(D3DRS_ZENABLE, 0), D3D_OK);
+    let target = h.create_render_target_ms(
+        (RT_SIZE, RT_SIZE),
+        D3DFMT_A8R8G8B8,
+        (D3DMULTISAMPLE_4_SAMPLES, 0),
+    );
+    let resolve = h.create_render_target(RT_SIZE, RT_SIZE, D3DFMT_A8R8G8B8);
+    assert_eq!(h.begin_state_block(), D3D_OK);
+    assert_eq!(h.set_render_state(D3DRS_POINTSIZE, 0x7fa0_5000), D3D_OK);
+    let resz = h.end_state_block();
+    for raw in [mtld3d_types::D3DFMT_A2M1, 32.0f32.to_bits()] {
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M1),
+            D3D_OK
+        );
+        assert_eq!(h.set_render_state(D3DRS_POINTSIZE, raw), D3D_OK);
+        assert_eq!(resz.capture(), D3D_OK);
+        assert_eq!(
+            h.set_render_state(D3DRS_POINTSIZE, mtld3d_types::D3DFMT_A2M0),
+            D3D_OK
+        );
+        assert_eq!(resz.apply(), D3D_OK);
+        assert_eq!(h.render_state(D3DRS_POINTSIZE), raw);
+        assert_pixel_eq(
+            coverage_pixel(&h, &target, &resolve, 0x80ff_ffff),
+            0x80ff_ffff,
+            "RESZ Capture cannot acquire latch membership",
+        );
+    }
+}

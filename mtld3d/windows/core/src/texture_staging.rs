@@ -1,0 +1,584 @@
+//! Decision helpers for per-mip texture staging: the Lock action and the release class.
+//!
+//! A writable Lock either hands back a pointer into the level's current
+//! staging pages or moves the level to fresh pages first. The pages may still
+//! be read by an upload: one scheduled at an earlier draw, waiting for the GPU
+//! to copy it, or kept for a replay after an aborted submit. Writing such
+//! pages in place changes what that upload carries, so a draw recorded before
+//! the Lock would sample texels written after it.
+//!
+//! Decision tree:
+//! - `D3DLOCK_READONLY`, or no upload reads the pages: `WriteInPlace`.
+//!   `D3DLOCK_NOOVERWRITE` is not a texture lock flag and is dropped
+//!   before the decision, see [`honoured_lock_flags`].
+//! - `D3DLOCK_DISCARD` on a whole-mip Lock of a `D3DPOOL_DEFAULT`
+//!   texture: Rename, no preserve (game promised the old bytes are
+//!   gone). Every other DISCARD is dropped first, see
+//!   [`honoured_lock_flags`].
+//! - Whole-mip with a reader: Rename + CPU-memcpy preserve. The game may
+//!   read every byte through the Lock pointer, and D3D9 hands it the
+//!   level's current contents whatever the texture's usage says.
+//! - Partial, compressed AND not block-aligned, with a reader: Rename +
+//!   Cpu preserve, see `rect_block_aligned` for the formula and why
+//!   preserve is forced.
+//! - Partial otherwise: the rule every other CPU write of a subresource
+//!   follows, [`decide_staging_write`]. In place when every upload still
+//!   reading the pages belongs to the frame being recorded and no GPU
+//!   operation on the texture was recorded since, which is the one case in
+//!   which nothing that can see the old bytes exists yet. Rename + Cpu
+//!   preserve otherwise.
+//!
+//! A level a partial Lock renames this way is the one a game rewrites in
+//! part between draws, so its later partial uploads copy their box into the
+//! device's snapshot arena (`crate::upload_snapshot`) and stop reading the
+//! staging: the next Lock finds no reader and writes in place, and the level
+//! pays one preserve rather than one per Lock.
+//!
+//! Why `D3DUSAGE_DYNAMIC` has no say: `plan_lock` keys the buffer
+//! equivalent on `D3DUSAGE_WRITEONLY`, the spec-documented "no readback"
+//! hint for `CreateVertexBuffer` / `CreateIndexBuffer`. `CreateTexture`
+//! documents no such hint. DYNAMIC only makes a default-pool level
+//! lockable and DISCARD legal on it; a plain Lock of a dynamic texture
+//! still sees the level's contents, as D3D9 specifies for every lockable
+//! resource. A game that locks a whole dynamic page and rewrites a few
+//! blocks of it (a lightmap page under animated light styles) relies on
+//! exactly that, so the whole-mip arm preserves regardless of usage.
+//!
+//! Why no GPU preserve path: `copyFromBuffer:toTexture:` only writes
+//! the locked sub-rect, leaving prior `MTLTexture` pixels intact. The
+//! GPU side preserves outside-rect pixels automatically. The Cpu
+//! preserve keeps the staging the whole level's CPU mirror: the game may
+//! read outside its written rect through the Lock pointer, a later
+//! upload's box may span texels this Lock did not write, and the
+//! encoder's compressed fallback reads the whole level.
+//!
+//! Side effects (allocate `PageBox`, sync memcpy preserve, queue
+//! retention, bump perf counters) stay in `d3d9::texture`; this
+//! module just returns a verdict.
+//!
+//! [`staging_droppable_class`] answers the other staging question, the
+//! one asked after an upload rather than before a write: whether a
+//! texture is of a class whose levels may release their staging at all.
+
+use mtld3d_types::{
+    D3DLOCK_DISCARD, D3DLOCK_NOOVERWRITE, D3DLOCK_READONLY, D3DPOOL_DEFAULT, D3DUSAGE_DEPTHSTENCIL,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_RENDERTARGET,
+};
+
+use crate::{dirty_rect::DirtyRect, texture_flags::TextureFlags};
+
+/// What the caller should do with the old backing's contents on a rename.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreserveKind {
+    /// No preserve needed.
+    ///
+    /// `D3DLOCK_DISCARD` on a whole-mip Lock of a default-pool texture:
+    /// the game promised to rewrite every byte before it reads any.
+    None,
+    /// Caller must synchronously memcpy the old `PageBox` into the fresh allocation.
+    ///
+    /// The copy happens before returning the Lock pointer. Two cases:
+    /// (a) whole-mip contended (game might read all bytes through the
+    /// pointer); (b) partial-but-unaligned compressed contended (encoder
+    /// will fall back to a full-mip blit; outside-rect bytes must be
+    /// valid).
+    Cpu,
+}
+
+/// Verdict for a single `LockRect` call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockAction {
+    /// Hand back a pointer into the existing `Arc<PageBox>`.
+    ///
+    /// No upload reads the pages, the caller promised not to write
+    /// (READONLY), or every upload still reading them belongs to the frame
+    /// being recorded with no GPU operation on the texture recorded since.
+    WriteInPlace,
+    /// Swap the slot's `Arc<PageBox>` for a fresh allocation and apply `preserve`.
+    ///
+    /// Caller queues the old Arc clone for seq-gated retention via the
+    /// encoder's `pending_blit_retention`.
+    FreshBox { preserve: PreserveKind },
+}
+
+/// Geometry of a single mip.
+///
+/// The static-per-mip data `decide_lock_action` needs to classify a
+/// Lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MipShape {
+    /// Mip pixel width.
+    pub mip_w: u32,
+    /// Mip pixel height.
+    pub mip_h: u32,
+    /// Format block width: `1` for uncompressed, `4` for DXT/BC.
+    pub block_w: u32,
+    /// Format block height: `1` for uncompressed, `4` for DXT/BC.
+    pub block_h: u32,
+}
+
+/// Is the slot's last write still potentially being read by the GPU?
+#[inline]
+#[must_use]
+pub const fn is_in_flight(slot_last_submit_seq: u64, coherent_seq: u64) -> bool {
+    slot_last_submit_seq > coherent_seq
+}
+
+/// Whether `rect` covers the whole mip (`None` is a whole-mip Lock).
+///
+/// `>=` for tolerance; `parse_rect` already clamps so equality is typical.
+#[inline]
+#[must_use]
+pub const fn is_whole_mip(rect: Option<DirtyRect>, shape: MipShape) -> bool {
+    match rect {
+        None => true,
+        Some(r) => r.x == 0 && r.y == 0 && r.w >= shape.mip_w && r.h >= shape.mip_h,
+    }
+}
+
+/// The `D3DLOCK_*` bits a texture Lock is served with: `flags` less the ones it cannot honour.
+///
+/// `D3DLOCK_NOOVERWRITE` is always dropped. D3D9 defines it for vertex and
+/// index buffers only; the flags a texture or surface lock accepts are
+/// `D3DLOCK_DISCARD`, `D3DLOCK_NO_DIRTY_UPDATE`, `D3DLOCK_NOSYSLOCK` and
+/// `D3DLOCK_READONLY` (plus `D3DLOCK_DONOTWAIT` on a surface). A texture lock
+/// carrying it is served as a plain lock, so its writes never reach an upload
+/// a draw recorded before the lock still reads.
+///
+/// DISCARD is honoured on a whole-mip Lock of a `D3DPOOL_DEFAULT` texture only,
+/// the one shape where "the contents are dead" can be taken literally. The
+/// staging is the CPU mirror of the whole level and a later re-upload (device
+/// recreate, managed eviction) publishes all of it, so a partial DISCARD would
+/// leave the bytes outside the rect undefined in what gets published. The
+/// managed and system-memory pools are served from that mirror for their whole
+/// life, so the same holds for every Lock of theirs. The game's writes then
+/// land on preserved contents, which is what D3D9 hands a lock that carries no
+/// usable discard.
+#[must_use]
+pub const fn honoured_lock_flags(
+    flags: u32,
+    pool: u32,
+    rect: Option<DirtyRect>,
+    shape: MipShape,
+) -> u32 {
+    let flags = flags & !D3DLOCK_NOOVERWRITE;
+    if pool == D3DPOOL_DEFAULT && is_whole_mip(rect, shape) {
+        flags
+    } else {
+        flags & !D3DLOCK_DISCARD
+    }
+}
+
+/// Block-aligned in the sense the encoder requires.
+///
+/// The rect lands on the block grid, OR the rect's right/bottom edge
+/// reaches the mip edge (the encoder tolerates that asymmetry because
+/// the trailing blocks are partially-occupied at the mip boundary
+/// anyway).
+///
+/// Mirrors the formula at `encoder.rs::run_texture_upload_blit` —
+/// must stay in lock-step. If that file's check changes, this one
+/// changes too. For uncompressed formats `block_w = block_h = 1`,
+/// so the check trivially passes.
+#[inline]
+const fn rect_block_aligned(r: DirtyRect, shape: MipShape) -> bool {
+    r.x.is_multiple_of(shape.block_w)
+        && r.y.is_multiple_of(shape.block_h)
+        && (r.w.is_multiple_of(shape.block_w) || r.x + r.w == shape.mip_w)
+        && (r.h.is_multiple_of(shape.block_h) || r.y + r.h == shape.mip_h)
+}
+
+/// Decide the Lock action for a single mip.
+///
+/// - `write` is what the caller knows about the pages, gathered as for any
+///   other CPU write (see [`StagingWrite`]). `HAS_READERS` covers in-flight
+///   submits as well as retained upload readers: a retired upload can still
+///   be replayed, so retirement alone does not end its read lifetime.
+///   `MAPPED` and `WHOLE_LEVEL` are ignored; the Lock decides those itself.
+/// - `flags` is the raw `D3DLOCK_*` bitfield from the game. A NOOVERWRITE,
+///   and a DISCARD the Lock cannot honour, are dropped here as well as in
+///   the caller (see [`honoured_lock_flags`]), so a verdict never rests on
+///   one.
+/// - `pool` is the texture's `D3DPOOL` captured at `CreateTexture`.
+/// - `rect` is the locked sub-rect. `None` ⇒ full-mip Lock.
+/// - `shape` carries the mip + block dimensions (see [`MipShape`]).
+///
+/// Unknown flag bits are ignored here — the caller logs them via
+/// `log_once_warn!`. Without `HAS_READERS` the answer is `WriteInPlace`
+/// whatever the flags, pool and rect, and the lock callers rely on that: they
+/// skip this call, and the gathering of the other facts, when nothing reads
+/// the pages.
+#[must_use]
+pub const fn decide_lock_action(
+    write: &StagingWrite,
+    flags: u32,
+    pool: u32,
+    rect: Option<DirtyRect>,
+    shape: MipShape,
+) -> LockAction {
+    let flags = honoured_lock_flags(flags, pool, rect, shape);
+    if flags & D3DLOCK_READONLY != 0 {
+        return LockAction::WriteInPlace;
+    }
+    if !write.contains(StagingWrite::HAS_READERS) {
+        return LockAction::WriteInPlace;
+    }
+    if flags & D3DLOCK_DISCARD != 0 {
+        return LockAction::FreshBox {
+            preserve: PreserveKind::None,
+        };
+    }
+
+    // The game may read every byte of the mip through the pointer, and
+    // D3D9 hands it the current contents whatever the usage says.
+    if is_whole_mip(rect, shape) {
+        return LockAction::FreshBox {
+            preserve: PreserveKind::Cpu,
+        };
+    }
+
+    // Partial off the compressed block grid: the encoder widens its read
+    // to the whole level, so even an unseen upload of this frame would
+    // carry this write. Rename and preserve every byte.
+    if let Some(r) = rect
+        && !rect_block_aligned(r, shape)
+    {
+        return LockAction::FreshBox {
+            preserve: PreserveKind::Cpu,
+        };
+    }
+
+    // Partial, with a reader: the pointer aliases pages an upload reads,
+    // so the write is one that upload must not see unless nothing recorded
+    // can see the version it replaces.
+    let lock_decides = StagingWrite::MAPPED.union(StagingWrite::WHOLE_LEVEL);
+    decide_staging_write(&StagingWrite::from_bits_retain(
+        write.bits() & !lock_decides.bits(),
+    ))
+}
+
+bitflags::bitflags! {
+    /// What a CPU write of one texture subresource knows about its staging pages.
+    ///
+    /// The input of [`decide_staging_write`], gathered by the writer just
+    /// before it touches the pages.
+    pub struct StagingWrite: u8 {
+        /// The game holds the subresource mapped, by a `LockRect` or a device context.
+        const MAPPED = 1 << 0;
+        /// A queued, replayable or in-flight upload still reads the pages.
+        const HAS_READERS = 1 << 1;
+        /// The subresource's latest upload belongs to the frame being recorded.
+        const SAME_FRAME = 1 << 2;
+        /// A GPU operation on the texture was recorded after a pending upload.
+        const OBSERVED = 1 << 3;
+        /// The pages rename whenever they have a reader.
+        ///
+        /// A render-target or depth texture, which the passes it is attached
+        /// to use without a record, or a read back from the GPU.
+        const ALWAYS_RENAME = 1 << 4;
+        /// The write covers every byte of the subresource.
+        const WHOLE_LEVEL = 1 << 5;
+    }
+}
+
+/// Where a CPU write of a texture subresource lands: its current pages or fresh ones.
+///
+/// A mapped subresource is written in place whatever its readers: the
+/// game's pointer aliases the current pages, and what it writes through it
+/// has to land in the pages the unmap publishes. Pages no upload reads are
+/// written in place. So are pages whose every pending upload belongs to the
+/// frame being recorded when no GPU operation on the texture was recorded
+/// since: the encoder replays a frame only after it is handed off, so nothing
+/// reads the pages during the write, and nothing recorded can see the version
+/// it replaces. Every other write moves to fresh pages, bare when it covers
+/// the whole subresource and carrying the old contents otherwise.
+#[must_use]
+pub const fn decide_staging_write(write: &StagingWrite) -> LockAction {
+    if write.contains(StagingWrite::MAPPED) || !write.contains(StagingWrite::HAS_READERS) {
+        return LockAction::WriteInPlace;
+    }
+    let seen = write.intersects(StagingWrite::OBSERVED.union(StagingWrite::ALWAYS_RENAME));
+    if write.contains(StagingWrite::SAME_FRAME) && !seen {
+        return LockAction::WriteInPlace;
+    }
+    let preserve = if write.contains(StagingWrite::WHOLE_LEVEL) {
+        PreserveKind::None
+    } else {
+        PreserveKind::Cpu
+    };
+    LockAction::FreshBox { preserve }
+}
+
+/// Whether a Lock of a released level has to read the level back from the GPU.
+///
+/// A default-pool level whose staging was released keeps its only copy on the
+/// GPU, and D3D9 hands a `LockRect` the level's current contents. So the
+/// released staging is re-created and refilled from the GPU before the pointer
+/// goes out, unless the caller has declared the contents dead.
+///
+/// `D3DLOCK_DISCARD` is that declaration and the only flag that qualifies: it
+/// is defined for a whole-level lock and promises the caller reads nothing it
+/// did not just write. The caller passes the flags through
+/// [`honoured_lock_flags`] first, so a DISCARD on a partial lock never reaches
+/// this decision, nor does a `D3DLOCK_NOOVERWRITE`, which is not a texture
+/// lock flag. `D3DLOCK_READONLY` is the opposite promise. D3D9 has no
+/// write-only lock flag: the "no readback expected" hint for a texture is
+/// `D3DUSAGE_DYNAMIC` at create time, and a dynamic texture keeps its staging
+/// for its whole life, so no usage bit reaches this decision.
+#[must_use]
+pub const fn released_level_lock_needs_readback(flags: u32) -> bool {
+    flags & D3DLOCK_DISCARD == 0
+}
+
+/// Whether a CPU write into a released level has to read the level back first.
+///
+/// A re-created staging holds nothing until the write lands, and the upload
+/// that follows is the bounding box of every write since the last flush. That
+/// box is only safe to upload while the staging holds the whole level: two
+/// writes before a flush otherwise push uninitialised bytes over the texels
+/// between them, which the GPU copy is the only holder of.
+///
+/// A write covering the whole level defines every byte itself, and a level
+/// the GPU never received has nothing on the GPU to preserve, so neither
+/// reads back. Every other write does.
+#[must_use]
+pub const fn released_level_write_needs_readback(whole_level: bool, was_uploaded: bool) -> bool {
+    !whole_level && was_uploaded
+}
+
+/// Whether a texture's class ever lets a level release its staging after an upload.
+///
+/// A default-pool texture without `D3DUSAGE_DYNAMIC` cannot be locked in D3D9,
+/// and the runtime keeps no system-memory copy of it: once the GPU holds every
+/// byte, ours is redundant, and keeping it doubles the footprint of every
+/// streamed texture inside a 32-bit game.
+///
+/// Every other class keeps its staging, each for a reason of its own. The
+/// lockable pools, `D3DUSAGE_DYNAMIC` and an offscreen-plain surface all hand
+/// the game a pointer back into it. Render targets and depth textures are
+/// written by the GPU, so no upload of ours ever makes the staging redundant;
+/// a render-target texture starts without staging instead
+/// ([`staging_lazy_class`]).
+/// Cubes and volumes are written and uploaded a whole level at a time by paths
+/// that expect the level to be there, and a re-created level is sized as a
+/// single 2D slice, which is short of a volume's box. `depth` does not identify
+/// a volume on its own: a single-slice `CreateVolumeTexture` is 2D on both
+/// sides, so the flag is what excludes it.
+#[must_use]
+pub const fn staging_droppable_class(
+    pool: u32,
+    usage: u32,
+    flags: TextureFlags,
+    depth: u32,
+) -> bool {
+    pool == D3DPOOL_DEFAULT
+        && usage & (D3DUSAGE_DYNAMIC | D3DUSAGE_RENDERTARGET | D3DUSAGE_DEPTHSTENCIL) == 0
+        && !flags.intersects(
+            TextureFlags::CUBE
+                .union(TextureFlags::OFFSCREEN_PLAIN)
+                .union(TextureFlags::DEPTH_FORMAT)
+                .union(TextureFlags::VOLUME_TEXTURE),
+        )
+        && depth <= 1
+}
+
+/// Whether a texture's levels start with no staging and get it at their first CPU use.
+///
+/// A default-pool render-target texture is drawn by the GPU, and D3D9 keeps
+/// no system-memory copy of it: its pixels reach the CPU through a read back.
+/// Until a CPU path needs a level (a map, a device context, a CPU copy into
+/// or out of it), the staging would only hold bytes the GPU's copy has
+/// already replaced, so the level starts released and claimed for the GPU,
+/// and its first CPU use reads the pixels back into fresh pages. A level
+/// keeps those pages once it has them.
+///
+/// A dynamic usage, a depth format, a cube, a volume and an offscreen-plain
+/// surface keep the staging they are created with, for the reasons
+/// [`staging_droppable_class`] gives.
+#[must_use]
+pub const fn staging_lazy_class(pool: u32, usage: u32, flags: TextureFlags, depth: u32) -> bool {
+    pool == D3DPOOL_DEFAULT
+        && usage & D3DUSAGE_RENDERTARGET != 0
+        && usage & (D3DUSAGE_DYNAMIC | D3DUSAGE_DEPTHSTENCIL) == 0
+        && !flags.intersects(
+            TextureFlags::CUBE
+                .union(TextureFlags::OFFSCREEN_PLAIN)
+                .union(TextureFlags::DEPTH_FORMAT)
+                .union(TextureFlags::VOLUME_TEXTURE),
+        )
+        && depth <= 1
+}
+
+/// Byte offset into a mip's staging Box for the start of the locked rect.
+///
+/// `pitch` is `mip_bytes_per_row` — for compressed formats this is
+/// bytes-per-block-row, **not** bytes-per-pixel-row, so the rect's
+/// pixel-space `x` and `y` must be converted to block coordinates before the
+/// offset math. For uncompressed formats `block_w` and `block_h` are 1 and
+/// `block_bytes == bytes_per_pixel`, so the same formula reduces to `r.y *
+/// pitch + r.x * bpp`.
+///
+/// Returns `0` for a `None` rect (full-mip lock).
+///
+/// Kept as a pure function so the block-coordinate conversion has one home and
+/// stays under test: a pixel-row index multiplied by a block-row pitch
+/// overshoots a compressed mip's staging allocation by a factor of `block_h`
+/// (4× for DXT) whenever `r.y > 0`, handing the game a Lock pointer past the
+/// end of the allocation to write through.
+#[must_use]
+pub const fn texture_lock_offset(
+    rect: Option<DirtyRect>,
+    pitch: u32,
+    block_w: u32,
+    block_h: u32,
+    block_bytes: u32,
+) -> usize {
+    match rect {
+        Some(r) => {
+            (r.y / block_h) as usize * pitch as usize
+                + (r.x / block_w) as usize * block_bytes as usize
+        }
+        None => 0,
+    }
+}
+
+/// Where a partial upload's box sits in the staging, and the shape its snapshot takes.
+///
+/// Rows are block rows for a compressed format. The snapshot holds the box's
+/// rows `pitch` bytes apart, so it occupies `pitch * rows` bytes.
+pub struct SnapshotLayout {
+    /// Byte offset of the box's first row in the level's staging.
+    pub src_offset: usize,
+    /// Bytes of one box row.
+    pub row_bytes: u32,
+    /// Rows the box spans.
+    pub rows: u32,
+    /// Row stride of the snapshot, a multiple of the requested alignment.
+    pub pitch: u32,
+    /// Bytes the snapshot occupies.
+    pub len: u32,
+}
+
+impl SnapshotLayout {
+    /// Whether every row of the box lies inside a staging of `src_len` bytes `src_pitch` apart.
+    ///
+    /// The layout is derived from the level's shape, so this fails only for
+    /// a staging that does not hold the level, such as a released level's
+    /// placeholder page.
+    #[must_use]
+    pub fn fits_source(&self, src_pitch: u32, src_len: usize) -> bool {
+        let last_row = u64::from(self.rows.saturating_sub(1)) * u64::from(src_pitch);
+        let end = (self.src_offset as u64)
+            .checked_add(last_row)
+            .and_then(|v| v.checked_add(u64::from(self.row_bytes)));
+        end.is_some_and(|end| end <= src_len as u64)
+    }
+}
+
+/// What a partial upload of a marked level does with its box.
+pub enum SnapshotBox {
+    /// The box covers the whole level and reads the staging by design.
+    ///
+    /// A whole-level write already moves to bare pages, and a level uploaded
+    /// whole is not the one a partial lock rewrites.
+    WholeLevel,
+    /// The arena cannot take the box.
+    ///
+    /// A compressed rect off the block grid, whose upload the encoder widens
+    /// to the whole level, or a snapshot over
+    /// [`crate::upload_snapshot::SNAPSHOT_MAX_BYTES`].
+    Declined,
+    /// The box is copied with this layout.
+    Copy(SnapshotLayout),
+}
+
+/// How a snapshot of `rect` is laid out, or why the upload reads the staging instead.
+///
+/// `block_bytes` is bytes per texel for an uncompressed format and per block
+/// for a compressed one, `src_pitch` the staging's row stride, and
+/// `pitch_align` the stride the snapshot's rows are rounded up to. An empty
+/// rect or a zero alignment, which no caller passes, is declined.
+#[must_use]
+pub fn snapshot_box(
+    rect: DirtyRect,
+    shape: MipShape,
+    block_bytes: u32,
+    src_pitch: u32,
+    pitch_align: u32,
+) -> SnapshotBox {
+    if is_whole_mip(Some(rect), shape) {
+        return SnapshotBox::WholeLevel;
+    }
+    if rect.w == 0 || rect.h == 0 || pitch_align == 0 || !rect_block_aligned(rect, shape) {
+        return SnapshotBox::Declined;
+    }
+    let block_x = rect.x / shape.block_w;
+    let block_y = rect.y / shape.block_h;
+    let cols = u64::from((rect.x + rect.w).div_ceil(shape.block_w) - block_x);
+    let rows = u64::from((rect.y + rect.h).div_ceil(shape.block_h) - block_y);
+    let row_bytes = cols * u64::from(block_bytes);
+    let pitch = row_bytes.next_multiple_of(u64::from(pitch_align));
+    let len = pitch * rows;
+    if row_bytes == 0 || len > crate::upload_snapshot::SNAPSHOT_MAX_BYTES as u64 {
+        return SnapshotBox::Declined;
+    }
+    let (Ok(row_bytes), Ok(rows), Ok(pitch), Ok(len)) = (
+        u32::try_from(row_bytes),
+        u32::try_from(rows),
+        u32::try_from(pitch),
+        u32::try_from(len),
+    ) else {
+        return SnapshotBox::Declined;
+    };
+    SnapshotBox::Copy(SnapshotLayout {
+        src_offset: texture_lock_offset(
+            Some(rect),
+            src_pitch,
+            shape.block_w,
+            shape.block_h,
+            block_bytes,
+        ),
+        row_bytes,
+        rows,
+        pitch,
+        len,
+    })
+}
+
+/// Copy `rows` rows of `row_bytes` from `src`, `src_pitch` apart from `src_offset`, into `dst`.
+///
+/// The rows land `dst_pitch` apart from the start of `dst`. `false`, with
+/// nothing copied, when a row would reach past the end of either slice.
+#[must_use]
+pub fn copy_rows(
+    src: &[u8],
+    src_offset: usize,
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_pitch: usize,
+    row_bytes: usize,
+    rows: usize,
+) -> bool {
+    let Some(last) = rows.checked_sub(1) else {
+        return true;
+    };
+    let src_end = last
+        .checked_mul(src_pitch)
+        .and_then(|v| v.checked_add(src_offset))
+        .and_then(|v| v.checked_add(row_bytes));
+    let dst_end = last
+        .checked_mul(dst_pitch)
+        .and_then(|v| v.checked_add(row_bytes));
+    if src_end.is_none_or(|end| end > src.len()) || dst_end.is_none_or(|end| end > dst.len()) {
+        return false;
+    }
+    for row in 0..rows {
+        let from = src_offset + row * src_pitch;
+        let to = row * dst_pitch;
+        dst[to..to + row_bytes].copy_from_slice(&src[from..from + row_bytes]);
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests;

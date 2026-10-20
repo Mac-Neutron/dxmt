@@ -1,0 +1,661 @@
+//! The presenter's decisions and bookkeeping, without a device where possible.
+//!
+//! `Inner` is built by hand with null handles: a packet's `Drop` and a slot's
+//! `Drop` both accept a null, so no Metal object is ever touched. The tests
+//! that need a queue skip when the machine has no Metal device.
+
+use std::{
+    sync::{Arc, atomic::Ordering},
+    thread,
+    time::Duration,
+};
+
+use mtld3d_shared::{
+    mtl::PresentDebugFlags,
+    mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind},
+};
+use objc2_metal::MTLPixelFormat;
+
+use super::*;
+
+/// The minimum present duration of the paced presents these tests note.
+const PACING: Duration = Duration::from_millis(16);
+
+fn packet(seq: u64, slot: Option<usize>) -> PresentPacket {
+    PresentPacket {
+        seq,
+        source: MetalHandle::<MTLTextureKind>::NULL,
+        layer: MetalHandle::<CAMetalLayerKind>::NULL,
+        slot,
+        view: 0,
+        mark: None,
+        ready_at: Instant::now(),
+    }
+}
+
+fn slot(reader: u64) -> Slot {
+    Slot {
+        texture: MetalHandle::<MTLTextureKind>::NULL,
+        width: 640,
+        height: 480,
+        format: MTLPixelFormat::BGRA8Unorm,
+        reader,
+    }
+}
+
+fn empty_inner() -> Inner {
+    Inner {
+        pending: VecDeque::new(),
+        committed_present_seq: 0,
+        presented_seq: 0,
+        flags: PresenterFlags::empty(),
+        slots: [const { None }; SNAPSHOT_SLOTS],
+        unreported_drawable_wait_ns: 0,
+        gate: None,
+    }
+}
+
+fn state_with(inner: Inner) -> Arc<PresentState> {
+    Arc::new(PresentState {
+        inner: Mutex::new(inner),
+        submit_cv: Condvar::new(),
+        presenter_cv: Condvar::new(),
+        present_retired: AtomicU64::new(0),
+        thread: Mutex::new(None),
+        stalled: AtomicBool::new(false),
+        present_occluded: false,
+        frame_signal: Arc::new(FrameSignal::new()),
+    })
+}
+
+/// The record owns the queue's only retain, so its thread runs on a live queue.
+///
+/// `create_command_queue` hands the retain to the record and keeps no copy,
+/// and the presenter thread retains the queue again at start. Without the
+/// record's retain this is a use after free that a loaded machine turns into
+/// a crash at thread start.
+#[test]
+fn a_record_keeps_the_queue_alive_for_its_thread() {
+    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+    let Some(device) = MTLCreateSystemDefaultDevice() else {
+        eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
+        return;
+    };
+    let queue = device
+        .newCommandQueue()
+        .expect("a queue on the default device");
+    // SAFETY: the raw address carries this retain, which the record adopts
+    // and releases when it drops at the end of this test.
+    let handle =
+        unsafe { MetalHandle::<MTLCommandQueueKind>::new(Retained::into_raw(queue) as u64) };
+    let record = DeviceRecord::new(handle, None, PresentDebugFlags::empty());
+    assert!(spawn(&record), "the presenter thread starts");
+    stop_and_join(record.present());
+}
+
+/// `debug.presentOccluded` reaches the state the presenter reads, and nothing else sets it.
+#[test]
+fn present_occluded_comes_from_the_queue_flags_alone() {
+    assert!(!PresentState::new(None, PresentDebugFlags::empty()).present_occluded);
+    assert!(PresentState::new(None, PresentDebugFlags::PRESENT_OCCLUDED).present_occluded);
+}
+
+/// A handle round-trips to its record, and only the destroying caller ends it.
+///
+/// `borrow` hands out a reference without consuming the handle's own, so a
+/// thunk that resolves a device leaves the record live for the next one;
+/// `consume` takes that last reference back.
+#[test]
+fn a_record_handle_round_trips_and_only_consume_ends_it() {
+    let record = DeviceRecord::new(
+        MetalHandle::<MTLCommandQueueKind>::NULL,
+        None,
+        PresentDebugFlags::empty(),
+    );
+    let handle = Arc::clone(&record).into_handle();
+    {
+        // SAFETY: the handle came from `into_handle` above and has not been
+        // consumed.
+        let borrowed = unsafe { DeviceRecord::borrow(handle) }.expect("the record is live");
+        assert!(Arc::ptr_eq(&borrowed, &record), "the same record");
+    }
+    // SAFETY: as above, and nothing names the handle after this.
+    let consumed = unsafe { DeviceRecord::consume(handle) }.expect("the record is live");
+    assert!(Arc::ptr_eq(&consumed, &record));
+    drop(consumed);
+    assert_eq!(
+        Arc::strong_count(&record),
+        1,
+        "the handle's reference is gone"
+    );
+}
+
+#[test]
+fn a_present_bearing_submit_waits_for_the_packet_on_the_back_buffer() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(5, None));
+    assert_eq!(decide(&inner, true), Decision::Wait(5));
+}
+
+#[test]
+fn a_no_present_submit_snapshots_instead_of_waiting() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(5, None));
+    assert_eq!(decide(&inner, false), Decision::Snapshot(5));
+}
+
+#[test]
+fn a_retargeted_packet_still_paces_a_present_bearing_submit() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(5, Some(0)));
+    assert_eq!(
+        decide(&inner, true),
+        Decision::Wait(5),
+        "the queue stays one deep whatever the pending present reads"
+    );
+    assert_eq!(
+        decide(&inner, false),
+        Decision::Proceed,
+        "a partial frame conflicts with nothing once the present reads a copy"
+    );
+    inner.flags.insert(PresenterFlags::HURRY);
+    assert_eq!(
+        decide(&inner, true),
+        Decision::Proceed,
+        "nor does a hurried one"
+    );
+    assert_eq!(
+        decide(&empty_inner(), true),
+        Decision::Proceed,
+        "nothing pending"
+    );
+}
+
+#[test]
+fn a_submit_waits_for_the_newest_pending_present() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(5, Some(0)));
+    inner.pending.push_back(packet(6, None));
+    assert_eq!(decide(&inner, true), Decision::Wait(6));
+    assert_eq!(decide(&inner, false), Decision::Snapshot(6));
+}
+
+#[test]
+fn hurry_turns_a_wait_into_a_snapshot_and_stop_into_nothing() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(5, None));
+    inner.flags.insert(PresenterFlags::HURRY);
+    assert_eq!(decide(&inner, true), Decision::Snapshot(5));
+    inner.flags.remove(PresenterFlags::HURRY);
+    assert_eq!(decide(&inner, true), Decision::Wait(5), "the level cleared");
+    inner.flags.insert(PresenterFlags::STOP);
+    assert_eq!(
+        decide(&inner, true),
+        Decision::Proceed,
+        "a stopping presenter drops every packet, so nothing reads the back buffer"
+    );
+}
+
+#[test]
+fn slots_prefer_free_then_the_oldest_reader() {
+    let mut inner = empty_inner();
+    assert_eq!(choose_slot(&inner), SlotChoice::Free(0), "never allocated");
+    inner.slots[0] = Some(slot(5));
+    assert_eq!(
+        choose_slot(&inner),
+        SlotChoice::Free(1),
+        "slot 0 busy, slot 1 unallocated"
+    );
+    inner.slots[1] = Some(slot(6));
+    assert_eq!(
+        choose_slot(&inner),
+        SlotChoice::Free(2),
+        "slots 0 and 1 busy, slot 2 unallocated"
+    );
+    inner.slots[2] = Some(slot(7));
+    assert_eq!(
+        choose_slot(&inner),
+        SlotChoice::Free(3),
+        "slots 0 to 2 busy, slot 3 unallocated"
+    );
+    inner.slots[3] = Some(slot(8));
+    assert_eq!(
+        choose_slot(&inner),
+        SlotChoice::Free(4),
+        "slots 0 to 3 busy, slot 4 unallocated"
+    );
+    inner.slots[4] = Some(slot(9));
+    assert_eq!(
+        choose_slot(&inner),
+        SlotChoice::Busy(0),
+        "all busy: the oldest reader"
+    );
+    inner.committed_present_seq = 5;
+    assert_eq!(
+        choose_slot(&inner),
+        SlotChoice::Free(0),
+        "reader 5 committed frees slot 0"
+    );
+    inner.committed_present_seq = 8;
+    assert_eq!(
+        choose_slot(&inner),
+        SlotChoice::Free(0),
+        "the first free one wins"
+    );
+}
+
+#[test]
+fn a_slot_at_another_geometry_is_replaced() {
+    let slot = slot(0);
+    assert!(slot.matches(640, 480, MTLPixelFormat::BGRA8Unorm));
+    assert!(!slot.matches(641, 480, MTLPixelFormat::BGRA8Unorm));
+    assert!(!slot.matches(640, 481, MTLPixelFormat::BGRA8Unorm));
+    assert!(!slot.matches(640, 480, MTLPixelFormat::RGBA16Float));
+}
+
+#[test]
+fn a_dropped_packet_frees_its_slot_and_leaves_retirement_alone() {
+    let state = state_with(empty_inner());
+    let mut inner = state.lock();
+    inner.slots[1] = Some(slot(7));
+    inner.slots[2] = Some(slot(8));
+    inner.slots[3] = Some(slot(9));
+    inner.slots[4] = Some(slot(10));
+    assert_eq!(choose_slot(&inner), SlotChoice::Free(0));
+    inner.slots[0] = Some(slot(6));
+    assert_eq!(choose_slot(&inner), SlotChoice::Busy(0));
+    drop_packet(&mut inner, packet(7, Some(1)));
+    assert_eq!(inner.committed_present_seq, 7, "consumed like a commit");
+    assert_eq!(inner.presented_seq, 0, "nothing was committed to the GPU");
+    assert_eq!(
+        state.present_retired.load(Ordering::Acquire),
+        0,
+        "no present buffer carries a dropped sequence"
+    );
+    assert_eq!(
+        choose_slot(&inner),
+        SlotChoice::Free(0),
+        "readers 6 and 7 are at or below the committed sequence"
+    );
+}
+
+#[test]
+fn a_drop_behind_a_committed_present_keeps_its_retirement_pending() {
+    let mut inner = empty_inner();
+    // Present 5 committed and is still on the GPU; the counter is behind it.
+    inner.committed_present_seq = 5;
+    inner.presented_seq = 5;
+    inner.pending.push_back(packet(6, None));
+    let state = state_with(inner);
+    state.present_retired.store(4, Ordering::Release);
+    drop_front(&state, 6);
+    let inner = state.lock();
+    assert_eq!(inner.committed_present_seq, 6, "the drop is consumed");
+    assert_eq!(
+        inner.presented_seq, 5,
+        "an idle wait retires the last committed present"
+    );
+    assert_eq!(
+        state.present_retired.load(Ordering::Acquire),
+        4,
+        "only present 5's completion handler moves the counter"
+    );
+}
+
+#[test]
+fn stop_wakes_a_submit_parked_in_its_wait() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(5, None));
+    let state = state_with(inner);
+    let waiter = Arc::clone(&state);
+    let worker = thread::spawn(move || {
+        let mut inner = waiter.lock();
+        let seq = match decide(&inner, true) {
+            Decision::Wait(seq) => seq,
+            other => panic!("expected a wait, got {other:?}"),
+        };
+        inner = waiter
+            .submit_cv
+            .wait_while(inner, |inner| {
+                inner.committed_present_seq < seq
+                    && !inner
+                        .flags
+                        .intersects(PresenterFlags::HURRY | PresenterFlags::STOP)
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        inner.flags
+    });
+    thread::sleep(Duration::from_millis(20));
+    state.lock().flags.insert(PresenterFlags::STOP);
+    state.submit_cv.notify_all();
+    let flags = worker.join().expect("the waiter returned");
+    assert!(flags.contains(PresenterFlags::STOP));
+}
+
+#[test]
+fn hurry_wakes_a_submit_parked_in_its_wait() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(5, None));
+    let state = state_with(inner);
+    let waiter = Arc::clone(&state);
+    let worker = thread::spawn(move || {
+        let inner = waiter.lock();
+        let inner = waiter
+            .submit_cv
+            .wait_while(inner, |inner| {
+                inner.committed_present_seq < 5
+                    && !inner
+                        .flags
+                        .intersects(PresenterFlags::HURRY | PresenterFlags::STOP)
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        decide(&inner, true)
+    });
+    thread::sleep(Duration::from_millis(20));
+    state.lock().flags.insert(PresenterFlags::HURRY);
+    state.submit_cv.notify_all();
+    assert_eq!(
+        worker.join().expect("the waiter returned"),
+        Decision::Snapshot(5),
+        "a hurried waiter re-decides into a snapshot"
+    );
+}
+
+#[test]
+fn an_idle_wait_returns_once_the_presenter_pops_the_last_packet() {
+    let mut inner = empty_inner();
+    inner.pending.push_back(packet(3, None));
+    let state = state_with(inner);
+    let waiter = Arc::clone(&state);
+    let worker = thread::spawn(move || {
+        let inner = waiter.lock();
+        let inner = waiter
+            .submit_cv
+            .wait_while(inner, |inner| {
+                !inner.pending.is_empty() && !inner.flags.contains(PresenterFlags::STOP)
+            })
+            .unwrap_or_else(PoisonError::into_inner);
+        (inner.committed_present_seq, inner.presented_seq)
+    });
+    thread::sleep(Duration::from_millis(20));
+    drop_front(&state, 3);
+    assert_eq!(
+        worker.join().expect("the waiter returned"),
+        (3, 0),
+        "the dropped packet is consumed and leaves nothing to retire"
+    );
+}
+
+#[test]
+fn two_devices_keep_their_own_wait_policy() {
+    let state_a = state_with(empty_inner());
+    let state_b = state_with(empty_inner());
+    set_wait_policy(&state_a, PresentWaitPolicy::SnapshotPending);
+    assert!(state_a.lock().flags.contains(PresenterFlags::HURRY));
+    assert!(
+        state_b.lock().flags.is_empty(),
+        "the other device is untouched"
+    );
+    set_wait_policy(&state_a, PresentWaitPolicy::WaitForCommit);
+    assert!(state_a.lock().flags.is_empty());
+}
+
+/// Each push reports the drawable waits committed since the previous one, once.
+///
+/// Two presents can commit between two pushes, and two pushes can come
+/// without a commit between them: the first case reports both waits, the
+/// second reports nothing again. A push to a stopped presenter still takes
+/// what it was owed.
+#[test]
+fn a_push_takes_the_drawable_waits_committed_since_the_last_one() {
+    let state = state_with(empty_inner());
+    state.lock().note_drawable_wait(3_000);
+    state.lock().note_drawable_wait(4_000);
+    assert_eq!(push(&state, packet(1, None)), 7_000, "both waits");
+    assert_eq!(push(&state, packet(2, None)), 0, "none twice");
+
+    state.lock().note_drawable_wait(5_000);
+    state.lock().flags.insert(PresenterFlags::STOP);
+    assert_eq!(push(&state, packet(3, None)), 5_000);
+    assert_eq!(push(&state, packet(4, None)), 0);
+}
+
+/// A packet the presenter drops unpresented resolves its paced mark, so the frame can finish.
+#[test]
+fn a_dropped_paced_packet_finishes_its_frame() {
+    use super::super::submission::RetirementCounter;
+
+    let floor = AtomicU64::new(0);
+    let state = state_with(empty_inner());
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    state
+        .frame_signal()
+        .attach(unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) });
+    let mut paced = packet(4, None);
+    paced.set_mark(state.frame_signal().note_submission(4, Some(PACING)));
+    state.lock().pending.push_back(paced);
+    assert_eq!(
+        floor.load(Ordering::Acquire),
+        3,
+        "the paced present holds the floor"
+    );
+    drop_front(&state, 4);
+    assert_eq!(floor.load(Ordering::Acquire), 4, "the drop resolved it");
+}
+
+/// Stopping the presenter, the queue's teardown, ends a frame-latency wait behind it.
+#[test]
+fn stop_ends_a_frame_latency_wait() {
+    use std::sync::mpsc;
+
+    use super::super::{frame_signal::FrameWait, submission::RetirementCounter};
+
+    let floor = AtomicU64::new(0);
+    let draw = Arc::new(AtomicU64::new(0));
+    let state = state_with(empty_inner());
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    state
+        .frame_signal()
+        .attach(unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) });
+    let (sender, receiver) = mpsc::channel();
+    let waiter = {
+        let signal = Arc::clone(state.frame_signal());
+        let draw = Arc::clone(&draw);
+        thread::spawn(move || {
+            // SAFETY: the waiter owns a reference to the atomic it reads.
+            let draw = unsafe { RetirementCounter::from_address(Arc::as_ptr(&draw) as u64) };
+            let _ =
+                sender.send(signal.wait(draw, 2, super::super::frame_signal::PACED_PRESENT_CAP));
+        })
+    };
+    assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+    stop_and_join(&state);
+    assert_eq!(
+        receiver.recv_timeout(Duration::from_secs(5)),
+        Ok(FrameWait::Ended)
+    );
+    waiter.join().unwrap();
+}
+
+/// A present dropped unshown releases a paced present whose mark is no longer on a packet.
+///
+/// The mark of a committed paced present lives in its drawable's presented
+/// handler; a covered window or a missing drawable means that handler may
+/// not run for as long as the window stays so, and the drop of the next
+/// packet has to release it.
+#[test]
+fn an_unshown_drop_releases_a_committed_paced_present() {
+    use super::super::submission::RetirementCounter;
+
+    let floor = AtomicU64::new(0);
+    let state = state_with(empty_inner());
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    state
+        .frame_signal()
+        .attach(unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) });
+    // Committed and handed to its drawable's handler: held outside any packet.
+    let committed = state.frame_signal().note_submission(3, Some(PACING));
+    let mut next = packet(4, None);
+    next.set_mark(state.frame_signal().note_submission(4, Some(PACING)));
+    state.lock().pending.push_back(next);
+    assert_eq!(
+        floor.load(Ordering::Acquire),
+        2,
+        "both paced presents hold the floor"
+    );
+    drop_unshown(&state, 4);
+    assert_eq!(floor.load(Ordering::Acquire), 4, "the drop released both");
+    drop(committed);
+}
+
+/// A present into an occluded window is paced by its duration, as one into a shown window is.
+///
+/// The display enforces the duration only for a window it shows; the
+/// presenter holds the rest to it, so the frame-latency bound needs the mark
+/// either way. Only a present with no duration at all goes unpaced.
+#[test]
+fn an_occluded_window_keeps_its_pace() {
+    let view = super::attachment::test_address_block();
+    let att = super::attachment::register(
+        view,
+        view + 8,
+        &super::attachment::AttachLatches {
+            hwnd: 0x40,
+            flags: super::attachment::AttachFlags::empty(),
+            color_space: mtld3d_shared::mtl::ColorSpacePolicy::Passthrough,
+            pacing_bits: 0,
+            backing_scale: 1,
+            backing_scale_sink: 0,
+            cursor_kick_sink: 0,
+            client_surface_request_sink: 0,
+            client_surface: 0,
+        },
+    );
+    let cap = 1.0 / 30.0;
+    att.set_min_present_duration(cap);
+    att.set_window_occluded(false);
+    assert_eq!(pacing(Some(&att)), Some(Duration::from_secs_f64(cap)));
+    att.set_window_occluded(true);
+    assert_eq!(
+        pacing(Some(&att)),
+        Some(Duration::from_secs_f64(cap)),
+        "an occluded window is paced too"
+    );
+    att.set_min_present_duration(0.0);
+    assert_eq!(pacing(Some(&att)), None, "no duration, no pace");
+    assert_eq!(pacing(None), None, "no attachment, no pace");
+    super::attachment::unregister(view);
+}
+
+/// The presenter keeps the pace of an occluded window and of a visible one that displays nothing.
+///
+/// A visible window whose paced presents the display shows is paced by the
+/// display alone; one whose last paced presents all came back undisplayed is
+/// held on the presenter's clock as an occluded one is, until one is shown.
+#[test]
+fn the_presenter_paces_a_window_that_displays_nothing() {
+    let view = super::attachment::test_address_block();
+    let att = super::attachment::register(
+        view,
+        view + 8,
+        &super::attachment::AttachLatches {
+            hwnd: 0x41,
+            flags: super::attachment::AttachFlags::empty(),
+            color_space: mtld3d_shared::mtl::ColorSpacePolicy::Passthrough,
+            pacing_bits: 0,
+            backing_scale: 1,
+            backing_scale_sink: 0,
+            cursor_kick_sink: 0,
+            client_surface_request_sink: 0,
+            client_surface: 0,
+        },
+    );
+    let cap = Duration::from_secs_f64(1.0 / 30.0);
+    att.set_min_present_duration(cap.as_secs_f64());
+    assert_eq!(
+        own_clock_pace(&att),
+        None,
+        "a shown window is paced by the display"
+    );
+    att.set_window_occluded(true);
+    assert_eq!(own_clock_pace(&att), Some(cap), "an occluded window");
+    att.set_window_occluded(false);
+    for _ in 0..super::attachment::UNDISPLAYED_PACED_LIMIT {
+        att.note_paced_present(false);
+    }
+    assert_eq!(
+        own_clock_pace(&att),
+        Some(cap),
+        "a visible window that displayed none of its last paced presents"
+    );
+    att.note_paced_present(true);
+    assert_eq!(own_clock_pace(&att), None, "until one is displayed");
+    super::attachment::unregister(view);
+}
+
+/// A hold lasts until its deadline, and a stop ends it early.
+#[test]
+fn a_hold_ends_at_its_deadline_or_at_a_stop() {
+    let state = state_with(empty_inner());
+    let start = Instant::now();
+    assert!(hold_until(&state, start + PACING), "the deadline passes");
+    assert!(start.elapsed() >= PACING, "the hold lasted its duration");
+
+    let holder = {
+        let state = Arc::clone(&state);
+        thread::spawn(move || hold_until(&state, Instant::now() + Duration::from_secs(30)))
+    };
+    thread::sleep(Duration::from_millis(50));
+    state.lock().flags.insert(PresenterFlags::STOP);
+    state.presenter_cv.notify_all();
+    assert!(!holder.join().unwrap(), "the stop ended the hold");
+}
+
+/// An idle wait releases a held present at once rather than sitting out its pace.
+#[test]
+fn an_idle_wait_releases_a_held_present() {
+    let state = state_with(empty_inner());
+    let holder = {
+        let state = Arc::clone(&state);
+        thread::spawn(move || hold_until(&state, Instant::now() + Duration::from_secs(30)))
+    };
+    thread::sleep(Duration::from_millis(50));
+    state.lock().flags.insert(PresenterFlags::DRAIN);
+    state.presenter_cv.notify_all();
+    assert!(holder.join().unwrap(), "the drain released the present");
+}
+
+/// An occluded drop releases the presents at or below it and keeps the ones behind it owed.
+///
+/// The present committed while the window was shown is released, since the
+/// display may not show it now. The packet behind the dropped one still has
+/// to be held to the window's pace when the presenter reaches it, so its
+/// mark keeps the frame-latency floor below it.
+#[test]
+fn an_occluded_drop_keeps_the_presents_behind_it_owed() {
+    use super::super::submission::RetirementCounter;
+
+    let floor = AtomicU64::new(0);
+    let state = state_with(empty_inner());
+    // SAFETY: `floor` outlives every use of the signal in this test.
+    state
+        .frame_signal()
+        .attach(unsafe { RetirementCounter::from_address(core::ptr::from_ref(&floor) as u64) });
+    // Committed and handed to its drawable's handler: held outside any packet.
+    let committed = state.frame_signal().note_submission(3, Some(PACING));
+    for seq in [4, 5] {
+        let mut next = packet(seq, None);
+        next.set_mark(state.frame_signal().note_submission(seq, Some(PACING)));
+        state.lock().pending.push_back(next);
+    }
+    assert_eq!(floor.load(Ordering::Acquire), 2);
+    drop_occluded(&state, 4);
+    assert_eq!(
+        floor.load(Ordering::Acquire),
+        4,
+        "the committed present and the dropped one are released, the next one is not"
+    );
+    drop_front(&state, 5);
+    assert_eq!(floor.load(Ordering::Acquire), 5);
+    drop(committed);
+}

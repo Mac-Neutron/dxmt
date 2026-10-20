@@ -1,0 +1,720 @@
+//! Cold shader and pipeline work attributed to its owning encoder submission.
+//!
+//! Native durations are nanoseconds, never raw ticks from another runtime.
+//! Frame totals and individual slow operations are kept distinct.
+
+#[cfg(perf_tracking)]
+use std::fmt::Write as _;
+
+use mtld3d_shared::perf::perf_enabled;
+
+#[cfg(perf_tracking)]
+const SLOW_NS: u64 = 2_000_000;
+#[cfg(perf_tracking)]
+const SLOW_LIMIT: usize = 5;
+
+#[cfg(test)]
+mod tests;
+
+/// One measured operation; parent totals include their nested children.
+#[repr(usize)]
+pub enum Kind {
+    ShaderVs,
+    ShaderPs,
+    EmitVs,
+    EmitPs,
+    ShaderPreparation,
+    Library,
+    Function,
+    CacheWrite,
+    Pipeline,
+    Sibling,
+    PipelinePreparation,
+    PipelineBuild,
+    PipelineCacheWrite,
+    Depth,
+    ResolveOther,
+    PipelineOther,
+}
+
+#[cfg(perf_tracking)]
+impl Kind {
+    const COUNT: usize = Self::PipelineOther as usize + 1;
+    const LABELS: [&'static str; Self::COUNT] = [
+        "VS miss total",
+        "PS miss total",
+        "  emit VS",
+        "  emit PS",
+        "  shader setup",
+        "  Metal library",
+        "  function lookup",
+        "  cache persist",
+        "PSO primary total",
+        "PSO sibling total",
+        "  PSO setup",
+        "  Metal PSO build",
+        "  PSO cache persist",
+        "depth state build",
+        "resolve remainder",
+        "pipeline remainder",
+    ];
+    /// Key base of each row in the `perf-kv` line, parallel to `LABELS`.
+    const KEYS: [&'static str; Self::COUNT] = [
+        "comp_vs_miss",
+        "comp_ps_miss",
+        "comp_emit_vs",
+        "comp_emit_ps",
+        "comp_shader_setup",
+        "comp_metal_library",
+        "comp_function_lookup",
+        "comp_shader_cache_persist",
+        "comp_pso_primary",
+        "comp_pso_sibling",
+        "comp_pso_setup",
+        "comp_pso_build",
+        "comp_pso_cache_persist",
+        "comp_depth_state",
+        "comp_resolve_remainder",
+        "comp_pipeline_remainder",
+    ];
+}
+
+/// Per-device compilation accounting; storage vanishes without PERF.
+#[derive(Default)]
+pub struct CompilationPerf {
+    #[cfg(perf_tracking)]
+    frame: [Metric; Kind::COUNT],
+    #[cfg(perf_tracking)]
+    window: [Metric; Kind::COUNT],
+    #[cfg(perf_tracking)]
+    slow: Vec<SlowOperation>,
+    #[cfg(perf_tracking)]
+    frame_serial: u64,
+    #[cfg(perf_tracking)]
+    asynchronous: AsyncMetrics,
+}
+
+#[cfg(perf_tracking)]
+pub(super) struct DeferredFrame {
+    metrics: [Metric; Kind::COUNT],
+    serial: u64,
+}
+
+impl CompilationPerf {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            #[cfg(perf_tracking)]
+            frame: [const { Metric::new() }; Kind::COUNT],
+            #[cfg(perf_tracking)]
+            window: [const { Metric::new() }; Kind::COUNT],
+            #[cfg(perf_tracking)]
+            slow: Vec::new(),
+            #[cfg(perf_tracking)]
+            frame_serial: 0,
+            #[cfg(perf_tracking)]
+            asynchronous: AsyncMetrics::new(),
+        }
+    }
+
+    /// Count a draw left out of its frame because its build was still in flight.
+    #[cfg(perf_tracking)]
+    pub fn note_skipped_draw(&mut self) {
+        if perf_enabled() {
+            self.asynchronous.skipped = self.asynchronous.skipped.saturating_add(1);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_skipped_draw(&mut self) {}
+
+    /// Count a draw encoded with a placeholder pipeline, its builds waited for at submission.
+    #[cfg(perf_tracking)]
+    pub fn note_deferred_draw(&mut self) {
+        if perf_enabled() {
+            self.asynchronous.deferred = self.asynchronous.deferred.saturating_add(1);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_deferred_draw(&mut self) {}
+
+    /// Sample how many builds are queued or running, keeping the window's peak.
+    #[cfg(perf_tracking)]
+    pub fn note_pending(&mut self, pending: usize) {
+        if perf_enabled() {
+            let pending = u64::try_from(pending).unwrap_or(u64::MAX);
+            self.asynchronous.pending_peak = self.asynchronous.pending_peak.max(pending);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_pending(&mut self, _pending: usize) {}
+
+    /// Count one installed build and the TSC cycles from its enqueue to its install.
+    #[cfg(perf_tracking)]
+    pub fn note_install(&mut self, enqueued_tsc: u64, installed_tsc: u64) {
+        if perf_enabled() {
+            let cycles = installed_tsc.saturating_sub(enqueued_tsc);
+            let metrics = &mut self.asynchronous;
+            metrics.installs = metrics.installs.saturating_add(1);
+            metrics.latency_cycles = metrics.latency_cycles.saturating_add(cycles);
+            metrics.latency_peak_cycles = metrics.latency_peak_cycles.max(cycles);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_install(&mut self, _enqueued_tsc: u64, _installed_tsc: u64) {}
+
+    /// Count one wait of the encoder for builds a draw could not do without.
+    ///
+    /// `stolen` is how many of the jobs the encoder ran on its own thread
+    /// while it waited, rather than waiting for a worker to reach them.
+    #[cfg(perf_tracking)]
+    pub fn note_urgent_wait(&mut self, ns: u64, stolen: u64) {
+        if perf_enabled() {
+            let metrics = &mut self.asynchronous;
+            metrics.urgent_waits = metrics.urgent_waits.saturating_add(1);
+            metrics.urgent_wait_ns = metrics.urgent_wait_ns.saturating_add(ns);
+            metrics.stolen = metrics.stolen.saturating_add(stolen);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_urgent_wait(&mut self, _ns: u64, _stolen: u64) {}
+
+    /// Count the encoder's own share of one miss: the probe, the key and the enqueue.
+    #[cfg(perf_tracking)]
+    pub fn note_miss(&mut self, ns: u64) {
+        if perf_enabled() {
+            let metrics = &mut self.asynchronous;
+            metrics.misses = metrics.misses.saturating_add(1);
+            metrics.miss_ns = metrics.miss_ns.saturating_add(ns);
+        }
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn note_miss(&mut self, _ns: u64) {}
+
+    /// Record elapsed work, evaluating identity only for a retained slow event.
+    pub fn record(
+        &mut self,
+        kind: Kind,
+        ns: u64,
+        success: bool,
+        seq: u64,
+        identity: impl FnOnce() -> Identity,
+    ) {
+        if !perf_enabled() {
+            return;
+        }
+        self.record_enabled(kind, ns, success, seq, identity);
+    }
+
+    #[cfg(not(perf_tracking))]
+    fn record_enabled(
+        &mut self,
+        _kind: Kind,
+        _ns: u64,
+        _success: bool,
+        _seq: u64,
+        _identity: impl FnOnce() -> Identity,
+    ) {
+        *self = Self::new();
+    }
+
+    #[cfg(perf_tracking)]
+    fn record_enabled(
+        &mut self,
+        kind: Kind,
+        ns: u64,
+        success: bool,
+        seq: u64,
+        identity: impl FnOnce() -> Identity,
+    ) {
+        let retain = !matches!(
+            kind,
+            Kind::ShaderVs | Kind::ShaderPs | Kind::Pipeline | Kind::Sibling
+        );
+        let index = kind as usize;
+        let metric = &mut self.frame[index];
+        metric.ns = metric.ns.saturating_add(ns);
+        metric.calls = metric.calls.saturating_add(1);
+        metric.failures = metric.failures.saturating_add(u64::from(!success));
+        // Parent totals remain in the table; retain leaf operations only.
+        if ns < SLOW_NS || !retain {
+            return;
+        }
+        let position = self.slow.partition_point(|event| event.ns >= ns);
+        if position >= SLOW_LIMIT {
+            return;
+        }
+        if self.slow.len() == SLOW_LIMIT {
+            self.slow.pop();
+        }
+        self.slow.insert(
+            position,
+            SlowOperation {
+                kind: index,
+                ns,
+                success,
+                seq,
+                identity: identity(),
+                serial: self.frame_serial,
+                encoder_ns: None,
+            },
+        );
+    }
+
+    /// Fold native shader phases without treating successful preparation as a build result.
+    pub fn shader_parts(
+        &mut self,
+        timings: &mtld3d_shared::perf::ShaderTimings,
+        success: bool,
+        seq: u64,
+        identity: impl Fn() -> Identity,
+    ) {
+        if !perf_enabled() {
+            return;
+        }
+        self.shader_parts_enabled(timings, success, seq, identity);
+    }
+
+    fn shader_parts_enabled(
+        &mut self,
+        timings: &mtld3d_shared::perf::ShaderTimings,
+        success: bool,
+        seq: u64,
+        identity: impl Fn() -> Identity,
+    ) {
+        if timings.preparation_ns == 0 {
+            return;
+        }
+        self.record_enabled(
+            Kind::ShaderPreparation,
+            timings.preparation_ns,
+            success || timings.library_ns != 0,
+            seq,
+            &identity,
+        );
+        if timings.library_ns != 0 {
+            self.record_enabled(
+                Kind::Library,
+                timings.library_ns,
+                success || timings.function_ns != 0,
+                seq,
+                &identity,
+            );
+        }
+        if timings.function_ns != 0 {
+            self.record_enabled(Kind::Function, timings.function_ns, success, seq, identity);
+        }
+    }
+
+    /// Close a submission, calculating residuals before taking window maxima.
+    #[cfg(perf_tracking)]
+    pub fn finish_frame(&mut self, resolve_ns: u64, pipeline_ns: u64, encoder_ns: u64) {
+        let frame = self.defer_frame();
+        self.finish_deferred_frame(frame, resolve_ns, pipeline_ns, encoder_ns);
+    }
+
+    #[cfg(perf_tracking)]
+    pub(super) const fn defer_frame(&mut self) -> DeferredFrame {
+        let frame = DeferredFrame {
+            metrics: core::mem::replace(&mut self.frame, [const { Metric::new() }; Kind::COUNT]),
+            serial: self.frame_serial,
+        };
+        self.frame_serial = self.frame_serial.wrapping_add(1);
+        frame
+    }
+
+    #[cfg(perf_tracking)]
+    pub(super) fn finish_deferred_frame(
+        &mut self,
+        mut frame: DeferredFrame,
+        resolve_ns: u64,
+        pipeline_ns: u64,
+        encoder_ns: u64,
+    ) {
+        // Called only once the native frequency is published. Preserve early install
+        // durations as native ticks until this aggregation boundary.
+        let metrics = &mut self.asynchronous;
+        metrics.latency_ns = metrics
+            .latency_ns
+            .saturating_add(cycles_to_ns(core::mem::take(&mut metrics.latency_cycles)));
+        metrics.latency_peak_ns = metrics.latency_peak_ns.max(cycles_to_ns(core::mem::take(
+            &mut metrics.latency_peak_cycles,
+        )));
+        let shaders = frame.metrics[Kind::ShaderVs as usize]
+            .ns
+            .saturating_add(frame.metrics[Kind::ShaderPs as usize].ns);
+        let pipelines = frame.metrics[Kind::Pipeline as usize]
+            .ns
+            .saturating_add(frame.metrics[Kind::Sibling as usize].ns)
+            .saturating_add(frame.metrics[Kind::Depth as usize].ns);
+        frame.metrics[Kind::ResolveOther as usize].ns = resolve_ns.saturating_sub(shaders);
+        frame.metrics[Kind::PipelineOther as usize].ns = pipeline_ns.saturating_sub(pipelines);
+        for (window, frame) in self.window.iter_mut().zip(&mut frame.metrics) {
+            window.ns = window.ns.saturating_add(frame.ns);
+            window.calls = window.calls.saturating_add(frame.calls);
+            window.failures = window.failures.saturating_add(frame.failures);
+            window.peak_ns = window.peak_ns.max(frame.ns);
+            *frame = Metric::new();
+        }
+        for event in &mut self.slow {
+            if event.serial == frame.serial {
+                event.encoder_ns = Some(encoder_ns);
+            }
+        }
+    }
+
+    /// Append the window's compilation keys to the `perf-kv` line.
+    ///
+    /// Every key is written whether or not the window compiled anything, so
+    /// the key set stays the same from one line to the next. Call before
+    /// [`Self::append_window`], which clears the window. The two remainder
+    /// rows are computed, never counted, so they carry no calls or failures.
+    #[cfg(perf_tracking)]
+    pub(super) fn append_kv(&self, kv: &mut super::KvLine) {
+        for ((index, base), metric) in Kind::KEYS.iter().enumerate().zip(&self.window) {
+            let remainder =
+                index == Kind::ResolveOther as usize || index == Kind::PipelineOther as usize;
+            if remainder {
+                // Computed from the encoder's resolve and pipeline phases,
+                // which run their timers in the timed frames only.
+                kv.per_frame_ms(base, ms(metric.ns));
+            } else {
+                kv.per_any_frame_ms(base, ms(metric.ns));
+            }
+            kv.peak_ms(base, ms(metric.peak_ns));
+            if !remainder {
+                kv.total(format_args!("{base}_calls"), metric.calls);
+                kv.total(format_args!("{base}_failed"), metric.failures);
+            }
+        }
+        let metrics = &self.asynchronous;
+        kv.total("comp_async_skipped_draws", metrics.skipped);
+        kv.count("comp_async_pending_peak", metrics.pending_peak);
+        kv.total("comp_async_installs", metrics.installs);
+        kv.per_event_ms(
+            "comp_async_latency",
+            ms(metrics.latency_ns),
+            metrics.installs,
+        );
+        kv.peak_ms("comp_async_latency", ms(metrics.latency_peak_ns));
+        kv.total("comp_async_deferred_draws", metrics.deferred);
+        kv.total("comp_async_urgent_waits", metrics.urgent_waits);
+        kv.per_any_frame_ms("comp_async_urgent_wait", ms(metrics.urgent_wait_ns));
+        kv.total("comp_async_stolen", metrics.stolen);
+        kv.total("comp_async_misses", metrics.misses);
+        kv.per_any_frame_ms("comp_async_miss", ms(metrics.miss_ns));
+    }
+
+    /// Render once with the existing PERF summary, then clear the window.
+    ///
+    /// `frames` is every frame of the window, `timed_frames` the frames that
+    /// ran their timers, the divisor of the two remainder rows.
+    #[cfg(perf_tracking)]
+    pub fn append_window(&mut self, output: &mut String, frames: u32, timed_frames: u32) {
+        if self.window.iter().all(|metric| metric.calls == 0) && self.asynchronous.is_idle() {
+            self.window = [const { Metric::new() }; Kind::COUNT];
+            self.slow.clear();
+            self.asynchronous = AsyncMetrics::new();
+            return;
+        }
+        let _ = writeln!(
+            output,
+            "\nCompilation (worker time for asynchronous builds; nested rows are not additive)"
+        );
+        self.write_metrics(output, frames.max(1), timed_frames.max(1));
+        self.write_slow(output);
+        self.asynchronous.write(output);
+        self.window = [const { Metric::new() }; Kind::COUNT];
+        self.slow.clear();
+        self.asynchronous = AsyncMetrics::new();
+    }
+
+    /// Emit startup work separately; no gameplay frame denominator applies.
+    #[cfg(perf_tracking)]
+    pub fn log_startup(&mut self, device: u64) {
+        if !perf_enabled() {
+            return;
+        }
+        self.log_startup_enabled(device);
+    }
+
+    #[cfg(not(perf_tracking))]
+    pub const fn log_startup(&mut self, _device: u64) {
+        *self = Self::new();
+    }
+
+    #[cfg(perf_tracking)]
+    fn log_startup_enabled(&mut self, device: u64) {
+        if self.frame.iter().all(|metric| metric.calls == 0) {
+            return;
+        }
+        self.window = std::mem::take(&mut self.frame);
+        let mut output = format!(
+            "cache prewarm PERF device={device:#x} (startup totals; outside gameplay windows)\n"
+        );
+        for (label, metric) in Kind::LABELS.iter().zip(&self.window) {
+            if metric.calls != 0 {
+                let _ = writeln!(
+                    output,
+                    "  {label:<20} {:>9.3} ms total  calls={:<5} failed={}",
+                    ms(metric.ns),
+                    metric.calls,
+                    metric.failures
+                );
+            }
+        }
+        self.write_slow(&mut output);
+        log::info!(target: super::LOG_TARGET, "{output}");
+        self.window = [const { Metric::new() }; Kind::COUNT];
+        self.slow.clear();
+    }
+
+    #[cfg(perf_tracking)]
+    fn write_metrics(&self, output: &mut String, frames: u32, timed_frames: u32) {
+        for (index, (label, metric)) in Kind::LABELS.iter().zip(&self.window).enumerate() {
+            let divisor =
+                if index == Kind::ResolveOther as usize || index == Kind::PipelineOther as usize {
+                    timed_frames
+                } else {
+                    frames
+                };
+            let _ = writeln!(
+                output,
+                "  {label:<20} {:>7.3} ms/frame  peak/frame {:>7.3} ms  total {:>9.3} ms  calls={:<5} failed={}",
+                ms(metric.ns) / f64::from(divisor),
+                ms(metric.peak_ns),
+                ms(metric.ns),
+                metric.calls,
+                metric.failures
+            );
+        }
+    }
+
+    #[cfg(perf_tracking)]
+    fn write_slow(&self, output: &mut String) {
+        for event in &self.slow {
+            let _ = write!(
+                output,
+                "  slow {}: {:.3} ms/call seq={} success={} {}",
+                Kind::LABELS[event.kind].trim(),
+                ms(event.ns),
+                event.seq,
+                event.success,
+                event.identity
+            );
+            if let Some(ns) = event.encoder_ns {
+                let _ = write!(output, " encoder_ops_same_submission={:.3}ms", ms(ns));
+            }
+            output.push('\n');
+        }
+    }
+}
+
+#[cfg(perf_tracking)]
+#[derive(Default)]
+struct Metric {
+    ns: u64,
+    calls: u64,
+    failures: u64,
+    peak_ns: u64,
+}
+
+#[cfg(perf_tracking)]
+impl Metric {
+    const fn new() -> Self {
+        Self {
+            ns: 0,
+            calls: 0,
+            failures: 0,
+            peak_ns: 0,
+        }
+    }
+}
+
+/// The asynchronous-build rows of one PERF window.
+#[cfg(perf_tracking)]
+#[derive(Default)]
+struct AsyncMetrics {
+    /// Draws left out of their frame while a build they needed was in flight.
+    skipped: u64,
+    /// Most builds queued or running at once.
+    pending_peak: u64,
+    /// Builds installed, and their summed and longest enqueue-to-install latency.
+    installs: u64,
+    latency_cycles: u64,
+    latency_peak_cycles: u64,
+    latency_ns: u64,
+    latency_peak_ns: u64,
+    /// Draws encoded with a placeholder pipeline, whose builds their submission waited for.
+    deferred: u64,
+    /// Encoder waits for builds a draw could not skip, their time, and the jobs it ran itself.
+    urgent_waits: u64,
+    urgent_wait_ns: u64,
+    stolen: u64,
+    /// Misses and the encoder time they cost before their jobs were queued.
+    misses: u64,
+    miss_ns: u64,
+}
+
+#[cfg(perf_tracking)]
+impl AsyncMetrics {
+    const fn new() -> Self {
+        Self {
+            skipped: 0,
+            pending_peak: 0,
+            installs: 0,
+            latency_cycles: 0,
+            latency_peak_cycles: 0,
+            latency_ns: 0,
+            latency_peak_ns: 0,
+            deferred: 0,
+            urgent_waits: 0,
+            urgent_wait_ns: 0,
+            stolen: 0,
+            misses: 0,
+            miss_ns: 0,
+        }
+    }
+
+    const fn is_idle(&self) -> bool {
+        self.skipped == 0
+            && self.deferred == 0
+            && self.installs == 0
+            && self.urgent_waits == 0
+            && self.misses == 0
+    }
+
+    fn write(&self, output: &mut String) {
+        if self.is_idle() {
+            return;
+        }
+        let _ = writeln!(
+            output,
+            "  async: draws skipped={}  pending peak={}  installs={}  latency avg {:.3} ms  max {:.3} ms",
+            self.skipped,
+            self.pending_peak,
+            self.installs,
+            ms(self.latency_ns) / mtld3d_shared::tsc::u64_to_f64_exact(self.installs.max(1)),
+            ms(self.latency_peak_ns),
+        );
+        let _ = writeln!(
+            output,
+            "  async: draws deferred={}  urgent waits={}  waited {:.3} ms  stolen={}  encoder per miss {:.3} ms  misses={}",
+            self.deferred,
+            self.urgent_waits,
+            ms(self.urgent_wait_ns),
+            self.stolen,
+            ms(self.miss_ns) / mtld3d_shared::tsc::u64_to_f64_exact(self.misses.max(1)),
+            self.misses,
+        );
+    }
+}
+
+#[cfg(perf_tracking)]
+struct SlowOperation {
+    kind: usize,
+    ns: u64,
+    success: bool,
+    seq: u64,
+    identity: Identity,
+    serial: u64,
+    encoder_ns: Option<u64>,
+}
+
+#[cfg(perf_tracking)]
+fn ms(ns: u64) -> f64 {
+    mtld3d_shared::tsc::u64_to_f64_exact(ns) / 1_000_000.0
+}
+
+/// Convert only PE-owned counters using the PE runtime's calibrated frequency.
+#[cfg(perf_tracking)]
+#[must_use]
+pub fn cycles_to_ns(cycles: u64) -> u64 {
+    u64::try_from(
+        u128::from(cycles) * 1_000_000_000 / u128::from(mtld3d_shared::tsc::tsc_hz().max(1)),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Owned metadata for a retained slow operation, formatted only at summary time.
+pub enum Identity {
+    Shader {
+        device: u64,
+        stage: &'static str,
+        shader: super::PairShaderId,
+    },
+    Prewarm {
+        device: u64,
+        kind: crate::shader_key::CachedKind,
+        key: u64,
+    },
+    Pipeline {
+        device: u64,
+        vs: super::PairShaderId,
+        ps: super::PairShaderId,
+        snapshot: Box<crate::pipeline_state::PipelineSnapshot>,
+        sibling: bool,
+    },
+    Depth {
+        device: u64,
+        key: u64,
+    },
+}
+
+#[cfg(perf_tracking)]
+impl std::fmt::Display for Identity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shader {
+                device,
+                stage,
+                shader,
+            } => write!(
+                f,
+                "device={device:#x} stage={stage} shader={}",
+                shader.tag()
+            ),
+            Self::Prewarm { device, kind, key } => write!(
+                f,
+                "device={device:#x} shader={} disk={key:#x}",
+                kind.entry_name(*key)
+            ),
+            Self::Pipeline {
+                device,
+                vs,
+                ps,
+                snapshot,
+                sibling,
+            } => {
+                write!(
+                    f,
+                    "device={device:#x} vs={} ps={} vdecl={:#x} layout=[",
+                    vs.tag(),
+                    ps.tag(),
+                    snapshot.vdecl_hash
+                )?;
+                for (stream, layout) in snapshot.stream_layouts.iter().enumerate() {
+                    if *layout != crate::pipeline_state::StreamLayout::UNUSED {
+                        write!(f, "{stream}:{layout:?};")?;
+                    }
+                }
+                write!(
+                    f,
+                    "] color={:?} attach={:?} samples={} rs={:?} extra={:?} ps_outputs={:#x} sibling={sibling}",
+                    snapshot.color_format,
+                    snapshot.attach,
+                    snapshot.sample_count,
+                    snapshot.rs,
+                    snapshot.extra,
+                    snapshot.ps_color_out_mask
+                )
+            }
+            Self::Depth { device, key } => write!(f, "device={device:#x} depth_key={key:#x}"),
+        }
+    }
+}

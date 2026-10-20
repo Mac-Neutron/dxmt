@@ -1,0 +1,1575 @@
+//! Unit tests for the D3D9 format mappings.
+//!
+//! Apple Silicon has no 24-bit depth, so the whole D24 family and the FOURCC
+//! sampleable-depth formats collapse onto `Depth32Float`, and the
+//! stencil-bearing ones onto `Depth32FloatStencil8`. These pin that collapse,
+//! keep `is_depth_format` in step with the mapping it wraps, and check that
+//! color and unknown formats stay unmapped. The colour side pins the
+//! wide-channel family (16-bit unorm and the floats): Metal format, pitch,
+//! and the missing-channel swizzle, plus `is_mapped_color_format` tracking
+//! the lookup table. `format_name` is pinned on both sides: a mapped name,
+//! and the fixed unknown fallback that callers log the raw code beside. The
+//! render-target family is pinned in both its forms: the pure one, and the
+//! device one where the two packed 16-bit members whose Metal counterpart is
+//! missing drop out while nothing else moves.
+
+use mtld3d_types::{D3DUSAGE_NONSECURE, D3DUSAGE_WRITEONLY};
+
+use super::{
+    D3DFMT_A8B8G8R8, D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16, D3DFMT_A16B16G16R16F,
+    D3DFMT_A32B32G32R32F, D3DFMT_D15S1, D3DFMT_D16, D3DFMT_D16_LOCKABLE, D3DFMT_D24FS8,
+    D3DFMT_D24S8, D3DFMT_D24X4S4, D3DFMT_D24X8, D3DFMT_D32, D3DFMT_D32F_LOCKABLE, D3DFMT_DF16,
+    D3DFMT_DF24, D3DFMT_DXT1, D3DFMT_G16R16, D3DFMT_G16R16F, D3DFMT_G32R32F, D3DFMT_INTZ,
+    D3DFMT_R5G6B5, D3DFMT_R8G8B8, D3DFMT_R16F, D3DFMT_R32F, D3DFMT_UYVY, D3DFMT_X8B8G8R8,
+    D3DFMT_X8R8G8B8, D3DFMT_YUY2, D3DRTYPE_CUBETEXTURE, D3DRTYPE_INDEXBUFFER, D3DRTYPE_SURFACE,
+    D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER, D3DRTYPE_VOLUME, D3DRTYPE_VOLUMETEXTURE,
+    D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_DMAP, D3DUSAGE_DONOTCLIP,
+    D3DUSAGE_DYNAMIC, D3DUSAGE_NPATCHES, D3DUSAGE_POINTS, D3DUSAGE_QUERY_FILTER,
+    D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING, D3DUSAGE_QUERY_SRGBREAD,
+    D3DUSAGE_QUERY_SRGBWRITE, D3DUSAGE_QUERY_VERTEXTEXTURE, D3DUSAGE_QUERY_WRAPANDMIP,
+    D3DUSAGE_RENDERTARGET, D3DUSAGE_RTPATCHES, D3DUSAGE_SOFTWAREPROCESSING, PixelFormat,
+    RenderScale, StandaloneSurfaceKind, Swizzle, block_row_pitch, compute_mip_count,
+    compute_mip_size, compute_volume_mip_count, depth_format_bytes_per_pixel, format_name,
+    is_advertised_depth_format, is_back_buffer_format, is_depth_format, is_mapped_color_format,
+    is_volume_texture_format, linear_mip_size, linear_row_pitch, map_d3d_depth_format,
+    map_d3d_format, resolve_mip_levels, standalone_surface_bytes, surface_bytes,
+    usage_allowed_for_rtype,
+};
+
+/// Every mapped colour format, in `format_name` order.
+///
+/// The usage-query rules below are properties of the whole table rather than
+/// of the formats that once carried a rule of their own, so they are asserted
+/// over all of it.
+const COLOUR_FORMATS: [u32; 37] = [
+    mtld3d_types::D3DFMT_A8R8G8B8,
+    mtld3d_types::D3DFMT_X8R8G8B8,
+    mtld3d_types::D3DFMT_A8B8G8R8,
+    mtld3d_types::D3DFMT_X8B8G8R8,
+    mtld3d_types::D3DFMT_R8G8B8,
+    mtld3d_types::D3DFMT_R5G6B5,
+    mtld3d_types::D3DFMT_A1R5G5B5,
+    mtld3d_types::D3DFMT_X1R5G5B5,
+    mtld3d_types::D3DFMT_A4R4G4B4,
+    mtld3d_types::D3DFMT_A8,
+    mtld3d_types::D3DFMT_A8L8,
+    mtld3d_types::D3DFMT_L8,
+    mtld3d_types::D3DFMT_L16,
+    mtld3d_types::D3DFMT_G16R16,
+    mtld3d_types::D3DFMT_A16B16G16R16,
+    mtld3d_types::D3DFMT_R16F,
+    mtld3d_types::D3DFMT_G16R16F,
+    mtld3d_types::D3DFMT_A16B16G16R16F,
+    mtld3d_types::D3DFMT_R32F,
+    mtld3d_types::D3DFMT_G32R32F,
+    mtld3d_types::D3DFMT_A32B32G32R32F,
+    mtld3d_types::D3DFMT_ATI1,
+    mtld3d_types::D3DFMT_V8U8,
+    mtld3d_types::D3DFMT_A2B10G10R10,
+    mtld3d_types::D3DFMT_A2R10G10B10,
+    mtld3d_types::D3DFMT_V16U16,
+    mtld3d_types::D3DFMT_Q8W8V8U8,
+    mtld3d_types::D3DFMT_Q16W16V16U16,
+    mtld3d_types::D3DFMT_DXT1,
+    mtld3d_types::D3DFMT_DXT2,
+    mtld3d_types::D3DFMT_DXT3,
+    mtld3d_types::D3DFMT_DXT4,
+    mtld3d_types::D3DFMT_DXT5,
+    mtld3d_types::D3DFMT_YUY2,
+    mtld3d_types::D3DFMT_UYVY,
+    mtld3d_types::D3DFMT_YV12,
+    mtld3d_types::D3DFMT_NV12,
+];
+
+#[test]
+fn depth_only_formats_promote_to_depth32float() {
+    // Apple Silicon has no Depth24Unorm: D24X8, D32, D16 and the lockable
+    // variants all share Depth32Float.
+    for fmt in [
+        D3DFMT_D16_LOCKABLE,
+        D3DFMT_D32,
+        D3DFMT_D24X8,
+        D3DFMT_D16,
+        D3DFMT_D32F_LOCKABLE,
+        // FOURCC sampleable-depth, minus INTZ (it carries a stencil
+        // plane, tested with the stencil-bearing family below).
+        D3DFMT_DF24,
+        D3DFMT_DF16,
+    ] {
+        assert_eq!(
+            map_d3d_depth_format(fmt),
+            Some(PixelFormat::Depth32Float),
+            "format {fmt} should map to Depth32Float"
+        );
+    }
+}
+
+#[test]
+fn stencil_bearing_formats_promote_to_depth32float_stencil8() {
+    // INTZ belongs here: it is the sampleable twin of D24S8 and carries
+    // its stencil plane.
+    for fmt in [D3DFMT_D24S8, D3DFMT_D24FS8, D3DFMT_INTZ] {
+        assert_eq!(
+            map_d3d_depth_format(fmt),
+            Some(PixelFormat::Depth32FloatStencil8),
+            "format {fmt} should map to Depth32FloatStencil8"
+        );
+    }
+}
+
+/// The depth formats the device does not serve have no mapping.
+///
+/// `D15S1` and `D24X4S4` carry a stencil narrower than any Metal format's,
+/// so every depth answer and every depth create refuses them.
+#[test]
+fn unserved_depth_formats_return_none() {
+    for fmt in [D3DFMT_D15S1, D3DFMT_D24X4S4] {
+        assert_eq!(map_d3d_depth_format(fmt), None, "format {fmt}");
+        assert!(!is_depth_format(fmt), "format {fmt}");
+        assert!(!is_advertised_depth_format(fmt), "format {fmt}");
+    }
+}
+
+/// The lockable depth formats are created but not advertised.
+///
+/// Their depth is served on `Depth32Float`, so a create that names one
+/// gets a working depth buffer, while every query refuses them because no
+/// `LockRect` of a depth surface is served. Every other mapped depth format
+/// is advertised.
+#[test]
+fn lockable_depth_formats_are_created_but_not_advertised() {
+    for fmt in [D3DFMT_D16_LOCKABLE, D3DFMT_D32F_LOCKABLE] {
+        assert!(is_depth_format(fmt), "format {fmt}");
+        assert!(!is_advertised_depth_format(fmt), "format {fmt}");
+    }
+    for fmt in [
+        D3DFMT_D16,
+        D3DFMT_D24X8,
+        D3DFMT_D24S8,
+        D3DFMT_D24FS8,
+        D3DFMT_D32,
+        D3DFMT_DF16,
+        D3DFMT_DF24,
+        D3DFMT_INTZ,
+    ] {
+        assert!(is_advertised_depth_format(fmt), "format {fmt}");
+    }
+}
+
+#[test]
+fn non_depth_formats_return_none() {
+    assert_eq!(map_d3d_depth_format(D3DFMT_A8R8G8B8), None);
+    assert_eq!(map_d3d_depth_format(0), None);
+    assert_eq!(map_d3d_depth_format(0xFFFF_FFFF), None);
+}
+
+#[test]
+fn is_depth_format_matches_map() {
+    assert!(is_depth_format(D3DFMT_D24X8));
+    assert!(is_depth_format(D3DFMT_D24S8));
+    assert!(is_depth_format(D3DFMT_INTZ));
+    assert!(is_depth_format(D3DFMT_DF24));
+    assert!(is_depth_format(D3DFMT_DF16));
+    assert!(!is_depth_format(D3DFMT_A8R8G8B8));
+}
+
+#[test]
+fn the_wide_channel_family_maps_to_its_metal_counterpart() {
+    // D3D9 names these formats most-significant channel first, so the
+    // stored order is the reverse of the name and matches Metal's
+    // R-then-G-then-B-then-A layout byte for byte. Channels a format does
+    // not store sample as 1.0, so only the four-channel members go through
+    // unswizzled. The 16-bit unorm pair follows the same rule as the
+    // floats.
+    let one = Swizzle::One;
+    let red_only = Some([Swizzle::Red, one, one, one]);
+    let red_green = Some([Swizzle::Red, Swizzle::Green, one, one]);
+    for (fmt, expected, bytes, swizzle) in [
+        (D3DFMT_G16R16, PixelFormat::Rg16Unorm, 4, red_green),
+        (D3DFMT_A16B16G16R16, PixelFormat::Rgba16Unorm, 8, None),
+        (D3DFMT_R16F, PixelFormat::R16Float, 2, red_only),
+        (D3DFMT_G16R16F, PixelFormat::Rg16Float, 4, red_green),
+        (D3DFMT_A16B16G16R16F, PixelFormat::Rgba16Float, 8, None),
+        (D3DFMT_R32F, PixelFormat::R32Float, 4, red_only),
+        (D3DFMT_G32R32F, PixelFormat::Rg32Float, 8, red_green),
+        (D3DFMT_A32B32G32R32F, PixelFormat::Rgba32Float, 16, None),
+    ] {
+        let mapping = map_d3d_format(fmt).expect("float format is mapped");
+        assert_eq!(mapping.metal_pixel_format(), expected, "format {fmt}");
+        assert_eq!(mapping.bytes_per_pixel(), bytes, "format {fmt}");
+        assert_eq!(mapping.swizzle(), swizzle, "format {fmt}");
+        assert!(!mapping.is_compressed(), "format {fmt}");
+    }
+    // Only the four-channel members carry alpha; the others read A = 1.
+    assert!(
+        map_d3d_format(D3DFMT_A16B16G16R16F)
+            .expect("mapped")
+            .has_alpha()
+    );
+    assert!(!map_d3d_format(D3DFMT_G16R16F).expect("mapped").has_alpha());
+    assert!(
+        map_d3d_format(D3DFMT_A16B16G16R16)
+            .expect("mapped")
+            .has_alpha()
+    );
+    assert!(!map_d3d_format(D3DFMT_G16R16).expect("mapped").has_alpha());
+}
+
+/// `X1R5G5B5` is `A1R5G5B5` with the top bit ignored.
+///
+/// Both take Metal's `Bgr5A1Unorm`; the X form forces the sampled alpha to 1
+/// through the swizzle, the way `X8R8G8B8` does against `A8R8G8B8`, and so
+/// reports no alpha channel to the blend translation.
+#[test]
+fn x1r5g5b5_is_a1r5g5b5_with_a_forced_alpha() {
+    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_X1R5G5B5};
+
+    let a1 = map_d3d_format(D3DFMT_A1R5G5B5).expect("mapped");
+    let x1 = map_d3d_format(D3DFMT_X1R5G5B5).expect("mapped");
+    assert_eq!(x1.metal_pixel_format(), a1.metal_pixel_format());
+    assert_eq!(x1.bytes_per_pixel(), 2);
+    assert_eq!(x1.block_bytes(), 2);
+    assert!(!x1.is_compressed());
+    assert_eq!(
+        x1.swizzle(),
+        Some([Swizzle::Red, Swizzle::Green, Swizzle::Blue, Swizzle::One])
+    );
+    assert_eq!(a1.swizzle(), None);
+    assert!(!x1.has_alpha());
+    assert!(a1.has_alpha());
+    assert_eq!(format_name(D3DFMT_X1R5G5B5), "X1R5G5B5");
+}
+
+/// The reversed-channel 32-bit pair and the 24-bit format the GPU widens.
+///
+/// `A8B8G8R8` / `X8B8G8R8` store R, G, B, A in ascending addresses, which is
+/// Metal's `RGBA8Unorm` byte for byte, and the X member forces alpha to 1 the
+/// way `X8R8G8B8` does. `R8G8B8` has no Metal counterpart at all, so it keeps
+/// its 3-byte source layout for Lock and staging while its texels are widened
+/// into a `Bgra8Unorm` backing by the upload pass.
+#[test]
+fn the_reversed_channel_and_24_bit_formats_map() {
+    let a8b8g8r8 = map_d3d_format(D3DFMT_A8B8G8R8).expect("mapped");
+    assert_eq!(a8b8g8r8.metal_pixel_format(), PixelFormat::Rgba8Unorm);
+    assert_eq!(a8b8g8r8.bytes_per_pixel(), 4);
+    assert_eq!(a8b8g8r8.swizzle(), None);
+    assert!(a8b8g8r8.has_alpha());
+
+    let x8b8g8r8 = map_d3d_format(D3DFMT_X8B8G8R8).expect("mapped");
+    assert_eq!(x8b8g8r8.metal_pixel_format(), PixelFormat::Rgba8Unorm);
+    assert_eq!(x8b8g8r8.bytes_per_pixel(), 4);
+    assert_eq!(
+        x8b8g8r8.swizzle(),
+        map_d3d_format(D3DFMT_X8R8G8B8).expect("mapped").swizzle(),
+        "the X member forces alpha to 1 like its BGRA twin"
+    );
+    assert!(!x8b8g8r8.has_alpha());
+
+    let r8g8b8 = map_d3d_format(D3DFMT_R8G8B8).expect("mapped");
+    assert_eq!(r8g8b8.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(
+        r8g8b8.bytes_per_pixel(),
+        3,
+        "source layout, not the backing"
+    );
+    assert_eq!(r8g8b8.block_bytes(), 3);
+    assert_eq!(
+        r8g8b8.swizzle(),
+        None,
+        "the upload pass writes D3D channel order into the backing"
+    );
+    assert!(!r8g8b8.has_alpha());
+    assert!(!r8g8b8.is_compressed());
+
+    // The 3-byte pitch is the one GDI computes for a 24-bit DIB of the same
+    // width, which is what a `GetDC` over the surface steps its rows by.
+    assert_eq!(linear_row_pitch(5, 3), 16);
+    assert_eq!(linear_row_pitch(4, 3), 12);
+    assert_eq!(
+        compute_mip_size(5, 2, 0, &r8g8b8),
+        (5, 2, 32, 16),
+        "a 24-bit level strides at the dword-rounded pitch"
+    );
+
+    // All three are unconditional: no device backs them differently.
+    for fmt in [D3DFMT_A8B8G8R8, D3DFMT_X8B8G8R8, D3DFMT_R8G8B8] {
+        assert!(is_mapped_color_format(fmt), "format {fmt}");
+        assert_eq!(
+            super::map_d3d_format_device(fmt, false)
+                .expect("mapped")
+                .metal_pixel_format(),
+            map_d3d_format(fmt).expect("mapped").metal_pixel_format(),
+            "format {fmt} is not device-dependent"
+        );
+    }
+    assert_eq!(format_name(D3DFMT_A8B8G8R8), "A8B8G8R8");
+    assert_eq!(format_name(D3DFMT_X8B8G8R8), "X8B8G8R8");
+    assert_eq!(format_name(D3DFMT_R8G8B8), "R8G8B8");
+}
+
+#[test]
+fn is_mapped_color_format_tracks_the_lookup() {
+    // The `CheckDeviceFormat` texture answer is derived from this, so it
+    // must stay exactly the set the create paths accept.
+    for fmt in [D3DFMT_A8R8G8B8, D3DFMT_A16B16G16R16F, D3DFMT_G32R32F] {
+        assert!(is_mapped_color_format(fmt), "format {fmt}");
+        assert!(map_d3d_format(fmt).is_some(), "format {fmt}");
+    }
+    for fmt in [0, 0xFFFF_FFFF, D3DFMT_D24S8] {
+        assert!(!is_mapped_color_format(fmt), "format {fmt}");
+        assert!(map_d3d_format(fmt).is_none(), "format {fmt}");
+    }
+}
+
+/// Volume formats are the uncompressed colour mappings plus DXT1 to DXT5.
+///
+/// The five DXT mappings keep a zero bytes-per-pixel, the compressed-layout
+/// marker the upload paths select block rows by.
+#[test]
+fn planar_yuv_stays_out_of_the_generic_mapping() {
+    use mtld3d_types::{D3DFMT_NV12, D3DFMT_YV12};
+
+    // A planar level is half again as tall as its logical height, which no
+    // consumer of a `FormatMapping` sizes for, so neither format may reach one
+    // through the lookup: the texture, cube and volume answers and every
+    // generic create path stay closed.
+    for fmt in [D3DFMT_YV12, D3DFMT_NV12] {
+        assert!(!is_mapped_color_format(fmt), "format {fmt:#x}");
+        assert!(super::lookup_d3d_format(fmt).is_none(), "format {fmt:#x}");
+        assert!(
+            super::map_d3d_format_device(fmt, false).is_none(),
+            "format {fmt:#x}"
+        );
+        assert!(!is_volume_texture_format(fmt), "format {fmt:#x}");
+        assert!(!super::is_render_target_format(fmt), "format {fmt:#x}");
+        assert!(!super::is_depth_format(fmt), "format {fmt:#x}");
+    }
+    assert_eq!(format_name(D3DFMT_YV12), "YV12");
+    assert_eq!(format_name(D3DFMT_NV12), "NV12");
+    // The storage a planar offscreen plain opts into: one byte per texel,
+    // read through `.r` with no swizzled view.
+    let storage = super::planar_yuv_storage_mapping();
+    assert_eq!(storage.metal_pixel_format(), PixelFormat::R8Unorm);
+    assert_eq!(storage.bytes_per_pixel(), 1);
+    assert_eq!(
+        (
+            storage.block_width(),
+            storage.block_height(),
+            storage.block_bytes()
+        ),
+        (1, 1, 1)
+    );
+    assert!(storage.swizzle().is_none());
+    assert!(!storage.has_alpha());
+}
+
+#[test]
+fn volume_texture_formats_include_native_bc1_bc2_bc3() {
+    for fmt in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_R5G6B5,
+        D3DFMT_R8G8B8,
+        D3DFMT_A16B16G16R16F,
+        D3DFMT_G32R32F,
+    ] {
+        assert!(is_volume_texture_format(fmt), "format {fmt}");
+    }
+    for fmt in [
+        D3DFMT_DXT1,
+        mtld3d_types::D3DFMT_DXT2,
+        mtld3d_types::D3DFMT_DXT3,
+        mtld3d_types::D3DFMT_DXT4,
+        mtld3d_types::D3DFMT_DXT5,
+    ] {
+        assert!(is_volume_texture_format(fmt), "format {fmt}");
+        assert_eq!(
+            map_d3d_format(fmt)
+                .expect("mapped BC format")
+                .bytes_per_pixel(),
+            0,
+            "format {fmt}"
+        );
+    }
+    for fmt in [
+        mtld3d_types::D3DFMT_ATI1,
+        D3DFMT_YUY2,
+        D3DFMT_UYVY,
+        D3DFMT_D24S8,
+        0,
+    ] {
+        assert!(!is_volume_texture_format(fmt), "format {fmt}");
+    }
+}
+
+/// DXT2 and DXT4 map to the Metal formats of DXT3 and DXT5: sRGB-twinned, never rendered.
+///
+/// The sRGB read answer of `CheckDeviceFormat` lists D3D9 formats by hand and
+/// has to list all four: the twin view is taken by Metal format at create.
+#[test]
+fn premultiplied_dxt_aliases_share_the_srgb_twinned_format_of_dxt3_and_dxt5() {
+    use mtld3d_types::{D3DFMT_DXT2, D3DFMT_DXT3, D3DFMT_DXT4, D3DFMT_DXT5};
+    for (alias, ordinary, srgb) in [
+        (D3DFMT_DXT2, D3DFMT_DXT3, PixelFormat::Bc2RgbaSrgb),
+        (D3DFMT_DXT4, D3DFMT_DXT5, PixelFormat::Bc3RgbaSrgb),
+    ] {
+        let alias_format = map_d3d_format(alias)
+            .expect("mapped alias")
+            .metal_pixel_format();
+        let ordinary_format = map_d3d_format(ordinary)
+            .expect("mapped ordinary format")
+            .metal_pixel_format();
+        assert_eq!(alias_format, ordinary_format, "alias {alias:#x}");
+        assert_eq!(alias_format.srgb_twin(), Some(srgb), "alias {alias:#x}");
+        for format in [alias, ordinary] {
+            assert!(
+                !super::is_render_target_format(format),
+                "format {format:#x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn format_name_renders_mapped_names_and_a_fixed_unknown() {
+    assert_eq!(format_name(D3DFMT_A8R8G8B8), "A8R8G8B8");
+    // The fallback carries no code, so a caller that needs one logs it
+    // alongside the name.
+    assert_eq!(format_name(0xFFFF_FFFF), "D3DFMT_unknown");
+}
+
+#[test]
+fn device_mapping_expands_the_packed_16_bit_family_only_without_native_support() {
+    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_R5G6B5, D3DFMT_X1R5G5B5};
+
+    use super::map_d3d_format_device;
+
+    // native_packed16 = true: identical to the plain lookup for every format.
+    for fmt in [
+        D3DFMT_R5G6B5,
+        D3DFMT_A1R5G5B5,
+        D3DFMT_X1R5G5B5,
+        D3DFMT_A4R4G4B4,
+        D3DFMT_A8R8G8B8,
+        D3DFMT_A16B16G16R16F,
+    ] {
+        let native = map_d3d_format_device(fmt, true).expect("mapped");
+        let plain = map_d3d_format(fmt).expect("mapped");
+        assert_eq!(
+            native.metal_pixel_format(),
+            plain.metal_pixel_format(),
+            "format {fmt}"
+        );
+        assert_eq!(native.swizzle(), plain.swizzle(), "format {fmt}");
+        assert_eq!(
+            native.bytes_per_pixel(),
+            plain.bytes_per_pixel(),
+            "format {fmt}"
+        );
+    }
+
+    // native_packed16 = false: the three packed members back Bgra8Unorm while
+    // keeping their 2-byte SOURCE layout (Lock pitch and staging sizing).
+    let r5g6b5 = map_d3d_format_device(D3DFMT_R5G6B5, false).expect("mapped");
+    assert_eq!(r5g6b5.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(r5g6b5.bytes_per_pixel(), 2);
+    assert_eq!(r5g6b5.block_bytes(), 2);
+    // No swizzle on any of the three: the upload pass writes D3D channel
+    // order and an opaque alpha, and a swizzled view cannot be an attachment.
+    assert_eq!(r5g6b5.swizzle(), None, "upload pass forces alpha opaque");
+    assert!(!r5g6b5.has_alpha());
+
+    let a1r5g5b5 = map_d3d_format_device(D3DFMT_A1R5G5B5, false).expect("mapped");
+    assert_eq!(a1r5g5b5.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(a1r5g5b5.bytes_per_pixel(), 2);
+    assert_eq!(a1r5g5b5.swizzle(), None);
+    assert!(a1r5g5b5.has_alpha());
+
+    // The X form drops the native path's alpha-forcing swizzle too: the
+    // upload pass writes the opaque alpha into the BGRA8 texel itself.
+    let x1r5g5b5 = map_d3d_format_device(D3DFMT_X1R5G5B5, false).expect("mapped");
+    assert_eq!(x1r5g5b5.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(x1r5g5b5.bytes_per_pixel(), 2);
+    assert_eq!(x1r5g5b5.swizzle(), None);
+    assert!(!x1r5g5b5.has_alpha());
+
+    let a4r4g4b4 = map_d3d_format_device(D3DFMT_A4R4G4B4, false).expect("mapped");
+    assert_eq!(a4r4g4b4.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(a4r4g4b4.bytes_per_pixel(), 2);
+    assert_eq!(
+        a4r4g4b4.swizzle(),
+        None,
+        "upload pass writes D3D channel order"
+    );
+    assert!(a4r4g4b4.has_alpha());
+
+    // Non-packed formats are untouched by the flag.
+    let bgra = map_d3d_format_device(D3DFMT_A8R8G8B8, false).expect("mapped");
+    assert_eq!(bgra.metal_pixel_format(), PixelFormat::Bgra8Unorm);
+    assert_eq!(bgra.bytes_per_pixel(), 4);
+}
+
+#[test]
+fn the_render_target_family_holds_the_formats_a_colour_attachment_accepts() {
+    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_A8, D3DFMT_L8, D3DFMT_X1R5G5B5};
+
+    use super::is_render_target_format;
+
+    for fmt in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_X8R8G8B8,
+        D3DFMT_A8B8G8R8,
+        D3DFMT_X8B8G8R8,
+        D3DFMT_R5G6B5,
+        D3DFMT_A1R5G5B5,
+        D3DFMT_G16R16,
+        D3DFMT_A16B16G16R16,
+        D3DFMT_R16F,
+        D3DFMT_G16R16F,
+        D3DFMT_A16B16G16R16F,
+        D3DFMT_R32F,
+        D3DFMT_G32R32F,
+        D3DFMT_A32B32G32R32F,
+    ] {
+        assert!(is_render_target_format(fmt), "format {fmt} renders");
+    }
+    // The swizzled pair reads through a channel correction a render write
+    // cannot undo, R8G8B8 has no Metal counterpart and is widened on upload,
+    // and the compressed and single-channel formats no D3D9 device rendered
+    // into stay out.
+    for fmt in [
+        D3DFMT_X1R5G5B5,
+        D3DFMT_A4R4G4B4,
+        D3DFMT_R8G8B8,
+        D3DFMT_DXT1,
+        D3DFMT_A8,
+        D3DFMT_L8,
+        D3DFMT_D24S8,
+    ] {
+        assert!(
+            !is_render_target_format(fmt),
+            "format {fmt} does not render"
+        );
+    }
+}
+
+#[test]
+fn only_the_native_packed_16_bit_pair_drops_out_of_the_device_answer() {
+    use mtld3d_types::{D3DFMT_A1R5G5B5, D3DFMT_A4R4G4B4, D3DFMT_X1R5G5B5};
+
+    use super::{is_render_target_format, is_render_target_format_device};
+
+    // With the native formats the device answer is the pure family exactly.
+    for fmt in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_X8R8G8B8,
+        D3DFMT_R5G6B5,
+        D3DFMT_A1R5G5B5,
+        D3DFMT_X1R5G5B5,
+        D3DFMT_A4R4G4B4,
+        D3DFMT_A16B16G16R16F,
+        D3DFMT_DXT1,
+    ] {
+        assert_eq!(
+            is_render_target_format_device(fmt, true),
+            is_render_target_format(fmt),
+            "format {fmt} under native packed 16-bit support"
+        );
+    }
+    // Without them the two members whose Metal counterpart is missing drop
+    // out; `map_d3d_format_device` backs them with Bgra8Unorm, which samples
+    // but would not read back at the source layout a Lock reports.
+    for fmt in [D3DFMT_R5G6B5, D3DFMT_A1R5G5B5] {
+        assert!(
+            is_render_target_format(fmt),
+            "format {fmt} renders natively"
+        );
+        assert!(
+            !is_render_target_format_device(fmt, false),
+            "format {fmt} is expansion-backed and does not render"
+        );
+        assert_eq!(
+            super::map_d3d_format_device(fmt, false)
+                .expect("mapped")
+                .metal_pixel_format(),
+            PixelFormat::Bgra8Unorm,
+            "format {fmt} is the expanded backing the answer is denied for"
+        );
+    }
+    // Nothing else moves with the flag.
+    for fmt in [
+        D3DFMT_A8R8G8B8,
+        D3DFMT_X8R8G8B8,
+        D3DFMT_A8B8G8R8,
+        D3DFMT_X8B8G8R8,
+        D3DFMT_X1R5G5B5,
+        D3DFMT_A4R4G4B4,
+        D3DFMT_G16R16,
+        D3DFMT_A16B16G16R16,
+        D3DFMT_R16F,
+        D3DFMT_G16R16F,
+        D3DFMT_A16B16G16R16F,
+        D3DFMT_R32F,
+        D3DFMT_G32R32F,
+        D3DFMT_A32B32G32R32F,
+        D3DFMT_R8G8B8,
+        D3DFMT_DXT1,
+    ] {
+        assert_eq!(
+            is_render_target_format_device(fmt, false),
+            is_render_target_format_device(fmt, true),
+            "format {fmt} does not depend on the packed 16-bit answer"
+        );
+    }
+}
+
+#[test]
+fn only_the_single_precision_floats_depend_on_device_filtering() {
+    use mtld3d_types::{
+        D3DUSAGE_DEPTHSTENCIL, D3DUSAGE_QUERY_FILTER, D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        D3DUSAGE_RENDERTARGET,
+    };
+
+    use super::supports_usage_query;
+
+    // Every usage shape that reaches the classifier, with and without the
+    // D3DUSAGE_QUERY_FILTER bit a title adds to it.
+    const PLAIN: [u32; 4] = [
+        0,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_DEPTHSTENCIL,
+        D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+    ];
+    const HALF_FLOATS: [u32; 3] = [D3DFMT_R16F, D3DFMT_G16R16F, D3DFMT_A16B16G16R16F];
+    const SINGLE_FLOATS: [u32; 3] = [D3DFMT_R32F, D3DFMT_G32R32F, D3DFMT_A32B32G32R32F];
+
+    for float32_filtering in [true, false] {
+        for fmt in HALF_FLOATS.into_iter().chain(SINGLE_FLOATS) {
+            for usage in PLAIN {
+                // Without the filter bit the answer is the same on either
+                // device: renderability and blending are device-independent.
+                assert!(
+                    supports_usage_query(fmt, usage, float32_filtering, true),
+                    "format {fmt} usage {usage:#x} filtering {float32_filtering}",
+                );
+            }
+        }
+        // Half floats filter on every GPU family.
+        for fmt in HALF_FLOATS {
+            for usage in PLAIN {
+                assert!(
+                    supports_usage_query(
+                        fmt,
+                        usage | D3DUSAGE_QUERY_FILTER,
+                        float32_filtering,
+                        true
+                    ),
+                    "format {fmt} usage {usage:#x} filtering {float32_filtering}",
+                );
+            }
+        }
+        // The single-precision three follow the device answer, in every
+        // usage shape the filter bit can be combined with.
+        for fmt in SINGLE_FLOATS {
+            for usage in PLAIN {
+                assert_eq!(
+                    supports_usage_query(
+                        fmt,
+                        usage | D3DUSAGE_QUERY_FILTER,
+                        float32_filtering,
+                        true
+                    ),
+                    float32_filtering,
+                    "format {fmt} usage {usage:#x} filtering {float32_filtering}",
+                );
+            }
+        }
+        // A format outside the float family is never gated.
+        assert!(supports_usage_query(
+            D3DFMT_A8R8G8B8,
+            D3DUSAGE_QUERY_FILTER,
+            float32_filtering,
+            true
+        ));
+        assert!(supports_usage_query(
+            D3DFMT_A16B16G16R16,
+            D3DUSAGE_QUERY_FILTER,
+            float32_filtering,
+            true
+        ));
+    }
+}
+
+/// Every depth format `map_d3d_depth_format` maps has a byte size here.
+///
+/// The two tables are consulted in sequence by `surface_bytes`, so a depth
+/// format present in one and missing from the other is charged zero bytes
+/// against the `GetAvailableTextureMem` budget.
+#[test]
+fn depth_size_table_covers_the_depth_mapping() {
+    for fmt in [
+        D3DFMT_D16,
+        D3DFMT_D16_LOCKABLE,
+        D3DFMT_D24X8,
+        D3DFMT_D24S8,
+        D3DFMT_D24FS8,
+        D3DFMT_D32,
+        D3DFMT_D32F_LOCKABLE,
+        D3DFMT_DF16,
+        D3DFMT_DF24,
+        D3DFMT_INTZ,
+    ] {
+        assert!(
+            map_d3d_depth_format(fmt).is_some(),
+            "{fmt:#x} is a depth format"
+        );
+        assert!(
+            depth_format_bytes_per_pixel(fmt).is_some(),
+            "{fmt:#x} has no depth byte size"
+        );
+    }
+    assert_eq!(depth_format_bytes_per_pixel(D3DFMT_A8R8G8B8), None);
+}
+
+#[test]
+fn surface_bytes_charges_colour_and_depth_surfaces() {
+    // A standalone 2048x2048 A8R8G8B8 render target is 16 MiB.
+    assert_eq!(surface_bytes(2048, 2048, D3DFMT_A8R8G8B8), 16 * 1024 * 1024);
+    assert_eq!(surface_bytes(2048, 2048, D3DFMT_X8R8G8B8), 16 * 1024 * 1024);
+    // Source bytes per pixel, not the Metal backing: R5G6B5 is 2 bytes even
+    // where it is expanded to BGRA8, and D24S8 is 4 even though the Metal
+    // texture behind it is `Depth32Float_Stencil8`.
+    assert_eq!(surface_bytes(256, 128, D3DFMT_R5G6B5), 256 * 128 * 2);
+    assert_eq!(surface_bytes(1024, 1024, D3DFMT_D24S8), 4 * 1024 * 1024);
+    assert_eq!(surface_bytes(1024, 1024, D3DFMT_D16), 2 * 1024 * 1024);
+    // An odd-width 16-bit depth surface strides at the dword-rounded
+    // host-visible pitch, the same one the equivalent texture level is
+    // measured on, so the two surface kinds are charged alike.
+    assert_eq!(surface_bytes(33, 16, D3DFMT_D16), 68 * 16);
+    assert_eq!(
+        surface_bytes(33, 16, D3DFMT_D16),
+        surface_bytes(33, 16, D3DFMT_R5G6B5)
+    );
+    // Block-compressed formats are charged by block: DXT1 is 8 bytes per
+    // 4x4 block, so half a byte per texel.
+    assert_eq!(surface_bytes(64, 64, D3DFMT_DXT1), 64 * 64 / 2);
+    // A format with neither mapping is charged nothing rather than panicking.
+    assert_eq!(surface_bytes(64, 64, 0), 0);
+}
+
+/// A multisampled surface is charged for every texture its create allocated.
+///
+/// The colour path allocates the single-sample texture an application
+/// resolves into plus a companion `sample_count` times its size; the
+/// depth-stencil path allocates only the multisampled attachment.
+#[test]
+fn standalone_surface_bytes_charges_the_multisampled_companion() {
+    const BASE: u64 = 2048 * 2048 * 4;
+
+    // One sample is the single-sample figure on both paths.
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_A8R8G8B8,
+            1,
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::IDENTITY,
+        ),
+        BASE
+    );
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_D24S8,
+            1,
+            StandaloneSurfaceKind::DepthStencil,
+            RenderScale::IDENTITY,
+        ),
+        BASE
+    );
+    // A colour target pays for the resolve target and the companion.
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_A8R8G8B8,
+            4,
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::IDENTITY,
+        ),
+        5 * BASE
+    );
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_A8R8G8B8,
+            2,
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::IDENTITY,
+        ),
+        3 * BASE
+    );
+    // A depth-stencil surface has no resolve target, so it pays for the
+    // multisampled attachment alone.
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_D24S8,
+            4,
+            StandaloneSurfaceKind::DepthStencil,
+            RenderScale::IDENTITY,
+        ),
+        4 * BASE
+    );
+    // A zero sample count is read as single-sampled rather than free.
+    assert_eq!(
+        standalone_surface_bytes(
+            2048,
+            2048,
+            D3DFMT_D24S8,
+            0,
+            StandaloneSurfaceKind::DepthStencil,
+            RenderScale::IDENTITY,
+        ),
+        BASE
+    );
+    // A format with no mapping stays at zero however many samples it claims.
+    assert_eq!(
+        standalone_surface_bytes(
+            64,
+            64,
+            0,
+            4,
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::IDENTITY,
+        ),
+        0
+    );
+}
+
+/// A scaled standalone surface is charged the extent its Metal textures hold.
+///
+/// The dimensions are the logical ones the surface reports; the charge
+/// measures the memory, so it converts them and takes the pitch from the
+/// converted width. Multisampling still multiplies whatever that comes to.
+#[test]
+fn standalone_surface_bytes_charges_the_scaled_extent() {
+    let half = RenderScale::from_percent(50);
+
+    // Half of each edge of a 640x480 four-byte surface is a quarter the bytes.
+    assert_eq!(
+        standalone_surface_bytes(
+            640,
+            480,
+            D3DFMT_A8R8G8B8,
+            1,
+            StandaloneSurfaceKind::ColorTarget,
+            half,
+        ),
+        320 * 240 * 4
+    );
+    assert_eq!(
+        standalone_surface_bytes(
+            640,
+            480,
+            D3DFMT_D24S8,
+            1,
+            StandaloneSurfaceKind::DepthStencil,
+            half,
+        ),
+        320 * 240 * 4
+    );
+    // The sample-count multipliers apply to the scaled figure, not the
+    // reported one.
+    assert_eq!(
+        standalone_surface_bytes(
+            640,
+            480,
+            D3DFMT_A8R8G8B8,
+            4,
+            StandaloneSurfaceKind::ColorTarget,
+            half,
+        ),
+        5 * 320 * 240 * 4
+    );
+    // The pitch follows the scaled width: a 16-bit surface 66 texels wide
+    // rounds its 33-texel half up to the dword-aligned 68 bytes, which is not
+    // half of the 132 bytes the reported width strides at.
+    assert_eq!(
+        standalone_surface_bytes(
+            66,
+            16,
+            D3DFMT_R5G6B5,
+            1,
+            StandaloneSurfaceKind::ColorTarget,
+            half,
+        ),
+        68 * 8
+    );
+    // A scale that rounds an edge to nothing still charges a texel row: the
+    // Metal texture it describes was created at one.
+    assert_eq!(
+        standalone_surface_bytes(
+            1,
+            1,
+            D3DFMT_A8R8G8B8,
+            1,
+            StandaloneSurfaceKind::ColorTarget,
+            RenderScale::from_percent(1),
+        ),
+        4
+    );
+}
+
+// ── Per-resource-type usage validation ──
+
+/// Every usage bit `usage_allowed_for_rtype` weighs, with a readable name.
+const VALIDATED_BITS: [(u32, &str); 17] = [
+    (D3DUSAGE_RENDERTARGET, "RENDERTARGET"),
+    (D3DUSAGE_DEPTHSTENCIL, "DEPTHSTENCIL"),
+    (D3DUSAGE_SOFTWAREPROCESSING, "SOFTWAREPROCESSING"),
+    (D3DUSAGE_DONOTCLIP, "DONOTCLIP"),
+    (D3DUSAGE_POINTS, "POINTS"),
+    (D3DUSAGE_RTPATCHES, "RTPATCHES"),
+    (D3DUSAGE_NPATCHES, "NPATCHES"),
+    (D3DUSAGE_DYNAMIC, "DYNAMIC"),
+    (D3DUSAGE_AUTOGENMIPMAP, "AUTOGENMIPMAP"),
+    (D3DUSAGE_DMAP, "DMAP"),
+    (D3DUSAGE_QUERY_LEGACYBUMPMAP, "QUERY_LEGACYBUMPMAP"),
+    (D3DUSAGE_QUERY_SRGBREAD, "QUERY_SRGBREAD"),
+    (D3DUSAGE_QUERY_FILTER, "QUERY_FILTER"),
+    (D3DUSAGE_QUERY_SRGBWRITE, "QUERY_SRGBWRITE"),
+    (
+        D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        "QUERY_POSTPIXELSHADER_BLENDING",
+    ),
+    (D3DUSAGE_QUERY_VERTEXTEXTURE, "QUERY_VERTEXTEXTURE"),
+    (D3DUSAGE_QUERY_WRAPANDMIP, "QUERY_WRAPANDMIP"),
+];
+
+/// Assert the exact set of single bits `rtype` accepts on its own.
+fn assert_accepts_exactly(rtype: u32, accepted: &[u32]) {
+    for (bit, name) in VALIDATED_BITS {
+        assert_eq!(
+            usage_allowed_for_rtype(bit, rtype),
+            accepted.contains(&bit),
+            "rtype {rtype} and {name} disagree with the allowed-usage table"
+        );
+    }
+}
+
+#[test]
+fn surface_rejects_the_sampling_only_usage_queries() {
+    // A plain surface is never bound as a shader resource, so no sampling
+    // question has an answer on it: filtering, the sRGB decode, the vertex
+    // fetch and the wrap/mip report all reject whatever the format.
+    for (bit, name) in [
+        (D3DUSAGE_QUERY_FILTER, "QUERY_FILTER"),
+        (D3DUSAGE_QUERY_SRGBREAD, "QUERY_SRGBREAD"),
+        (D3DUSAGE_QUERY_VERTEXTEXTURE, "QUERY_VERTEXTEXTURE"),
+        (D3DUSAGE_QUERY_WRAPANDMIP, "QUERY_WRAPANDMIP"),
+        (D3DUSAGE_DYNAMIC, "DYNAMIC"),
+        (D3DUSAGE_SOFTWAREPROCESSING, "SOFTWAREPROCESSING"),
+    ] {
+        assert!(
+            !usage_allowed_for_rtype(bit, D3DRTYPE_SURFACE),
+            "{name} is not expressible by a plain surface"
+        );
+        assert!(
+            usage_allowed_for_rtype(bit, D3DRTYPE_TEXTURE),
+            "{name} is a texture question"
+        );
+        // Combining it with a bit the surface does express does not rescue it.
+        assert!(
+            !usage_allowed_for_rtype(bit | D3DUSAGE_RENDERTARGET, D3DRTYPE_SURFACE),
+            "{name} beside RENDERTARGET is still not a surface question"
+        );
+    }
+}
+
+#[test]
+fn surface_expresses_the_binding_and_blend_bits() {
+    assert_accepts_exactly(
+        D3DRTYPE_SURFACE,
+        &[
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        ],
+    );
+    // SRGBWRITE is a property of the render pass, so it is a question only
+    // once the query asks about a render target.
+    assert!(usage_allowed_for_rtype(
+        D3DUSAGE_RENDERTARGET | D3DUSAGE_QUERY_SRGBWRITE,
+        D3DRTYPE_SURFACE
+    ));
+    assert!(!usage_allowed_for_rtype(
+        D3DUSAGE_QUERY_SRGBWRITE,
+        D3DRTYPE_SURFACE
+    ));
+}
+
+#[test]
+fn texture_expresses_every_bit_but_the_vertex_processing_hints() {
+    assert_accepts_exactly(
+        D3DRTYPE_TEXTURE,
+        &[
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_DEPTHSTENCIL,
+            D3DUSAGE_SOFTWAREPROCESSING,
+            D3DUSAGE_DYNAMIC,
+            D3DUSAGE_AUTOGENMIPMAP,
+            D3DUSAGE_QUERY_LEGACYBUMPMAP,
+            D3DUSAGE_QUERY_SRGBREAD,
+            D3DUSAGE_QUERY_FILTER,
+            D3DUSAGE_QUERY_SRGBWRITE,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+            D3DUSAGE_QUERY_VERTEXTEXTURE,
+            D3DUSAGE_QUERY_WRAPANDMIP,
+        ],
+    );
+}
+
+#[test]
+fn linear_row_pitch_rounds_up_to_a_dword() {
+    // 32-bit rows are already a multiple of 4 at every width.
+    assert_eq!(linear_row_pitch(64, 4), 256);
+    assert_eq!(linear_row_pitch(33, 4), 132);
+    // 16-bit rows round up at odd widths, which is where a tight stride and
+    // the stride GDI computes for the same surface part company.
+    assert_eq!(linear_row_pitch(32, 2), 64);
+    assert_eq!(linear_row_pitch(33, 2), 68);
+    assert_eq!(linear_row_pitch(1, 2), 4);
+    // 8-bit rows round up to the next dword at every width but a multiple of 4.
+    assert_eq!(linear_row_pitch(5, 1), 8);
+    assert_eq!(linear_row_pitch(8, 1), 8);
+    assert_eq!(linear_row_pitch(0, 2), 0);
+}
+
+#[test]
+fn a_mip_level_is_sized_and_strided_at_the_host_visible_pitch() {
+    // A 16-bit level at an odd width: the same 68-byte stride an offscreen
+    // surface of that width reports, and a size that holds every row at it.
+    let r5g6b5 = map_d3d_format(D3DFMT_R5G6B5).expect("mapped");
+    let (w, h, size, pitch) = compute_mip_size(33, 4, 0, &r5g6b5);
+    assert_eq!((w, h), (33, 4));
+    assert_eq!(pitch, linear_row_pitch(33, 2));
+    assert_eq!(pitch, 68);
+    assert_eq!(size, 68 * 4);
+
+    // Sub-levels round on their own width, not on level 0's.
+    let (w, h, size, pitch) = compute_mip_size(33, 4, 1, &r5g6b5);
+    assert_eq!((w, h), (16, 2));
+    assert_eq!(pitch, 32);
+    assert_eq!(size, 64);
+}
+
+/// A depth level is measured on the formula its colour twin is measured on.
+///
+/// A depth format reaches the sizing as a bare bytes-per-pixel, with no
+/// `FormatMapping` of its own, so the two entry points have to agree level for
+/// level or a `D3DFMT_D16` chain and an `R5G6B5` chain of the same shape are
+/// charged different bytes against the texture-memory budget.
+#[test]
+fn a_depth_level_matches_the_colour_level_of_its_pixel_size() {
+    let r5g6b5 = map_d3d_format(D3DFMT_R5G6B5).expect("mapped");
+    let bpp = depth_format_bytes_per_pixel(D3DFMT_D16).expect("depth size");
+    for level in 0..6 {
+        assert_eq!(
+            linear_mip_size(33, 33, level, bpp),
+            compute_mip_size(33, 33, level, &r5g6b5),
+            "level {level}"
+        );
+    }
+
+    // The odd top level strides at the dword-rounded pitch, not the tight one.
+    assert_eq!(linear_mip_size(33, 33, 0, 2), (33, 33, 68 * 33, 68));
+    // A 4-byte format is already dword-aligned at every width.
+    assert_eq!(linear_mip_size(33, 33, 0, 4), (33, 33, 33 * 4 * 33, 33 * 4));
+}
+
+/// The block-parameter pitch answers what the `FormatMapping` one does.
+///
+/// A texture that has already unpacked its format into block parameters sizes
+/// a level through `block_row_pitch`, so it has to agree with
+/// `compute_mip_size` on both sides of the compressed/linear split or the same
+/// level measures differently depending on which entry point asked.
+#[test]
+fn the_block_pitch_agrees_with_the_format_mapping_pitch() {
+    for (fmt_code, bpp) in [(D3DFMT_A8R8G8B8, 4), (D3DFMT_R5G6B5, 2), (D3DFMT_DXT1, 0)] {
+        let fmt = map_d3d_format(fmt_code).expect("mapped");
+        for level in 0..4 {
+            let (w, _, _, pitch) = compute_mip_size(66, 66, level, &fmt);
+            assert_eq!(
+                block_row_pitch(w, fmt.block_width(), fmt.block_bytes(), bpp),
+                pitch,
+                "format {fmt_code:#x} level {level}"
+            );
+        }
+    }
+
+    // An uncompressed row rounds up to a dword; a compressed one to a block.
+    assert_eq!(block_row_pitch(33, 1, 2, 2), 68);
+    assert_eq!(block_row_pitch(33, 4, 8, 0), 72);
+}
+
+#[test]
+fn a_compressed_mip_level_is_sized_in_block_rows() {
+    let dxt1 = map_d3d_format(D3DFMT_DXT1).expect("mapped");
+    let (w, h, size, pitch) = compute_mip_size(64, 64, 0, &dxt1);
+    assert_eq!((w, h), (64, 64));
+    assert_eq!(pitch, 128);
+    assert_eq!(size, 128 * 16);
+
+    // A 1x1 level still occupies one whole block.
+    let (w, h, size, pitch) = compute_mip_size(64, 64, 6, &dxt1);
+    assert_eq!((w, h), (1, 1));
+    assert_eq!(pitch, 8);
+    assert_eq!(size, 8);
+}
+
+#[test]
+fn cube_texture_drops_depth_stencil_and_the_legacy_bump_map_query() {
+    assert_accepts_exactly(
+        D3DRTYPE_CUBETEXTURE,
+        &[
+            D3DUSAGE_RENDERTARGET,
+            D3DUSAGE_SOFTWAREPROCESSING,
+            D3DUSAGE_DYNAMIC,
+            D3DUSAGE_AUTOGENMIPMAP,
+            D3DUSAGE_QUERY_SRGBREAD,
+            D3DUSAGE_QUERY_FILTER,
+            D3DUSAGE_QUERY_SRGBWRITE,
+            D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+            D3DUSAGE_QUERY_VERTEXTEXTURE,
+            D3DUSAGE_QUERY_WRAPANDMIP,
+        ],
+    );
+}
+
+#[test]
+fn volumes_are_sampling_only() {
+    // No render-target or depth binding on a 3D resource, and no mip
+    // generation; the volume and its container answer alike.
+    let accepted = [
+        D3DUSAGE_SOFTWAREPROCESSING,
+        D3DUSAGE_DYNAMIC,
+        D3DUSAGE_QUERY_SRGBREAD,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_QUERY_SRGBWRITE,
+        D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+        D3DUSAGE_QUERY_VERTEXTEXTURE,
+        D3DUSAGE_QUERY_WRAPANDMIP,
+    ];
+    assert_accepts_exactly(D3DRTYPE_VOLUMETEXTURE, &accepted);
+    assert_accepts_exactly(D3DRTYPE_VOLUME, &accepted);
+}
+
+#[test]
+fn buffers_express_only_the_dynamic_bit() {
+    assert_accepts_exactly(D3DRTYPE_VERTEXBUFFER, &[D3DUSAGE_DYNAMIC]);
+    assert_accepts_exactly(D3DRTYPE_INDEXBUFFER, &[D3DUSAGE_DYNAMIC]);
+}
+
+#[test]
+fn unvalidated_bits_and_unknown_resource_types() {
+    // WRITEONLY and NONSECURE are not capability questions: they ride
+    // through any query without changing the answer.
+    for rtype in [D3DRTYPE_SURFACE, D3DRTYPE_TEXTURE, D3DRTYPE_VERTEXBUFFER] {
+        assert!(usage_allowed_for_rtype(
+            D3DUSAGE_WRITEONLY | D3DUSAGE_NONSECURE,
+            rtype
+        ));
+    }
+    // An unrecognised resource type expresses nothing, but an empty query
+    // still has to reach the per-format arms that reject it.
+    assert!(usage_allowed_for_rtype(0, 0));
+    assert!(!usage_allowed_for_rtype(D3DUSAGE_RENDERTARGET, 0));
+}
+
+#[test]
+fn a_volume_chain_is_measured_on_its_largest_extent() {
+    // Depth counts alongside width and height: a 2x4x8 volume runs down to
+    // 1x1x1 in four levels, one more than its 4-texel height alone allows.
+    assert_eq!(compute_volume_mip_count(2, 4, 8), 4);
+    assert_eq!(compute_volume_mip_count(8, 4, 2), 4);
+    assert_eq!(compute_volume_mip_count(1, 1, 1), 1);
+    assert_eq!(compute_volume_mip_count(64, 64, 64), 7);
+    // A single-slice volume is the 2D chain of its face.
+    assert_eq!(
+        compute_volume_mip_count(64, 16, 1),
+        compute_mip_count(64, 16)
+    );
+}
+
+#[test]
+fn a_requested_level_count_is_capped_at_the_natural_chain() {
+    let natural = compute_mip_count(64, 64);
+    assert_eq!(natural, 7);
+    // 0 asks for the whole chain.
+    assert_eq!(resolve_mip_levels(0, natural), natural);
+    // A count inside the chain is taken as given.
+    assert_eq!(resolve_mip_levels(1, natural), 1);
+    assert_eq!(resolve_mip_levels(natural, natural), natural);
+    // A count past it resolves to the chain rather than to repeated 1x1
+    // levels Metal would refuse to allocate.
+    assert_eq!(resolve_mip_levels(natural + 1, natural), natural);
+    assert_eq!(resolve_mip_levels(20, natural), natural);
+    // A 1x1 texture has exactly one level, whatever is asked for.
+    assert_eq!(resolve_mip_levels(4, compute_mip_count(1, 1)), 1);
+}
+
+#[test]
+fn v16u16_uses_native_signed_storage_and_noautogen_fallback() {
+    let format = mtld3d_types::D3DFMT_V16U16;
+    let mapped = map_d3d_format(format).expect("V16U16 mapping");
+    assert_eq!(mapped.metal_pixel_format(), PixelFormat::Rg16Snorm);
+    assert_eq!(
+        mapped.swizzle(),
+        Some([Swizzle::Red, Swizzle::Green, Swizzle::One, Swizzle::One])
+    );
+    assert_eq!(mapped.bytes_per_pixel(), 4);
+    assert!(!mapped.has_alpha());
+    assert!(!mapped.is_compressed());
+    assert_eq!(compute_mip_size(3, 2, 0, &mapped), (3, 2, 24, 12));
+    assert!(is_volume_texture_format(format));
+    assert!(!super::is_render_target_format(format));
+    assert!(super::uses_noautogen_fallback(format));
+    for ordinary in [mtld3d_types::D3DFMT_V8U8, D3DFMT_A8R8G8B8, D3DFMT_DXT1] {
+        assert!(!super::uses_noautogen_fallback(ordinary));
+    }
+}
+
+#[test]
+fn v16u16_rejects_srgb_write_queries_before_autogen_fallback() {
+    for extra in [
+        0,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_QUERY_SRGBREAD,
+    ] {
+        assert!(!super::supports_usage_query(
+            mtld3d_types::D3DFMT_V16U16,
+            D3DUSAGE_QUERY_SRGBWRITE | extra,
+            true,
+            true
+        ));
+    }
+}
+
+#[test]
+fn q8w8v8u8_uses_native_signed_storage_and_noautogen_fallback() {
+    let format = mtld3d_types::D3DFMT_Q8W8V8U8;
+    let mapped = map_d3d_format(format).expect("Q8W8V8U8 mapping");
+    assert_eq!(mapped.metal_pixel_format(), PixelFormat::Rgba8Snorm);
+    assert_eq!(mapped.swizzle(), None);
+    assert_eq!(mapped.bytes_per_pixel(), 4);
+    assert!(mapped.has_alpha());
+    assert!(!mapped.is_compressed());
+    assert_eq!(compute_mip_size(3, 2, 0, &mapped), (3, 2, 24, 12));
+    assert!(is_volume_texture_format(format));
+    assert!(!super::is_render_target_format(format));
+    assert!(super::uses_noautogen_fallback(format));
+    for ordinary in [mtld3d_types::D3DFMT_V8U8, D3DFMT_A8R8G8B8, D3DFMT_DXT1] {
+        assert!(!super::uses_noautogen_fallback(ordinary));
+    }
+}
+
+#[test]
+fn q8w8v8u8_rejects_srgb_write_queries_before_autogen_fallback() {
+    for extra in [
+        0,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_QUERY_SRGBREAD,
+    ] {
+        assert!(!super::supports_usage_query(
+            mtld3d_types::D3DFMT_Q8W8V8U8,
+            D3DUSAGE_QUERY_SRGBWRITE | extra,
+            true,
+            true
+        ));
+    }
+}
+
+#[test]
+fn q16w16v16u16_uses_native_signed_storage_and_noautogen_fallback() {
+    let format = mtld3d_types::D3DFMT_Q16W16V16U16;
+    let mapped = map_d3d_format(format).expect("Q16W16V16U16 mapping");
+    assert_eq!(mapped.metal_pixel_format(), PixelFormat::Rgba16Snorm);
+    assert_eq!(mapped.swizzle(), None);
+    assert_eq!(mapped.bytes_per_pixel(), 8);
+    assert!(mapped.has_alpha());
+    assert!(!mapped.is_compressed());
+    assert_eq!(compute_mip_size(3, 2, 0, &mapped), (3, 2, 48, 24));
+    assert!(is_volume_texture_format(format));
+    assert!(!super::is_render_target_format(format));
+    assert!(super::uses_noautogen_fallback(format));
+    for ordinary in [mtld3d_types::D3DFMT_V8U8, D3DFMT_A8R8G8B8, D3DFMT_DXT1] {
+        assert!(!super::uses_noautogen_fallback(ordinary));
+    }
+}
+
+#[test]
+fn q16w16v16u16_rejects_srgb_write_queries_before_autogen_fallback() {
+    for extra in [
+        0,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_QUERY_SRGBREAD,
+    ] {
+        assert!(!super::supports_usage_query(
+            mtld3d_types::D3DFMT_Q16W16V16U16,
+            D3DUSAGE_QUERY_SRGBWRITE | extra,
+            true,
+            true
+        ));
+    }
+}
+
+#[test]
+fn ten_bit_formats_use_native_packed_storage_without_attachment_support() {
+    for (format, native, name, value) in [
+        (
+            mtld3d_types::D3DFMT_A2R10G10B10,
+            PixelFormat::Bgr10A2Unorm,
+            "A2R10G10B10",
+            94,
+        ),
+        (
+            mtld3d_types::D3DFMT_A2B10G10R10,
+            PixelFormat::Rgb10A2Unorm,
+            "A2B10G10R10",
+            90,
+        ),
+    ] {
+        let mapping = map_d3d_format(format).expect("packed ten-bit mapping");
+        assert_eq!(mapping.metal_pixel_format(), native);
+        assert_eq!(mapping.bytes_per_pixel(), 4);
+        assert_eq!(mapping.block_width(), 1);
+        assert_eq!(mapping.block_height(), 1);
+        assert_eq!(mapping.block_bytes(), 4);
+        assert_eq!(mapping.swizzle(), None);
+        assert!(mapping.has_alpha());
+        assert_eq!(mapping.metal_pixel_format().srgb_twin(), None);
+        assert_eq!(super::format_name(format), name);
+        assert!(super::uses_noautogen_fallback(format));
+        assert!(super::is_volume_texture_format(format));
+        assert!(!super::is_render_target_format(format));
+        assert_eq!(native as u32, value);
+        for filtering in [false, true] {
+            for extra in [0, D3DUSAGE_AUTOGENMIPMAP, D3DUSAGE_QUERY_FILTER] {
+                for unsupported in [D3DUSAGE_QUERY_LEGACYBUMPMAP, D3DUSAGE_QUERY_SRGBWRITE] {
+                    assert!(!super::supports_usage_query(
+                        format,
+                        extra | unsupported,
+                        filtering,
+                        true
+                    ));
+                }
+            }
+            assert!(super::supports_usage_query(
+                format,
+                D3DUSAGE_QUERY_FILTER,
+                filtering,
+                true
+            ));
+        }
+    }
+}
+
+/// The sRGB-write query is the render-target answer, for every format.
+///
+/// The encode belongs to the render pass, and every colour attachment takes
+/// it: the pass binds the sRGB twin view where the Metal format has one and
+/// the pixel shader emits the OETF where it has not. So the answer tracks
+/// `is_render_target_format_device` across the whole table and on either
+/// device, with no format carrying a rule of its own, and it does not depend
+/// on the bits the query is combined with.
+#[test]
+fn srgb_write_queries_follow_render_target_capability() {
+    use mtld3d_types::{
+        D3DFMT_A8R8G8B8, D3DFMT_DXT1, D3DFMT_L8, D3DFMT_R5G6B5, D3DFMT_R32F, D3DFMT_V8U8,
+    };
+
+    const COMBINED: [u32; 6] = [
+        0,
+        D3DUSAGE_RENDERTARGET,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DUSAGE_QUERY_SRGBREAD,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_QUERY_POSTPIXELSHADER_BLENDING,
+    ];
+
+    for native_packed16 in [false, true] {
+        for format in COLOUR_FORMATS {
+            let renderable = super::is_render_target_format_device(format, native_packed16);
+            for extra in COMBINED {
+                assert_eq!(
+                    super::supports_usage_query(
+                        format,
+                        D3DUSAGE_QUERY_SRGBWRITE | extra,
+                        true,
+                        native_packed16
+                    ),
+                    renderable,
+                    "format {format} extra {extra:#x} packed16 {native_packed16}"
+                );
+            }
+        }
+        // The two ends of the rule, named: a colour attachment answers yes
+        // whether or not its Metal format has an sRGB twin, and a sampled
+        // format answers no whether or not it has one.
+        for format in [D3DFMT_A8R8G8B8, D3DFMT_R32F] {
+            assert!(super::supports_usage_query(
+                format,
+                D3DUSAGE_QUERY_SRGBWRITE,
+                true,
+                native_packed16
+            ));
+        }
+        for format in [D3DFMT_DXT1, D3DFMT_L8, D3DFMT_V8U8] {
+            assert!(!super::supports_usage_query(
+                format,
+                D3DUSAGE_QUERY_SRGBWRITE,
+                true,
+                native_packed16
+            ));
+        }
+    }
+    // A device that widens the packed 16-bit formats renders into neither,
+    // so the encode goes with the render target.
+    assert!(super::supports_usage_query(
+        D3DFMT_R5G6B5,
+        D3DUSAGE_QUERY_SRGBWRITE,
+        true,
+        true
+    ));
+    assert!(!super::supports_usage_query(
+        D3DFMT_R5G6B5,
+        D3DUSAGE_QUERY_SRGBWRITE,
+        true,
+        false
+    ));
+}
+
+/// The legacy bump-map query answers yes for the signed `(du, dv)` formats alone.
+///
+/// `D3DCAPS9::TextureOpCaps` advertises `BUMPENVMAP` and
+/// `BUMPENVMAPLUMINANCE`, and V8U8, V16U16 and Q8W8V8U8 are the formats a
+/// bump stage reads its displacement from. Every other colour format answers
+/// no, alone and beside the sampling usages.
+#[test]
+fn legacy_bump_map_queries_answer_yes_for_the_bump_formats_only() {
+    use mtld3d_types::{D3DFMT_Q8W8V8U8, D3DFMT_V8U8, D3DFMT_V16U16};
+
+    const BUMP_FORMATS: [u32; 3] = [D3DFMT_V8U8, D3DFMT_V16U16, D3DFMT_Q8W8V8U8];
+    const COMBINED: [u32; 6] = [
+        0,
+        D3DUSAGE_DYNAMIC,
+        D3DUSAGE_AUTOGENMIPMAP,
+        D3DUSAGE_QUERY_FILTER,
+        D3DUSAGE_QUERY_SRGBREAD,
+        D3DUSAGE_QUERY_WRAPANDMIP,
+    ];
+
+    for float32_filtering in [false, true] {
+        for native_packed16 in [false, true] {
+            for format in COLOUR_FORMATS {
+                if BUMP_FORMATS.contains(&format) {
+                    continue;
+                }
+                for extra in COMBINED {
+                    assert!(
+                        !super::supports_usage_query(
+                            format,
+                            D3DUSAGE_QUERY_LEGACYBUMPMAP | extra,
+                            float32_filtering,
+                            native_packed16
+                        ),
+                        "format {format} extra {extra:#x}"
+                    );
+                }
+            }
+            // The bump query adds nothing to the answer the rest of the usage
+            // gets, so a bump format answers it the way it answers that rest.
+            for format in BUMP_FORMATS {
+                for extra in COMBINED {
+                    assert_eq!(
+                        super::supports_usage_query(
+                            format,
+                            D3DUSAGE_QUERY_LEGACYBUMPMAP | extra,
+                            float32_filtering,
+                            native_packed16
+                        ),
+                        super::supports_usage_query(
+                            format,
+                            extra,
+                            float32_filtering,
+                            native_packed16
+                        ),
+                        "format {format} extra {extra:#x}"
+                    );
+                }
+                assert!(super::supports_usage_query(
+                    format,
+                    D3DUSAGE_QUERY_LEGACYBUMPMAP,
+                    float32_filtering,
+                    native_packed16
+                ));
+            }
+        }
+    }
+}
+
+/// The back-buffer set is the six formats D3D9 specifies, A2R10G10B10 in fullscreen alone.
+///
+/// Formats a device renders into but no swap chain is specified in (the
+/// float and wide-channel families, the reversed-channel 8-bit pair) stay
+/// out in both modes.
+#[test]
+fn back_buffer_formats_are_the_d3d9_set() {
+    for windowed in [true, false] {
+        for format in [
+            D3DFMT_A8R8G8B8,
+            D3DFMT_X8R8G8B8,
+            mtld3d_types::D3DFMT_A1R5G5B5,
+            mtld3d_types::D3DFMT_X1R5G5B5,
+            D3DFMT_R5G6B5,
+        ] {
+            assert!(
+                is_back_buffer_format(format, windowed),
+                "{format} windowed={windowed}"
+            );
+        }
+        for format in [
+            D3DFMT_A8B8G8R8,
+            D3DFMT_X8B8G8R8,
+            D3DFMT_A16B16G16R16,
+            D3DFMT_A16B16G16R16F,
+            D3DFMT_A32B32G32R32F,
+            D3DFMT_G16R16,
+            D3DFMT_R32F,
+            0,
+        ] {
+            assert!(
+                !is_back_buffer_format(format, windowed),
+                "{format} windowed={windowed}"
+            );
+        }
+    }
+    assert!(is_back_buffer_format(
+        mtld3d_types::D3DFMT_A2R10G10B10,
+        false
+    ));
+    assert!(!is_back_buffer_format(
+        mtld3d_types::D3DFMT_A2R10G10B10,
+        true
+    ));
+}

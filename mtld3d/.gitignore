@@ -1,0 +1,11 @@
+/target
+/windows/target
+/unix/target
+/.wine-isolated
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~

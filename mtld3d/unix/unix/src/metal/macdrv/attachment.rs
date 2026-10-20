@@ -1,0 +1,798 @@
+//! One attachment record per device: the display state a metal view owns.
+//!
+//! `AttachMetalLayer` creates a metal view and its `CAMetalLayer` for one
+//! device's window and registers an [`Attachment`] for them here, keyed by
+//! the view's address, which is the handle every later thunk of that device
+//! already carries (`SubmitFrame`, `DestroyCommandQueue`, `SetCursorOverlay`).
+//! Everything the display decides for that window lives on the record:
+//! whether the layer carries the HDR configuration, the live EDR headroom,
+//! the present throttle, the window's occlusion, the backing scale published
+//! to the PE side and the present-geometry streak. Several devices attached
+//! at once each own their record, and one device's teardown touches only its
+//! own.
+//!
+//! Liveness. A record is live exactly while it is in [`ATTACHMENTS`]. The
+//! `view` and `layer` addresses and the three PE-side sink addresses a record
+//! holds are valid only while it is live: `DestroyCommandQueue` unregisters
+//! the record before it releases the view, and the PE side drops the box
+//! behind the sinks after that thunk returns. So every dereference of one of
+//! those addresses happens inside a helper in this file that holds the
+//! registry lock and checks the record is still the one the map holds for
+//! its view (`Arc::ptr_eq`, not key equality, so a view address the
+//! allocator hands out again names a new record rather than resurrecting an
+//! old one). Outside those helpers a record is plain data: atomics and
+//! immutable words a main-thread observer, the submit thread and the API
+//! thread may read at any time, whether or not the record is still live.
+//! The Wine client surface a record names is held by a reference the record
+//! owns, which its teardown gives back after unregistering it, so another
+//! device's teardown takes its own reference on it under the registry lock.
+//!
+//! The lock is held for a lookup plus one retain or one atomic store, never
+//! across `AppKit` work, and nothing in this file takes any other lock, so
+//! the registry lock sits at the bottom of every order. It is not taken
+//! anywhere else.
+
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::{
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
+};
+
+use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
+use objc2::{MainThreadMarker, rc::Retained};
+use rustc_hash::FxHashMap;
+
+use crate::metal::command::{GeometryStreak, PresentGeometry};
+
+/// How many presents may pass between headroom refreshes.
+///
+/// Refreshing every present would put a main-queue block in every frame for
+/// a value that tracks display brightness, so it is sampled every this many
+/// presents instead. A present counter rather than a clock because the call
+/// site is per-present and this needs no new time source; the cost is that
+/// the interval is measured in frames, which at 30 to 300 fps puts the
+/// refresh somewhere between one second and a tenth of one.
+pub const HEADROOM_REFRESH_PRESENTS: u64 = 32;
+
+/// Paced presents in a row the display did not show before a visible window counts as unshown.
+///
+/// A window that has just come on screen leaves its first four or five
+/// drawables undisplayed on a 120 Hz panel, and one being covered a few
+/// until the occlusion notification lands, so the run has to be longer than
+/// those. A window that never shows a drawable reaches it in about 130 ms at
+/// that panel's rate, the most it presents unpaced.
+pub const UNDISPLAYED_PACED_LIMIT: u32 = 16;
+
+/// The live records, keyed by the raw `NSView*` address attach created.
+///
+/// `LazyLock` because the map's constructor is not `const`.
+static ATTACHMENTS: LazyLock<Mutex<FxHashMap<usize, Arc<Attachment>>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
+
+bitflags::bitflags! {
+    /// The two switches attach resolves once for the record's lifetime.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct AttachFlags: u8 {
+        /// `color.hdr.enable` from `mtld3d.conf`, as the attach carried it.
+        ///
+        /// Deciding the layer configuration for a screen first seen
+        /// mid-session needs the user's gate, and that gate only ever
+        /// arrives on the attach wire.
+        const HDR_ENABLE_REQUESTED = 1 << 0;
+        /// Attach configured the layer for HDR.
+        ///
+        /// Seeds the record's live `hdr_active` state; the display-follow
+        /// path moves that state afterwards, never this bit.
+        const HDR_ACTIVE = 1 << 1;
+    }
+}
+
+/// What attach latched for a record, handed to [`register`].
+pub struct AttachLatches {
+    /// The guest window the view was attached to.
+    ///
+    /// Names the window the view is kept for once the device is gone.
+    pub hwnd: u64,
+    pub flags: AttachFlags,
+    /// `color.space` from `mtld3d.conf`.
+    ///
+    /// Reconfiguring the layer for a new screen has to pick the colorspace
+    /// family attach would have picked for it.
+    pub color_space: ColorSpacePolicy,
+    /// The guest's vsync ask and the user's frame cap, as `pack_pacing` folds them.
+    pub pacing_bits: u64,
+    /// The Wine layer's contents scale as attach read it, already published.
+    pub backing_scale: u32,
+    /// Address of the PE-side `AtomicU32` a changed backing scale is published into, `0` = none.
+    pub backing_scale_sink: usize,
+    /// Address of the PE-side `AtomicU32` a cursor re-apply is asked through, `0` = none.
+    pub cursor_kick_sink: usize,
+    /// Address of the PE-side `AtomicU32` a client surface present is asked through, `0` = none.
+    pub client_surface_request_sink: usize,
+    /// Wine's client surface the view sits in, `0` = none.
+    ///
+    /// The record owns one reference on it, taken at attach and given back
+    /// by the teardown that unregisters the record.
+    pub client_surface: usize,
+}
+
+/// The display state of one attached metal view.
+///
+/// Immutable words identify the record and carry what attach latched; the
+/// atomics are what the main thread derives from the display and the
+/// presenting thread reads per present. See the module doc for which of
+/// them may be dereferenced, and where.
+pub struct Attachment {
+    /// Raw `NSView*`, the registry key.
+    view: usize,
+    /// Raw `CAMetalLayer*` of that view.
+    layer: usize,
+    /// See [`AttachLatches::hwnd`].
+    hwnd: u64,
+    /// See [`AttachLatches::backing_scale_sink`].
+    backing_scale_sink: usize,
+    /// See [`AttachLatches::cursor_kick_sink`].
+    cursor_kick_sink: usize,
+    /// See [`AttachLatches::client_surface_request_sink`].
+    client_surface_request_sink: usize,
+    /// See [`AttachLatches::client_surface`].
+    client_surface: usize,
+    /// The main-thread watch on the hidden state of the view's client view, `0` = none.
+    ///
+    /// An address `client_view_watch` hands out and takes back, dereferenced
+    /// on the main thread alone; the record only carries it from the attach
+    /// that installs the watch to the teardown that removes it.
+    client_view_watch: AtomicUsize,
+    /// When the record was registered, which orders the devices on one window.
+    attached_at: Instant,
+    flags: AttachFlags,
+    color_space: ColorSpacePolicy,
+    /// Raw `NSWindow*` the occlusion observer filters notifications by.
+    ///
+    /// Written on the main thread, compared against the notification's own
+    /// live object, never dereferenced. `0` while the view has no window.
+    window: AtomicUsize,
+    /// Whether the layer currently carries the EDR configuration.
+    ///
+    /// Written at attach and again on the main thread whenever the window's
+    /// screen changes its EDR capability, so it always names the
+    /// configuration the layer actually has. The present route is taken
+    /// from the drawable's own pixel format rather than from here, so a
+    /// reconfiguration landing between two presents cannot mismatch the pass.
+    hdr_active: AtomicBool,
+    /// Whether the window is fully occluded (covered or minimised).
+    ///
+    /// Seeded at attach and updated by the occlusion observer, both on the
+    /// main thread; read by `submit_frame` per present to skip the
+    /// `nextDrawable` acquire while nothing reaches the screen. Relaxed is
+    /// enough: a one-frame lag at the transition is harmless and bounded by
+    /// the retained `allowsNextDrawableTimeout` safety valve.
+    window_occluded: AtomicBool,
+    /// Live EDR headroom as `f32::to_bits`, published by the main thread.
+    ///
+    /// `submit_frame` needs this every present to drive the HDR tone-map
+    /// shader, but deriving it means walking `NSView.window -> NSWindow.screen`,
+    /// and those two are main-thread-only however read-only the `NSScreen`
+    /// property at the end of the walk is. Seeded to `1.0`, which the HDR
+    /// shader treats as the identity curve, so the presents before the first
+    /// refresh lands are correct rather than merely safe.
+    current_headroom_bits: AtomicU32,
+    /// Last headroom an `info!` line was emitted for, as `f32::to_bits`.
+    ///
+    /// `0` = never logged; the first refresh always logs to establish a
+    /// baseline distinct from the attach-time line. Written only on the main
+    /// thread.
+    last_logged_headroom_bits: AtomicU32,
+    /// Whether a headroom refresh is already queued on the main thread.
+    ///
+    /// Bounds the main queue to one outstanding refresh per record no matter
+    /// how far ahead the presenting thread runs.
+    headroom_refresh_pending: AtomicBool,
+    /// Presents since the last headroom refresh was queued.
+    ///
+    /// Starts already due so the first present after attach queues a refresh
+    /// rather than waiting out a full interval on the seeded `1.0`.
+    presents_since_headroom_refresh: AtomicU64,
+    /// Minimum seconds between presents, as `f64::to_bits`; `0.0` = no throttle.
+    ///
+    /// The longer of the vsync-equivalent cap (`1 / panel_max_hz`) and the
+    /// user's `present.maxFps` cap. Set at attach from the panel under the
+    /// window, and after that written only by the main-thread
+    /// reconciliation, which re-derives it for the panel the window is on
+    /// now whenever the display or the pacing a Reset latched moved.
+    min_present_duration_bits: AtomicU64,
+    /// When the presenter last released a paced present the compositor did not show.
+    ///
+    /// Nanoseconds after `attached_at`, `0` = none yet. The display paces a
+    /// shown window per layer, so the presenter's own pace for an unshown one
+    /// lives on the record too, and two swap chains presenting into two
+    /// hidden windows keep a pace each. Written only by the presenter of the
+    /// device that owns the view.
+    unshown_release_ns: AtomicU64,
+    /// Paced presents in a row whose drawable the display did not show.
+    ///
+    /// Counted by the drawables' presented handlers, which Metal runs on a
+    /// thread of its own, for presents into the window while it reads
+    /// visible: a drawable whose `presentedTime` is 0 adds one, a displayed
+    /// one sets it back to 0. At [`UNDISPLAYED_PACED_LIMIT`] the
+    /// window counts as unshown although it reads visible
+    /// ([`Attachment::displays_nothing`]).
+    undisplayed_paced: AtomicU32,
+    /// Present pacing latched from the PE side, encoded by `pack_pacing`.
+    ///
+    /// Attach and the D3D9 Reset path both write it, and the display-follow
+    /// reconciliation reads it back so a re-derivation on another panel
+    /// still honours the guest's vsync request and the user's ceiling. One
+    /// packed word rather than two atomics, so a Reset landing between two
+    /// reads cannot hand the reconciliation half of each.
+    present_pacing_bits: AtomicU64,
+    /// Backing scale last published to the PE side.
+    ///
+    /// Compared against before publishing, so the PE side only hears about
+    /// real changes.
+    current_backing_scale: AtomicU32,
+    /// Consecutive presents at one geometry; gates the `MetalFX` route.
+    present_streak: GeometryStreak,
+    /// Whether the present pass applies this layer's gamma ramp.
+    ///
+    /// The ramp's 256 entries live in `metal::gamma`, which owns them for as
+    /// long as the layer is attached; this flag is what the present path
+    /// reads per frame to pick the pipeline. It is set only after the entries
+    /// are in place and cleared before they are removed, both on the encoder
+    /// thread, so a frame that reads `true` always finds a table to bind.
+    gamma_active: AtomicBool,
+}
+
+impl Attachment {
+    fn new(view: usize, layer: usize, latches: &AttachLatches) -> Self {
+        Self {
+            view,
+            layer,
+            hwnd: latches.hwnd,
+            backing_scale_sink: latches.backing_scale_sink,
+            cursor_kick_sink: latches.cursor_kick_sink,
+            client_surface_request_sink: latches.client_surface_request_sink,
+            client_surface: latches.client_surface,
+            client_view_watch: AtomicUsize::new(0),
+            attached_at: Instant::now(),
+            flags: latches.flags,
+            color_space: latches.color_space,
+            window: AtomicUsize::new(0),
+            hdr_active: AtomicBool::new(latches.flags.contains(AttachFlags::HDR_ACTIVE)),
+            window_occluded: AtomicBool::new(false),
+            current_headroom_bits: AtomicU32::new(1.0_f32.to_bits()),
+            last_logged_headroom_bits: AtomicU32::new(0),
+            headroom_refresh_pending: AtomicBool::new(false),
+            presents_since_headroom_refresh: AtomicU64::new(HEADROOM_REFRESH_PRESENTS),
+            min_present_duration_bits: AtomicU64::new(0),
+            unshown_release_ns: AtomicU64::new(0),
+            undisplayed_paced: AtomicU32::new(0),
+            present_pacing_bits: AtomicU64::new(latches.pacing_bits),
+            current_backing_scale: AtomicU32::new(latches.backing_scale),
+            present_streak: GeometryStreak::new(),
+            gamma_active: AtomicBool::new(false),
+        }
+    }
+
+    /// Whether this layer's present pass applies a gamma ramp.
+    ///
+    /// The `Acquire` pairs with the `Release` in [`Self::set_gamma_active`],
+    /// so a frame that reads `true` also observes the entries the ramp's
+    /// handler wrote before it.
+    #[must_use]
+    pub fn gamma_active(&self) -> bool {
+        self.gamma_active.load(Ordering::Acquire)
+    }
+
+    /// Turn the present-pass gamma transform on or off for this layer.
+    pub fn set_gamma_active(&self, active: bool) {
+        self.gamma_active.store(active, Ordering::Release);
+    }
+
+    /// The raw `NSView*` address this record is keyed by; compared, never dereferenced here.
+    #[must_use]
+    pub const fn view(&self) -> usize {
+        self.view
+    }
+
+    /// The raw `CAMetalLayer*` address; compared, never dereferenced here.
+    #[must_use]
+    pub const fn layer(&self) -> usize {
+        self.layer
+    }
+
+    /// The guest window the view was attached to.
+    #[must_use]
+    pub const fn hwnd(&self) -> u64 {
+        self.hwnd
+    }
+
+    /// Wine's client surface the record holds a reference on, `0` = none.
+    #[must_use]
+    pub const fn client_surface(&self) -> usize {
+        self.client_surface
+    }
+
+    /// Hand the record the address of its client view watch, giving back any it held.
+    pub fn replace_client_view_watch(&self, watch: usize) -> usize {
+        self.client_view_watch.swap(watch, Ordering::AcqRel)
+    }
+
+    /// Take the client view watch address out of the record, `0` when it holds none.
+    pub fn take_client_view_watch(&self) -> usize {
+        self.client_view_watch.swap(0, Ordering::AcqRel)
+    }
+
+    /// `color.hdr.enable` as the attach carried it.
+    #[must_use]
+    pub const fn hdr_enable_requested(&self) -> bool {
+        self.flags.contains(AttachFlags::HDR_ENABLE_REQUESTED)
+    }
+
+    /// `color.space` as the attach carried it.
+    #[must_use]
+    pub const fn color_space(&self) -> ColorSpacePolicy {
+        self.color_space
+    }
+
+    /// The raw `NSWindow*` the occlusion observer matches, `0` = none.
+    #[must_use]
+    pub fn window(&self) -> usize {
+        self.window.load(Ordering::Relaxed)
+    }
+
+    pub fn set_window(&self, window: usize) {
+        self.window.store(window, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn hdr_active(&self) -> bool {
+        self.hdr_active.load(Ordering::Relaxed)
+    }
+
+    pub fn set_hdr_active(&self, active: bool) {
+        self.hdr_active.store(active, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn window_occluded(&self) -> bool {
+        self.window_occluded.load(Ordering::Relaxed)
+    }
+
+    pub fn set_window_occluded(&self, occluded: bool) {
+        self.window_occluded.store(occluded, Ordering::Relaxed);
+    }
+
+    /// The live EDR headroom the main thread last published.
+    #[must_use]
+    pub fn headroom(&self) -> f32 {
+        f32::from_bits(self.current_headroom_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn set_headroom(&self, headroom: f32) {
+        self.current_headroom_bits
+            .store(headroom.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The headroom last logged, `None` = never logged.
+    #[must_use]
+    pub fn last_logged_headroom(&self) -> Option<f32> {
+        match self.last_logged_headroom_bits.load(Ordering::Relaxed) {
+            0 => None,
+            bits => Some(f32::from_bits(bits)),
+        }
+    }
+
+    pub fn set_last_logged_headroom(&self, headroom: f32) {
+        self.last_logged_headroom_bits
+            .store(headroom.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Count one present and say whether it is this record's turn to queue a headroom refresh.
+    ///
+    /// `true` at most once per [`HEADROOM_REFRESH_PRESENTS`] presents, and
+    /// never while a refresh queued earlier has not run yet. The caller
+    /// queues the refresh; [`Self::end_headroom_refresh`] is the refresh
+    /// reporting back.
+    pub fn begin_headroom_refresh(&self) -> bool {
+        let due = self
+            .presents_since_headroom_refresh
+            .fetch_add(1, Ordering::Relaxed)
+            >= HEADROOM_REFRESH_PRESENTS;
+        if !due
+            || self
+                .headroom_refresh_pending
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return false;
+        }
+        self.presents_since_headroom_refresh
+            .store(0, Ordering::Relaxed);
+        true
+    }
+
+    /// The queued headroom refresh has run; the next due present may queue another.
+    pub fn end_headroom_refresh(&self) {
+        self.headroom_refresh_pending
+            .store(false, Ordering::Release);
+    }
+
+    /// A Reset re-paced this record: make a reconciliation due now, and say whether to queue it.
+    ///
+    /// The pacing the record now carries reaches the present throttle only
+    /// through the main-thread reconciliation, so the present counter is set
+    /// to already due before the pending flag is tried. `true` when no refresh
+    /// is in flight: the caller queues one, and the counter restarts with it
+    /// so the Reset costs one refresh, not one plus the next present's.
+    /// `false` while a refresh queued earlier has not run yet; that one may
+    /// have read the pacing before the Reset wrote it, and the counter left
+    /// due makes the next present queue another as soon as it reports back.
+    pub fn request_refresh(&self) -> bool {
+        self.presents_since_headroom_refresh
+            .store(HEADROOM_REFRESH_PRESENTS, Ordering::Relaxed);
+        if self
+            .headroom_refresh_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.presents_since_headroom_refresh
+            .store(0, Ordering::Relaxed);
+        true
+    }
+
+    /// The present throttle in seconds, `0.0` = none.
+    #[must_use]
+    pub fn min_present_duration_sec(&self) -> f64 {
+        f64::from_bits(self.min_present_duration_bits.load(Ordering::Relaxed))
+    }
+
+    pub fn set_min_present_duration(&self, seconds: f64) {
+        self.min_present_duration_bits
+            .store(seconds.to_bits(), Ordering::Relaxed);
+    }
+
+    /// When the next paced present into this window may go while the compositor shows none of it.
+    ///
+    /// What [`next_unshown_release`] answers for the previous release and the
+    /// time the frame was `ready`; the answer then replaces the previous one.
+    pub fn unshown_release_at(&self, ready: Instant, duration: Duration) -> Instant {
+        let last = match self.unshown_release_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => self.attached_at.checked_add(Duration::from_nanos(ns)),
+        };
+        let at = next_unshown_release(last, ready, duration);
+        let ns = at.saturating_duration_since(self.attached_at).as_nanos();
+        self.unshown_release_ns.store(
+            u64::try_from(ns).unwrap_or(u64::MAX).max(1),
+            Ordering::Relaxed,
+        );
+        at
+    }
+
+    /// Count one paced present the display showed (`displayed`) or let go unshown.
+    ///
+    /// Returns the change it made to [`Self::displays_nothing`]: `Some(true)`
+    /// when this present completed the run of undisplayed ones, `Some(false)`
+    /// when a displayed one ended such a run, `None` otherwise.
+    pub fn note_paced_present(&self, displayed: bool) -> Option<bool> {
+        let before = if displayed {
+            self.undisplayed_paced.swap(0, Ordering::Relaxed)
+        } else {
+            let (Ok(run) | Err(run)) =
+                self.undisplayed_paced
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |run| {
+                        Some(run.saturating_add(1))
+                    });
+            run
+        };
+        undisplayed_run_edge(before, displayed)
+    }
+
+    /// Whether the window displays nothing although it reads visible.
+    ///
+    /// True once [`UNDISPLAYED_PACED_LIMIT`] paced presents in a row came
+    /// back with `presentedTime` 0, until a displayed one: nothing enforces
+    /// such a window's present duration, so the presenter holds its paced
+    /// presents to it as it does an occluded window's.
+    #[must_use]
+    pub fn displays_nothing(&self) -> bool {
+        self.undisplayed_paced.load(Ordering::Relaxed) >= UNDISPLAYED_PACED_LIMIT
+    }
+
+    /// The pacing word `pack_pacing` produced.
+    #[must_use]
+    pub fn pacing_bits(&self) -> u64 {
+        self.present_pacing_bits.load(Ordering::Relaxed)
+    }
+
+    pub fn set_pacing_bits(&self, bits: u64) {
+        self.present_pacing_bits.store(bits, Ordering::Relaxed);
+    }
+
+    /// The backing scale last published to the PE side.
+    #[must_use]
+    pub fn backing_scale(&self) -> u32 {
+        self.current_backing_scale.load(Ordering::Relaxed)
+    }
+
+    pub fn set_backing_scale(&self, scale: u32) {
+        self.current_backing_scale.store(scale, Ordering::Relaxed);
+    }
+
+    /// Advance this record's present-geometry streak, and say whether it has settled.
+    pub fn present_settled(&self, geometry: PresentGeometry) -> bool {
+        self.present_streak.settled(geometry)
+    }
+}
+
+fn lock() -> std::sync::MutexGuard<'static, FxHashMap<usize, Arc<Attachment>>> {
+    ATTACHMENTS
+        .lock()
+        .expect("attachment registry mutex poisoned")
+}
+
+/// Whether `att` is the record the registry holds for its view.
+///
+/// The liveness check every dereference in this file rests on; `map` is the
+/// locked registry.
+fn is_live(map: &FxHashMap<usize, Arc<Attachment>>, att: &Arc<Attachment>) -> bool {
+    map.get(&att.view)
+        .is_some_and(|live| Arc::ptr_eq(live, att))
+}
+
+/// When a paced present into a window the compositor does not show may go.
+///
+/// `presentDrawable:afterMinimumDuration:` counts a present's minimum
+/// duration from the time the previous drawable was displayed, so in a window
+/// that displays nothing the duration has no reference, and the presenter
+/// keeps the pace itself: one `duration` after the previous release `last`,
+/// or when the frame was `ready` if that is later.
+///
+/// Counting from readiness rather than from when the presenter got to the
+/// frame matters when its timed wait wakes late. A process macOS runs in the
+/// background (a minimised game; a test launched from a service) has its
+/// timers coalesced, and a hold can end a hundred milliseconds past its
+/// deadline. The frames that became ready meanwhile then go at once, on the
+/// schedule they missed, so the pace holds on average. A game slower than the
+/// pace has its frames ready after the deadline and goes at its own rate,
+/// with no burst.
+pub fn next_unshown_release(last: Option<Instant>, ready: Instant, duration: Duration) -> Instant {
+    last.and_then(|last| last.checked_add(duration))
+        .map_or(ready, |at| at.max(ready))
+}
+
+/// How one paced present moves a run of undisplayed ones that stood at `before`.
+///
+/// `Some(true)` when an undisplayed present makes the run reach
+/// [`UNDISPLAYED_PACED_LIMIT`], `Some(false)` when a displayed one ends a run
+/// that had reached it, `None` when the window's state does not change.
+pub const fn undisplayed_run_edge(before: u32, displayed: bool) -> Option<bool> {
+    if displayed {
+        if before >= UNDISPLAYED_PACED_LIMIT {
+            Some(false)
+        } else {
+            None
+        }
+    } else if before.saturating_add(1) == UNDISPLAYED_PACED_LIMIT {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Create the record for a freshly attached view and make it live.
+///
+/// Attach unregisters a record whose teardown never ran before it registers
+/// the view again, giving back what that record held, so the insert here
+/// replaces nothing.
+pub fn register(view: usize, layer: usize, latches: &AttachLatches) -> Arc<Attachment> {
+    let att = Arc::new(Attachment::new(view, layer, latches));
+    lock().insert(view, Arc::clone(&att));
+    att
+}
+
+/// Take the record for `view` out of the registry. **Device teardown only.**
+///
+/// Runs before the teardown releases the view, so from here on no helper in
+/// this file dereferences the view, its layer or the sinks. `None` for a
+/// view no record names, which is what a device that never attached looks
+/// like.
+pub fn unregister(view: usize) -> Option<Arc<Attachment>> {
+    lock().remove(&view)
+}
+
+/// A block of `0x1_0000` addresses that no other caller in this process is handed.
+///
+/// The registry is one map for the process and the unit tests that fill it
+/// run in parallel, so a test takes the view and layer addresses it
+/// registers, and any window it looks records up by, from a block of its own
+/// rather than from a constant another test may pick too. Block `0` is never
+/// handed out: address `0` is what a device that never attached carries.
+#[cfg(test)]
+pub fn test_address_block() -> usize {
+    /// The next block to hand out.
+    ///
+    /// A static because the resource is process-wide: the blocks partition
+    /// the key space of the one registry map, which every test shares.
+    static NEXT_BLOCK: AtomicUsize = AtomicUsize::new(1);
+    NEXT_BLOCK.fetch_add(1, Ordering::Relaxed) << 16
+}
+
+/// The live record for `view`, if any.
+#[must_use]
+pub fn find(view: usize) -> Option<Arc<Attachment>> {
+    lock().get(&view).cloned()
+}
+
+/// The live record whose layer is `layer`, if any.
+///
+/// A linear scan over a handful of records at most; the callers are the
+/// Reset path, never a present.
+#[must_use]
+pub fn find_by_layer(layer: usize) -> Option<Arc<Attachment>> {
+    lock().values().find(|att| att.layer == layer).cloned()
+}
+
+/// The client surface of the newest live record on `hwnd`, retained through `retain`.
+///
+/// `retain` takes a reference on the surface while the record is live under
+/// the registry lock, and the record's teardown gives its own reference
+/// back only after it unregistered the record, so the surface outlives the
+/// call whatever that device does meanwhile; the caller gives the reference
+/// back. `None` when no live record on `hwnd` holds a surface.
+pub fn retain_newest_surface_on(hwnd: u64, retain: impl FnOnce(usize) -> usize) -> Option<usize> {
+    let map = lock();
+    let retained = newest_with_surface_on(&map, hwnd).map(|newest| retain(newest.client_surface));
+    drop(map);
+    retained.filter(|&surface| surface != 0)
+}
+
+/// Ask the device that owns `view` to have Wine show its window's client surface again.
+///
+/// ORs `reason` into the record's PE-side request word, which the device
+/// takes at its next `Present` and answers with `PresentClientSurface`. Only
+/// the newest record on its window that holds a surface asks: Wine shows one
+/// client surface per window, the newest device's, so an older device's view
+/// is hidden on purpose and asking for it would change nothing. `false`, and
+/// nothing written, for a view no live record names, a record without a
+/// surface or a request word, or one a newer device on its window outranks.
+pub fn request_client_surface(view: usize, reason: ClientSurfaceRequest) -> bool {
+    let map = lock();
+    let Some(att) = map.get(&view) else {
+        return false;
+    };
+    if att.client_surface_request_sink == 0
+        || !newest_with_surface_on(&map, att.hwnd).is_some_and(|newest| Arc::ptr_eq(newest, att))
+    {
+        return false;
+    }
+    // SAFETY: as in `publish_backing_scale`: the PE side backs this address
+    // with an `AtomicU32` in a box it keeps until after the teardown thunk
+    // that unregisters the record has returned, and the record is live under
+    // the registry lock.
+    let sink = unsafe { &*(att.client_surface_request_sink as *const AtomicU32) };
+    sink.fetch_or(reason.bits(), Ordering::Release);
+    // The write above is what the lock guards: the record's teardown
+    // unregisters it under the same lock before the PE side drops the word.
+    drop(map);
+    true
+}
+
+/// The newest live record on `hwnd` that holds a client surface; `map` is the locked registry.
+fn newest_with_surface_on(
+    map: &FxHashMap<usize, Arc<Attachment>>,
+    hwnd: u64,
+) -> Option<&Arc<Attachment>> {
+    map.values()
+        .filter(|att| att.hwnd == hwnd && att.client_surface != 0)
+        .max_by_key(|att| att.attached_at)
+}
+
+/// A snapshot of every live record, for a main-thread observer to walk.
+#[must_use]
+pub fn live() -> Vec<Arc<Attachment>> {
+    lock().values().cloned().collect()
+}
+
+/// Retain the record's `NSView`, or `None` once it is no longer live.
+///
+/// The marker is the caller's proof that it is on the main thread, where it
+/// goes on to walk the view; the registry only answers whether the record is
+/// still live. This and [`retain_layer`] are the only places a view or a
+/// layer is resurrected from the address a record holds.
+pub fn retain_view(
+    att: &Arc<Attachment>,
+    _mtm: MainThreadMarker,
+) -> Option<Retained<objc2_app_kit::NSView>> {
+    let map = lock();
+    if !is_live(&map, att) {
+        return None;
+    }
+    // SAFETY: the record is live under the registry lock, and teardown
+    // unregisters it under the same lock before it releases the metal view,
+    // so the address names a live `NSView` here and the retain this takes
+    // keeps it alive for the caller's walk.
+    unsafe { Retained::retain(att.view as *mut objc2_app_kit::NSView) }
+}
+
+/// Retain the record's `CAMetalLayer`, or `None` once it is no longer live.
+///
+/// The marker is the caller's proof that it is on the main thread, where it
+/// goes on to configure the layer, for the same reason [`retain_view`] takes
+/// one.
+pub fn retain_layer(
+    att: &Arc<Attachment>,
+    _mtm: MainThreadMarker,
+) -> Option<Retained<objc2_quartz_core::CAMetalLayer>> {
+    let map = lock();
+    if !is_live(&map, att) {
+        return None;
+    }
+    // SAFETY: wine retains the layer for the metal view's lifetime, the
+    // record is live under the registry lock, and teardown unregisters it
+    // under the same lock before releasing that view, so the address names a
+    // live layer here.
+    unsafe { Retained::retain(att.layer as *mut objc2_quartz_core::CAMetalLayer) }
+}
+
+/// Publish a backing scale into the record's PE-side sink, while the record is live.
+///
+/// The store is `Relaxed`: the value stands alone, the PE side reads it once
+/// per present, and there is nothing for it to order against. A record that
+/// was unregistered, or that has no sink, publishes nowhere.
+pub fn publish_backing_scale(att: &Arc<Attachment>, scale: u32) {
+    let map = lock();
+    if att.backing_scale_sink == 0 || !is_live(&map, att) {
+        return;
+    }
+    // SAFETY: the PE side backs this address with an `AtomicU32` in a box it
+    // keeps at that address until after the teardown thunk that unregisters
+    // this record has returned; the record is live under the registry lock,
+    // so the box is still there. `AtomicU32` has the same size and alignment
+    // in both images.
+    let sink = unsafe { &*(att.backing_scale_sink as *const AtomicU32) };
+    sink.store(scale, Ordering::Relaxed);
+}
+
+/// Ask every live device to re-apply its cursor through Wine.
+///
+/// Called when the pointer comes back after another process held it. The
+/// kick is idempotent (a null-then-set at the device's next `WM_SETCURSOR`),
+/// so every device gets it rather than guessing which one the pointer
+/// concerns. The store is `Release` against the PE side's `AcqRel` swap; the
+/// flag is the whole message.
+pub fn request_cursor_kick_all() {
+    let map = lock();
+    for att in map.values().filter(|att| att.cursor_kick_sink != 0) {
+        // SAFETY: as in `publish_backing_scale`: the record is live under the
+        // registry lock, so the PE-side box behind the address is still
+        // there.
+        let sink = unsafe { &*(att.cursor_kick_sink as *const AtomicU32) };
+        sink.store(1, Ordering::Release);
+    }
+}
+
+/// The record's live EDR headroom, counting this present towards the next refresh.
+///
+/// Reads the value the main thread last published and queues a refresh when
+/// one is due. Never touches `AppKit`, so it is safe to call from the
+/// presenting thread. Called every present whatever the layer is configured
+/// for, because the refresh it queues is also what notices the window
+/// moving onto a display of the other class: an SDR session that never
+/// polled would never see a panel with headroom appear under it.
+///
+/// `1.0` until the first refresh lands, which is still correct for the HDR
+/// shader: BT.2446-A at `L_hdr = L_sdr = 100` is the identity curve.
+pub fn current_headroom(att: &Arc<Attachment>) -> f32 {
+    if att.begin_headroom_refresh() {
+        let att = Arc::clone(att);
+        super::run_on_main_thread_async(move || super::refresh_attachment_on_main(&att));
+    }
+    att.headroom()
+}
+
+#[cfg(test)]
+mod tests;

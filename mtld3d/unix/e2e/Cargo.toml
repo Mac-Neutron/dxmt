@@ -1,0 +1,21 @@
+[package]
+name = "mtld3d-e2e"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description.workspace = true
+authors.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+# The runner reads the log the layer wrote for a process it lost, so it takes
+# the file naming and the fatal banner from the crate that defines them rather
+# than restating either.
+mtld3d-shared = { workspace = true }
+# `bench-shape` reads D3D9 render-state values out of the layer's frame dump,
+# and those constants have one home.
+mtld3d-types = { path = "../../windows/types" }
+
+[lints]
+workspace = true

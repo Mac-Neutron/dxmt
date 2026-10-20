@@ -1,0 +1,1410 @@
+//! Unit tests for the D3D9 to Metal translation helpers.
+//!
+//! Pins the enum tables (blend ops, `D3DDECLTYPE_*` formats) alongside the conversions that
+//! have no second source of truth: D3DCOLOR byte order and the `ColorFill` encodings, FVF
+//! expansion into `D3DVERTEXELEMENT9`, attribute resolution against declared VS semantics and
+//! the fixed-function convention, triangle-fan rewriting, the depth-bias conversion, and the
+//! `ColorFill` pattern splat. A wrong mapping here reaches the
+//! screen as wrong pixels, not a crash.
+
+use mtld3d_types::{
+    D3DDECLTYPE_UNUSED, D3DDECLUSAGE_BINORMAL, D3DDECLUSAGE_DEPTH, D3DDECLUSAGE_FOG,
+    D3DDECLUSAGE_TANGENT,
+};
+
+use super::*;
+use crate::dxso::DeclUsage;
+
+/// The passthrough list of an untransformed layout, which passes nothing through.
+const NO_PASSTHROUGH: [u8; MAX_LINKED_INPUTS] = [0; MAX_LINKED_INPUTS];
+
+fn u16_indices(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect()
+}
+
+fn u32_indices(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
+        .collect()
+}
+
+/// The whole index list a rewrite produces, into a buffer of its own size.
+fn rewritten(fan: &FanRewrite) -> Vec<u8> {
+    let mut out = vec![0xAAu8; fan.byte_len()];
+    fan.write(&mut out);
+    out
+}
+
+/// `count` little-endian indices of `size` bytes each.
+fn index_stream(indices: &[u32], size: usize) -> Vec<u8> {
+    indices
+        .iter()
+        .flat_map(|i| i.to_le_bytes().into_iter().take(size))
+        .collect()
+}
+
+#[test]
+fn nonindexed_fan_becomes_absolute_u16_triangles() {
+    // DrawPrimitive(FAN, start 10, 3 prims): fan vertices 10..=14.
+    let fan = FanRewrite::sequential(10, 3).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt16);
+    assert_eq!(fan.index_count(), 9);
+    assert_eq!(fan.byte_len(), 18);
+    assert_eq!(
+        u16_indices(&rewritten(&fan)),
+        vec![10, 11, 12, 10, 12, 13, 10, 13, 14]
+    );
+    assert_eq!((fan.min_vertex(), fan.max_vertex()), (10, 14));
+}
+
+#[test]
+fn fan_rewrite_writes_only_the_triangles_that_fit() {
+    // The draw path sizes the arena block with `byte_len`; a shorter buffer
+    // is filled with whole triangles and the rest left alone.
+    let fan = FanRewrite::sequential(0, 3).expect("fits");
+    let mut short = vec![0xAAu8; 6];
+    fan.write(&mut short);
+    assert_eq!(u16_indices(&short), vec![0, 1, 2]);
+}
+
+#[test]
+fn fan_pattern_is_the_relative_fan_and_clips_to_the_buffer() {
+    let mut out = vec![0xAAu8; fan_pattern_bytes(3)];
+    fill_fan_pattern_u16(&mut out, 3);
+    assert_eq!(u16_indices(&out), vec![0, 1, 2, 0, 2, 3, 0, 3, 4]);
+    // Asking for more triangles than the buffer holds writes what fits.
+    let mut short = vec![0xAAu8; fan_pattern_bytes(1)];
+    fill_fan_pattern_u16(&mut short, 5);
+    assert_eq!(u16_indices(&short), vec![0, 1, 2]);
+    // The last addressable triangle ends exactly at u16::MAX.
+    let mut tail = vec![0u8; fan_pattern_bytes(FAN_PATTERN_MAX_TRIANGLES)];
+    fill_fan_pattern_u16(&mut tail, FAN_PATTERN_MAX_TRIANGLES);
+    assert_eq!(
+        &u16_indices(&tail)[tail.len() / 2 - 3..],
+        &[0, u16::MAX - 1, u16::MAX]
+    );
+}
+
+#[test]
+fn fan_widens_to_u32_past_u16_range() {
+    let fan = FanRewrite::sequential(0xFFFE, 1).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt32);
+    assert_eq!(fan.byte_len(), 12);
+    assert_eq!(
+        u32_indices(&rewritten(&fan)),
+        vec![0xFFFE, 0xFFFF, 0x1_0000]
+    );
+    assert!(FanRewrite::sequential(u32::MAX - 1, 1).is_none());
+}
+
+#[test]
+fn indexed_fan_folds_the_base_vertex_in() {
+    // 16-bit app indices 5,6,7,8 with base vertex 100: triangles over
+    // 105..=108.
+    let src = index_stream(&[5, 6, 7, 8], 2);
+    let fan = FanRewrite::indexed(&src, 2, 100, 2).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt16);
+    assert_eq!(
+        u16_indices(&rewritten(&fan)),
+        vec![105, 106, 107, 105, 107, 108]
+    );
+    assert_eq!((fan.min_vertex(), fan.max_vertex()), (105, 108));
+    // A negative base is legal as long as no index goes below zero.
+    let fan = FanRewrite::indexed(&src, 2, -5, 2).expect("fits");
+    assert_eq!(u16_indices(&rewritten(&fan)), vec![0, 1, 2, 0, 2, 3]);
+    assert!(FanRewrite::indexed(&src, 2, -6, 2).is_none());
+}
+
+#[test]
+fn indexed_fan_reads_32_bit_indices_and_rejects_short_streams() {
+    let src = index_stream(&[1, 2, 0x2_0000], 4);
+    let fan = FanRewrite::indexed(&src, 4, 0, 1).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt32);
+    assert_eq!(u32_indices(&rewritten(&fan)), vec![1, 2, 0x2_0000]);
+    assert!(FanRewrite::indexed(&src, 4, 0, 2).is_none());
+    assert!(FanRewrite::indexed(&src, 3, 0, 1).is_none());
+    // A 32-bit stream every index of which fits 16 bits narrows, halving
+    // the bytes the draw stages.
+    let narrow = index_stream(&[1, 2, 3, 4], 4);
+    let fan = FanRewrite::indexed(&narrow, 4, 0, 2).expect("fits");
+    assert_eq!(fan.index_type(), IndexType::UInt16);
+    assert_eq!(fan.byte_len(), 12);
+    assert_eq!(u16_indices(&rewritten(&fan)), vec![1, 2, 3, 1, 3, 4]);
+}
+
+fn pos3() -> D3DVERTEXELEMENT9 {
+    D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset: 0,
+        type_: D3DDECLTYPE_FLOAT3,
+        method: 0,
+        usage: D3DDECLUSAGE_POSITION,
+        usage_index: 0,
+    }
+}
+
+fn tex0(offset: u16) -> D3DVERTEXELEMENT9 {
+    D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_: D3DDECLTYPE_FLOAT2,
+        method: 0,
+        usage: D3DDECLUSAGE_TEXCOORD,
+        usage_index: 0,
+    }
+}
+
+fn to_bits4(arr: [f32; 4]) -> [u32; 4] {
+    [
+        arr[0].to_bits(),
+        arr[1].to_bits(),
+        arr[2].to_bits(),
+        arr[3].to_bits(),
+    ]
+}
+
+#[test]
+fn d3dcolor_to_rgba_default_is_white() {
+    // D3DRS_BLENDFACTOR's default is 0xFFFFFFFF (opaque white).
+    let rgba = d3dcolor_to_rgba_f32(0xFFFF_FFFF);
+    assert_eq!(to_bits4(rgba), to_bits4([1.0, 1.0, 1.0, 1.0]));
+}
+
+#[test]
+fn d3dcolor_to_rgba_zero_is_transparent_black() {
+    let rgba = d3dcolor_to_rgba_f32(0x0000_0000);
+    assert_eq!(to_bits4(rgba), to_bits4([0.0, 0.0, 0.0, 0.0]));
+}
+
+#[test]
+fn d3dcolor_to_rgba_argb_byte_order() {
+    // 0xAARRGGBB. A=0x80, R=0x40, G=0x20, B=0x10. The u8→f32 path
+    // is exact (each byte fits f32 mantissa), so bit-equality holds.
+    let rgba = d3dcolor_to_rgba_f32(0x8040_2010);
+    assert_eq!(rgba[0].to_bits(), (f32::from(0x40u8) / 255.0).to_bits());
+    assert_eq!(rgba[1].to_bits(), (f32::from(0x20u8) / 255.0).to_bits());
+    assert_eq!(rgba[2].to_bits(), (f32::from(0x10u8) / 255.0).to_bits());
+    assert_eq!(rgba[3].to_bits(), (f32::from(0x80u8) / 255.0).to_bits());
+}
+
+#[test]
+fn linear_to_srgb_encodes_colour_lanes_only() {
+    // 0x7f linear stores as 0xbb once sRGB-encoded; alpha passes through.
+    let rgba = linear_to_srgb_rgba(d3dcolor_to_rgba_f32(0x407f_7f7f));
+    // The stored byte, as the exactly representable float it rounds to.
+    let to_byte = |v: f32| (v * 255.0).round().to_bits();
+    let byte = |b: u8| f32::from(b).to_bits();
+    assert_eq!(to_byte(rgba[0]), byte(0xbb));
+    assert_eq!(to_byte(rgba[1]), byte(0xbb));
+    assert_eq!(to_byte(rgba[2]), byte(0xbb));
+    assert_eq!(rgba[3].to_bits(), (f32::from(0x40u8) / 255.0).to_bits());
+    // The end points map onto themselves (to within a ulp at white), and
+    // an over-range lane clamps before encoding.
+    let ends = linear_to_srgb_rgba([0.0, 1.0, 2.0, 1.0]);
+    assert_eq!(ends[0].to_bits(), 0.0f32.to_bits());
+    assert_eq!(to_byte(ends[1]), byte(0xff));
+    assert_eq!(to_byte(ends[2]), byte(0xff));
+}
+
+#[test]
+fn color_fill_a8r8g8b8_roundtrips_the_d3dcolor() {
+    // BGRA8 bytes read back as the same D3DCOLOR: filling 0xdeadbeef must
+    // read back 0xdeadbeef.
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A8R8G8B8).unwrap();
+    assert_eq!(bytes, vec![0xef, 0xbe, 0xad, 0xde]);
+    assert_eq!(
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+        0xdead_beef
+    );
+}
+
+#[test]
+fn color_fill_reversed_channel_formats_store_rgba_order() {
+    // The A8B8G8R8 family stores R, G, B then alpha in ascending addresses,
+    // so the same D3DCOLOR lands in the reverse byte order of A8R8G8B8.
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A8B8G8R8).unwrap();
+    assert_eq!(bytes, vec![0xad, 0xbe, 0xef, 0xde]);
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_X8B8G8R8).unwrap(),
+        bytes,
+        "the X member shares the layout; its fourth byte is ignored on read"
+    );
+}
+
+#[test]
+fn color_fill_r32f_is_red_channel_normalized() {
+    // R=0xad → 0xad/255.0: ColorFill promotes the red byte to a
+    // normalized float.
+    let bytes = d3dcolor_fill_pixel_bytes(0x00ad_0000, D3DFMT_R32F).unwrap();
+    let f = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    assert_eq!(f.to_bits(), (f32::from(0xadu8) / 255.0).to_bits());
+}
+
+#[test]
+fn color_fill_r5g6b5_packs_top_bits() {
+    // Filling 0xdeadbeef into an R5G6B5 surface packs to the 16-bit value
+    // 0xadfd (R=0xad>>3, G=0xbe>>2, B=0xef>>3).
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_R5G6B5).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0xadfd);
+}
+
+#[test]
+fn color_fill_packed_5551_takes_the_top_bits() {
+    // 0xdeadbeef into A1R5G5B5: A=0xde>>7=1, R=0xad>>3, G=0xbe>>3, B=0xef>>3
+    // pack to 0xd6fd. X1R5G5B5 shares the layout, so it shares the encoding.
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A1R5G5B5).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0xd6fd);
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_X1R5G5B5).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0xd6fd);
+    // An alpha below half clears the top bit rather than rounding it up.
+    let bytes = d3dcolor_fill_pixel_bytes(0x7fad_beef, D3DFMT_A1R5G5B5).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0x56fd);
+}
+
+#[test]
+fn color_fill_packed_4444_takes_the_top_nibbles() {
+    // 0xdeadbeef into A4R4G4B4 keeps the high nibble of each channel in
+    // A, R, G, B order: 0xdabe.
+    let bytes = d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A4R4G4B4).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0xdabe);
+    // Every channel saturated packs to every bit set.
+    let bytes = d3dcolor_fill_pixel_bytes(0xffff_ffff, D3DFMT_A4R4G4B4).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 0xffff);
+}
+
+#[test]
+fn color_fill_l8_is_the_rec709_luminance() {
+    // 0.2125*0xad + 0.7154*0xbe + 0.0721*0xef = 190.42 -> 0xbe.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_L8).unwrap(),
+        vec![0xbe]
+    );
+    // The luminance ignores alpha, and the weights sum to one, so white
+    // stays white and black stays black.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x00ff_ffff, D3DFMT_L8).unwrap(),
+        vec![0xff]
+    );
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xff00_0000, D3DFMT_L8).unwrap(),
+        vec![0x00]
+    );
+    // A pure-green colour keeps the green weight alone: 0.7154*0xff = 182.4.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x0000_ff00, D3DFMT_L8).unwrap(),
+        vec![182]
+    );
+}
+
+#[test]
+fn color_fill_a8_is_the_alpha_byte() {
+    // An alpha-only destination takes the D3DCOLOR's alpha and nothing else.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A8).unwrap(),
+        vec![0xde]
+    );
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x00ff_ffff, D3DFMT_A8).unwrap(),
+        vec![0x00]
+    );
+}
+
+#[test]
+fn color_fill_unsupported_format_is_none() {
+    // Block-compressed / unmapped formats aren't encoded yet. (The packed
+    // 16-bit formats ARE encoded — on a device that expands them to BGRA8
+    // the 16-bit fill page rides the ordinary upload, which widens it.)
+    assert!(d3dcolor_fill_pixel_bytes(0xffff_ffff, D3DFMT_X8R8G8B8).is_some());
+    assert!(d3dcolor_fill_pixel_bytes(0xffff_ffff, 0x0000_0000).is_none());
+}
+
+#[test]
+fn decl_type_to_metal_format_table() {
+    // Each D3DDECLTYPE we support maps to a typed VertexFormat and a
+    // size. If anyone flips a mapping here without updating both sides,
+    // this catches it.
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_FLOAT1),
+        (VertexFormat::Float, 4)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_FLOAT2),
+        (VertexFormat::Float2, 8)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_FLOAT3),
+        (VertexFormat::Float3, 12)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_FLOAT4),
+        (VertexFormat::Float4, 16)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_D3DCOLOR),
+        (VertexFormat::UChar4NormalizedBgra, 4)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_UBYTE4),
+        (VertexFormat::UChar4, 4)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_UBYTE4N),
+        (VertexFormat::UChar4Normalized, 4)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_SHORT2),
+        (VertexFormat::Short2, 4)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_SHORT4),
+        (VertexFormat::Short4, 8)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_SHORT2N),
+        (VertexFormat::Short2Normalized, 4)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_SHORT4N),
+        (VertexFormat::Short4Normalized, 8)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_USHORT2N),
+        (VertexFormat::UShort2Normalized, 4)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_USHORT4N),
+        (VertexFormat::UShort4Normalized, 8)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_FLOAT16_2),
+        (VertexFormat::Half2, 4)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_FLOAT16_4),
+        (VertexFormat::Half4, 8)
+    );
+    // Unsupported types report INVALID so the caller can skip.
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_UDEC3),
+        (VertexFormat::Invalid, 0)
+    );
+    assert_eq!(
+        decl_type_to_metal_format(D3DDECLTYPE_DEC3N),
+        (VertexFormat::Invalid, 0)
+    );
+}
+
+#[test]
+fn fvf_synthesize_elements_position_normal_tex1() {
+    let (elems, stride) = fvf_to_elements(D3DFVF_XYZ | D3DFVF_NORMAL | (1 << 8));
+    assert_eq!(elems.len(), 3);
+    assert_eq!(elems[0].usage, D3DDECLUSAGE_POSITION);
+    assert_eq!(elems[0].type_, D3DDECLTYPE_FLOAT3);
+    assert_eq!(elems[0].offset, 0);
+    assert_eq!(elems[1].usage, D3DDECLUSAGE_NORMAL);
+    assert_eq!(elems[1].offset, 12);
+    assert_eq!(elems[2].usage, D3DDECLUSAGE_TEXCOORD);
+    assert_eq!(elems[2].usage_index, 0);
+    assert_eq!(elems[2].offset, 24);
+    assert_eq!(stride, 32);
+}
+
+#[test]
+fn fvf_synthesize_elements_xyzrhw_diffuse_tex1() {
+    let (elems, stride) = fvf_to_elements(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | (1 << 8));
+    assert_eq!(elems.len(), 3);
+    assert_eq!(elems[0].usage, D3DDECLUSAGE_POSITIONT);
+    assert_eq!(elems[0].type_, D3DDECLTYPE_FLOAT4);
+    assert_eq!(elems[1].usage, D3DDECLUSAGE_COLOR);
+    assert_eq!(elems[1].usage_index, 0);
+    assert_eq!(elems[1].type_, D3DDECLTYPE_D3DCOLOR);
+    assert_eq!(elems[1].offset, 16);
+    assert_eq!(elems[2].usage, D3DDECLUSAGE_TEXCOORD);
+    assert_eq!(elems[2].offset, 20);
+    assert_eq!(stride, 28);
+}
+
+#[test]
+fn fvf_to_elements_matches_d3d9_blend_matrix() {
+    // Each row is (type_, usage, usage_index, offset); the table maps an
+    // fvf to its expected element rows via the canonical D3D9 FVF ->
+    // declaration conversion. Covers every XYZBn / LASTBETA combination,
+    // including the XYZB2|D3DCOLOR quirk (weight = D3DCOLOR, index =
+    // UBYTE4).
+    type Row = (u8, u8, u8, u16);
+    let cases: &[(u32, &[Row])] = &[
+        (
+            D3DFVF_XYZ,
+            &[(D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0)],
+        ),
+        (
+            D3DFVF_XYZW,
+            &[(D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITION, 0, 0)],
+        ),
+        (
+            D3DFVF_XYZRHW,
+            &[(D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT, 0, 0)],
+        ),
+        (
+            D3DFVF_XYZB1,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT1, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+            ],
+        ),
+        (
+            D3DFVF_XYZB1 | D3DFVF_LASTBETA_UBYTE4,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_UBYTE4, D3DDECLUSAGE_BLENDINDICES, 0, 12),
+            ],
+        ),
+        (
+            D3DFVF_XYZB1 | D3DFVF_LASTBETA_D3DCOLOR,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_BLENDINDICES, 0, 12),
+            ],
+        ),
+        (
+            D3DFVF_XYZB2,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT2, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+            ],
+        ),
+        (
+            D3DFVF_XYZB2 | D3DFVF_LASTBETA_UBYTE4,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT1, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+                (D3DDECLTYPE_UBYTE4, D3DDECLUSAGE_BLENDINDICES, 0, 16),
+            ],
+        ),
+        (
+            D3DFVF_XYZB2 | D3DFVF_LASTBETA_D3DCOLOR,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+                (D3DDECLTYPE_UBYTE4, D3DDECLUSAGE_BLENDINDICES, 0, 16),
+            ],
+        ),
+        (
+            D3DFVF_XYZB3,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+            ],
+        ),
+        (
+            D3DFVF_XYZB3 | D3DFVF_LASTBETA_UBYTE4,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT2, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+                (D3DDECLTYPE_UBYTE4, D3DDECLUSAGE_BLENDINDICES, 0, 20),
+            ],
+        ),
+        (
+            D3DFVF_XYZB3 | D3DFVF_LASTBETA_D3DCOLOR,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT2, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+                (D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_BLENDINDICES, 0, 20),
+            ],
+        ),
+        (
+            D3DFVF_XYZB4,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+            ],
+        ),
+        (
+            D3DFVF_XYZB4 | D3DFVF_LASTBETA_UBYTE4,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+                (D3DDECLTYPE_UBYTE4, D3DDECLUSAGE_BLENDINDICES, 0, 24),
+            ],
+        ),
+        (
+            D3DFVF_XYZB4 | D3DFVF_LASTBETA_D3DCOLOR,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+                (D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_BLENDINDICES, 0, 24),
+            ],
+        ),
+        (
+            D3DFVF_XYZB5,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+                (D3DDECLTYPE_FLOAT1, D3DDECLUSAGE_BLENDINDICES, 0, 28),
+            ],
+        ),
+        (
+            D3DFVF_XYZB5 | D3DFVF_LASTBETA_UBYTE4,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+                (D3DDECLTYPE_UBYTE4, D3DDECLUSAGE_BLENDINDICES, 0, 28),
+            ],
+        ),
+        (
+            D3DFVF_XYZB5 | D3DFVF_LASTBETA_D3DCOLOR,
+            &[
+                (D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION, 0, 0),
+                (D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BLENDWEIGHT, 0, 12),
+                (D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_BLENDINDICES, 0, 28),
+            ],
+        ),
+    ];
+    for (fvf, expected) in cases {
+        let (elems, _stride) = fvf_to_elements(*fvf);
+        assert_eq!(
+            elems.len(),
+            expected.len(),
+            "element count for fvf {fvf:#x}"
+        );
+        for (i, (ty, usage, usage_index, offset)) in expected.iter().enumerate() {
+            assert_eq!(elems[i].type_, *ty, "type fvf {fvf:#x} elem {i}");
+            assert_eq!(elems[i].usage, *usage, "usage fvf {fvf:#x} elem {i}");
+            assert_eq!(
+                elems[i].usage_index, *usage_index,
+                "usage_index fvf {fvf:#x} elem {i}"
+            );
+            assert_eq!(elems[i].offset, *offset, "offset fvf {fvf:#x} elem {i}");
+            assert_eq!(elems[i].stream, 0, "stream fvf {fvf:#x} elem {i}");
+            assert_eq!(elems[i].method, 0, "method fvf {fvf:#x} elem {i}");
+        }
+    }
+}
+
+#[test]
+fn fvf_synthesize_elements_xyzb3() {
+    let (elems, stride) = fvf_to_elements(D3DFVF_XYZB3);
+    // XYZB3 with no LASTBETA flag: 3 floats position + 3 blend weights.
+    assert_eq!(elems.len(), 2);
+    assert_eq!(elems[0].usage, D3DDECLUSAGE_POSITION);
+    assert_eq!(elems[1].usage, D3DDECLUSAGE_BLENDWEIGHT);
+    assert_eq!(elems[1].type_, D3DDECLTYPE_FLOAT3);
+    assert_eq!(stride, 24);
+}
+
+#[test]
+fn resolve_attrs_for_vs_swaps_register_indices() {
+    // VS declares position on v2 and texcoord0 on v7 — the resolved
+    // attr_index must match the register, not the FVF convention.
+    let semantics = vec![
+        InputSemantic {
+            usage: DeclUsage::Position,
+            usage_index: 0,
+            register_index: 2,
+        },
+        InputSemantic {
+            usage: DeclUsage::Texcoord,
+            usage_index: 0,
+            register_index: 7,
+        },
+    ];
+    let elems = [pos3(), tex0(12)];
+    let resolved = resolve_attrs_for_vs(&elems, &semantics);
+    assert_eq!(resolved.attrs.len(), 2);
+    assert_eq!(resolved.attrs[0].attr_index, 2);
+    assert_eq!(resolved.attrs[1].attr_index, 7);
+    assert_eq!(resolved.extents[0], 20);
+    assert_eq!(resolved.used_streams, 0b1);
+}
+
+#[test]
+fn resolve_attrs_skips_unused_semantics() {
+    // VS declares only POSITION; NORMAL in the decl is silently dropped.
+    let semantics = vec![InputSemantic {
+        usage: DeclUsage::Position,
+        usage_index: 0,
+        register_index: 0,
+    }];
+    let elems = [
+        pos3(),
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 12,
+            type_: D3DDECLTYPE_FLOAT3,
+            method: 0,
+            usage: D3DDECLUSAGE_NORMAL,
+            usage_index: 0,
+        },
+    ];
+    let resolved = resolve_attrs_for_vs(&elems, &semantics);
+    assert_eq!(resolved.attrs.len(), 1);
+    assert_eq!(resolved.attrs[0].attr_index, 0);
+    // The extent covers only the consumed position: the unconsumed normal
+    // is not in the descriptor, and counting it would force the layout
+    // stride past a packed buffer's true per-vertex span.
+    assert_eq!(resolved.extents[0], 12);
+}
+
+#[test]
+fn resolve_attrs_for_ff_matches_ff_convention() {
+    // POSITION → attr(0), TEXCOORD0 → attr(4). Must agree with
+    // `crate::dxso::ff_attr_index_for_semantic`.
+    let elems = [pos3(), tex0(12)];
+    let resolved = resolve_attrs_for_ff(&elems, &NO_PASSTHROUGH);
+    assert_eq!(resolved.attrs.len(), 2);
+    assert_eq!(resolved.attrs[0].attr_index, 0);
+    assert_eq!(resolved.attrs[1].attr_index, 4);
+    assert_eq!(resolved.extents[0], 20);
+}
+
+/// The FF descriptor fetches `D3DCOLOR` blend indices as raw bytes in memory order.
+///
+/// A normalized BGRA fetch would hand the FF VS colour channels in (0, 1),
+/// swizzled, where it needs each byte's value as a palette index. Every other
+/// `D3DCOLOR` element, and the same element under a programmable VS, keeps
+/// the colour fetch.
+#[test]
+fn resolve_attrs_for_ff_fetches_d3dcolor_blend_indices_as_bytes() {
+    let (elements, _) = fvf_to_elements(D3DFVF_XYZB3 | D3DFVF_LASTBETA_D3DCOLOR | D3DFVF_DIFFUSE);
+    let format_of = |resolved: &ResolvedAttrs, attr: u32| {
+        resolved
+            .attrs
+            .iter()
+            .find(|a| a.attr_index == attr)
+            .map(|a| a.format)
+    };
+    let ff = resolve_attrs_for_ff(&elements, &NO_PASSTHROUGH);
+    assert_eq!(format_of(&ff, 13), Some(VertexFormat::UChar4), "indices");
+    assert_eq!(format_of(&ff, 12), Some(VertexFormat::Float2), "weights");
+    assert_eq!(
+        format_of(&ff, 2),
+        Some(VertexFormat::UChar4NormalizedBgra),
+        "diffuse"
+    );
+    let semantics = [InputSemantic {
+        usage: DeclUsage::BlendIndices,
+        usage_index: 0,
+        register_index: 3,
+    }];
+    let programmable = resolve_attrs_for_vs(&elements, &semantics);
+    assert_eq!(
+        format_of(&programmable, 3),
+        Some(VertexFormat::UChar4NormalizedBgra),
+        "a programmable VS decodes D3DCOLOR itself"
+    );
+}
+
+#[test]
+fn resolve_attrs_keeps_each_stream_separate() {
+    // POSITION on stream 0, COLOR0 on stream 1 at offset 0, an unconsumed
+    // NORMAL on stream 1 past it: stream 1's extent stops at the colour,
+    // the colour attribute points at buffer 1, and both streams are used.
+    let elems = [
+        pos3(),
+        D3DVERTEXELEMENT9 {
+            stream: 1,
+            offset: 0,
+            type_: D3DDECLTYPE_D3DCOLOR,
+            method: 0,
+            usage: D3DDECLUSAGE_COLOR,
+            usage_index: 0,
+        },
+        D3DVERTEXELEMENT9 {
+            stream: 1,
+            offset: 4,
+            type_: D3DDECLTYPE_FLOAT3,
+            method: 0,
+            usage: D3DDECLUSAGE_NORMAL,
+            usage_index: 0,
+        },
+    ];
+    let semantics = vec![
+        InputSemantic {
+            usage: DeclUsage::Position,
+            usage_index: 0,
+            register_index: 0,
+        },
+        InputSemantic {
+            usage: DeclUsage::Color,
+            usage_index: 0,
+            register_index: 1,
+        },
+    ];
+    let resolved = resolve_attrs_for_vs(&elems, &semantics);
+    assert_eq!(resolved.attrs.len(), 2);
+    assert_eq!(resolved.attrs[0].buffer_index, 0);
+    assert_eq!(resolved.attrs[1].buffer_index, 1);
+    assert_eq!(resolved.attrs[1].attr_index, 1);
+    assert_eq!(resolved.extents[0], 12);
+    assert_eq!(resolved.extents[1], 4);
+    assert_eq!(resolved.used_streams, 0b11);
+
+    // A stream that only carries unconsumed elements is not used and
+    // reports no extent — nothing in the descriptor reads from it.
+    let resolved = resolve_attrs_for_vs(&elems, &semantics[..1]);
+    assert_eq!(resolved.used_streams, 0b1);
+    assert_eq!(resolved.extents[1], 0);
+
+    // The FF path maps streams the same way.
+    let resolved = resolve_attrs_for_ff(&elems, &NO_PASSTHROUGH);
+    assert_eq!(resolved.attrs.len(), 3);
+    assert_eq!(resolved.attrs[1].buffer_index, 1);
+    assert_eq!(resolved.used_streams, 0b11);
+}
+
+#[test]
+fn resolve_attrs_drops_streams_past_the_slot_table() {
+    let elems = [
+        pos3(),
+        D3DVERTEXELEMENT9 {
+            stream: 16,
+            offset: 0,
+            type_: D3DDECLTYPE_D3DCOLOR,
+            method: 0,
+            usage: D3DDECLUSAGE_COLOR,
+            usage_index: 0,
+        },
+    ];
+    let resolved = resolve_attrs_for_ff(&elems, &NO_PASSTHROUGH);
+    assert_eq!(resolved.attrs.len(), 1);
+    assert_eq!(resolved.used_streams, 0b1);
+    let layout = ff_vs_layout_from_elements(&elems);
+    assert!(
+        !layout.has_color0(),
+        "dropped element leaves no flag behind"
+    );
+}
+
+fn end() -> D3DVERTEXELEMENT9 {
+    D3DVERTEXELEMENT9 {
+        stream: D3DDECL_END_STREAM,
+        offset: 0,
+        type_: mtld3d_types::D3DDECLTYPE_UNUSED,
+        method: 0,
+        usage: 0,
+        usage_index: 0,
+    }
+}
+
+#[test]
+fn pack_vertex_decl_hash_stable_across_calls() {
+    let elems = [pos3(), tex0(12), end()];
+    let h_a = pack_vertex_decl(&elems).expect("pack a").hash;
+    let h_b = pack_vertex_decl(&elems).expect("pack b").hash;
+    assert_eq!(h_a, h_b);
+    let swapped = [pos3(), tex0(16), end()];
+    let h_c = pack_vertex_decl(&swapped).expect("pack c").hash;
+    assert_ne!(h_a, h_c);
+}
+
+#[test]
+fn pack_vertex_decl_multi_stream_distinct_hash_and_mask() {
+    // Two layouts that differ *only* by stream must hash differently so
+    // the pipeline cache keeps them apart, and the stream mask names the
+    // streams the draw path has to snapshot.
+    let on_stream = |stream| D3DVERTEXELEMENT9 {
+        stream,
+        offset: 0,
+        type_: D3DDECLTYPE_FLOAT3,
+        method: 0,
+        usage: D3DDECLUSAGE_POSITION,
+        usage_index: 0,
+    };
+    let a = pack_vertex_decl(&[on_stream(0), end()]).expect("stream 0 accepted");
+    let b = pack_vertex_decl(&[on_stream(1), end()]).expect("stream 1 accepted");
+    assert_ne!(a.hash, b.hash, "stream must participate in the decl hash");
+    assert_eq!(a.stream_mask, 0b01);
+    assert_eq!(b.stream_mask, 0b10);
+    let both = pack_vertex_decl(&[on_stream(0), tex0(0), on_stream(3), end()]).expect("pack");
+    assert_eq!(both.stream_mask, 0b1001);
+    // A stream past the slot table is accepted (D3D9 validates structure
+    // only) but contributes no bit.
+    let wide = pack_vertex_decl(&[on_stream(0), on_stream(16), end()]).expect("pack");
+    assert_eq!(wide.stream_mask, 0b1);
+}
+
+#[test]
+fn pack_vertex_decl_requires_terminator() {
+    assert!(pack_vertex_decl(&[pos3()]).is_none());
+}
+
+#[test]
+fn pack_vertex_decl_preserves_terminator_in_output() {
+    let elems = [pos3(), tex0(12), end()];
+    let packed = pack_vertex_decl(&elems).expect("pack").elements_with_end;
+    assert_eq!(packed.len(), 3);
+    assert_eq!(packed.last().unwrap().stream, D3DDECL_END_STREAM);
+}
+
+#[test]
+fn ff_vs_layout_clamps_tex_coord_count_to_8() {
+    // A vertex declaration that claims TEXCOORD at usage_index = 12
+    // must not produce tex_coord_count > 8 — FfVsKey's per-stage
+    // arrays are [u8; 8] and OOB-crashed the encoder thread.
+    let elements = [
+        pos3(),
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 12,
+            type_: D3DDECLTYPE_FLOAT2,
+            method: 0,
+            usage: D3DDECLUSAGE_TEXCOORD,
+            usage_index: 12,
+        },
+    ];
+    let layout = ff_vs_layout_from_elements(&elements);
+    assert_eq!(layout.tex_coord_count, 8);
+}
+
+#[test]
+fn ff_vs_layout_in_spec_usage_index_7_yields_8() {
+    let elements = [
+        pos3(),
+        D3DVERTEXELEMENT9 {
+            stream: 0,
+            offset: 12,
+            type_: D3DDECLTYPE_FLOAT2,
+            method: 0,
+            usage: D3DDECLUSAGE_TEXCOORD,
+            usage_index: 7,
+        },
+    ];
+    let layout = ff_vs_layout_from_elements(&elements);
+    assert_eq!(layout.tex_coord_count, 8);
+}
+
+#[test]
+fn ff_vs_layout_single_tex0_yields_1() {
+    let layout = ff_vs_layout_from_elements(&[pos3(), tex0(12)]);
+    assert_eq!(layout.tex_coord_count, 1);
+}
+
+#[test]
+fn declaration_rhw_matches_full_layout_across_streams_and_texcoord_extents() {
+    assert!(!vertex_decl_has_rhw(&[]));
+    assert!(!vertex_decl_has_rhw(&[pos3(), tex0(12)]));
+    for stream in [0, 15, 16, u16::MAX] {
+        for usage_index in [0, 7, 8, u8::MAX] {
+            let position = D3DVERTEXELEMENT9 {
+                stream,
+                usage: D3DDECLUSAGE_POSITIONT,
+                ..pos3()
+            };
+            let texcoord = D3DVERTEXELEMENT9 {
+                stream,
+                usage_index,
+                ..tex0(12)
+            };
+            // A malformed TEXCOORD after POSITIONT must still reach diagnostics.
+            // Reversing the order must preserve both the flag and maximum extent.
+            for elements in [
+                [position, texcoord, tex0(16)],
+                [tex0(16), texcoord, position],
+            ] {
+                let expected_rhw = u32::from(stream) < MAX_STREAMS;
+                assert_eq!(vertex_decl_has_rhw(&elements), expected_rhw);
+                let full = ff_vs_layout_from_elements(&elements);
+                assert_eq!(full.has_rhw(), expected_rhw);
+                let expected_extent = if expected_rhw {
+                    usage_index.saturating_add(1).min(8)
+                } else {
+                    1
+                };
+                assert_eq!(full.tex_coord_count, expected_extent);
+            }
+        }
+    }
+}
+
+#[test]
+fn texcoord_extent_clamp_covers_all_diagnostic_keys() {
+    assert_eq!(checked_tex_coord_count(None), 0);
+    for index in 0..=u8::MAX {
+        assert_eq!(
+            checked_tex_coord_count(Some(index)),
+            index.saturating_add(1).min(8)
+        );
+    }
+}
+
+#[test]
+fn d3d_depth_bias_reaches_clip_space_unscaled_over_the_full_depth_range() {
+    // D3D9 states the bias in the depth range itself, and the vertex shader
+    // adds it times `w`, so over a 0..1 viewport the raw value is the offset.
+    for raw in [0.0_f32, -0.0, 2.5e-5, -2.5e-5, 0.1] {
+        assert_eq!(
+            d3d_depth_bias_to_clip(raw.to_bits(), 0.0, 1.0).to_bits(),
+            raw.to_bits()
+        );
+    }
+}
+
+#[test]
+fn d3d_depth_bias_is_divided_by_the_viewport_depth_range() {
+    // The viewport maps clip depth into `min_z..max_z` after the vertex
+    // shader added the offset, scaling it by the range; dividing first
+    // leaves the fragment the absolute bias D3D9 asked for.
+    let clip = d3d_depth_bias_to_clip(0.125_f32.to_bits(), 0.25, 0.75);
+    assert_eq!(clip.to_bits(), 0.25_f32.to_bits());
+}
+
+#[test]
+fn d3d_depth_bias_is_dropped_over_an_empty_depth_range() {
+    for (min_z, max_z) in [(0.5_f32, 0.5_f32), (0.75, 0.25)] {
+        let clip = d3d_depth_bias_to_clip(0.125_f32.to_bits(), min_z, max_z);
+        assert_eq!(clip.to_bits(), 0.0_f32.to_bits());
+    }
+}
+
+#[test]
+fn d3d_slope_scale_follows_the_render_scale() {
+    // At the identity the factor reaches Metal as the game wrote it; on a
+    // target rasterized at 3/4 size each render pixel spans 4/3 of a reported
+    // one, so Metal's per-pixel slope is 4/3 larger and the factor shrinks
+    // by 3/4 to keep the offset.
+    for raw in [0.0_f32, -0.0, 2.0, -1.5] {
+        assert_eq!(
+            d3d_slope_scale_to_metal(raw.to_bits(), 1.0).to_bits(),
+            raw.to_bits()
+        );
+    }
+    assert_eq!(
+        d3d_slope_scale_to_metal(2.0_f32.to_bits(), 0.75).to_bits(),
+        1.5_f32.to_bits()
+    );
+}
+
+#[test]
+fn d3d_to_metal_blend_op_table() {
+    assert_eq!(d3d_to_metal_blend_op(1), BlendOperation::Add);
+    assert_eq!(d3d_to_metal_blend_op(2), BlendOperation::Subtract);
+    assert_eq!(d3d_to_metal_blend_op(3), BlendOperation::ReverseSubtract);
+    assert_eq!(d3d_to_metal_blend_op(4), BlendOperation::Min);
+    assert_eq!(d3d_to_metal_blend_op(5), BlendOperation::Max);
+    // Unknown → Add (with warn).
+    assert_eq!(d3d_to_metal_blend_op(0), BlendOperation::Add);
+    assert_eq!(d3d_to_metal_blend_op(99), BlendOperation::Add);
+}
+
+#[test]
+fn color_fill_float_formats_carry_normalized_channels() {
+    // 0xAARRGGBB = 0x8040_2010 → R=0x40, G=0x20, B=0x10, A=0x80, each
+    // normalized by 255 and stored in R, G, B, A order.
+    let expect = |byte: u8| f32::from(byte) / 255.0;
+
+    let bytes = d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_A32B32G32R32F).unwrap();
+    assert_eq!(bytes.len(), 16);
+    for (i, byte) in [0x40u8, 0x20, 0x10, 0x80].into_iter().enumerate() {
+        let lane = f32::from_le_bytes([
+            bytes[i * 4],
+            bytes[i * 4 + 1],
+            bytes[i * 4 + 2],
+            bytes[i * 4 + 3],
+        ]);
+        assert_eq!(lane.to_bits(), expect(byte).to_bits(), "lane {i}");
+    }
+
+    let bytes = d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_G32R32F).unwrap();
+    assert_eq!(bytes.len(), 8);
+    assert_eq!(
+        f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]).to_bits(),
+        expect(0x20).to_bits()
+    );
+
+    // The half-float twins carry the same values through binary16.
+    let bytes = d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_A16B16G16R16F).unwrap();
+    assert_eq!(bytes.len(), 8);
+    for (i, byte) in [0x40u8, 0x20, 0x10, 0x80].into_iter().enumerate() {
+        let lane = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+        assert_eq!(lane, f32_to_f16_bits(expect(byte)), "lane {i}");
+    }
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_G16R16F)
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_R16F).unwrap(),
+        f32_to_f16_bits(expect(0x40)).to_le_bytes().to_vec()
+    );
+}
+
+#[test]
+fn color_fill_unorm16_formats_replicate_each_channel() {
+    // 0xab widens to 0xabab: exact at both endpoints, half an LSB elsewhere.
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x8040_2010, D3DFMT_A16B16G16R16).unwrap(),
+        vec![0x40, 0x40, 0x20, 0x20, 0x10, 0x10, 0x80, 0x80]
+    );
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xff00_ff00, D3DFMT_G16R16).unwrap(),
+        vec![0x00, 0x00, 0xff, 0xff]
+    );
+}
+
+#[test]
+fn f32_to_f16_bits_matches_the_ieee_encoding() {
+    // Exactly representable values, both signs.
+    assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+    assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
+    assert_eq!(f32_to_f16_bits(1.0), 0x3c00);
+    assert_eq!(f32_to_f16_bits(-2.0), 0xc000);
+    assert_eq!(f32_to_f16_bits(0.5), 0x3800);
+    // Largest finite binary16, and the first magnitude that overflows it.
+    assert_eq!(f32_to_f16_bits(65504.0), 0x7bff);
+    assert_eq!(f32_to_f16_bits(65536.0), 0x7c00);
+    assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
+    assert_eq!(f32_to_f16_bits(f32::NEG_INFINITY), 0xfc00);
+    // NaN stays a NaN (exponent all ones, non-zero payload).
+    let nan = f32_to_f16_bits(f32::NAN);
+    assert_eq!(nan & 0x7c00, 0x7c00);
+    assert_ne!(nan & 0x03ff, 0);
+    // Subnormals: the smallest one, and a magnitude below it flushing to
+    // a signed zero.
+    assert_eq!(f32_to_f16_bits(f32::from_bits(0x3380_0000)), 0x0001);
+    assert_eq!(f32_to_f16_bits(-1.0e-9), 0x8000);
+    // Ties round to even. binary16's ulp at 1.0 is 2^-10, so 1.0 + 2^-11
+    // sits exactly between 1.0 (even) and its successor, and lands on 1.0;
+    // 1.0 + 3 * 2^-11 sits between the successor (odd) and the one after
+    // (even), and lands on the one after.
+    assert_eq!(f32_to_f16_bits(1.0 + 0.000_488_281_25), 0x3c00);
+    assert_eq!(
+        f32_to_f16_bits(3.0f32.mul_add(0.000_488_281_25, 1.0)),
+        0x3c02
+    );
+}
+
+#[test]
+fn border_addressing_and_colour_presets() {
+    use mtld3d_shared::mtl::BorderColor;
+    assert_eq!(
+        d3d_to_metal_address_mode(D3DTADDRESS_BORDER),
+        AddressMode::ClampToBorderColor
+    );
+    assert_eq!(d3d_border_color_to_metal(0), BorderColor::TransparentBlack);
+    assert_eq!(
+        d3d_border_color_to_metal(0xFF00_0000),
+        BorderColor::OpaqueBlack
+    );
+    assert_eq!(
+        d3d_border_color_to_metal(0xFFFF_FFFF),
+        BorderColor::OpaqueWhite
+    );
+    // Anything else has no preset and falls back to opaque black.
+    assert_eq!(
+        d3d_border_color_to_metal(0xFFFF_FF00),
+        BorderColor::OpaqueBlack
+    );
+    assert_eq!(
+        d3d_border_color_to_metal(0x00FF_FFFF),
+        BorderColor::OpaqueBlack
+    );
+}
+
+#[test]
+fn splat_pattern_repeats_across_the_slice() {
+    let mut dst = [0u8; 12];
+    splat_pixel_pattern(&mut dst, &[1, 2, 3, 4]);
+    assert_eq!(dst, [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]);
+}
+
+#[test]
+fn splat_pattern_fills_a_partial_trailing_pixel() {
+    let mut dst = [0u8; 6];
+    splat_pixel_pattern(&mut dst, &[9, 8, 7, 6]);
+    assert_eq!(dst, [9, 8, 7, 6, 9, 8]);
+}
+
+#[test]
+fn splat_pattern_truncates_a_pattern_wider_than_the_slice() {
+    let mut dst = [0u8; 2];
+    splat_pixel_pattern(&mut dst, &[4, 5, 6, 7]);
+    assert_eq!(dst, [4, 5]);
+}
+
+#[test]
+fn splat_pattern_leaves_the_slice_alone_for_an_empty_pattern() {
+    let mut dst = [7u8; 3];
+    splat_pixel_pattern(&mut dst, &[]);
+    assert_eq!(dst, [7, 7, 7]);
+}
+
+#[test]
+fn fill_mode_preserves_triangles_and_maps_only_wireframe_to_lines() {
+    assert_eq!(d3d_to_metal_fill(D3DFILL_SOLID), TriangleFillMode::Fill);
+    assert_eq!(
+        d3d_to_metal_fill(D3DFILL_WIREFRAME),
+        TriangleFillMode::Lines
+    );
+    assert_eq!(d3d_to_metal_fill(D3DFILL_POINT), TriangleFillMode::Fill);
+    assert_eq!(d3d_to_metal_fill(u32::MAX), TriangleFillMode::Fill);
+}
+
+#[test]
+fn colorfill_a2r10g10b10_uses_nearest_normalized_channels() {
+    for (input, rgb, alpha) in [
+        (0, 0, 0),
+        (42, 168, 0),
+        (43, 173, 1),
+        (63, 253, 1),
+        (127, 509, 1),
+        (128, 514, 2),
+        (212, 850, 2),
+        (213, 855, 3),
+        (255, 1023, 3),
+    ] {
+        let color = u32::from_le_bytes([input; 4]);
+        let bytes = d3dcolor_fill_pixel_bytes(color, D3DFMT_A2R10G10B10).unwrap();
+        let expected = (alpha << 30) | (rgb << 20) | (rgb << 10) | rgb;
+        assert_eq!(bytes, u32::to_le_bytes(expected), "channel={input}");
+    }
+    let bytes = d3dcolor_fill_pixel_bytes(0x7f2b_00ff, D3DFMT_A2R10G10B10).unwrap();
+    assert_eq!(bytes, ((1_u32 << 30) | (173 << 20) | 1023).to_le_bytes());
+}
+
+#[test]
+fn colorfill_signed_formats_store_r_g_b_a_as_u_v_w_q() {
+    // 0xdeadbeef has four distinct channels, so an exchanged lane changes the
+    // bytes: R 0xad, G 0xbe, B 0xef, A 0xde land on 0x56, 0x5f, 0x77, 0x6f of
+    // 0x7f and on 0x56d6, 0x5f5f, 0x77f7, 0x6f6f of 0x7fff.
+    for (format, expected) in [
+        (D3DFMT_V8U8, vec![0x56, 0x5f]),
+        (D3DFMT_Q8W8V8U8, vec![0x56, 0x5f, 0x77, 0x6f]),
+        (D3DFMT_V16U16, vec![0xd6, 0x56, 0x5f, 0x5f]),
+        (
+            D3DFMT_Q16W16V16U16,
+            vec![0xd6, 0x56, 0x5f, 0x5f, 0xf7, 0x77, 0x6f, 0x6f],
+        ),
+    ] {
+        assert_eq!(
+            d3dcolor_fill_pixel_bytes(0xdead_beef, format),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn colorfill_signed_formats_never_set_the_sign_bit() {
+    // A channel at or above 0x80 is still a value in [0, 1]: the endpoints
+    // are zero and the largest positive code, never a negative one.
+    for (color, narrow, wide) in [
+        (0x0000_0000, [0x00; 4], [0x0000; 4]),
+        (0xffff_ffff, [0x7f; 4], [0x7fff; 4]),
+        (0x8080_8080, [0x40; 4], [0x4040; 4]),
+        (0x00ff_0000, [0x7f, 0, 0, 0], [0x7fff, 0, 0, 0]),
+        (0x0000_ff00, [0, 0x7f, 0, 0], [0, 0x7fff, 0, 0]),
+        (0x0000_00ff, [0, 0, 0x7f, 0], [0, 0, 0x7fff, 0]),
+        (0xff00_0000, [0, 0, 0, 0x7f], [0, 0, 0, 0x7fff]),
+    ] {
+        let wide: Vec<u8> = wide.iter().flat_map(|w: &u16| w.to_le_bytes()).collect();
+        for (format, expected) in [
+            (D3DFMT_V8U8, &narrow[..2]),
+            (D3DFMT_Q8W8V8U8, &narrow[..]),
+            (D3DFMT_V16U16, &wide[..4]),
+            (D3DFMT_Q16W16V16U16, &wide[..]),
+        ] {
+            assert_eq!(
+                d3dcolor_fill_pixel_bytes(color, format).as_deref(),
+                Some(expected),
+                "format {format}, colour {color:#010x}"
+            );
+        }
+    }
+}
+
+#[test]
+fn colorfill_signed_channels_are_the_nearest_code_for_every_byte() {
+    for channel in 0..=255u8 {
+        let values = [channel, 255 - channel, channel ^ 0x55, channel ^ 0xaa];
+        let [r, g, b, a] = values;
+        let color = u32::from_le_bytes([b, g, r, a]);
+        for (format, maximum, count) in [
+            (D3DFMT_V8U8, 127.0, 2),
+            (D3DFMT_Q8W8V8U8, 127.0, 4),
+            (D3DFMT_V16U16, 32767.0, 2),
+            (D3DFMT_Q16W16V16U16, 32767.0, 4),
+        ] {
+            let bytes = d3dcolor_fill_pixel_bytes(color, format).unwrap();
+            let encoded: Vec<u16> = if bytes.len() == count {
+                bytes.iter().map(|&v| u16::from(v)).collect()
+            } else {
+                u16_indices(&bytes)
+            };
+            assert_eq!(encoded.len(), count);
+            for (&actual, &input) in encoded.iter().zip(&values) {
+                let expected = (f64::from(input) / 255.0 * maximum).round();
+                assert_eq!(
+                    f64::from(actual).to_bits(),
+                    expected.to_bits(),
+                    "format {format}, input {input}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn colorfill_a2b10g10r10_exchanges_only_red_and_blue() {
+    for color in [
+        0,
+        0xffff_ffff,
+        0x7f2b_00ff,
+        0x3f00_ff2b,
+        0x2a2a_2a2a,
+        0x2b2b_2b2b,
+        0x7f7f_7f7f,
+        0x8080_8080,
+        0xd4d4_d4d4,
+        0xd5d5_d5d5,
+    ] {
+        let before = d3dcolor_fill_pixel_bytes(color, D3DFMT_A2R10G10B10).unwrap();
+        let word = u32::from_le_bytes(before.try_into().unwrap());
+        let expected = (word & 0xc00f_fc00) | ((word & 1023) << 20) | ((word >> 20) & 1023);
+        assert_eq!(
+            d3dcolor_fill_pixel_bytes(color, D3DFMT_A2B10G10R10).unwrap(),
+            expected.to_le_bytes()
+        );
+    }
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0x7f2b_00ff, D3DFMT_A2B10G10R10).unwrap(),
+        ((1_u32 << 30) | (1023 << 20) | 0x00ad).to_le_bytes()
+    );
+    // Four distinct channels: alpha 3, blue 959, green 762, red 694 (0x2b6).
+    assert_eq!(
+        d3dcolor_fill_pixel_bytes(0xdead_beef, D3DFMT_A2B10G10R10).unwrap(),
+        ((3_u32 << 30) | (959 << 20) | (762 << 10) | 0x02b6).to_le_bytes()
+    );
+}
+
+fn element(offset: u16, type_: u8, usage: u8, usage_index: u8) -> D3DVERTEXELEMENT9 {
+    D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_,
+        method: 0,
+        usage,
+        usage_index,
+    }
+}
+
+/// A pre-transformed declaration carrying every semantic a `ps_3_0` can read beside the FF set.
+fn pretransformed_monster() -> [D3DVERTEXELEMENT9; 11] {
+    [
+        element(0, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT, 0),
+        element(16, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BLENDWEIGHT, 0),
+        element(32, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BLENDINDICES, 0),
+        element(48, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_NORMAL, 0),
+        element(64, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_FOG, 0),
+        element(80, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_TEXCOORD, 0),
+        element(96, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_TANGENT, 0),
+        element(112, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_BINORMAL, 0),
+        element(128, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_DEPTH, 0),
+        element(144, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 0),
+        element(148, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR, 1),
+    ]
+}
+
+fn passthrough_code(usage: u8, usage_index: u8) -> u8 {
+    decl_passthrough_code(usage, usage_index).expect("semantic passes through")
+}
+
+#[test]
+fn a_pretransformed_layout_passes_its_other_semantics_through_in_declaration_order() {
+    let elements = pretransformed_monster();
+    let passthrough = rhw_passthrough(&elements);
+    let expected = [
+        passthrough_code(D3DDECLUSAGE_BLENDWEIGHT, 0),
+        passthrough_code(D3DDECLUSAGE_BLENDINDICES, 0),
+        passthrough_code(D3DDECLUSAGE_NORMAL, 0),
+        passthrough_code(D3DDECLUSAGE_FOG, 0),
+        passthrough_code(D3DDECLUSAGE_TANGENT, 0),
+        passthrough_code(D3DDECLUSAGE_BINORMAL, 0),
+        passthrough_code(D3DDECLUSAGE_DEPTH, 0),
+        0,
+    ];
+    assert_eq!(passthrough, expected);
+    assert_eq!(
+        pack_vertex_decl(&[&elements[..], &[end()]].concat())
+            .expect("pack")
+            .passthrough,
+        expected,
+        "the packed declaration carries the same list"
+    );
+
+    // Entry k reads attribute 15 + k; the rest keep the FF convention, and
+    // nothing lands on the FF normal or blend slots the pre-transformed
+    // stage never declares.
+    let resolved = resolve_attrs_for_ff(&elements, &passthrough);
+    let attr_of = |offset: u32| {
+        resolved
+            .attrs
+            .iter()
+            .find(|a| a.offset == offset)
+            .map(|a| (a.attr_index, a.format))
+    };
+    assert_eq!(attr_of(0), Some((0, VertexFormat::Float4)), "POSITIONT");
+    for (k, offset) in [16, 32, 48, 64, 96, 112, 128].into_iter().enumerate() {
+        let attr = 15 + u32::try_from(k).expect("slot fits u32");
+        assert_eq!(
+            attr_of(offset),
+            Some((attr, VertexFormat::Float4)),
+            "entry {k}"
+        );
+    }
+    assert_eq!(attr_of(80), Some((4, VertexFormat::Float4)), "TEXCOORD0");
+    assert_eq!(
+        attr_of(144),
+        Some((2, VertexFormat::UChar4NormalizedBgra)),
+        "COLOR0"
+    );
+    assert_eq!(
+        attr_of(148),
+        Some((3, VertexFormat::UChar4NormalizedBgra)),
+        "COLOR1"
+    );
+    assert_eq!(resolved.attrs.len(), elements.len());
+}
+
+#[test]
+fn an_untransformed_layout_passes_nothing_through() {
+    let mut elements = pretransformed_monster();
+    elements[0].usage = D3DDECLUSAGE_POSITION;
+    let passthrough = rhw_passthrough(&elements);
+    assert_eq!(passthrough, NO_PASSTHROUGH);
+    let resolved = resolve_attrs_for_ff(&elements, &passthrough);
+    assert!(resolved.attrs.iter().all(|a| a.attr_index < 15));
+}
+
+#[test]
+fn a_pretransformed_passthrough_skips_dropped_elements_repeats_and_overflow() {
+    let mut elements = vec![element(0, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_POSITIONT, 0)];
+    // An element on a stream past the table and one with no Metal format
+    // never reach the descriptor, so they never pass through either.
+    let mut far = element(16, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_NORMAL, 0);
+    far.stream = 16;
+    elements.push(far);
+    elements.push(element(16, D3DDECLTYPE_UNUSED, D3DDECLUSAGE_TANGENT, 0));
+    // Ten distinct semantics and one repeat: the first eight pass through.
+    for index in 0..10 {
+        elements.push(element(
+            32,
+            D3DDECLTYPE_FLOAT4,
+            D3DDECLUSAGE_COLOR,
+            2 + index,
+        ));
+    }
+    elements.push(element(32, D3DDECLTYPE_FLOAT4, D3DDECLUSAGE_COLOR, 2));
+    let expected: Vec<u8> = (0..8)
+        .map(|index| passthrough_code(D3DDECLUSAGE_COLOR, 2 + index))
+        .collect();
+    assert_eq!(rhw_passthrough(&elements)[..], expected[..]);
+}

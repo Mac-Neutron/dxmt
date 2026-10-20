@@ -1,0 +1,626 @@
+//! Always-on PE-side crash diagnostics.
+//!
+//! Installed once from `init_logger()` during `DllMain` `PROCESS_ATTACH`, and
+//! the vectored handler is removed again on a `PROCESS_DETACH` the process
+//! survives: a VEH registration is a process-wide pointer into this image, and
+//! launchers and benchmarks routinely `LoadLibrary` d3d9, probe the caps and
+//! `FreeLibrary` it before carrying on. Left behind, the registration turns
+//! the process's next exception (C++ throws included) into an instruction
+//! fetch from unmapped memory, which raises the next exception, which reaches
+//! the same stale entry, until the main thread's stack is gone. The panic hook
+//! needs no such care: it lives in this cdylib's own `std` and nothing else in
+//! the process can reach it once the image is gone.
+//!
+//! Two pieces, both diagnostic-only — they print the crumb trail and
+//! delegate termination to the normal SEH / `panic_abort` paths:
+//!
+//! 1. A Vectored Exception Handler that filters to truly-fatal `NTSTATUS`
+//!    codes AND faults that originate inside our `d3d9.dll` image. On a
+//!    match it writes a one-line FATAL banner + dumps the shared crumb
+//!    trail, then returns `EXCEPTION_CONTINUE_SEARCH` — `WoW`'s
+//!    unhandled-exception filter still gets a chance to write
+//!    `Crash.txt` before the process dies.
+//!
+//! 2. A panic hook. `panic = "abort"` ends the process inside the hook's
+//!    caller, so the hook writes the report into the log synchronously:
+//!    the panic's thread name, thread id, location and message, worded as
+//!    the default hook words them, then the crumb trail. It then chains
+//!    to the previous (default) hook, which prints the same
+//!    `thread '…' panicked at …` report and (with `RUST_BACKTRACE`) a
+//!    backtrace to stderr, where a game a launcher spawned shows nothing.
+//!    Empty backtraces under Wine are accepted as-is.
+//!
+//! Faults in other modules (game code, `ClientExtensions.dll` `VMProtect`
+//! probes, system DLLs) pass through to SEH normally, so `VMProtect`'s
+//! first-chance recovery still works and `WoW` continues. Their report is a
+//! first-chance one: it waits in the backlog and opens no log, since the
+//! fault may be handled. When nothing handles it, Wine ends the process with
+//! `TerminateProcess` on itself, which runs nothing of ours, so before
+//! `Direct3DCreate9` that report dies with the process and only the unix
+//! side's first-chance line on stderr remains. A top-level filter for
+//! unhandled exceptions does not cover that case: the startup code of a game
+//! built with Visual Studio 2015 or later replaces such a filter without
+//! chaining, and one left behind by a `FreeLibrary` before any device would
+//! point into unmapped code.
+//!
+//! The vectored handler runs on whatever thread raised the exception, and
+//! nothing it reaches touches a Rust thread-local or the allocator: fixed
+//! buffers, atomics, `kernel32` lookups that allocate nothing, and the
+//! synchronous log thunk. Wine leaves `TEB.ThreadLocalStoragePointer` null
+//! on a thread created without thread-attach notifications and after a
+//! thread's detach, and copy protectors raise exceptions on such threads, so
+//! a thread-local read in the handler faults inside this image; that fault
+//! reaches the handler again, and a protector's frame that resumes the first
+//! exception at its own PC loops the thread. A faulting thread may also hold
+//! an allocator's lock.
+//!
+//! `RUST_BACKTRACE=1` is set here (if unset) so the default panic hook
+//! attempts a backtrace.
+
+use core::{
+    ffi::c_void,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering},
+};
+
+use mtld3d_core::{address_space::FreeSpace, crash_report::PanicLine};
+use mtld3d_shared::crumb;
+
+// NTSTATUS codes the handler filters on.
+const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+const STATUS_HEAP_CORRUPTION: u32 = 0xC000_0374;
+const STATUS_PRIVILEGED_INSTRUCTION: u32 = 0xC000_0096;
+const STATUS_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+const STATUS_STACK_BUFFER_OVERRUN: u32 = 0xC000_0409;
+const STATUS_ASSERTION_FAILURE: u32 = 0xC000_0420;
+
+const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+pub const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 4;
+/// `GetModuleHandleEx` flag that leaves the module's reference count as it is.
+const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 2;
+/// `GetModuleHandleEx` flag that keeps the module loaded until the process ends.
+pub const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 1;
+/// What opens the panic line in the log, ahead of std's own wording.
+const PANIC_PREFIX: &str = "[mtld3d::d3d9] PANIC: ";
+/// The name a panic line gives a thread that has none, as std's default hook does.
+const UNNAMED_THREAD: &str = "<unnamed>";
+/// Bytes of a thread's name a panic line carries.
+const THREAD_NAME_CAPACITY: usize = 128;
+/// UTF-16 units of a thread's description read at most, in search of its terminator.
+const THREAD_DESCRIPTION_SCAN: usize = 512;
+
+static INSTALLED: AtomicBool = AtomicBool::new(false);
+static D3D9_HMODULE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+/// The registration `RtlAddVectoredExceptionHandler` handed back, for [`uninstall`].
+static VEH_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
+/// Faults outside our image reported so far; the report stops after a few.
+static FOREIGN_REPORTS: AtomicU32 = AtomicU32::new(0);
+
+/// How many faults outside our image get a line in the log.
+///
+/// Some programs probe with deliberate access violations, and every one
+/// of those would otherwise cost a module lookup and a crumb dump.
+const FOREIGN_REPORT_LIMIT: u32 = 4;
+
+/// `MEMORY_BASIC_INFORMATION`, one region of the address space.
+#[repr(C)]
+struct MemoryBasicInformation {
+    base_address: *mut c_void,
+    allocation_base: *mut c_void,
+    allocation_protect: u32,
+    region_size: usize,
+    state: u32,
+    protect: u32,
+    kind: u32,
+}
+
+const MEM_FREE: u32 = 0x1_0000;
+
+/// Free address space of this process: the sum of the usable free regions and the largest.
+///
+/// The free figure the address-space watch and the crash lines report. It is
+/// not `GlobalMemoryStatusEx`'s `ullAvailVirtual`, which Wine computes as the
+/// total minus the process working set (see `mtld3d_core::address_space`).
+/// Free space that no single allocation can use is what fails a DLL load or a
+/// game's streaming block long before the total runs out, so both come from
+/// the same walk. Allocation-free, so the exception handler can call it.
+pub fn free_space() -> FreeSpace {
+    let mut space = FreeSpace::new();
+    walk_regions(|addr, info| {
+        space.add_region(info.state == MEM_FREE, addr as u64, info.region_size as u64);
+    });
+    space
+}
+
+/// Visit every region of the address space in address order, with its base address.
+///
+/// One `VirtualQuery` per region (a few thousand calls), stopping where the
+/// query fails or the address would wrap.
+fn walk_regions(mut visit: impl FnMut(usize, &MemoryBasicInformation)) {
+    let mut addr = 0usize;
+    loop {
+        let mut info = MemoryBasicInformation {
+            base_address: core::ptr::null_mut(),
+            allocation_base: core::ptr::null_mut(),
+            allocation_protect: 0,
+            region_size: 0,
+            state: 0,
+            protect: 0,
+            kind: 0,
+        };
+        // SAFETY: kernel32 export filling a struct of the size passed.
+        let got = unsafe {
+            VirtualQuery(
+                addr as *const c_void,
+                &raw mut info,
+                size_of::<MemoryBasicInformation>(),
+            )
+        };
+        if got == 0 || info.region_size == 0 {
+            break;
+        }
+        visit(addr, &info);
+        let Some(next) = addr.checked_add(info.region_size) else {
+            break;
+        };
+        addr = next;
+    }
+}
+
+const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_IMAGE: u32 = 0x100_0000;
+const MEM_MAPPED: u32 = 0x4_0000;
+
+/// A summary of the address space: region counts by state and the largest regions.
+///
+/// One line of text for the log, built when the free space crosses one of
+/// the watch's thresholds, so the log names who owns the space (image,
+/// mapped file, private commit, private reserve) and where the biggest holes
+/// are.
+pub fn address_space_map() -> String {
+    let mut regions: Vec<(usize, usize, u32, u32)> = Vec::new();
+    walk_regions(|addr, info| regions.push((addr, info.region_size, info.state, info.kind)));
+    let mut free = 0usize;
+    let mut committed = 0usize;
+    let mut reserved = 0usize;
+    let mut image = 0usize;
+    let mut mapped = 0usize;
+    let mut free_holes = 0usize;
+    let mut used_regions = 0usize;
+    for &(_, size, state, kind) in &regions {
+        if state == MEM_FREE {
+            free += size;
+            free_holes += 1;
+            continue;
+        }
+        used_regions += 1;
+        if kind == MEM_IMAGE {
+            image += size;
+        } else if kind == MEM_MAPPED {
+            mapped += size;
+        } else if state == MEM_COMMIT {
+            committed += size;
+        } else if state == MEM_RESERVE {
+            reserved += size;
+        }
+    }
+    let mut out = format!(
+        "regions used={used_regions} free_holes={free_holes}; MiB: free={} image={} mapped={} \
+         private_commit={} private_reserve={}; largest used:",
+        free >> 20,
+        image >> 20,
+        mapped >> 20,
+        committed >> 20,
+        reserved >> 20
+    );
+    let mut used: Vec<_> = regions
+        .iter()
+        .filter(|r| r.2 != MEM_FREE)
+        .copied()
+        .collect();
+    used.sort_by_key(|r| core::cmp::Reverse(r.1));
+    for (base, size, state, kind) in used.into_iter().take(12) {
+        let what = if kind == MEM_IMAGE {
+            "image"
+        } else if kind == MEM_MAPPED {
+            "mapped"
+        } else if state == MEM_COMMIT {
+            "commit"
+        } else {
+            "reserve"
+        };
+        let _ = core::fmt::Write::write_fmt(
+            &mut out,
+            format_args!(" {base:#010x}+{}M({what})", size >> 20),
+        );
+    }
+    let mut holes: Vec<_> = regions
+        .iter()
+        .filter(|r| r.2 == MEM_FREE)
+        .copied()
+        .collect();
+    holes.sort_by_key(|r| core::cmp::Reverse(r.1));
+    out.push_str("; largest holes:");
+    for (base, size, _, _) in holes.into_iter().take(6) {
+        let _ =
+            core::fmt::Write::write_fmt(&mut out, format_args!(" {base:#010x}+{}M", size >> 20));
+    }
+    out
+}
+
+#[repr(C)]
+struct ExceptionRecord {
+    code: u32,
+    flags: u32,
+    nested: *mut Self,
+    address: *mut c_void,
+    n_params: u32,
+    information: [usize; 15],
+}
+
+#[repr(C)]
+struct ExceptionPointers {
+    record: *mut ExceptionRecord,
+    context: *mut c_void,
+}
+
+type VectoredHandler = extern "system" fn(*mut ExceptionPointers) -> i32;
+
+unsafe extern "system" {
+    fn RtlAddVectoredExceptionHandler(first: u32, handler: VectoredHandler) -> *mut c_void;
+    fn RtlRemoveVectoredExceptionHandler(handle: *mut c_void) -> u32;
+    pub fn GetModuleHandleExA(flags: u32, module_name: *const u8, out: *mut *mut c_void) -> i32;
+    fn GetModuleFileNameW(module: *mut c_void, filename: *mut u16, size: u32) -> u32;
+    fn VirtualQuery(
+        address: *const c_void,
+        buffer: *mut MemoryBasicInformation,
+        length: usize,
+    ) -> usize;
+    fn GetCurrentThread() -> *mut c_void;
+    fn GetCurrentThreadId() -> u32;
+    fn GetThreadDescription(thread: *mut c_void, description: *mut *mut u16) -> i32;
+    fn LocalFree(memory: *mut c_void) -> *mut c_void;
+}
+
+/// Install the VEH and the panic hook. Idempotent.
+///
+/// `d3d9_module` is the `HMODULE` passed to `DllMain` — saved so we can
+/// later check whether a faulting PC lives in our DLL image.
+pub fn install(d3d9_module: *mut c_void) {
+    if INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+
+    if std::env::var_os("RUST_BACKTRACE").is_none() {
+        // `full` over `1` because Wine's unwinder returns very few
+        // frames; the `1`-mode elision of std-internal frames usually
+        // strips the result to empty. `full` keeps everything captured.
+        // SAFETY: DllMain runs single-threaded on the main thread
+        // before any of our spawned threads exist.
+        unsafe { std::env::set_var("RUST_BACKTRACE", "full") };
+    }
+
+    D3D9_HMODULE.store(d3d9_module, Ordering::Release);
+    // SAFETY: ntdll export; safe to call from DllMain.
+    let veh = unsafe { RtlAddVectoredExceptionHandler(1, handler) };
+    VEH_HANDLE.store(veh, Ordering::Release);
+    install_panic_hook();
+}
+
+/// Remove the VEH before the image goes away. Idempotent.
+///
+/// Called from `DllMain` `PROCESS_DETACH` when no device was created: a
+/// `FreeLibrary` the process survives, or the exit of a process that never
+/// created one. Once a device exists the image is pinned, so the only
+/// detach left is process exit, which terminates the process instead and
+/// never gets here.
+pub fn uninstall() {
+    if !INSTALLED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let veh = VEH_HANDLE.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if veh.is_null() {
+        return;
+    }
+    // SAFETY: `veh` is the live registration `install` stored; ntdll export.
+    unsafe { RtlRemoveVectoredExceptionHandler(veh) };
+}
+
+fn install_panic_hook() {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // A panic ends the process: its report may open the early log, with
+        // the lines queued since load ahead of it.
+        crate::log_sink::forward_parked();
+        write_panic_line(info);
+        crate::log_sink::write_crash(b"[mtld3d::d3d9] PANIC - dumping crumb trail:\n");
+        crumb::dump_recent(32);
+        emit_image_bases();
+        // Chain to the default hook, which prints the same report to stderr
+        // and a backtrace (possibly empty on Wine). The log has the report
+        // already; backtrace quality is best-effort.
+        prev(info);
+    }));
+}
+
+/// Write the panic's thread, location and message into the log, as std's default hook words them.
+///
+/// The default hook prints them to stderr only, which a game a launcher
+/// spawned does not have, and under `panic = "abort"` nothing runs after the
+/// hooks. So the line goes out here, synchronously, before the crumb trail.
+/// It reads no Rust thread-local and allocates nothing from the Rust
+/// allocator: `std::thread::current` may allocate on a thread std has not
+/// seen and panics on one past its thread-local teardown, and a panic inside
+/// the hook would abort before the line is written. The thread's name comes
+/// from its Win32 description instead, which std sets for every thread it
+/// names, and the id is the one the default hook prints.
+fn write_panic_line(info: &std::panic::PanicHookInfo<'_>) {
+    let mut name = [0u8; THREAD_NAME_CAPACITY];
+    let name = thread_name(&mut name);
+    // SAFETY: kernel32 export with no arguments.
+    let thread_id = unsafe { GetCurrentThreadId() };
+    let line = PanicLine::new(
+        PANIC_PREFIX,
+        name,
+        thread_id,
+        info.location(),
+        info.payload_as_str(),
+    );
+    crate::log_sink::write_crash(line.bytes());
+}
+
+/// The calling thread's Win32 description as UTF-8 in `buf`, or `<unnamed>` when it has none.
+///
+/// `GetThreadDescription` hands back a buffer from the process heap, not
+/// from the Rust allocator, freed here with `LocalFree`. A name longer than
+/// `buf` is cut, at a character boundary.
+fn thread_name(buf: &mut [u8; THREAD_NAME_CAPACITY]) -> &str {
+    // SAFETY: kernel32 export; the pseudo-handle names the calling thread.
+    let thread = unsafe { GetCurrentThread() };
+    let mut description: *mut u16 = core::ptr::null_mut();
+    // SAFETY: kernel32 export writing one pointer to the out slot given.
+    let hr = unsafe { GetThreadDescription(thread, &raw mut description) };
+    if hr < 0 || description.is_null() {
+        return UNNAMED_THREAD;
+    }
+    let mut units = 0;
+    while units < THREAD_DESCRIPTION_SCAN {
+        let unit = description.wrapping_add(units);
+        // SAFETY: the description is NUL-terminated and the scan stops at
+        // the terminator, so every unit read lies inside it.
+        if unsafe { unit.read() } == 0 {
+            break;
+        }
+        units += 1;
+    }
+    // SAFETY: the `units` units ahead of the terminator, read above.
+    let units = unsafe { core::slice::from_raw_parts(description, units) };
+    let mut pos = 0;
+    push_utf16(buf, &mut pos, units);
+    // SAFETY: the buffer `GetThreadDescription` allocated, freed once.
+    unsafe { LocalFree(description.cast()) };
+    let text = match core::str::from_utf8(&buf[..pos]) {
+        Ok(text) => text,
+        Err(cut) => core::str::from_utf8(&buf[..cut.valid_up_to()]).unwrap_or_default(),
+    };
+    if text.is_empty() {
+        UNNAMED_THREAD
+    } else {
+        text
+    }
+}
+
+/// Print the runtime load bases for our own DLL(s).
+///
+/// Wine's `dbghelp` rarely loads PDBs end-to-end, so symbolicated frames
+/// inside d3d9.dll come out as `<unknown>` in std's backtrace. Knowing the
+/// load base lets you compute RVAs (`pc - base`) and resolve them
+/// externally:
+///
+/// ```sh
+/// llvm-symbolizer --obj=windows/target/i686-pc-windows-msvc/release/d3d9.dll \
+///                 --pdb=windows/target/i686-pc-windows-msvc/release/d3d9.pdb \
+///                 <RVA>
+/// ```
+fn emit_image_bases() {
+    let our = D3D9_HMODULE.load(Ordering::Acquire);
+    if our.is_null() {
+        return;
+    }
+    let mut buf = [0u8; 64];
+    let mut pos = 0;
+    push(&mut buf, &mut pos, b"[mtld3d::d3d9] d3d9.dll base=");
+    push_hex(&mut buf, &mut pos, our as usize as u64);
+    push(&mut buf, &mut pos, b"\n");
+    crate::log_sink::write_crash(&buf[..pos]);
+}
+
+extern "system" fn handler(ep: *mut ExceptionPointers) -> i32 {
+    if ep.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: ep non-null per check; kernel-supplied for handler lifetime.
+    let rec = unsafe { (*ep).record };
+    if rec.is_null() {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    // SAFETY: rec non-null per check.
+    let code = unsafe { (*rec).code };
+    // SAFETY: rec non-null per check.
+    let addr = unsafe { (*rec).address };
+
+    let always_fatal = matches!(
+        code,
+        STATUS_HEAP_CORRUPTION | STATUS_STACK_BUFFER_OVERRUN | STATUS_ASSERTION_FAILURE
+    );
+    let possibly_fatal = matches!(
+        code,
+        STATUS_ACCESS_VIOLATION
+            | STATUS_DATATYPE_MISALIGNMENT
+            | STATUS_PRIVILEGED_INSTRUCTION
+            | STATUS_ILLEGAL_INSTRUCTION
+    );
+
+    // Diagnostic-only. Do NOT terminate — let SEH unwind so the game's own
+    // unhandled-exception filter still gets to write its crash report.
+    // Only an always-fatal code is known to end the process here; a fault in
+    // our image is still a first chance a frame up the stack may handle.
+    if always_fatal || (possibly_fatal && fault_in_our_dll(addr)) {
+        let line = fatal_line(code, addr);
+        if always_fatal {
+            crate::log_sink::write_crash(line.bytes());
+        } else {
+            crate::log_sink::write_fault(line.bytes());
+        }
+        crumb::dump_recent(32);
+    } else if possibly_fatal {
+        report_foreign_fault(code, addr);
+    }
+    EXCEPTION_CONTINUE_SEARCH
+}
+
+/// Note a fault in someone else's code, with the module it landed in.
+///
+/// Wine names the address of an unhandled fault but not the module, and a
+/// launcher-spawned game leaves no way to run the debugger afterwards. The
+/// first few faults get the owning module's path and our most recent API
+/// crumbs, which is usually enough to tell "the game dereferenced what we
+/// returned" from "unrelated".
+fn report_foreign_fault(code: u32, addr: *mut c_void) {
+    if FOREIGN_REPORTS.fetch_add(1, Ordering::AcqRel) >= FOREIGN_REPORT_LIMIT {
+        return;
+    }
+    // The lookup and the file name each take Wine's loader lock for the
+    // walk of the module list (`RtlPcToFileHeader` and `LdrGetDllFullName`
+    // enter `loader_section` in `dlls/ntdll/loader.c`). The lock is a critical
+    // section, so a fault on the thread that holds it re-enters it, and the
+    // report costs this only for the first few foreign faults. The handle is
+    // borrowed: without UNCHANGED_REFCOUNT every report would add a reference
+    // the faulting module never loses.
+    let mut module: *mut c_void = core::ptr::null_mut();
+    // SAFETY: kernel32 export; `addr` is only used as a lookup key.
+    let found = unsafe {
+        GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            addr.cast::<u8>(),
+            &raw mut module,
+        )
+    };
+    // The wide form: the ANSI one converts through a buffer it allocates on
+    // the process heap.
+    let mut path = [0u16; 260];
+    let path_len = if found == 0 || module.is_null() {
+        0
+    } else {
+        // SAFETY: kernel32 export writing at most `path.len()` UTF-16 units.
+        unsafe { GetModuleFileNameW(module, path.as_mut_ptr(), 260) }
+    };
+    let mut buf = [0u8; 1024];
+    let mut pos = 0;
+    push(
+        &mut buf,
+        &mut pos,
+        b"[mtld3d::d3d9] fault outside d3d9.dll: code=",
+    );
+    push_hex(&mut buf, &mut pos, u64::from(code));
+    push(&mut buf, &mut pos, b" addr=");
+    push_hex(&mut buf, &mut pos, addr as usize as u64);
+    push(&mut buf, &mut pos, b" module=");
+    if path_len == 0 {
+        push(&mut buf, &mut pos, b"?");
+    } else {
+        let n = (path_len as usize).min(path.len());
+        push_utf16(&mut buf, &mut pos, &path[..n]);
+        push(&mut buf, &mut pos, b" base=");
+        push_hex(&mut buf, &mut pos, module as usize as u64);
+    }
+    push_free_space(&mut buf, &mut pos);
+    push(&mut buf, &mut pos, b"\n");
+    // A first chance: the fault may be handled, so the line opens no log.
+    crate::log_sink::write_fault(&buf[..pos]);
+    crumb::dump_recent(16);
+}
+
+/// Append the free address space so a crash line carries it.
+fn push_free_space(buf: &mut [u8], pos: &mut usize) {
+    let space = free_space();
+    push(buf, pos, b" free_mib=");
+    push_hex(buf, pos, space.total_mib());
+    push(buf, pos, b" largest_free_mib=");
+    push_hex(buf, pos, space.largest_mib());
+}
+
+/// Whether `addr` lies in this image, from its own headers.
+///
+/// Every access violation and illegal instruction in the process asks this,
+/// so it makes no call: no loader lock, and no reference taken on the module
+/// that faulted.
+fn fault_in_our_dll(addr: *mut c_void) -> bool {
+    let base = D3D9_HMODULE.load(Ordering::Acquire) as usize;
+    if base == 0 {
+        return false;
+    }
+    // SAFETY: `base` is this image's `HMODULE` from `DllMain`, and the
+    // handler is registered only while the image is mapped.
+    let Some(size) = (unsafe { mtld3d_shared::identity::image_size(base) }) else {
+        return false;
+    };
+    (addr as usize).wrapping_sub(base) < size
+}
+
+/// The `FATAL` line for an exception in our image or with a fatal code, in a fixed buffer.
+struct FatalLine {
+    buf: [u8; 160],
+    len: usize,
+}
+
+impl FatalLine {
+    /// The line's bytes.
+    fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+fn fatal_line(code: u32, addr: *mut c_void) -> FatalLine {
+    let mut buf = [0u8; 160];
+    let mut pos = 0;
+    push(&mut buf, &mut pos, b"[mtld3d::d3d9] FATAL: code=");
+    push_hex(&mut buf, &mut pos, u64::from(code));
+    push(&mut buf, &mut pos, b" addr=");
+    push_hex(&mut buf, &mut pos, addr as usize as u64);
+    push_free_space(&mut buf, &mut pos);
+    push(&mut buf, &mut pos, b"\n");
+    FatalLine { buf, len: pos }
+}
+
+fn push(buf: &mut [u8], pos: &mut usize, bytes: &[u8]) {
+    let avail = buf.len() - *pos;
+    let take = bytes.len().min(avail);
+    buf[*pos..*pos + take].copy_from_slice(&bytes[..take]);
+    *pos += take;
+}
+
+/// Append UTF-16 text as UTF-8, an unpaired surrogate as U+FFFD.
+fn push_utf16(buf: &mut [u8], pos: &mut usize, units: &[u16]) {
+    for c in char::decode_utf16(units.iter().copied()) {
+        let mut utf8 = [0u8; 4];
+        let c = c.unwrap_or(char::REPLACEMENT_CHARACTER);
+        push(buf, pos, c.encode_utf8(&mut utf8).as_bytes());
+    }
+}
+
+fn push_hex(buf: &mut [u8], pos: &mut usize, v: u64) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    if *pos + 18 > buf.len() {
+        return;
+    }
+    buf[*pos] = b'0';
+    buf[*pos + 1] = b'x';
+    *pos += 2;
+    for i in (0..16).rev() {
+        let nib = usize::try_from((v >> (i * 4)) & 0xf).expect("4-bit nibble fits usize");
+        buf[*pos] = HEX[nib];
+        *pos += 1;
+    }
+}

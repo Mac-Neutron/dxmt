@@ -1,0 +1,1228 @@
+//! Draw paths beyond the smoke triangle.
+//!
+//! Phase 1 covers the pre-transformed (XYZRHW) screen-space path used by
+//! 2D/UI geometry.
+
+use mtld3d_tests::{DrawIndexedUpParams, Harness, PosColorVertex, RhwVertex, Surface};
+use mtld3d_types::{
+    D3DCULL_NONE, D3DERR_INVALIDCALL, D3DFMT_A8R8G8B8, D3DFMT_INDEX16, D3DFMT_INDEX32,
+    D3DFVF_DIFFUSE, D3DFVF_XYZ, D3DFVF_XYZRHW, D3DLOCK_READONLY, D3DPOOL_DEFAULT,
+    D3DPOOL_SYSTEMMEM, D3DPT_LINELIST, D3DPT_LINESTRIP, D3DPT_POINTLIST, D3DPT_TRIANGLEFAN,
+    D3DPT_TRIANGLELIST, D3DPT_TRIANGLESTRIP, D3DRS_CULLMODE, D3DRS_LIGHTING, D3DUSAGE_WRITEONLY,
+};
+
+const MAGENTA: u32 = 0xFFFF_00FF;
+const BLACK: u32 = 0xFF00_0000;
+const GREEN: u32 = 0xFF00_FF00;
+
+#[test]
+fn xyzrhw_quad_maps_to_screen_rect() {
+    let h = Harness::new();
+    // Stage 0 may carry a binding from an earlier device in this process; this
+    // harness is fresh, but make the routing explicit.
+    assert_eq!(h.clear_texture(0), 0, "no texture bound");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZRHW | D3DFVF_DIFFUSE), 0, "SetFVF");
+
+    // RHW=1 screen-space quad covering pixels (100,100)..(200,200).
+    let quad = [
+        RhwVertex {
+            x: 100.0,
+            y: 100.0,
+            z: 0.5,
+            rhw: 1.0,
+            color: MAGENTA,
+        },
+        RhwVertex {
+            x: 200.0,
+            y: 100.0,
+            z: 0.5,
+            rhw: 1.0,
+            color: MAGENTA,
+        },
+        RhwVertex {
+            x: 100.0,
+            y: 200.0,
+            z: 0.5,
+            rhw: 1.0,
+            color: MAGENTA,
+        },
+        RhwVertex {
+            x: 200.0,
+            y: 200.0,
+            z: 0.5,
+            rhw: 1.0,
+            color: MAGENTA,
+        },
+    ];
+
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLESTRIP, 2, &quad),
+            0,
+            "DrawPrimitiveUP strip"
+        );
+    });
+
+    assert_eq!(
+        h.read_pixel(150, 150),
+        MAGENTA,
+        "inside the screen-space rect"
+    );
+    assert_eq!(
+        h.read_pixel(50, 50),
+        BLACK,
+        "outside the rect stays background"
+    );
+}
+
+#[test]
+fn draw_and_present_balance_device_refcount() {
+    // A draw + Present must not leak a device reference (e.g. via an implicit
+    // render-target / depth-stencil surface bound through the public refcount).
+    // Per the D3D9 refcount model the device count after a draw + Present is
+    // exactly what it was before, so a surviving reference here is a leak.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: GREEN,
+    };
+    let tri = [v(0.0, 0.5), v(0.5, -0.5), v(-0.5, -0.5)];
+    let base = h.device_refcount();
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri),
+            0,
+            "DrawPrimitiveUP",
+        );
+    });
+    assert_eq!(
+        h.device_refcount(),
+        base,
+        "a draw + Present leaves the device refcount balanced",
+    );
+}
+
+/// Arm fixed-function diffuse passthrough for clip-space `PosColorVertex` draws.
+fn arm_diffuse(h: &Harness) {
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture");
+    h.select_diffuse_stage(0);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+}
+
+fn read_target_pixel(h: &Harness, target: &Surface<'_>, x: u32, y: u32) -> u32 {
+    let (hr, desc) = target.desc();
+    assert_eq!(hr, 0, "GetDesc");
+    let sysmem = h.create_offscreen_plain_surface(
+        desc.width,
+        desc.height,
+        D3DFMT_A8R8G8B8,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.get_render_target_data_hr(target, &sysmem),
+        0,
+        "GetRenderTargetData",
+    );
+    let locked = sysmem.lock_rect(D3DLOCK_READONLY);
+    let pitch_pixels = locked.pitch().cast_unsigned() / 4;
+    let index = usize::try_from(y * pitch_pixels + x).expect("pixel index fits usize");
+    locked.as_u32(index + 1)[index]
+}
+
+fn indexed_draw_survives_clear_pass_coalescing(draw: impl FnOnce(&Harness, &[PosColorVertex])) {
+    const EDGE: u32 = 64;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(
+        h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE),
+        0,
+        "culling off",
+    );
+    let target = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    let other = h.create_render_target(EDGE, EDGE, D3DFMT_A8R8G8B8);
+    let backbuffer = h.render_target(0);
+    let vertex = |x: f32, y: f32, color: u32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color,
+    };
+    let left = [
+        vertex(-0.9, 0.8, GREEN),
+        vertex(-0.1, 0.8, GREEN),
+        vertex(-0.1, -0.8, GREEN),
+        vertex(-0.9, -0.8, GREEN),
+    ];
+    let right = [
+        vertex(0.1, 0.8, MAGENTA),
+        vertex(0.9, 0.8, MAGENTA),
+        vertex(0.1, -0.8, MAGENTA),
+        vertex(0.9, 0.8, MAGENTA),
+        vertex(0.9, -0.8, MAGENTA),
+        vertex(0.1, -0.8, MAGENTA),
+    ];
+
+    assert_eq!(h.set_render_target(0, &target), 0, "bind first target");
+    assert_eq!(h.clear_target(BLACK), 0, "clear first target");
+    draw(&h, &left);
+    assert_eq!(h.set_render_target(0, &other), 0, "bind other target");
+    assert_eq!(h.clear_target(BLACK), 0, "clear other target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right),
+        0,
+        "draw into other target",
+    );
+    assert_eq!(h.set_render_target(0, &target), 0, "rebind first target");
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 2, &right),
+        0,
+        "draw into first target after rebind",
+    );
+    assert_eq!(h.set_render_target(0, &backbuffer), 0, "restore backbuffer");
+
+    assert_eq!(
+        read_target_pixel(&h, &target, 16, 32),
+        GREEN,
+        "the indexed draw before the target switch remains visible",
+    );
+    assert_eq!(
+        read_target_pixel(&h, &target, 48, 32),
+        MAGENTA,
+        "the later draw contributes after loading the target",
+    );
+}
+
+#[test]
+fn every_primitive_type_draws() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: GREEN,
+    };
+    let points = [v(0.0, 0.0)];
+    let line = [v(-0.5, 0.0), v(0.5, 0.0)];
+    let strip3 = [v(-0.5, 0.0), v(0.0, 0.5), v(0.5, 0.0)];
+    // Each list is sized for one primitive of its kind; the path must accept it.
+    for (prim, count, verts) in [
+        (D3DPT_POINTLIST, 1u32, &points[..]),
+        (D3DPT_LINELIST, 1, &line[..]),
+        (D3DPT_LINESTRIP, 1, &line[..]),
+        (D3DPT_TRIANGLESTRIP, 1, &strip3[..]),
+    ] {
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_primitive_up(prim, count, verts),
+                0,
+                "primitive {prim} draws"
+            );
+        });
+    }
+}
+
+#[test]
+fn triangle_fan_draws_as_triangle_list() {
+    // Metal has no triangle-fan primitive, so mtld3d expands a fan into a
+    // triangle list. A 4-vertex fan (2 triangles) is a diamond covering the
+    // screen centre; the corners stay background.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let fan = [
+        PosColorVertex {
+            x: 0.0,
+            y: 0.6,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 0.6,
+            y: 0.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: -0.6,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -0.6,
+            y: 0.0,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLEFAN, 2, &fan),
+            0,
+            "TRIANGLEFAN draws (expanded to a triangle list)",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "centre is inside the fan diamond",
+    );
+    assert_eq!(
+        h.read_pixel(10, 10),
+        BLACK,
+        "corner is outside the fan diamond",
+    );
+}
+
+/// The fan diamond `triangle_fan_draws_as_triangle_list` draws, as a slice.
+fn fan_diamond() -> [PosColorVertex; 4] {
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: GREEN,
+    };
+    [v(0.0, 0.6), v(0.6, 0.0), v(0.0, -0.6), v(-0.6, 0.0)]
+}
+
+#[test]
+fn bound_triangle_fan_draws_from_a_vertex_buffer() {
+    // `DrawPrimitive(D3DPT_TRIANGLEFAN)` over a bound vertex buffer: the fan
+    // is rewritten as a triangle-list index stream at draw time, so the
+    // diamond renders exactly like the UP form. The fan starts past two
+    // padding vertices to prove `StartVertex` is honoured.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let pad = PosColorVertex {
+        x: 0.9,
+        y: 0.9,
+        z: 0.5,
+        color: MAGENTA,
+    };
+    let mut verts = vec![pad, pad];
+    verts.extend_from_slice(&fan_diamond());
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let count = u32::try_from(verts.len()).expect("count fits u32");
+    let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLEFAN, 2, 2),
+            0,
+            "bound TRIANGLEFAN draws",
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "centre is inside the fan");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the fan");
+    assert_eq!(
+        h.read_pixel(600, 20),
+        BLACK,
+        "the padding vertices before StartVertex are not part of the fan",
+    );
+}
+
+/// The `rim + 2` vertices of a disc fan of radius 0.8.
+///
+/// The centre, then the rim clockwise on screen (decreasing angle) so the
+/// default cull keeps every triangle, closed by repeating the first rim
+/// vertex.
+fn fan_disc(rim: u16) -> Vec<PosColorVertex> {
+    let mut verts = vec![PosColorVertex {
+        x: 0.0,
+        y: 0.0,
+        z: 0.5,
+        color: GREEN,
+    }];
+    for k in 0..=rim {
+        let angle = core::f32::consts::FRAC_PI_2
+            - f32::from(k % rim) * core::f32::consts::TAU / f32::from(rim);
+        verts.push(PosColorVertex {
+            x: 0.8 * angle.cos(),
+            y: 0.8 * angle.sin(),
+            z: 0.5,
+            color: GREEN,
+        });
+    }
+    verts
+}
+
+#[test]
+fn long_bound_triangle_fan_outgrows_the_shared_index_pattern() {
+    // Bound `DrawPrimitive` fans share one index pattern buffer that starts
+    // at 256 triangles and grows on demand. A short fan and then a 300
+    // triangle fan in the same frame make it grow while the short fan's draw
+    // still references the first buffer; both must render.
+    const RIM: u16 = 300;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let mut verts = fan_diamond().to_vec();
+    let diamond_len = u32::try_from(verts.len()).expect("count fits u32");
+    verts.extend_from_slice(&fan_disc(RIM));
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let count = u32::try_from(verts.len()).expect("count fits u32");
+    let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+    let rim = u32::from(RIM);
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLEFAN, 0, 2), 0, "short fan");
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLEFAN, diamond_len, rim),
+            0,
+            "300 triangle fan",
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "centre is inside both fans");
+    // (0.5, 0.5) in clip space: outside the diamond, inside the disc.
+    assert_eq!(h.read_pixel(480, 120), GREEN, "the long fan's rim renders");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the disc");
+}
+
+#[test]
+fn long_triangle_fan_up_outgrows_the_shared_index_pattern() {
+    // `DrawPrimitiveUP` fans ride the same shared index pattern as bound
+    // fans, over the caller's vertices exactly as they arrive. A short fan
+    // and then a 300 triangle fan in the same frame make the pattern grow
+    // while the short fan's draw still references the first buffer; both
+    // must render.
+    const RIM: u16 = 300;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let disc = fan_disc(RIM);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLEFAN, 2, &fan_diamond()),
+            0,
+            "short fan",
+        );
+        assert_eq!(
+            d.draw_primitive_up(D3DPT_TRIANGLEFAN, u32::from(RIM), &disc),
+            0,
+            "300 triangle fan",
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "centre is inside both fans");
+    // (0.5, 0.5) in clip space: outside the diamond, inside the disc.
+    assert_eq!(h.read_pixel(480, 120), GREEN, "the long fan's rim renders");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the disc");
+}
+
+#[test]
+fn bound_indexed_triangle_fan_honours_base_vertex_and_start_index() {
+    // `DrawIndexedPrimitive(D3DPT_TRIANGLEFAN)`: the fan's indices are read
+    // from the bound 16-bit index buffer at `StartIndex`, the base vertex is
+    // folded in, and the result draws as a triangle list. The index buffer
+    // lists the diamond in reverse so the draw proves the app's indices are
+    // used rather than a sequential range.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let pad = PosColorVertex {
+        x: 0.9,
+        y: 0.9,
+        z: 0.5,
+        color: MAGENTA,
+    };
+    let mut verts = vec![pad, pad, pad];
+    verts.extend_from_slice(&fan_diamond());
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let count = u32::try_from(verts.len()).expect("count fits u32");
+    let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+    // Two unused leading indices, then the diamond relative to base vertex 3,
+    // wound the other way round from the UP test so a sequential range could
+    // not pass by accident; that reversal flips the facing, so culling is off.
+    assert_eq!(
+        h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE),
+        0,
+        "cull off"
+    );
+    let indices: [u16; 6] = [0, 0, 3, 2, 1, 0];
+    let ib = h.create_index_buffer(12, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    ib.lock(0, 0, 0).write(&indices);
+    assert_eq!(h.set_indices(&ib), 0, "SetIndices");
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 3, 0, 4, 2, 2),
+            0,
+            "bound indexed TRIANGLEFAN draws",
+        );
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "centre is inside the fan");
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the fan");
+    assert_eq!(
+        h.read_pixel(600, 20),
+        BLACK,
+        "the padding vertices below the base vertex are not part of the fan",
+    );
+}
+
+/// A second diamond, a quarter the size, off to the left of the first.
+///
+/// Its centre pixel is (160, 240) and the first diamond does not reach the
+/// screen centre once the fan draws this one instead, so one pixel read at
+/// each place says which of the two fans the index buffer described.
+fn small_left_diamond() -> [PosColorVertex; 4] {
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: MAGENTA,
+    };
+    [v(-0.5, 0.25), v(-0.25, 0.0), v(-0.5, -0.25), v(-0.75, 0.0)]
+}
+
+#[test]
+fn indexed_triangle_fan_draws_after_its_index_buffer_released_its_backing() {
+    // A `D3DPOOL_DEFAULT` `D3DUSAGE_WRITEONLY` index buffer keeps no CPU copy
+    // of its contents once its upload has carried every byte, so the fan
+    // rewrite has to read the application's indices back off the GPU. The
+    // buffer describes two disjoint fans over one vertex buffer; the first
+    // draw comes after the release, and the second after a `Lock` that
+    // rewrites only the second fan's four indices, so both the read-back copy
+    // and the buffer it is pinned into have to be right.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let mut verts = Vec::from(fan_diamond());
+    verts.extend_from_slice(&small_left_diamond());
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let count = u32::try_from(verts.len()).expect("count fits u32");
+    let vb = h.create_vertex_buffer(stride * count, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+
+    // Eight 16-bit indices: the first fan, then four the second `Lock` fills.
+    let ib = h.create_index_buffer(16, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    let first: [u16; 8] = [0, 1, 2, 3, 0, 0, 0, 0];
+    ib.lock(0, 0, 0).write(&first);
+    assert_eq!(h.set_indices(&ib), 0, "SetIndices");
+
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 4, 0, 2),
+            0,
+            "indexed TRIANGLEFAN draws with no CPU copy of the indices",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the first fan's indices survived the backing release"
+    );
+    assert_eq!(h.read_pixel(10, 10), BLACK, "corner is outside the fan");
+
+    // Announce the second fan's four indices and write only those. The
+    // backing the read-back installed holds the first four, so the upload is
+    // free to carry the whole buffer or just the window; either way the fan
+    // at `StartIndex` 4 has to be the small diamond.
+    let second: [u16; 4] = [4, 5, 6, 7];
+    ib.lock(8, 8, 0).write(&second);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 8, 4, 2),
+            0,
+            "the second fan draws",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(160, 240),
+        MAGENTA,
+        "the refilled indices describe the small diamond"
+    );
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLACK,
+        "the first fan is not drawn by the second draw"
+    );
+}
+
+#[test]
+fn indexed_triangle_fan_materialises_partial_index_backing() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    for format in [D3DFMT_INDEX16, D3DFMT_INDEX32] {
+        let mut verts = Vec::from(fan_diamond());
+        verts.extend_from_slice(&small_left_diamond());
+        let stride =
+            u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+        let vb = h.create_vertex_buffer(stride * 8, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+        vb.lock(0, 0, 0).write(&verts);
+        assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0);
+        let index_size = if format == D3DFMT_INDEX16 { 2 } else { 4 };
+        let ib = h.create_index_buffer(index_size * 8, D3DUSAGE_WRITEONLY, format, D3DPOOL_DEFAULT);
+        if format == D3DFMT_INDEX16 {
+            ib.lock(0, 0, 0).write(&[0_u16, 1, 2, 3, 0, 0, 0, 0]);
+            ib.lock(index_size * 4, index_size * 2, 0)
+                .write(&[4_u16, 5]);
+            ib.lock(index_size * 6, index_size * 2, 0)
+                .write(&[6_u16, 7]);
+        } else {
+            ib.lock(0, 0, 0).write(&[0_u32, 1, 2, 3, 0, 0, 0, 0]);
+            ib.lock(index_size * 4, index_size * 2, 0)
+                .write(&[4_u32, 5]);
+            ib.lock(index_size * 6, index_size * 2, 0)
+                .write(&[6_u32, 7]);
+        }
+        assert_eq!(h.set_indices(&ib), 0);
+        // No draw or readback precedes the partial writes: the first fan
+        // needs the untouched device bytes, the second the queued uploads.
+        for (start, pixel, color) in [(0, 320, GREEN), (4, 160, MAGENTA)] {
+            h.render_once(BLACK, |d| {
+                assert_eq!(
+                    d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 8, start, 2),
+                    0
+                );
+            });
+            assert_eq!(
+                h.read_pixel(pixel, 240),
+                color,
+                "format {format}, start {start}"
+            );
+            assert_eq!(h.read_pixel(10, 10), BLACK);
+        }
+    }
+}
+
+#[test]
+fn indexed_triangle_fan_materialises_partial_backing_during_a_lock() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let mut verts = Vec::from(fan_diamond());
+    verts.extend_from_slice(&small_left_diamond());
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let vb = h.create_vertex_buffer(stride * 8, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&verts);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0);
+    for partial in [true, false] {
+        let ib = h.create_index_buffer(16, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+        ib.lock(0, 0, 0).write(&[0_u16, 1, 2, 3, 0, 0, 0, 0]);
+        assert_eq!(h.set_indices(&ib), 0);
+        let mut locked = if partial {
+            ib.lock(8, 8, 0)
+        } else {
+            ib.lock(0, 0, 0)
+        };
+        if partial {
+            locked.write(&[4_u16, 5, 6, 7]);
+        } else {
+            locked.write(&[0_u16, 1, 2, 3, 4, 5, 6, 7]);
+        }
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 8, 4, 2),
+                0
+            );
+        });
+        assert_eq!(
+            h.read_pixel(160, 240),
+            MAGENTA,
+            "the mapped write reaches the fan"
+        );
+        // The lock pointer must still name the installed backing after readback.
+        if partial {
+            locked.write(&[0_u16, 1, 2, 3]);
+        } else {
+            locked.write(&[0_u16, 1, 2, 3, 0, 1, 2, 3]);
+        }
+        drop(locked);
+        h.render_once(BLACK, |d| {
+            assert_eq!(
+                d.draw_indexed_primitive(D3DPT_TRIANGLEFAN, 0, 0, 8, 4, 2),
+                0
+            );
+        });
+        assert_eq!(
+            h.read_pixel(320, 240),
+            GREEN,
+            "the same lock stays writable after the draw"
+        );
+    }
+}
+
+#[test]
+fn indexed_primitive_up_draws() {
+    // DrawIndexedPrimitiveUP feeds inline vertices + an inline index stream; the
+    // index data is copied into the unix side's upload ring per draw. The
+    // triangle covers the screen centre; the corners stay background.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let verts = [
+        PosColorVertex {
+            x: 0.0,
+            y: 0.5,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 0.5,
+            y: -0.5,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -0.5,
+            y: -0.5,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    let indices: [u16; 3] = [0, 1, 2];
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive_up(
+                &DrawIndexedUpParams {
+                    prim: D3DPT_TRIANGLELIST,
+                    min_vertex_index: 0,
+                    num_vertices: 3,
+                    prim_count: 1,
+                    index_format: D3DFMT_INDEX16,
+                },
+                &indices,
+                &verts,
+            ),
+            0,
+            "DrawIndexedPrimitiveUP draws",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "centre is inside the triangle"
+    );
+    assert_eq!(
+        h.read_pixel(10, 10),
+        BLACK,
+        "corner is outside the triangle"
+    );
+}
+
+#[test]
+fn indexed_primitive_up_triangle_fan_draws() {
+    // A fan via DrawIndexedPrimitiveUP expands the index stream into a triangle
+    // list (Metal has no fan primitive). A 4-index fan (2 triangles) is a
+    // diamond covering the centre.
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let verts = [
+        PosColorVertex {
+            x: 0.0,
+            y: 0.6,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 0.6,
+            y: 0.0,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: 0.0,
+            y: -0.6,
+            z: 0.5,
+            color: GREEN,
+        },
+        PosColorVertex {
+            x: -0.6,
+            y: 0.0,
+            z: 0.5,
+            color: GREEN,
+        },
+    ];
+    let indices: [u16; 4] = [0, 1, 2, 3];
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_indexed_primitive_up(
+                &DrawIndexedUpParams {
+                    prim: D3DPT_TRIANGLEFAN,
+                    min_vertex_index: 0,
+                    num_vertices: 4,
+                    prim_count: 2,
+                    index_format: D3DFMT_INDEX16,
+                },
+                &indices,
+                &verts,
+            ),
+            0,
+            "indexed TRIANGLEFAN draws (expanded to a triangle list)",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "centre is inside the fan diamond"
+    );
+    assert_eq!(
+        h.read_pixel(10, 10),
+        BLACK,
+        "corner is outside the fan diamond"
+    );
+}
+
+#[test]
+fn inline_draw_data_reads_its_own_payload_across_upload_ring_chunks() {
+    // Inline indices and inline vertices past 4 KiB are copied into the unix
+    // upload ring, one payload after another, and each draw binds its own
+    // offset. Twenty oversized vertex streams (4800 bytes each) outgrow the
+    // ring's first chunk mid-frame. Every draw paints the same region, so the
+    // pixel names the draw whose payload the last bind read: a bind at the
+    // wrong offset shows an earlier draw's colour. Three frames run back to
+    // back, so later frames append behind payloads earlier ones still read.
+    const RED: u32 = 0xFFFF_0000;
+    const BLUE: u32 = 0xFF00_00FF;
+    let h = Harness::new();
+    arm_diffuse(&h);
+    assert_eq!(h.set_render_state(D3DRS_CULLMODE, D3DCULL_NONE), 0);
+    let v = |x, y, color| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color,
+    };
+    // One triangle over the top-left quadrant, then 99 degenerate ones.
+    let stream = |color| {
+        let mut verts = vec![
+            v(-1.0, 1.0, color),
+            v(0.2, 1.0, color),
+            v(-1.0, -0.2, color),
+        ];
+        verts.resize(300, v(-1.0, -1.0, color));
+        verts
+    };
+    let streams: Vec<Vec<PosColorVertex>> = (0..20)
+        .map(|i| stream(if i == 19 { BLUE } else { RED }))
+        .collect();
+    assert!(core::mem::size_of_val(streams[0].as_slice()) > 4096);
+    // Two quads over the top-right quadrant; odd draws index the magenta one.
+    let quad = |color| {
+        [
+            v(0.1, 0.1, color),
+            v(0.1, 0.9, color),
+            v(0.9, 0.9, color),
+            v(0.9, 0.1, color),
+        ]
+    };
+    let mut quads = quad(GREEN).to_vec();
+    quads.extend_from_slice(&quad(MAGENTA));
+    let green: [u16; 6] = [0, 1, 2, 0, 2, 3];
+    let magenta: [u16; 6] = [4, 5, 6, 4, 6, 7];
+    let params = DrawIndexedUpParams {
+        prim: D3DPT_TRIANGLELIST,
+        min_vertex_index: 0,
+        num_vertices: 8,
+        prim_count: 2,
+        index_format: D3DFMT_INDEX16,
+    };
+    for _ in 0..3 {
+        h.render_once(BLACK, |d| {
+            for (i, verts) in streams.iter().enumerate() {
+                assert_eq!(
+                    d.draw_primitive_up(D3DPT_TRIANGLELIST, 100, verts),
+                    0,
+                    "oversized UP draw {i}"
+                );
+            }
+            for j in 0..40 {
+                let indices = if j % 2 == 0 { &green } else { &magenta };
+                assert_eq!(
+                    d.draw_indexed_primitive_up(&params, indices, &quads),
+                    0,
+                    "indexed UP draw {j}"
+                );
+            }
+        });
+    }
+    assert_eq!(
+        h.read_pixel(160, 120),
+        BLUE,
+        "the last oversized stream drew from its own vertices"
+    );
+    assert_eq!(
+        h.read_pixel(480, 120),
+        MAGENTA,
+        "the last indexed draw read its own indices"
+    );
+    assert_eq!(h.read_pixel(320, 400), BLACK, "the bottom stays clear");
+}
+
+#[test]
+fn bound_indexed_draw_survives_clear_pass_coalescing() {
+    indexed_draw_survives_clear_pass_coalescing(|h, vertices| {
+        let stride =
+            u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+        let byte_len = stride * u32::try_from(vertices.len()).expect("vertex count fits u32");
+        let vertex_buffer =
+            h.create_vertex_buffer(byte_len, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+        vertex_buffer.lock(0, 0, 0).write(vertices);
+        assert_eq!(
+            h.set_stream_source(0, &vertex_buffer, 0, stride),
+            0,
+            "SetStreamSource",
+        );
+        let indices: [u16; 6] = [0, 1, 3, 1, 2, 3];
+        let index_buffer =
+            h.create_index_buffer(12, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+        index_buffer.lock(0, 0, 0).write(&indices);
+        assert_eq!(h.set_indices(&index_buffer), 0, "SetIndices");
+        assert_eq!(
+            h.draw_indexed_primitive(D3DPT_TRIANGLELIST, 0, 0, 4, 0, 2),
+            0,
+            "bound indexed draw",
+        );
+    });
+}
+
+#[test]
+fn inline_indexed_draw_survives_clear_pass_coalescing() {
+    indexed_draw_survives_clear_pass_coalescing(|h, vertices| {
+        let indices: [u16; 6] = [0, 1, 3, 1, 2, 3];
+        assert_eq!(
+            h.draw_indexed_primitive_up(
+                &DrawIndexedUpParams {
+                    prim: D3DPT_TRIANGLELIST,
+                    min_vertex_index: 0,
+                    num_vertices: 4,
+                    prim_count: 2,
+                    index_format: D3DFMT_INDEX16,
+                },
+                &indices,
+                vertices,
+            ),
+            0,
+            "inline indexed draw",
+        );
+    });
+}
+
+#[test]
+fn generated_indexed_draw_survives_clear_pass_coalescing() {
+    indexed_draw_survives_clear_pass_coalescing(|h, vertices| {
+        let fan_indices: [u16; 4] = [0, 1, 2, 3];
+        assert_eq!(
+            h.draw_indexed_primitive_up(
+                &DrawIndexedUpParams {
+                    prim: D3DPT_TRIANGLEFAN,
+                    min_vertex_index: 0,
+                    num_vertices: 4,
+                    prim_count: 2,
+                    index_format: D3DFMT_INDEX16,
+                },
+                &fan_indices,
+                vertices,
+            ),
+            0,
+            "fan rewritten to generated indices",
+        );
+    });
+}
+
+#[test]
+fn process_vertices_transforms_to_screen_space() {
+    // A null destination is still rejected.
+    let h = Harness::new();
+    assert_eq!(
+        h.process_vertices_hr(),
+        D3DERR_INVALIDCALL,
+        "ProcessVertices with a null destination is INVALIDCALL",
+    );
+
+    // A quad at z=0 through the default (identity) transforms maps to
+    // (x*320+320, -y*240+240, 0, 1) in the 640x480 viewport.
+    let vtx = |x: f32, y: f32, color: u32| PosColorVertex {
+        x,
+        y,
+        z: 0.0,
+        color,
+    };
+    let quad = [
+        vtx(-0.5, -0.5, 0xFFFF_0000),
+        vtx(-0.5, 0.5, 0xFF00_FF00),
+        vtx(0.5, -0.5, 0xFF00_00FF),
+        vtx(0.5, 0.5, 0xFFFF_FFFF),
+    ];
+    let src = h.create_vertex_buffer(
+        u32::try_from(core::mem::size_of_val(&quad)).unwrap(),
+        0,
+        D3DFVF_XYZ | D3DFVF_DIFFUSE,
+        D3DPOOL_SYSTEMMEM,
+    );
+    src.lock(0, 0, 0).write(&quad);
+    assert_eq!(h.set_fvf(D3DFVF_XYZ | D3DFVF_DIFFUSE), 0, "SetFVF");
+    assert_eq!(
+        h.set_stream_source(
+            0,
+            &src,
+            0,
+            u32::try_from(core::mem::size_of::<PosColorVertex>()).unwrap()
+        ),
+        0,
+        "SetStreamSource",
+    );
+
+    let dst = h.create_vertex_buffer(
+        u32::try_from(quad.len() * 16).unwrap(),
+        0,
+        D3DFVF_XYZRHW,
+        D3DPOOL_SYSTEMMEM,
+    );
+    assert_eq!(
+        h.process_vertices(0, 0, u32::try_from(quad.len()).unwrap(), &dst),
+        0,
+        "ProcessVertices",
+    );
+
+    let out: Vec<f32> = dst.lock(0, 0, 0).read(quad.len() * 4);
+    for (i, v) in quad.iter().enumerate() {
+        let b = i * 4;
+        assert!(
+            (out[b] - v.x.mul_add(320.0, 320.0)).abs() < 1e-3,
+            "x[{i}] = {}",
+            out[b]
+        );
+        assert!(
+            (out[b + 1] - (-v.y).mul_add(240.0, 240.0)).abs() < 1e-3,
+            "y[{i}] = {}",
+            out[b + 1]
+        );
+        assert!(out[b + 2].abs() < 1e-3, "z[{i}] = {}", out[b + 2]);
+        assert!((out[b + 3] - 1.0).abs() < 1e-6, "rhw[{i}] = {}", out[b + 3]);
+    }
+}
+
+#[test]
+fn draw_without_decl_or_fvf_is_invalid_but_a_bound_draw_still_renders() {
+    // With neither a vertex declaration nor an FVF bound, the runtime has no
+    // way to interpret the vertex stream and a `Draw*` must reject with
+    // `D3DERR_INVALIDCALL` per the D3D9 spec. The same draw
+    // must still succeed and render once an FVF (and thus an implicit
+    // declaration) is bound, proving the guard fires only when both are absent.
+    let h = Harness::new();
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: GREEN,
+    };
+    let tri = [v(0.0, 0.5), v(0.5, -0.5), v(-0.5, -0.5)];
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+
+    // A live stream source is bound throughout, so the only thing missing in
+    // the reject case is the vertex layout source.
+    let vb = h.create_vertex_buffer(stride * 3, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&tri);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+
+    // (a) No declaration, no FVF -> the draw is invalid.
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(
+        h.set_vertex_declaration_null(),
+        0,
+        "SetVertexDeclaration(NULL)"
+    );
+    assert_eq!(h.fvf(), 0, "no FVF after SetVertexDeclaration(NULL)");
+    assert_eq!(h.begin_scene(), 0, "BeginScene");
+    assert_eq!(
+        h.draw_primitive(D3DPT_TRIANGLELIST, 0, 1),
+        D3DERR_INVALIDCALL,
+        "DrawPrimitive with neither decl nor FVF rejects",
+    );
+    assert_eq!(
+        h.draw_primitive_up(D3DPT_TRIANGLELIST, 1, &tri),
+        D3DERR_INVALIDCALL,
+        "DrawPrimitiveUP with neither decl nor FVF rejects",
+    );
+    assert_eq!(h.end_scene(), 0, "EndScene");
+
+    // (b) An FVF binds an implicit declaration -> a normal draw still renders.
+    arm_diffuse(&h);
+    h.render_once(BLACK, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1),
+            0,
+            "DrawPrimitive with an FVF bound succeeds",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "the FVF-bound triangle renders at the screen centre",
+    );
+}
+
+/// A draw of zero primitives succeeds and draws nothing; an inline draw with a zero stride fails.
+///
+/// D3D9 answers `D3D_OK` for a zero primitive count on every draw entry point
+/// and every primitive type, fans included, and `D3DERR_INVALIDCALL` for a
+/// `DrawPrimitiveUP` or `DrawIndexedPrimitiveUP` whose vertex stride is zero,
+/// whatever the count.
+#[test]
+fn zero_primitive_draws_succeed_and_a_zero_inline_stride_fails() {
+    let h = Harness::new();
+    arm_diffuse(&h);
+    let v = |x: f32, y: f32| PosColorVertex {
+        x,
+        y,
+        z: 0.5,
+        color: GREEN,
+    };
+    let tri = [v(0.0, 0.5), v(0.5, -0.5), v(-0.5, -0.5)];
+    let indices: [u16; 3] = [0, 1, 2];
+    let stride = u32::try_from(core::mem::size_of::<PosColorVertex>()).expect("stride fits u32");
+    let vb = h.create_vertex_buffer(stride * 3, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&tri);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+    let ib = h.create_index_buffer(6, D3DUSAGE_WRITEONLY, D3DFMT_INDEX16, D3DPOOL_DEFAULT);
+    ib.lock(0, 0, 0).write(&indices);
+    assert_eq!(h.set_indices(&ib), 0, "SetIndices");
+    let inline = |prim, prim_count| DrawIndexedUpParams {
+        prim,
+        min_vertex_index: 0,
+        num_vertices: 3,
+        prim_count,
+        index_format: D3DFMT_INDEX16,
+    };
+    h.render_once(BLACK, |d| {
+        for prim in [
+            D3DPT_POINTLIST,
+            D3DPT_LINELIST,
+            D3DPT_LINESTRIP,
+            D3DPT_TRIANGLELIST,
+            D3DPT_TRIANGLESTRIP,
+            D3DPT_TRIANGLEFAN,
+        ] {
+            assert_eq!(
+                d.draw_primitive(prim, 0, 0),
+                0,
+                "DrawPrimitive of type {prim} with no primitives"
+            );
+            assert_eq!(
+                d.draw_indexed_primitive(prim, 0, 0, 3, 0, 0),
+                0,
+                "DrawIndexedPrimitive of type {prim} with no primitives"
+            );
+            assert_eq!(
+                d.draw_primitive_up(prim, 0, &tri),
+                0,
+                "DrawPrimitiveUP of type {prim} with no primitives"
+            );
+            assert_eq!(
+                d.draw_indexed_primitive_up(&inline(prim, 0), &indices, &tri),
+                0,
+                "DrawIndexedPrimitiveUP of type {prim} with no primitives"
+            );
+            for prim_count in [0, 1] {
+                assert_eq!(
+                    d.draw_primitive_up_with_stride(prim, prim_count, &tri, 0),
+                    D3DERR_INVALIDCALL,
+                    "DrawPrimitiveUP of type {prim}, count {prim_count}, with a zero stride"
+                );
+                assert_eq!(
+                    d.draw_indexed_primitive_up_with_stride(
+                        &inline(prim, prim_count),
+                        &indices,
+                        &tri,
+                        0
+                    ),
+                    D3DERR_INVALIDCALL,
+                    "DrawIndexedPrimitiveUP of type {prim}, count {prim_count}, with a zero stride"
+                );
+            }
+        }
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        BLACK,
+        "none of the accepted draws put a primitive on screen"
+    );
+    // The device is still usable: the same bound triangle draws.
+    h.render_once(BLACK, |d| {
+        assert_eq!(d.draw_primitive(D3DPT_TRIANGLELIST, 0, 1), 0, "a real draw");
+    });
+    assert_eq!(h.read_pixel(320, 240), GREEN, "the real draw renders");
+}
+
+#[test]
+fn bound_buffer_uses_stream_source_stride_not_decl_extent() {
+    // A bound `DrawPrimitive` steps the vertex stream by the `SetStreamSource`
+    // stride, NOT the vertex declaration's min-extent. When the application's
+    // vertex struct is larger than the declared elements (trailing padding),
+    // using the min-extent fetches every vertex past the first at the wrong
+    // offset and the primitive degenerates — the screen centre would miss.
+    use mtld3d_types::{
+        D3DDECL_END_STREAM, D3DDECLTYPE_D3DCOLOR, D3DDECLTYPE_FLOAT3, D3DDECLTYPE_UNUSED,
+        D3DDECLUSAGE_COLOR, D3DDECLUSAGE_POSITION, D3DVERTEXELEMENT9,
+    };
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct PaddedVertex {
+        x: f32,
+        y: f32,
+        z: f32,
+        color: u32,
+        _pad: [f32; 4],
+    }
+
+    let h = Harness::new();
+    let elem = |offset: u16, type_: u8, usage: u8| D3DVERTEXELEMENT9 {
+        stream: 0,
+        offset,
+        type_,
+        method: 0,
+        usage,
+        usage_index: 0,
+    };
+    // Declaration min-extent is 16 (FLOAT3@0 + D3DCOLOR@12); struct is 32.
+    let decl_elems = [
+        elem(0, D3DDECLTYPE_FLOAT3, D3DDECLUSAGE_POSITION),
+        elem(12, D3DDECLTYPE_D3DCOLOR, D3DDECLUSAGE_COLOR),
+        D3DVERTEXELEMENT9 {
+            stream: D3DDECL_END_STREAM,
+            offset: 0,
+            type_: D3DDECLTYPE_UNUSED,
+            method: 0,
+            usage: 0,
+            usage_index: 0,
+        },
+    ];
+    let decl = h.create_vertex_declaration(&decl_elems);
+    assert_eq!(h.set_vertex_declaration(&decl), 0, "SetVertexDeclaration");
+    assert_eq!(h.set_render_state(D3DRS_LIGHTING, 0), 0, "lighting off");
+    assert_eq!(h.clear_texture(0), 0, "no texture");
+    h.select_diffuse_stage(0);
+
+    let v = |x: f32, y: f32| PaddedVertex {
+        x,
+        y,
+        z: 0.5,
+        color: GREEN,
+        _pad: [0.0; 4],
+    };
+    // Full-screen quad as a triangle strip: with the wrong stride, verts 1..3
+    // decode from the wrong offsets and the quad no longer covers the centre.
+    let quad = [v(-1.0, 1.0), v(1.0, 1.0), v(-1.0, -1.0), v(1.0, -1.0)];
+    let stride = u32::try_from(core::mem::size_of::<PaddedVertex>()).expect("stride fits u32");
+    let vb = h.create_vertex_buffer(stride * 4, D3DUSAGE_WRITEONLY, 0, D3DPOOL_DEFAULT);
+    vb.lock(0, 0, 0).write(&quad);
+    assert_eq!(h.set_stream_source(0, &vb, 0, stride), 0, "SetStreamSource");
+
+    h.render_once(MAGENTA, |d| {
+        assert_eq!(
+            d.draw_primitive(D3DPT_TRIANGLESTRIP, 0, 2),
+            0,
+            "bound padded-stride DrawPrimitive",
+        );
+    });
+    assert_eq!(
+        h.read_pixel(320, 240),
+        GREEN,
+        "padded bound vertices must step by the SetStreamSource stride",
+    );
+}

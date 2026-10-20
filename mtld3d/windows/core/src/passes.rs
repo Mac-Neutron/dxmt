@@ -1,0 +1,7678 @@
+//! Pure-Rust render-pass state machine used by the PE-side `FrameEncoder`.
+//!
+//! Holds the `passes: Vec<Pass>` plus the bookkeeping for pass breaks on
+//! `SetRenderTarget`, `SetDepthStencilSurface`, and mid-frame `Clear`.
+
+use log::{Level, log_enabled, trace};
+use mtld3d_shared::{
+    BlitCommand, BlitCommandType, Command, CommandType, MetalHandle,
+    mtl::{
+        CullMode, PixelFormat, StencilOp, TriangleFillMode, VERTEX_STREAM_SLOTS,
+        VisibilityResultMode,
+    },
+    mtl_handle::{MTLRenderPipelineStateKind, MTLTextureKind},
+};
+use mtld3d_types::D3DSWAPEFFECT_DISCARD;
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+
+use crate::{
+    async_compile::DeferredPipelineId,
+    convert::d3d_to_metal_stencil_op,
+    depth_stencil_state::{DepthStencilSnapshot, STENCIL_MASK_BITS, StencilFaceState},
+    dirty_range::DirtyRange,
+    pipeline_state::{ExtraColorAttachments, PipelineAttachFlags, PipelineRsBits},
+    render_scale::{RenderScale, TargetExtent},
+};
+
+#[cfg(debug_assertions)]
+mod draw_state;
+
+#[cfg(debug_assertions)]
+pub use draw_state::DrawStateLedger;
+
+/// What a clear-only pass carries, and the attachments it must land on.
+struct ClearMerge {
+    color: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view the clear-only pass writes its colour through, or null.
+    ///
+    /// A merge target must write through the same view: the clear value is
+    /// stored raw through the linear view and sRGB-encoded through the twin,
+    /// so moving the load action across the two changes the stored colour.
+    color_srgb: MetalHandle<MTLTextureKind>,
+    color_subresource: u32,
+    /// Render targets 1..3 as `(texture, subresource)`; a null texture is an unbound slot.
+    ///
+    /// A merge target must carry exactly this set, slot for slot.
+    extra: [(MetalHandle<MTLTextureKind>, u32); 3],
+    depth: MetalHandle<MTLTextureKind>,
+    /// Mip level of `depth` the clear lands on.
+    ///
+    /// A merge target must render into the same level: a pass on another
+    /// level of the texture neither takes the clear nor consumes it.
+    depth_level: u32,
+    needs_color: bool,
+    needs_depth: bool,
+    needs_stencil: bool,
+}
+
+/// One attachment a clear-only pass clears, as Rule I follows it through later passes.
+///
+/// `slice` and `level` locate the subresource and `size` is that level's extent,
+/// which a later write has to cover in full to overwrite the clear. `depth`
+/// marks the depth plane, the only one a depth transfer can overwrite.
+struct ClearedTarget {
+    texture: MetalHandle<MTLTextureKind>,
+    slice: u32,
+    level: u32,
+    size: (u32, u32),
+    depth: bool,
+}
+
+impl ClearedTarget {
+    const NONE: Self = Self {
+        texture: MetalHandle::NULL,
+        slice: 0,
+        level: 0,
+        size: (0, 0),
+        depth: false,
+    };
+}
+
+/// The attachments one clear-only pass clears: render targets 0..3 and depth, at most five.
+///
+/// A fixed array rather than a `Vec`, so judging a candidate allocates nothing.
+struct ClearedTargets {
+    items: [ClearedTarget; 5],
+    len: usize,
+}
+
+impl ClearedTargets {
+    const fn push(&mut self, target: ClearedTarget) {
+        self.items[self.len] = target;
+        self.len += 1;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &ClearedTarget> {
+        self.items[..self.len].iter()
+    }
+}
+
+/// Compile-time gate for Rule A (first-use `DontCare`).
+///
+/// On the colour side only the back buffer qualifies, and only under
+/// `D3DSWAPEFFECT_DISCARD`: its contents are undefined after `Present`, so its
+/// first pass of a frame has nothing to load. Under `FLIP` and `COPY` the back
+/// buffer's contents are defined after `Present`, and every other colour
+/// target keeps its contents across `Present` in D3D9; a game may draw over
+/// last frame's pixels without clearing, so their first use loads. The depth
+/// plane takes the same first-use `DontCare`, which together with Rule B drops
+/// depth across `Present` as a kept divergence (see
+/// [`ENABLE_LAST_USE_DEPTH_DONTCARE`]). Flip to `false` for a single-line
+/// hotfix if a game surfaces that reads prior-frame depth on first use of
+/// frame N.
+const ENABLE_FIRST_USE_DONTCARE: bool = true;
+
+/// Compile-time gate for Rule A on the stencil plane (first-use `DontCare`).
+///
+/// The stencil plane shares the depth texture, so its first use in a frame
+/// takes the same `DontCare` the depth plane takes, under the same
+/// predicate. Stencil written in frame N and tested in frame N+1 without a
+/// clear in between was already lost before this rule: Rule B discards the
+/// stencil store together with the depth store at frame end. Flip to
+/// `false` if a game surfaces that carries stencil across `Present` and a
+/// frame-start `Load` turns out to matter.
+const ENABLE_FIRST_USE_STENCIL_DONTCARE: bool = true;
+
+/// Compile-time gate for Rule B (last-use depth/stencil `DontCare`).
+///
+/// Together with Rule A's first-use `DontCare` on the depth and stencil
+/// planes, this discards the depth and stencil contents of every surface
+/// nothing samples at each `Present`. D3D9 leaves those contents undefined
+/// after `Present` only when the game asks for it:
+/// `D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL` on the implicit surface, or
+/// `Discard = TRUE` passed to `CreateDepthStencilSurface`. Neither is
+/// consulted. The discard is a kept divergence for the store and load
+/// bandwidth it saves on a tile-based GPU; a game that tests against depth
+/// or stencil left from an earlier frame without clearing it reads undefined
+/// values. Depth that is sampleable or has been bound as a texture keeps
+/// `Store`. The same discard reaches back over the texture's trailing passes
+/// that neither read nor write depth or stencil (an interface pass with the
+/// depth test off or always passing), since nothing in the frame reads what
+/// the pass before them stores; that part is not a divergence. The rationale
+/// and the sites it costs are in the Kept divergences section of
+/// `unix/conformance/CONFORMANCE.md`. Flipping this alone does not
+/// carry depth across `Present`: [`ENABLE_FIRST_USE_DONTCARE`] and
+/// [`ENABLE_FIRST_USE_STENCIL_DONTCARE`] discard it again on the next frame's
+/// first use.
+const ENABLE_LAST_USE_DEPTH_DONTCARE: bool = true;
+
+/// Compile-time gate for Rule C (color `Store=DontCare`).
+///
+/// Applies when the next pass that touches the same color rt begins with
+/// a full-attachment clear, i.e. its `color_load == ColorLoad::Clear
+/// { .. }`. That load action is reached only by a `Clear` the encoder
+/// judged to cover the whole attachment; a `Clear` bounded by a sub-rect
+/// viewport, a scissor or `pRects` paints a quad over a `Load` instead and
+/// is therefore not a Rule C opportunity. Mirrors Rule B but keyed on
+/// color and predicated on the next-pass clear instead of
+/// last-occurrence. Flip to `false` if a game starts a pass with `Clear`
+/// but expects to read the underlying rt contents in some way mtld3d
+/// doesn't model (no such case is known).
+const ENABLE_NEXT_CLEAR_COLOR_DONTCARE: bool = true;
+
+/// Compile-time gate for Rule C's depth arm (depth and stencil `Store=DontCare`).
+///
+/// Applies when the next pass in the submission on the same depth texture
+/// and mip level opens with a full-attachment `Clear` of the plane, over a
+/// render area no smaller colour attachment confines: the depth store goes on
+/// a `DepthLoad::Clear`, the stencil store on a `StencilLoad::Clear`. Skipped
+/// for sampleable or ever-sampled textures and when anything between the two
+/// passes reads or writes the texture. Flip to
+/// `false` if a game surfaces that observes depth between a pass and a later
+/// clear through a path the scan does not model.
+const ENABLE_NEXT_CLEAR_DEPTH_DONTCARE: bool = true;
+
+/// Compile-time gate for discarding a stencil plane nothing has written.
+///
+/// A depth-stencil surface starts with undefined contents in D3D9, so until
+/// a stencil clear, a stencil-writing draw or a blit that can carry stencil
+/// reaches the texture, its stencil plane holds nothing to preserve and every
+/// pass on it loads and stores that plane `DontCare`. Many titles ask for
+/// D24S8 and never touch stencil. Flip to `false` if a game surfaces that
+/// writes stencil through a path `stencil_written_textures` does not see.
+const ENABLE_UNWRITTEN_STENCIL_DONTCARE: bool = true;
+
+/// Compile-time gate for discarding the depth loads of a pass that never uses depth.
+///
+/// A pass whose draws and clear-quads neither read nor write depth or
+/// stencil, and whose store of a plane is already `DontCare`, loads that
+/// plane `DontCare` instead of `Load`: nothing inside the pass reads it and
+/// nothing after it can. A depth test that always passes with depth writes
+/// off reads nothing. Typical case: an interface pass drawn over the scene
+/// with the depth test off or always passing, on the depth surface's last
+/// pass of the frame.
+/// Flip to `false` if a game surfaces that reads depth in a pass through a
+/// draw path that does not report its depth-stencil state.
+const ENABLE_UNUSED_DEPTH_LOAD_DONTCARE: bool = true;
+
+/// Compile-time gate for Rule F (cull clear-only passes that write nothing).
+///
+/// A pass with no draws and no leading blits qualifies when none of its
+/// attachments both clears and stores, and none resolves, after Rules B/C
+/// and G run, whatever the store actions of the attachments that only load.
+/// Such a pass has no observable effect: what it stores is what it loaded or
+/// what was undefined already. Passes with leading blits stay (the blits are
+/// real work scheduled before the encoder).
+const ENABLE_CULL_DEAD_CLEAR_PASSES: bool = true;
+
+/// Compile-time gate for Rule G: strip unwritten colour attachments from a clear-only pass.
+///
+/// Fires per colour attachment of a pass with no draws and no leading blits
+/// when the attachment neither stores a `Clear` nor resolves, whatever its
+/// store. Render target 0 goes only when a depth attachment remains; the pass
+/// then becomes a *depth-only* Metal render pass with no
+/// `colorAttachments[0]` binding. Requires unix-side `encode_pass` to handle
+/// `color_texture == 0` with `command_count > 0`.
+const ENABLE_STRIP_DEAD_COLOR_IN_CLEAR_ONLY: bool = true;
+
+/// Compile-time gate for Rule H — strip the color attachment from a pass-with-draws.
+///
+/// Fires when every draw in the pass runs with `D3DRS_COLORWRITEENABLE == 0`.
+/// Symmetric to Rule G but for passes that contain draws (Rule G only
+/// covers clear-only passes). Predicate: `color_writes_observed == false`,
+/// `color_texture != 0`, `depth_texture != 0` (Metal needs ≥1 attachment),
+/// no colour attachment smaller than the depth attachment (the strip must not
+/// widen the render area), and at least one draw command (otherwise Rule G
+/// already handled it).
+/// A pass that also carries a colour clear-quad qualifies only when Rule C
+/// already discarded its colour stores, since the clear is content D3D9
+/// keeps across `Present`. The rule also rewrites the pass's
+/// `SetRenderPipelineState` commands to
+/// bind a matching no-color pipeline variant — the caller passes a
+/// `with_color_handle → no_color_handle` side-map populated at draw time
+/// from `FrameEncoder::no_color_pipeline_alt`. Eliminates Apple's "Unused
+/// Texture" Insight on the cascade-color texture across cascade caster
+/// passes. Flip to `false` if a game surfaces relying on color writes
+/// against a masked-everywhere attachment (no such case is known — D3D9
+/// spec is unambiguous).
+const ENABLE_NO_COLOR_PASS_FOR_DRAWS: bool = true;
+
+/// Compile-time gate for Rule I (drop a clear-only pass whose targets are overwritten unread).
+///
+/// A clear-only pass (no draw, no leading blit, no resolve of its own, no
+/// counting query, no multisampled colour attachment, no stencil clear) goes
+/// when every attachment it clears is fully overwritten later in the same
+/// submission before anything reads it. A full overwrite is a leading depth
+/// transfer into the same level of a depth target, which always writes that
+/// whole level, or a leading texture-to-texture copy onto the same slice and
+/// level covering its whole extent. Anything else that touches the texture first (a sampler bind, a
+/// blit reading it, any attachment of it) is a read and keeps the pass, and so
+/// does reaching the end of the submission: D3D9 keeps render-target contents
+/// across `Present`, and a mid-frame flush continues the frame. The pass's
+/// uncleared attachments load and store what they already hold, or discard it
+/// under a `DontCare` load, so dropping them changes nothing D3D9 defines.
+/// Runs first in the submit pipeline, before Rule E could fold the dead clear
+/// into a later pass's load action. Flip to `false` if a game surfaces that
+/// reads a cleared target through a path the scan does not model.
+const ENABLE_DROP_OVERWRITTEN_CLEAR_PASSES: bool = true;
+
+/// Compile-time gate for leaving out draws that can write nothing.
+///
+/// A draw is dead when colour writes are masked off on every colour target
+/// of its pass, the depth write cannot happen (no depth attachment, or
+/// `D3DRS_ZENABLE` or `D3DRS_ZWRITEENABLE` off), the stencil cannot change
+/// (no stencil plane, `D3DRS_STENCILENABLE` off, a zero write mask, or
+/// `KEEP` for every operation of both faces), and no occlusion query is
+/// counting. D3D9 has no other way for a draw to be observed: there are no
+/// unordered writes or stream output, a vertex texture fetch only reads, and
+/// clip planes, point sprites, alpha-to-coverage and the multisample mask only
+/// narrow which of those writes land. The encoder then records none of the
+/// draw's commands, so no sampler bind of it counts as a read for Rule I and
+/// the pass it would have opened stays unopened. Flip to `false` if a game
+/// surfaces that observes such a draw through a path this list misses.
+const ENABLE_SKIP_DEAD_DRAWS: bool = true;
+
+/// Compile-time gate for Rule J (join adjacent passes on identical attachments).
+///
+/// A pass that loads every attachment the pass before it stored, on the same
+/// views, with no leading blit in between and no sampler reading one of those
+/// attachments, continues that pass rather than starting a new one; the two
+/// become one Metal render pass and the store and load between them go. The
+/// encoder state a fresh encoder would have given the second pass is put back
+/// at the join, or the passes stay apart. Flip to `false` if a game surfaces
+/// that observes the boundary between two such passes through a path the
+/// join does not model.
+const ENABLE_MERGE_ADJACENT_PASSES: bool = true;
+
+/// Compile-time gate for Rule K (`DontCare` under a first draw that covers render target 0).
+///
+/// A pass opened through [`PassState::open_pass_for_covering_draw`] starts
+/// with a draw its caller knows writes every pixel and sample of render target
+/// 0, the `StretchRect` render quad over a whole destination level, so
+/// nothing the pass would load survives that draw. The pass still opens with
+/// `Load`, and every other rule reasons over that `Load` as before; once they
+/// have run, a covered pass that still loads discards instead. Not a
+/// divergence: the load it removes is one no pixel of the result reads. Flip
+/// to `false` if a covering caller turns out to leave part of the attachment
+/// unwritten.
+const ENABLE_COVERED_COLOR_DONTCARE: bool = true;
+
+/// The blend factor, as a `D3DCOLOR`, that a fresh Metal render encoder blends with.
+///
+/// A fresh encoder blends with (0, 0, 0, 0), not with D3D9's default opaque
+/// white, so the per-draw dedup starts each pass at this value and a draw at
+/// the D3D9 default emits its `SetBlendColor`.
+const FRESH_BLEND_COLOR: u32 = 0x0000_0000;
+
+/// The encoder states Rule J reconciles at a join, as the command type that sets each.
+///
+/// A draw can read each without its pass having set it, because a fresh
+/// Metal render encoder starts with a value for it and the per-draw dedup
+/// cache leaves out a command that would set the value a fresh encoder
+/// already holds (`LastBoundCache::reset`). Bindings are not on the list: the
+/// cache starts every binding unset, so a draw binds everything it reads.
+const JOIN_STATES: [CommandType; 10] = [
+    CommandType::SetRenderPipelineState,
+    CommandType::SetViewport,
+    CommandType::SetDepthStencilState,
+    CommandType::SetCullMode,
+    CommandType::SetScissorRect,
+    CommandType::SetTriangleFillMode,
+    CommandType::SetDepthBias,
+    CommandType::SetStencilReference,
+    CommandType::SetBlendColor,
+    CommandType::SetVisibilityResultMode,
+];
+
+/// Sub-target for one-line-per-event pass-break / pass-open trace probes.
+///
+/// Gated by `RUST_LOG=mtld3d::d3d9::passes=trace`; the helpers below short-circuit
+/// to a single `log_enabled!` call when the target isn't active.
+const TRACE_TARGET: &str = "mtld3d::d3d9::passes";
+
+/// Depth-path probes.
+///
+/// `RUST_LOG=mtld3d::d3d9::depth=trace` opts in; this is the same
+/// sub-target the encoder + device modules use for
+/// `depth: pass attach=…`, `depth: surface bind tex=…`, and
+/// `depth: slot N …`. Re-used here so the per-`Clear` decision (Quad
+/// vs. Folded-amend vs. Folded-pending vs. visibility-fallback) shows
+/// up next to those probes — pre-fix vs. post-fix the count of each
+/// branch firing tells you immediately which Clear shape the game is
+/// using and whether the clear-quad path is reached.
+const DEPTH_TRACE_TARGET: &str = "mtld3d::d3d9::depth";
+
+/// Matches `STAGE_COUNT = 16` (PS3.0 allows s0–s15) used by `StageBindingsPtr` in the d3d9 crate.
+///
+/// The 4th CSM cascade shadow texture on the receiver path lands at
+/// slot 8.
+pub const LAST_BOUND_MAX_STAGES: usize = 16;
+
+/// Vertex texture fetch slots (`vs_3_0` s0..s3, `D3DVERTEXTEXTURESAMPLER0..3`).
+pub const VERTEX_SAMPLER_SLOTS: usize = 4;
+
+/// Cascade-summary probe target.
+///
+/// Used both to gate the per-frame summary log line at submit time AND
+/// to skip the per-draw / per-bind counter increments in
+/// `note_caster_draw` and `emit_command` when the probe is off. Without
+/// the gate at the increment sites the probe would have non-zero cost at
+/// default `RUST_LOG` (one `HashMap` entry per caster draw + per sample
+/// bind), violating the zero-cost-when-off discipline that all mtld3d
+/// diag probes follow.
+const CASCADE_PROBE_TARGET: &str = "mtld3d::d3d9::cascade";
+
+/// Pack a `(x, y, w, h)` viewport rect into a single u64.
+///
+/// Keeps the per-(texture, viewport) `log_once_trace_by!` keys for the
+/// clear-quad probes deduping at the right grain.
+const fn pack_viewport_key(vp: (u32, u32, u32, u32)) -> u64 {
+    let (x, y, w, h) = vp;
+    ((x as u64) << 48) ^ ((y as u64) << 32) ^ ((w as u64) << 16) ^ (h as u64)
+}
+
+/// Whether the `(x, y, w, h)` region spans a whole `(w, h)` extent from its origin.
+const fn region_covers_extent(region: (u32, u32, u32, u32), extent: (u32, u32)) -> bool {
+    let (x, y, w, h) = region;
+    x == 0 && y == 0 && extent_covers((w, h), extent)
+}
+
+/// Whether the `outer` extent reaches at least as far as `inner` on both axes.
+const fn extent_covers(outer: (u32, u32), inner: (u32, u32)) -> bool {
+    outer.0 >= inner.0 && outer.1 >= inner.1
+}
+
+/// How the next render-pass should load its color attachment.
+///
+/// `Load` preserves whatever the previous pass wrote; `Clear` replaces
+/// it with the stored RGBA bits (f32 bits each); `DontCare` leaves
+/// tile memory uninitialized at pass start (used on first-frame-use
+/// of an rt whose prior contents are undefined or about to be fully
+/// overwritten).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorLoad {
+    Load,
+    Clear { r: u32, g: u32, b: u32, a: u32 },
+    DontCare,
+}
+
+/// How the next render-pass should load its depth attachment.
+///
+/// `Load` carries the previous pass's depth buffer forward; `Clear`
+/// resets it to `value` (stored as f32 bits); `DontCare` leaves tile
+/// memory uninitialized at pass start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepthLoad {
+    Load,
+    Clear { value: u32 },
+    DontCare,
+}
+
+/// How the next render-pass should load its stencil attachment.
+///
+/// Separate from `DepthLoad` because the two planes of a combined
+/// `Depth32Float_Stencil8` attachment take independent load actions:
+/// `Clear(D3DCLEAR_STENCIL)` without `D3DCLEAR_ZBUFFER` resets stencil while
+/// carrying depth forward, and a stencil clear value is an integer rather
+/// than an f32 bit pattern. `DontCare` comes from Rule A's first-use
+/// discard, from a stencil plane nothing has written yet, and from a pass
+/// that neither uses nor keeps the plane; games carry stencil across passes
+/// within a frame, so a later pass on a written plane that it uses loads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StencilLoad {
+    Load,
+    Clear { value: u32 },
+    DontCare,
+}
+
+/// How the render-pass should store its attachment at pass end.
+///
+/// `Store` writes tile memory back to device memory; `DontCare`
+/// discards it. Used on the last pass with a given depth attachment
+/// in a frame (Rule B, a kept divergence: see
+/// `ENABLE_LAST_USE_DEPTH_DONTCARE`), on colour, depth and stencil
+/// attachments whose next consumer this submission begins with a full-
+/// attachment `Clear` (Rule C), on a stencil plane nothing has written, and
+/// on the presented multisampled back buffer once its resolve is taken.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreAction {
+    Store,
+    DontCare,
+}
+
+/// Result of `PassState::clear_depth` / `clear_color`.
+///
+/// `Folded` is the fast path: pass either had no work yet
+/// (Clear amended into the load action in place) or was closed (Clear
+/// stashed in `pending_*_clear` for the next pass-open). The caller
+/// has nothing more to do.
+///
+/// `EmitQuad` means the pass already had draws when the Clear
+/// arrived. Ending the pass and starting a fresh one with
+/// `loadAction = Clear` is wrong on Metal — Metal's load-Clear is
+/// full-attachment, ignoring viewport, and would wipe the prior
+/// draws (e.g. each tile of a shared shadow tile atlas wipes the
+/// previously rendered tiles). Instead the caller — the
+/// `FrameEncoder` layer that owns the per-format clear-quad pipeline
+/// cache — emits a fullscreen-triangle draw inside the current
+/// encoder, scissored to the D3D9 viewport, that writes the constant
+/// clear value as depth (and color when `has_color`). The pass
+/// stays open. `NoOp` means there was nothing to clear: no depth-stencil
+/// texture is attached, or the viewport has no area, and D3D9 clears nothing
+/// in either case. The pass state is left untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DepthClearOutcome {
+    Folded,
+    NoOp,
+    EmitQuad {
+        value: u32,
+        viewport: (u32, u32, u32, u32),
+        has_color: bool,
+        color_format: PixelFormat,
+    },
+}
+
+/// What `clear_stencil` decided.
+///
+/// `Folded` means the clear became the next pass's `loadAction`; `EmitQuad`
+/// means the caller paints a scissored quad instead, because folding would
+/// clear the whole attachment and wipe tiles the frame already drew. `NoOp`
+/// means there was nothing to clear: no depth-stencil texture is attached, or
+/// the viewport has no area, and D3D9 clears nothing in either case. The pass
+/// state is left untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StencilClearOutcome {
+    Folded,
+    NoOp,
+    EmitQuad {
+        value: u32,
+        viewport: (u32, u32, u32, u32),
+        has_color: bool,
+        color_format: PixelFormat,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorClearOutcome {
+    Folded,
+    EmitQuad {
+        rgba: (u32, u32, u32, u32),
+        viewport: (u32, u32, u32, u32),
+        color_format: PixelFormat,
+    },
+}
+
+/// Render target 1..3 as currently bound, before any pass has frozen it.
+///
+/// `size` is the extent Metal allocated for the bound subresource, the one the
+/// pass will see, and `logical_size` the one D3D9 reports; `scale` relates the
+/// two exactly as for render target 0, through [`TargetExtent`]. A
+/// slot is bound when `texture` is non-null, and takes part in a pass only
+/// when `size` equals render target 0's (the D3D9 rule: draws reach targets
+/// whose extent matches the first one; a mismatched target is still cleared).
+#[derive(Debug, PartialEq, Eq)]
+pub struct ExtraColorSlot {
+    pub texture: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of `texture`, NULL when the target is single-sampled.
+    ///
+    /// When set it is what the pass attaches; `texture` becomes the resolve
+    /// target and stays the identity every rule, every sampler bind and every
+    /// blit sees.
+    pub msaa_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `msaa_texture`, NULL when it has none.
+    ///
+    /// Carried beside the companion rather than looked up, because the twin
+    /// map answers for the single-sample handles every identity question is
+    /// asked with and a multisampled companion is never one of them.
+    pub msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Sample count of the target; 1 when it is single-sampled.
+    ///
+    /// A target whose count differs from render target 0's takes no part in
+    /// the pass, the same way a differently-sized one does not: Metal takes a
+    /// pass's sample count from its attachments and rejects a disagreement.
+    pub sample_count: u8,
+    /// `slice | (level << 16)`, as on [`Pass`].
+    pub subresource: u32,
+    pub size: (u32, u32),
+    pub logical_size: (u32, u32),
+    pub format: PixelFormat,
+    pub scale: RenderScale,
+    /// Whether the target's D3D format has a real alpha channel.
+    pub has_alpha: bool,
+}
+
+impl ExtraColorSlot {
+    /// The unbound slot.
+    pub const NONE: Self = Self {
+        texture: MetalHandle::NULL,
+        msaa_texture: MetalHandle::NULL,
+        msaa_srgb_texture: MetalHandle::NULL,
+        sample_count: 1,
+        subresource: 0,
+        size: (0, 0),
+        logical_size: (0, 0),
+        format: PixelFormat::Bgra8Unorm,
+        scale: RenderScale::IDENTITY,
+        has_alpha: false,
+    };
+
+    #[must_use]
+    pub const fn is_bound(&self) -> bool {
+        !self.texture.is_null()
+    }
+}
+
+/// One of render targets 1..3 as frozen onto a [`Pass`].
+///
+/// Unbound when `texture` is null. The load and store actions follow the
+/// same rules as render target 0's, evaluated per attachment.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PassColorAttachment {
+    texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `texture`, bound in its place under `D3DRS_SRGBWRITEENABLE`.
+    ///
+    /// Null when the pass writes linear. Only the render-pass descriptor
+    /// uses it: every identity question (seen sets, load/store rules) is
+    /// asked with `texture`, since the two views share one Metal texture.
+    srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion the pass actually attaches, NULL when there is none.
+    msaa_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `msaa_texture`, null when the pass writes linear.
+    ///
+    /// Metal takes the resolve destination's pixel format from the
+    /// attachment's, so a pass that attaches this resolves into
+    /// `srgb_texture` rather than into `texture`.
+    msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// The view a resolve writes, set by `finalize_store_actions` on the pass that takes it.
+    ///
+    /// Null on every other pass, and never set unless `msaa_texture` is.
+    resolve_texture: MetalHandle<MTLTextureKind>,
+    subresource: u32,
+    size: (u32, u32),
+    format: PixelFormat,
+    load: ColorLoad,
+    store: StoreAction,
+}
+
+/// Attachment and scope of one texture-upload pass.
+///
+/// `size` is the destination mip's own extent (what the load action's
+/// full-coverage test measures `rect` against), `subresource` is
+/// `(slice, level)` where `slice` is the cube face or volume depth plane.
+pub struct UploadPassTarget {
+    pub texture: MetalHandle<MTLTextureKind>,
+    pub subresource: (u32, u32),
+    pub size: (u32, u32),
+    pub format: PixelFormat,
+    /// `(x, y, width, height)` of the dirty rect, in destination texels.
+    pub rect: (u32, u32, u32, u32),
+}
+
+/// The states that decide whether a draw can write anything, as the encoder resolves them.
+///
+/// `attach` carries the depth and stencil planes the pass the draw lands in
+/// actually binds (`HAS_DEPTH`, `HAS_STENCIL`); its other bits are ignored.
+/// `extra` and `ps_color_out_mask` are what the pipeline key reads for render
+/// targets 1..3. `counting_query` is set while any occlusion query is open on
+/// the encoder, since a counting query observes samples that write nothing.
+pub struct DrawWrites<'a> {
+    pub rs: &'a PipelineRsBits,
+    pub extra: &'a ExtraColorAttachments,
+    pub ps_color_out_mask: u8,
+    pub depth_stencil: &'a DepthStencilSnapshot,
+    pub attach: PipelineAttachFlags,
+    pub counting_query: bool,
+}
+
+/// `true` when a draw running with `writes` has no effect D3D9 lets anyone observe.
+///
+/// The conditions are the ones the `ENABLE_SKIP_DEAD_DRAWS` gate lists.
+/// Stencil operations are compared after translation, so they read exactly
+/// as the `MTLDepthStencilState` the draw would get.
+#[must_use]
+pub fn draw_writes_nothing(writes: &DrawWrites<'_>) -> bool {
+    if writes.counting_query
+        || !writes
+            .rs
+            .writes_no_color(writes.extra, writes.ps_color_out_mask)
+    {
+        return false;
+    }
+    let ds = writes.depth_stencil;
+    let depth_writes = writes.attach.contains(PipelineAttachFlags::HAS_DEPTH)
+        && ds.depth_enable != 0
+        && ds.depth_write != 0;
+    !depth_writes && !draw_writes_stencil(ds, writes.attach)
+}
+
+impl PassColorAttachment {
+    /// The unbound attachment.
+    pub const NONE: Self = Self {
+        texture: MetalHandle::NULL,
+        srgb_texture: MetalHandle::NULL,
+        msaa_texture: MetalHandle::NULL,
+        msaa_srgb_texture: MetalHandle::NULL,
+        resolve_texture: MetalHandle::NULL,
+        subresource: 0,
+        size: (0, 0),
+        format: PixelFormat::Bgra8Unorm,
+        load: ColorLoad::DontCare,
+        store: StoreAction::DontCare,
+    };
+
+    #[must_use]
+    pub const fn is_bound(&self) -> bool {
+        !self.texture.is_null()
+    }
+    #[must_use]
+    pub const fn texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.texture
+    }
+    /// The view the render pass binds.
+    ///
+    /// The multisampled companion where the target has one, and in either
+    /// case the sRGB twin of it when the pass encodes on write.
+    #[must_use]
+    pub const fn attachment_texture(&self) -> MetalHandle<MTLTextureKind> {
+        if self.msaa_texture.is_null() {
+            if self.srgb_texture.is_null() {
+                self.texture
+            } else {
+                self.srgb_texture
+            }
+        } else if self.msaa_srgb_texture.is_null() {
+            self.msaa_texture
+        } else {
+            self.msaa_srgb_texture
+        }
+    }
+    /// The single-sample view the pass resolves into, NULL when it takes no resolve.
+    #[must_use]
+    pub const fn resolve_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.resolve_texture
+    }
+    /// The view a resolve of this attachment writes, whether or not it takes one.
+    const fn resolve_view(&self) -> MetalHandle<MTLTextureKind> {
+        if self.srgb_texture.is_null() {
+            self.texture
+        } else {
+            self.srgb_texture
+        }
+    }
+    #[must_use]
+    pub const fn slice(&self) -> u32 {
+        self.subresource & 0xffff
+    }
+    #[must_use]
+    pub const fn level(&self) -> u32 {
+        self.subresource >> 16
+    }
+    #[must_use]
+    pub const fn format(&self) -> PixelFormat {
+        self.format
+    }
+    #[must_use]
+    pub const fn load(&self) -> ColorLoad {
+        self.load
+    }
+    #[must_use]
+    pub const fn store(&self) -> StoreAction {
+        self.store
+    }
+    /// Whether the attachment changes its texture in a pass that draws nothing.
+    ///
+    /// Only a `Clear` load that is stored, or a multisample resolve, does: a
+    /// `Load` stores back what it loaded, and a `DontCare` load stores
+    /// contents that were already undefined, which the texture's old contents
+    /// stand in for as well as anything.
+    const fn written_without_draws(&self) -> bool {
+        clear_is_stored(matches!(self.load, ColorLoad::Clear { .. }), self.store)
+            || !self.resolve_texture.is_null()
+    }
+}
+
+/// One bound colour attachment of a [`Pass`] as the store rules see it.
+struct BoundColorAttachment {
+    /// 0 = render target 0, 1..=3 = extras.
+    slot: usize,
+    texture: MetalHandle<MTLTextureKind>,
+    subresource: u32,
+    store: StoreAction,
+}
+
+impl BoundColorAttachment {
+    const NONE: Self = Self {
+        slot: 0,
+        texture: MetalHandle::NULL,
+        subresource: 0,
+        store: StoreAction::DontCare,
+    };
+}
+
+/// The bound colour attachments of one pass, at most four, in slot order.
+///
+/// A fixed array rather than a `Vec` because the store rules build one per
+/// pass per frame.
+struct BoundColorAttachments {
+    items: [BoundColorAttachment; 4],
+    len: usize,
+}
+
+impl BoundColorAttachments {
+    fn iter(&self) -> impl Iterator<Item = &BoundColorAttachment> {
+        self.items[..self.len].iter()
+    }
+}
+
+/// The full colour binding set of the device, taken off the pass state.
+///
+/// `PassState::take_color_attachments` hands it out so a caller can bind
+/// targets of its own for a scoped pass and then put the device's binding
+/// back exactly, extras and alpha bit included.
+pub struct SavedColorAttachments {
+    texture: MetalHandle<MTLTextureKind>,
+    msaa_texture: MetalHandle<MTLTextureKind>,
+    msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    sample_count: u8,
+    slice: u32,
+    level: u32,
+    logical_size: (u32, u32),
+    /// Extent Metal allocated for the bound subresource.
+    size: (u32, u32),
+    format: PixelFormat,
+    scale: RenderScale,
+    has_alpha: bool,
+    extra: [ExtraColorSlot; 3],
+}
+
+impl SavedColorAttachments {
+    /// Render target `slot` (0..=3) as a bindable [`ExtraColorSlot`], if bound.
+    ///
+    /// Slot 0 is always bound. The returned value carries the logical size
+    /// and scale, so binding it as render target 0 reproduces the device's
+    /// coordinate space for that target.
+    #[must_use]
+    pub fn slot(&self, slot: usize) -> Option<ExtraColorSlot> {
+        if slot == 0 {
+            return Some(ExtraColorSlot {
+                texture: self.texture,
+                msaa_texture: self.msaa_texture,
+                msaa_srgb_texture: self.msaa_srgb_texture,
+                sample_count: self.sample_count,
+                subresource: self.slice | (self.level << 16),
+                size: self.size,
+                logical_size: self.logical_size,
+                format: self.format,
+                scale: self.scale,
+                has_alpha: self.has_alpha,
+            });
+        }
+        let extra = &self.extra[slot - 1];
+        extra.is_bound().then_some(ExtraColorSlot {
+            texture: extra.texture,
+            msaa_texture: extra.msaa_texture,
+            msaa_srgb_texture: extra.msaa_srgb_texture,
+            sample_count: extra.sample_count,
+            subresource: extra.subresource,
+            size: extra.size,
+            logical_size: extra.logical_size,
+            format: extra.format,
+            scale: extra.scale,
+            has_alpha: extra.has_alpha,
+        })
+    }
+
+    /// Whether extra slot `slot` (1..=3) matches render target 0's extent.
+    #[must_use]
+    pub fn extra_matches_rt0(&self, slot: usize) -> bool {
+        let extra = &self.extra[slot - 1];
+        extra.is_bound() && extra.size == self.size
+    }
+}
+
+/// One Metal render pass.
+///
+/// Each pass maps to a single `MTLRenderCommandEncoder` on the unix side.
+/// Attachments are frozen at pass open; further changes (`SetRenderTarget`,
+/// mid-frame Clear, depth change) end the current pass and open a new one.
+pub struct Pass {
+    color_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `color_texture`, bound in its place under `D3DRS_SRGBWRITEENABLE`.
+    ///
+    /// Null when the pass writes linear. See
+    /// [`PassColorAttachment::srgb_texture`] for why identity stays on the
+    /// base handle.
+    color_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of `color_texture`, NULL when it is single-sampled.
+    ///
+    /// The pass attaches this and resolves into `color_texture`; every rule,
+    /// every sampler bind and every blit keeps keying on `color_texture`,
+    /// which is the D3D9 surface's identity and the only one anything but a
+    /// render pass ever touches.
+    color_msaa_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `color_msaa_texture`, null when the pass writes linear.
+    ///
+    /// See [`PassColorAttachment::msaa_srgb_texture`] for why the two views
+    /// have to be chosen together.
+    color_msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Non-NULL on the pass that takes the multisample resolve.
+    ///
+    /// Set by `finalize_store_actions` on the last pass of the submission
+    /// that binds `color_msaa_texture`, and by `note_msaa_read` when
+    /// something reads the resolved content earlier than that. Carries the
+    /// view the resolve writes: `color_srgb_texture` when the pass encodes on
+    /// write, else `color_texture`.
+    color_resolve_texture: MetalHandle<MTLTextureKind>,
+    color_subresource: u32,
+    color_size: (u32, u32),
+    color_format: PixelFormat,
+    color_load: ColorLoad,
+    /// Defaults to `Store` at pass open.
+    ///
+    /// `PassState::finalize_store_actions` flips to `DontCare` at submit
+    /// time when the very next pass this frame touching the same color
+    /// texture begins with a full-attachment `Clear` (Rule C) — the prior
+    /// contents are provably overwritten. The last pass per rt in the
+    /// frame is naturally exempt (no next pass), so backbuffer Present
+    /// and persistent rt contents survive.
+    color_store: StoreAction,
+    depth_texture: MetalHandle<MTLTextureKind>,
+    /// Mip level of `depth_texture` the pass renders depth into.
+    depth_level: u32,
+    /// Extent of `depth_texture` at `depth_level`, in its own space; `(0, 0)` without one.
+    ///
+    /// Carried beside the handle because D3D9 lets a depth surface be larger
+    /// than render target 0, so `color_size` does not say how much of the
+    /// depth plane a load action or a copy covers.
+    depth_size: (u32, u32),
+    depth_load: DepthLoad,
+    stencil_load: StencilLoad,
+    /// Store action of the depth plane; defaults to `Store`.
+    ///
+    /// Flipped to `DontCare` by `finalize_store_actions` on the *last*
+    /// pass with each depth texture in the frame (Rule B), unless the texture
+    /// is sampleable or sampled. D3D9 keeps depth and stencil across
+    /// `Present` unless the game asked to discard them; dropping them anyway
+    /// is a kept divergence, see [`ENABLE_LAST_USE_DEPTH_DONTCARE`]. Also
+    /// flipped when the next pass on the same texture and level clears the
+    /// depth plane in full (Rule C's depth arm).
+    depth_store: StoreAction,
+    /// Store action of the stencil plane of a combined texture; defaults to `Store`.
+    ///
+    /// Decided apart from `depth_store`, since each plane of a
+    /// `Depth32Float_Stencil8` attachment takes its own store action: Rule B
+    /// discards both, Rule C's depth arm discards the plane the next pass
+    /// clears, and a stencil plane nothing has written is discarded outright
+    /// (see [`ENABLE_UNWRITTEN_STENCIL_DONTCARE`]). Inert on a texture with no
+    /// stencil plane.
+    stencil_store: StoreAction,
+    viewport: (u32, u32, u32, u32),
+    commands: Vec<Command>,
+    /// Blits replayed inside an `MTLBlitCommandEncoder` *before* this pass's render encoder begins.
+    ///
+    /// Drained from `PassState::pending_leading_blits` at pass open. Used
+    /// by `StretchRect` so a texture-to-texture copy that happens between
+    /// two D3D9 draws lands in correct order with both passes (the
+    /// global `frame_blit_commands` runs at frame start and would mis-
+    /// order a mid-frame `StretchRect` against the source pass's draws).
+    leading_blits: Vec<BlitCommand>,
+    /// Latched `true` by a `SetVisibilityResultMode(Counting, …)` command in this pass.
+    ///
+    /// Emitted into the pass via `PassState::emit_command`. The submit
+    /// path uses this to decide whether to attach the frame's visibility
+    /// result buffer to this pass's render-pass descriptor. Passes with
+    /// only `Disabled` (trailing END with no further active queries) or
+    /// no visibility command at all keep the attachment cleared, which
+    /// avoids Metal tracking the buffer in the pass's resource residency
+    /// set and keeps the `MTL_DEBUG_LAYER` validator from retaining
+    /// per-pass tracking state for it.
+    has_counting_visibility: bool,
+    /// What the depth attachment is and what the pass's draws did with it.
+    ///
+    /// See [`PassDepthFlags`] for the bits.
+    depth_flags: PassDepthFlags,
+    /// What the pass's draws did with render target 0.
+    ///
+    /// See [`PassColorFlags`] for the bits.
+    color_flags: PassColorFlags,
+    /// `[start, end)` command-index ranges of color clear-quad blocks emitted into this pass.
+    ///
+    /// Recorded by `PassState::open_color_clear_quad_block` /
+    /// `close_color_clear_quad_block` from the encoder's
+    /// `emit_clear_quad_color_inner`.
+    ///
+    /// Rule H ignores commands inside these ranges when deciding
+    /// whether a "real" color-writing draw is present, and removes the
+    /// ranges entirely when it strips the color attachment — the
+    /// color clear-quad pipeline declares a color output and would
+    /// fail Metal's pipeline-vs-RP format validation against a
+    /// stripped (depth-only) descriptor. It strips such a pass only when
+    /// Rule C already discards its colour stores, so the removed writes
+    /// are dead work.
+    color_clear_quad_ranges: Vec<(usize, usize)>,
+    /// Render targets 1..3; all unbound on a single-target pass.
+    extra_color: [PassColorAttachment; 3],
+}
+
+impl Pass {
+    #[must_use]
+    pub const fn color_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.color_texture
+    }
+    /// The view the render pass binds for colour attachment 0.
+    ///
+    /// The multisampled companion where render target 0 has one, and in
+    /// either case the sRGB twin of it when the pass encodes on write.
+    #[must_use]
+    pub const fn color_attachment_texture(&self) -> MetalHandle<MTLTextureKind> {
+        if self.color_msaa_texture.is_null() {
+            if self.color_srgb_texture.is_null() {
+                self.color_texture
+            } else {
+                self.color_srgb_texture
+            }
+        } else if self.color_msaa_srgb_texture.is_null() {
+            self.color_msaa_texture
+        } else {
+            self.color_msaa_srgb_texture
+        }
+    }
+    /// The single-sample view the pass resolves render target 0 into, NULL for none.
+    #[must_use]
+    pub const fn color_resolve_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.color_resolve_texture
+    }
+    /// The view a resolve of render target 0 writes, whether or not this pass takes one.
+    const fn color_resolve_view(&self) -> MetalHandle<MTLTextureKind> {
+        if self.color_srgb_texture.is_null() {
+            self.color_texture
+        } else {
+            self.color_srgb_texture
+        }
+    }
+    /// Drop colour attachment 0 together with every view of it the render pass could bind.
+    ///
+    /// `color_attachment_texture` falls back to the sRGB twin and the
+    /// multisampled companion, so a strip that nulled `color_texture` alone
+    /// would still attach one of those, `DontCare` on both ends, to a pass
+    /// whose pipelines may declare no colour output. Load and store go back
+    /// to their unused defaults so a stale `Clear` does not mislead readers.
+    const fn drop_color_attachment(&mut self) {
+        self.color_texture = MetalHandle::NULL;
+        self.color_srgb_texture = MetalHandle::NULL;
+        self.color_msaa_texture = MetalHandle::NULL;
+        self.color_msaa_srgb_texture = MetalHandle::NULL;
+        self.color_resolve_texture = MetalHandle::NULL;
+        self.color_subresource = 0;
+        self.color_load = ColorLoad::DontCare;
+        self.color_store = StoreAction::DontCare;
+    }
+    /// Whether no bound colour attachment is smaller than the depth attachment on either axis.
+    ///
+    /// Metal rasterizes a pass over the smallest extent among its
+    /// attachments. A colour attachment smaller than the depth attachment
+    /// therefore bounds what the pass reaches of the depth surface: removing
+    /// it would widen the pass's draws, and a whole-surface depth clear folded
+    /// into its load action need not reach past that area. True without a
+    /// depth attachment.
+    fn color_extent_covers_depth(&self) -> bool {
+        if self.depth_texture.is_null() {
+            return true;
+        }
+        (self.color_texture.is_null() || extent_covers(self.color_size, self.depth_size))
+            && self
+                .extra_color
+                .iter()
+                .filter(|a| a.is_bound())
+                .all(|a| extent_covers(a.size, self.depth_size))
+    }
+    /// Whether a depth or stencil `Clear` load of this pass stops short of its depth surface.
+    ///
+    /// A load-action clear reaches only the render area, which a colour
+    /// attachment smaller than the depth surface confines.
+    fn clears_depth_past_its_area(&self) -> bool {
+        (matches!(self.depth_load, DepthLoad::Clear { .. })
+            || matches!(self.stencil_load, StencilLoad::Clear { .. }))
+            && !self.color_extent_covers_depth()
+    }
+    /// Whether this pass repeats the depth and stencil clears of `prev`, a depth-only clear pass.
+    ///
+    /// `prev` attaches no colour, records no draw and attaches the same depth
+    /// texture, level and extent, and every plane this pass loads with `Clear`
+    /// it cleared to the same value. Such a pass may load `Clear` though its
+    /// colour attachments are smaller than the depth surface: the whole
+    /// surface already holds that value.
+    fn repeats_depth_clear_of(&self, prev: &Self) -> bool {
+        let clears_depth = matches!(self.depth_load, DepthLoad::Clear { .. });
+        let clears_stencil = matches!(self.stencil_load, StencilLoad::Clear { .. });
+        prev.color_texture.is_null()
+            && prev.extra_color.iter().all(|a| !a.is_bound())
+            && !prev.commands.iter().any(Command::is_draw)
+            && prev.depth_texture == self.depth_texture
+            && prev.depth_level == self.depth_level
+            && prev.depth_size == self.depth_size
+            && (!clears_depth || prev.depth_load == self.depth_load)
+            && (!clears_stencil || prev.stencil_load == self.stencil_load)
+    }
+    /// Whether render target 0 changes its texture when the pass draws nothing.
+    ///
+    /// The same test as `PassColorAttachment::written_without_draws`.
+    const fn color_written_without_draws(&self) -> bool {
+        !self.color_texture.is_null()
+            && (clear_is_stored(
+                matches!(self.color_load, ColorLoad::Clear { .. }),
+                self.color_store,
+            ) || !self.color_resolve_texture.is_null())
+    }
+    /// Whether the depth attachment changes its texture when the pass draws nothing.
+    ///
+    /// A stored `Clear` of either plane does, each plane judged by its own
+    /// store action; the stencil plane counts only where the texture has one.
+    const fn depth_written_without_draws(&self) -> bool {
+        !self.depth_texture.is_null()
+            && (clear_is_stored(
+                matches!(self.depth_load, DepthLoad::Clear { .. }),
+                self.depth_store,
+            ) || (self.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
+                && clear_is_stored(
+                    matches!(self.stencil_load, StencilLoad::Clear { .. }),
+                    self.stencil_store,
+                )))
+    }
+    /// Take `next`'s work into this pass, as Rule J joins them.
+    ///
+    /// `join` is emitted between the two command lists. The joined pass keeps
+    /// this pass's load actions and takes `next`'s store actions and
+    /// resolves; `next` is left with an empty command list.
+    fn absorb(&mut self, next: &mut Self, join: &PassJoin) {
+        let offset = self.commands.len() + join.len;
+        self.commands.extend_from_slice(join.commands());
+        self.commands.append(&mut next.commands);
+        self.color_clear_quad_ranges.extend(
+            next.color_clear_quad_ranges
+                .iter()
+                .map(|&(start, end)| (start + offset, end + offset)),
+        );
+        self.color_store = next.color_store;
+        self.color_resolve_texture = next.color_resolve_texture;
+        for (mine, theirs) in self.extra_color.iter_mut().zip(&next.extra_color) {
+            mine.store = theirs.store;
+            mine.resolve_texture = theirs.resolve_texture;
+        }
+        self.depth_store = next.depth_store;
+        self.stencil_store = next.stencil_store;
+        // What the draws of either half did to the depth planes.
+        self.depth_flags |=
+            next.depth_flags & (PassDepthFlags::USED | PassDepthFlags::STENCIL_WRITTEN);
+        self.has_counting_visibility |= next.has_counting_visibility;
+        // Whether this pass's first draw covers render target 0 stays this
+        // pass's own: the joined draws run after it.
+        self.color_flags |= next.color_flags & PassColorFlags::WRITES_OBSERVED;
+    }
+    /// The per-pass half of [`PassState::resolve_pending_pipelines`].
+    fn resolve_pending_pipelines(
+        &mut self,
+        answer: &impl Fn(&DeferredPipelineId) -> Option<MetalHandle<MTLRenderPipelineStateKind>>,
+    ) -> u32 {
+        let set_pipeline = CommandType::SetRenderPipelineState as u32;
+        if !self
+            .commands
+            .iter()
+            .any(|c| c.cmd == set_pipeline && DeferredPipelineId::is_placeholder(c.param_b))
+        {
+            return 0;
+        }
+        // `kept[i]` is how many commands before index `i` stay, which is
+        // where a clear-quad range boundary at `i` moves to.
+        let mut kept = Vec::with_capacity(self.commands.len() + 1);
+        let mut removed = 0;
+        let mut dropping = false;
+        let mut index = 0;
+        self.commands.retain_mut(|command| {
+            kept.push(index);
+            let keep = if command.cmd == set_pipeline {
+                match DeferredPipelineId::from_placeholder(command.param_b) {
+                    None => {
+                        dropping = false;
+                        true
+                    }
+                    Some(id) => {
+                        let pipeline = answer(&id);
+                        if let Some(pipeline) = pipeline {
+                            command.param_b = pipeline.raw();
+                        }
+                        dropping = pipeline.is_none();
+                        !dropping
+                    }
+                }
+            } else if dropping && command.is_draw() {
+                removed += 1;
+                false
+            } else {
+                true
+            };
+            index += usize::from(keep);
+            keep
+        });
+        kept.push(index);
+        for (start, end) in &mut self.color_clear_quad_ranges {
+            *start = kept[*start];
+            *end = kept[*end];
+        }
+        removed
+    }
+    /// Render targets 1..3 of this pass, unbound entries included.
+    #[must_use]
+    pub const fn extra_color(&self) -> &[PassColorAttachment; 3] {
+        &self.extra_color
+    }
+    /// Bit `i` set ⇒ render target `i + 1` is bound on this pass.
+    #[must_use]
+    pub fn extra_present_mask(&self) -> u8 {
+        self.extra_color
+            .iter()
+            .enumerate()
+            .fold(0, |m, (i, a)| if a.is_bound() { m | (1 << i) } else { m })
+    }
+    /// Every bound colour attachment on the pass, with its absolute slot.
+    ///
+    /// Render target 0 (slot 0) first, then the bound extras (slots 1..=3).
+    /// Lets the load/store rules treat the attachments uniformly; the slot
+    /// feeds [`Self::color_load_of`] / [`Self::set_color_store_of`].
+    fn bound_color_attachments(&self) -> BoundColorAttachments {
+        let mut list = BoundColorAttachments {
+            items: [BoundColorAttachment::NONE; 4],
+            len: 0,
+        };
+        if !self.color_texture.is_null() {
+            list.items[0] = BoundColorAttachment {
+                slot: 0,
+                texture: self.color_texture,
+                subresource: self.color_subresource,
+                store: self.color_store,
+            };
+            list.len = 1;
+        }
+        for (i, a) in self.extra_color.iter().enumerate() {
+            if a.is_bound() {
+                list.items[list.len] = BoundColorAttachment {
+                    slot: i + 1,
+                    texture: a.texture,
+                    subresource: a.subresource,
+                    store: a.store,
+                };
+                list.len += 1;
+            }
+        }
+        list
+    }
+    /// Load action of attachment `slot` (0 = render target 0, 1..=3 = extras).
+    const fn color_load_of(&self, slot: usize) -> ColorLoad {
+        if slot == 0 {
+            self.color_load
+        } else {
+            self.extra_color[slot - 1].load
+        }
+    }
+    /// Set the store action of attachment `slot` (0 = render target 0, 1..=3 = extras).
+    const fn set_color_store_of(&mut self, slot: usize, store: StoreAction) {
+        if slot == 0 {
+            self.color_store = store;
+        } else {
+            self.extra_color[slot - 1].store = store;
+        }
+    }
+    #[must_use]
+    pub const fn color_slice(&self) -> u32 {
+        self.color_subresource & 0xffff
+    }
+    #[must_use]
+    pub const fn color_level(&self) -> u32 {
+        self.color_subresource >> 16
+    }
+    #[must_use]
+    pub const fn color_size(&self) -> (u32, u32) {
+        self.color_size
+    }
+    /// Metal pixel format of the pass's color attachment.
+    ///
+    /// Included in `PipelineKey` so cache hits distinguish pipelines by
+    /// rt format — a pipeline built for `BGRA8Unorm` would be rejected by
+    /// Metal if bound against an rt with a different format.
+    #[must_use]
+    pub const fn color_format(&self) -> PixelFormat {
+        self.color_format
+    }
+    #[must_use]
+    pub const fn depth_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.depth_texture
+    }
+    /// Whether a draw or clear-quad in the pass can write its stencil plane.
+    #[must_use]
+    pub const fn writes_stencil(&self) -> bool {
+        self.depth_flags.contains(PassDepthFlags::STENCIL_WRITTEN)
+    }
+    /// Mip level of `depth_texture` the pass renders depth into.
+    #[must_use]
+    pub const fn depth_level(&self) -> u32 {
+        self.depth_level
+    }
+    #[must_use]
+    pub const fn color_load(&self) -> ColorLoad {
+        self.color_load
+    }
+    /// The colour a `Clear` load writes, from whichever colour attachment clears.
+    ///
+    /// A D3D9 `Clear` gives every bound target one colour, so the attachments
+    /// that load with `Clear` agree on it. Render target 0 is not always one
+    /// of them: Rule G strips it from a clear-only pass whose extras it keeps,
+    /// so the extras are asked too. `None` when no attachment clears.
+    #[must_use]
+    pub fn color_clear_rgba(&self) -> Option<(u32, u32, u32, u32)> {
+        core::iter::once(self.color_load)
+            .chain(
+                self.extra_color
+                    .iter()
+                    .filter(|a| a.is_bound())
+                    .map(PassColorAttachment::load),
+            )
+            .find_map(|load| match load {
+                ColorLoad::Clear { r, g, b, a } => Some((r, g, b, a)),
+                ColorLoad::Load | ColorLoad::DontCare => None,
+            })
+    }
+    #[must_use]
+    pub const fn color_store(&self) -> StoreAction {
+        self.color_store
+    }
+    #[must_use]
+    pub const fn depth_load(&self) -> DepthLoad {
+        self.depth_load
+    }
+
+    #[must_use]
+    pub const fn stencil_load(&self) -> StencilLoad {
+        self.stencil_load
+    }
+    #[must_use]
+    pub const fn depth_store(&self) -> StoreAction {
+        self.depth_store
+    }
+    /// Store action of the stencil plane, meaningful only when the depth texture has one.
+    #[must_use]
+    pub const fn stencil_store(&self) -> StoreAction {
+        self.stencil_store
+    }
+    /// `(origin_x, origin_y, width, height)` in pixels.
+    ///
+    /// `x, y` are non-zero when the game sub-rects the render target via
+    /// `SetViewport` — essential for XYZRHW-relative UI draws.
+    #[must_use]
+    pub const fn viewport(&self) -> (u32, u32, u32, u32) {
+        self.viewport
+    }
+    #[must_use]
+    pub fn commands(&self) -> &[Command] {
+        &self.commands
+    }
+
+    #[must_use]
+    pub fn leading_blits(&self) -> &[BlitCommand] {
+        &self.leading_blits
+    }
+
+    #[must_use]
+    pub const fn has_counting_visibility(&self) -> bool {
+        self.has_counting_visibility
+    }
+
+    #[must_use]
+    pub const fn color_writes_observed(&self) -> bool {
+        self.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
+    }
+
+    #[must_use]
+    pub fn color_clear_quad_ranges(&self) -> &[(usize, usize)] {
+        &self.color_clear_quad_ranges
+    }
+}
+
+/// Per-pass record of the byte range each VB/IB was read from by draws.
+///
+/// Scoped to the currently-open render pass, keyed by `BufferId` raw.
+///
+/// Load-bearing for the rename-at-overlap upload model: when an inline
+/// `Staged` upload overwrites a region a draw already read *this frame*,
+/// applying it to the live device buffer would corrupt that earlier draw
+/// (they share one buffer), so the encoder renames instead. `overlaps`
+/// drives that decision; the `reorder` perf counter rides on the same
+/// signal.
+///
+/// Tracking is per-FRAME, not per-pass: the upload blits emit into the
+/// frame-head leading phase (before *every* pass), so an upload that
+/// overwrites a region read by a draw in an earlier, already-closed pass
+/// would corrupt it just the same — the tracker must remember draws across
+/// pass boundaries. Cleared at frame start (`reset_frame`) and per-buffer
+/// on a rename (the fresh buffer has no draws yet).
+#[derive(Default)]
+struct DrawnRangeTracker {
+    // FxHash, not SipHash: `note` runs a `.entry` per draw (twice per
+    // indexed draw), the same per-draw probe frequency as the encoder's
+    // resource caches.
+    ranges: FxHashMap<u64, DirtyRange>,
+}
+
+impl DrawnRangeTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Conjoin `[offset, offset + size)` into the range drawn from buffer `id` this pass.
+    ///
+    /// A `size` of 0 runs to the end of the buffer.
+    fn note(&mut self, id: u64, offset: u32, size: u32, logical_len: u32) {
+        self.ranges
+            .entry(id)
+            .or_default()
+            .conjoin(offset, size, logical_len);
+    }
+
+    /// True if buffer `id` was drawn this pass from a range overlapping the half-open `[off, end)`.
+    fn overlaps(&self, id: u64, off: u32, end: u32) -> bool {
+        self.ranges.get(&id).is_some_and(|r| r.overlaps(off, end))
+    }
+
+    /// Forget buffer `id`'s drawn range — called after a rename.
+    ///
+    /// The fresh device buffer has been read by no draw yet.
+    fn clear_buffer(&mut self, id: u64) {
+        self.ranges.remove(&id);
+    }
+
+    fn clear(&mut self) {
+        self.ranges.clear();
+    }
+}
+
+bitflags::bitflags! {
+    /// Descriptor bits for the attachments bound on `PassState`, and one pass decision.
+    ///
+    /// Packed into a u8 instead of separate `bool` fields; read via the
+    /// `current_*` accessors and folded onto each `Pass`/pipeline snapshot at
+    /// draw time. [`Self::RT0_DROPPED`] is the one bit that describes the
+    /// pass rather than an attachment.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+    pub struct CurrentAttachmentFlags: u8 {
+        /// Whether the bound colour RT's D3D format has a real alpha channel.
+        ///
+        /// Tracked alongside `current_color_format` because the Metal pixel
+        /// format alone can't tell X8R8G8B8 (no alpha) from A8R8G8B8 (both are
+        /// `Bgra8Unorm`). Read at draw time into the pipeline snapshot's
+        /// `COLOR_HAS_ALPHA` bit so destination-alpha blend factors clamp on
+        /// alpha-less targets. Updated in lockstep with the format by
+        /// `set_color_rt_has_alpha` (called from the encoder's colour-RT bind);
+        /// `reset_frame` seeds it set for the alpha-bearing backbuffer.
+        const COLOR_HAS_ALPHA = 1 << 0;
+        /// Set when the currently bound depth attachment came from the sampleable-depth path.
+        ///
+        /// That path is `CreateTexture(D24X8, USAGE_DEPTHSTENCIL)`
+        /// — i.e. a sampleable shadow map. Clear for standalone
+        /// `CreateDepthStencilSurface` targets that can never be sampled.
+        /// Folded onto the `Pass` at `ensure_pass_open` so Rule B
+        /// (last-use depth `DontCare`) can short-circuit on it without
+        /// relying on the per-session `seen_sampled_textures` set (which
+        /// has a bootstrap-frame gap for cascades sampled rarely).
+        const DEPTH_SAMPLEABLE = 1 << 1;
+        /// Set when the bound depth attachment's D3D format carries a stencil plane.
+        ///
+        /// D24S8 / D24FS8 / INTZ all map to the combined Metal
+        /// `Depth32Float_Stencil8` texture. The clear-quad pipelines must declare
+        /// the matching depth/stencil attachment formats or Metal's
+        /// pipeline-vs-render-pass validation rejects them (undefined behaviour /
+        /// heap corruption with the layer off).
+        const DEPTH_HAS_STENCIL = 1 << 2;
+        /// Set when the bound depth attachment is rasterized at the size D3D9 reports for it.
+        ///
+        /// Cleared by every change of depth attachment and restated in
+        /// lockstep by `set_depth_unscaled`, so an attachment nobody vouched
+        /// for reads as scaled. `reset_frame` seeds it for the frame's own
+        /// depth surface, which `render.scale` reduces with the back buffer.
+        const DEPTH_UNSCALED = 1 << 3;
+        /// Set while the open pass, or the next one a draw opens, attaches no colour target.
+        ///
+        /// Such a pass leaves render target 0 out, and with it every render
+        /// target 1..3, so the depth surface alone sets its extent. Only
+        /// `set_rt0_dropped` sets it, and only right before the pass it
+        /// describes is opened or continued: by a draw that leaves a lone 1x1
+        /// render target 0 unwritten, or by a region depth or stencil clear
+        /// that reaches past a colour target smaller than the depth surface.
+        /// `end_current_pass` clears it, so no other opener can inherit it.
+        const RT0_DROPPED = 1 << 4;
+    }
+}
+
+/// Whether render target 0 may be left out of a pass so the depth surface sets its extent.
+///
+/// The binding half of the rule; whether the draw writes render target 0 is
+/// the draw's half.
+pub enum Rt0DropCandidate {
+    /// The bindings do not have the shape.
+    No,
+    /// Render target 0 is a lone 1x1 target over a larger depth surface.
+    Yes,
+    /// The shape holds but `render.scale` reduces the depth surface, so render target 0 stays.
+    ScaledDepth,
+}
+
+bitflags::bitflags! {
+    /// What a pass's depth attachment is, and what the pass did with it.
+    ///
+    /// `SAMPLEABLE` and `HAS_STENCIL` are folded from
+    /// [`CurrentAttachmentFlags`] when the pass opens; `USED` and
+    /// `STENCIL_WRITTEN` are set while the pass records, by the draw path and
+    /// the depth-stencil clear-quad.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct PassDepthFlags: u8 {
+        /// The depth attachment is a sampleable shadow map.
+        ///
+        /// Created via `CreateTexture(D24X8, USAGE_DEPTHSTENCIL)`. Rule B
+        /// short-circuits on this flag: any sampleable depth keeps `Store`
+        /// regardless of whether it's been sampled this session yet, which
+        /// avoids the bootstrap-frame gap where a cascade sampled only every
+        /// Nth frame loses content on the intervening frames.
+        const SAMPLEABLE = 1 << 0;
+        /// The depth attachment carries a stencil plane (`Depth32Float_Stencil8`).
+        const HAS_STENCIL = 1 << 1;
+        /// A draw or clear-quad in the pass tested or wrote depth or stencil.
+        ///
+        /// A draw sets it when its depth-stencil state enables the depth test
+        /// or the stencil test on a plane the pass attaches; a depth or
+        /// stencil clear-quad sets it too. Every other helper draw runs with
+        /// the inert state, which neither reads nor writes the attachment.
+        const USED = 1 << 2;
+        /// A draw or clear-quad in the pass can write the stencil plane.
+        const STENCIL_WRITTEN = 1 << 3;
+    }
+}
+
+bitflags::bitflags! {
+    /// What the draws of a pass did with its render target 0.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct PassColorFlags: u8 {
+        /// A draw arrived at the pass with `D3DRS_COLORWRITEENABLE != 0`.
+        ///
+        /// Clear when the pass opens. When the pass closes with this still
+        /// clear AND at least one real (non-clear-quad) draw was emitted,
+        /// Rule H (`strip_color_from_no_color_draw_passes`) strips the color
+        /// attachment and rewrites the pass's `SetRenderPipelineState`
+        /// commands to bind the matching no-color pipeline variant,
+        /// eliminating Apple's "Unused Texture" warning on cascade caster
+        /// passes where every draw runs with color writes masked off but the
+        /// bound pipeline still declares a color output.
+        const WRITES_OBSERVED = 1 << 0;
+        /// The first draw of the pass writes every pixel and sample of render target 0.
+        ///
+        /// Set by [`PassState::open_pass_for_covering_draw`] on the pass it
+        /// opens, and read by Rule K. A pass joined onto another by Rule J
+        /// leaves it behind, since its draws then follow the other pass's.
+        const FIRST_DRAW_COVERS = 1 << 1;
+    }
+}
+
+/// What the back buffer holds when a frame starts, as the swap effect defines it.
+///
+/// `D3DSWAPEFFECT_DISCARD` leaves the back buffer undefined after `Present`,
+/// which is what lets Rule A discard it on first use. `FLIP` and `COPY` define
+/// its contents after `Present`; the one back-buffer texture keeps the pixels
+/// the previous frame left, the closest match, so a game that redraws only
+/// part of the frame without clearing keeps the rest.
+#[derive(Clone, Copy)]
+pub enum BackbufferContents {
+    /// `D3DSWAPEFFECT_DISCARD`: undefined after `Present`.
+    Undefined,
+    /// `D3DSWAPEFFECT_FLIP` or `D3DSWAPEFFECT_COPY`: the pixels carry over.
+    Preserved,
+}
+
+impl BackbufferContents {
+    /// The contents a swap chain created with `swap_effect` starts each frame with.
+    #[must_use]
+    pub const fn from_swap_effect(swap_effect: u32) -> Self {
+        if swap_effect == D3DSWAPEFFECT_DISCARD {
+            Self::Undefined
+        } else {
+            Self::Preserved
+        }
+    }
+}
+
+/// The per-frame inputs `PassState::reset_frame` seeds a new frame from.
+///
+/// A parameter struct rather than a long argument list: the frame's
+/// backbuffer identity, its logical size and format, the depth surface and
+/// whether it carries stencil, the back-buffer render scale, and whether this
+/// frame continues one that a mid-frame flush interrupted (see
+/// [`PassState::reset_frame`]).
+pub struct FrameReset {
+    pub backbuffer: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `backbuffer`, or null when there is none.
+    ///
+    /// Registered as the back buffer's twin every frame, so a
+    /// `D3DRS_SRGBWRITEENABLE` draw straight onto the swap chain attaches it
+    /// and Metal encodes after the blender. Re-supplied per frame because
+    /// `Reset` and an auto-resize replace the pair together.
+    pub backbuffer_srgb: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of the back buffer, NULL when it is single-sampled.
+    pub backbuffer_msaa: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of `backbuffer_msaa`, or null when there is none.
+    ///
+    /// Registered as that companion's twin every frame, for the same reason
+    /// `backbuffer_srgb` is.
+    pub backbuffer_msaa_srgb: MetalHandle<MTLTextureKind>,
+    /// Sample count of the back buffer and of the frame's default depth surface.
+    pub backbuffer_sample_count: u8,
+    /// Logical back-buffer size, the resolution D3D9 reports.
+    pub backbuffer_size: (u32, u32),
+    pub backbuffer_format: PixelFormat,
+    /// Whether `backbuffer` starts the frame undefined, from the swap effect.
+    pub backbuffer_contents: BackbufferContents,
+    pub depth_texture: MetalHandle<MTLTextureKind>,
+    /// Extent of `depth_texture` in its own space; `(0, 0)` when there is none.
+    ///
+    /// The frame's default depth attachment is created at the rasterized back
+    /// buffer's size, so this is `render_scale` of `backbuffer_size`. Passed in
+    /// rather than derived here for the same reason `depth_has_stencil` is:
+    /// how the attachment was made is the caller's knowledge, not the pass
+    /// machine's.
+    pub depth_size: (u32, u32),
+    pub depth_has_stencil: bool,
+    pub render_scale: RenderScale,
+    /// `true` when the previous submit was a mid-frame flush, not a `Present`.
+    pub continues_frame: bool,
+}
+
+/// Pass-management state machine.
+///
+/// Owned by the encoder thread's `FrameEncoder`; every frame begins with
+/// `reset_frame` and ends with `end_current_pass` followed by draining
+/// `passes()` into the submit thunk.
+pub struct PassState {
+    passes: Vec<Pass>,
+    current_pass_closed: bool,
+
+    current_color_texture: MetalHandle<MTLTextureKind>,
+    /// Multisampled companion of the bound render target 0, NULL for none.
+    ///
+    /// Set in lockstep with the colour binding by [`PassState::set_color_msaa`],
+    /// the way `COLOR_HAS_ALPHA` is set by `set_color_rt_has_alpha`: the
+    /// colour setters clear it, so a target bound without one can never
+    /// inherit the previous target's.
+    current_color_msaa_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twin view of the bound render target 0's companion, NULL for none.
+    ///
+    /// Set with the companion by [`PassState::set_color_msaa`]. A
+    /// multisampled pass writing sRGB attaches this and resolves into
+    /// `current_color_srgb_texture`, which Metal requires to share its
+    /// pixel format.
+    current_color_msaa_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// Sample count of the bound render target 0; 1 when it is single-sampled.
+    ///
+    /// Read per draw into the pipeline key, and by the clear-quad and blit
+    /// pipelines, which Metal requires to match the pass.
+    current_color_sample_count: u8,
+    /// Sample count of the bound depth attachment; 1 when there is none.
+    ///
+    /// Metal rejects a pass whose attachments disagree, so `ensure_pass_open`
+    /// drops a depth attachment that does not match the colour one.
+    current_depth_sample_count: u8,
+    current_color_subresource: u32,
+    current_color_size: (u32, u32),
+    current_color_format: PixelFormat,
+    /// Render targets 1..3 as bound by the device.
+    ///
+    /// Every entry is `ExtraColorSlot::NONE` on the single-target path,
+    /// which keeps `current_extra_present_mask` at zero and every
+    /// multi-target branch cold.
+    current_extra_color: [ExtraColorSlot; 3],
+    /// Bit `i` set ⇒ `current_extra_color[i]` is bound AND matches render target 0's extent.
+    ///
+    /// Recomputed whenever a colour binding changes; read per draw to key
+    /// the pipeline and the PS variant, so the size rule is evaluated once
+    /// per bind rather than once per draw.
+    current_extra_present_mask: u8,
+    /// `current_extra_color` as the pipeline key sees it, rebuilt on every colour bind.
+    ///
+    /// Cached so a draw copies 16 bytes instead of walking the three slots.
+    current_extra_attachments: ExtraColorAttachments,
+    current_depth_texture: MetalHandle<MTLTextureKind>,
+    /// Mip level of `current_depth_texture` bound as the depth attachment.
+    current_depth_level: u32,
+    /// Extent of the bound depth attachment's mip level, in its own space.
+    ///
+    /// `(0, 0)` when nothing is attached. Held beside the handle the way
+    /// `current_color_size` is held beside `current_color_texture`, so
+    /// `viewport_covers_depth_attachment` can answer whether a whole-target
+    /// depth `Clear` may fold into the pass's load action.
+    current_depth_size: (u32, u32),
+    /// Descriptor bits for the currently bound colour/depth attachments.
+    ///
+    /// `COLOR_HAS_ALPHA` / `DEPTH_SAMPLEABLE` / `DEPTH_HAS_STENCIL`. See
+    /// `CurrentAttachmentFlags` for the per-bit semantics.
+    current_attachments: CurrentAttachmentFlags,
+
+    pending_color_clear: Option<(u32, u32, u32, u32)>,
+    pending_depth_clear: Option<u32>,
+    pending_stencil_clear: Option<u32>,
+
+    /// Sticky across frames — games call `SetViewport` once and expect it to persist.
+    ///
+    /// When width/height are zero (uninitialized) we fall back to
+    /// `(0, 0, color_size.0, color_size.1)` at pass-begin.
+    viewport_x: u32,
+    viewport_y: u32,
+    viewport_width: u32,
+    viewport_height: u32,
+    /// D3D9's per-viewport depth range.
+    ///
+    /// Default `(0.0, 1.0)` matches Metal's default and the D3DVIEWPORT9
+    /// uninitialized state; games that partition depth (sky / world /
+    /// weapon) override these.
+    viewport_min_z: f32,
+    viewport_max_z: f32,
+    /// The viewport last *emitted* onto the open pass's encoder.
+    ///
+    /// Held as `(x, y, w, h, min_z_bits, max_z_bits)` (z-range kept as
+    /// raw bits for exact equality). Seeded by `ensure_pass_open` to the
+    /// first command it pushes; `set_viewport` skips a mid-pass re-emit
+    /// that matches it. A fresh `MTLRenderCommandEncoder` carries no
+    /// viewport state, so this resets to `None` at each pass open via the
+    /// seed.
+    last_emitted_viewport: Option<(u32, u32, u32, u32, u32, u32)>,
+
+    /// Blits queued by `StretchRect` between two passes.
+    ///
+    /// Drained into the next pass's `leading_blits` at
+    /// `ensure_pass_open`. If the frame ends with no follow-up pass,
+    /// `submit` synthesises a trailing blit-only pass so the queued blits
+    /// still run.
+    pending_leading_blits: Vec<BlitCommand>,
+
+    /// Color-attachment textures that have already been used as an rt this D3D9 frame.
+    ///
+    /// Inserted at `ensure_pass_open`. First-use opens the door to
+    /// `ColorLoad::DontCare` (Rule A) — subsequent uses default to `Load`
+    /// so accumulated draws survive across pass breaks. Consulted only by the
+    /// load/store rules (Rule A first-use, the finalisers), which reason about
+    /// the whole D3D9 frame, so a mid-frame flush does *not* clear it (the
+    /// content it tracks stays in VRAM across the flush). Reset on a real
+    /// `Present`. Capacity hint matches a typical frame shape (backbuffer + a
+    /// few CSM ping-pong RTs).
+    seen_color_rts: FxHashSet<(MetalHandle<MTLTextureKind>, u32)>,
+    /// Depth-attachment textures that have already been used as a depth rt this D3D9 frame.
+    ///
+    /// Same semantics as `seen_color_rts`.
+    seen_depth_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Textures a queued blit writes this frame (`StretchRect` destinations, mipmap regens).
+    ///
+    /// Inserted by `push_pending_leading_blit`, which sees every ordered blit
+    /// before it is drained into some pass's `leading_blits`. Rule A consults
+    /// it: the blit that wrote the texture may sit in an earlier pass's
+    /// leading list, not the one that first attaches the texture, so the
+    /// attachment's own `leading_blits` are not enough to know that its
+    /// content is live. Frame-scoped like [`Self::seen_color_rts`]: a mid-frame
+    /// flush keeps it, since the copy stays in VRAM for the continuation, and a
+    /// real `Present` resets it.
+    blit_written_rts: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// The swap-chain backbuffer texture for this frame, captured in `reset_frame`.
+    ///
+    /// Rule A's colour `DontCare` applies to this handle alone, since only the
+    /// back buffer starts a frame with undefined contents (see
+    /// [`Self::backbuffer_contents`]). Also the
+    /// left-hand side of [`Self::target_scale`]'s comparison: it is what makes
+    /// "is the back buffer bound" a handle identity rather than something the
+    /// D3D9 layer has to infer and pass down.
+    backbuffer_texture: MetalHandle<MTLTextureKind>,
+    /// Whether `backbuffer_texture` starts the frame undefined, seeded in `reset_frame`.
+    ///
+    /// Rule A discards the back buffer on first use only when it is
+    /// [`BackbufferContents::Undefined`], the discard swap effect; under `FLIP`
+    /// and `COPY` its first use loads, like any other colour target.
+    backbuffer_contents: BackbufferContents,
+    /// Fraction of the logical resolution the back buffer is rasterized at.
+    ///
+    /// Seeded per frame from `FrameData`. Applies to the back buffer alone: a
+    /// game-created render target is exactly the size the game asked for, so
+    /// coordinates aimed at one are already in that texture's space. See
+    /// [`Self::target_scale`].
+    render_scale: RenderScale,
+    /// The scale of the *currently bound* colour attachment.
+    ///
+    /// The back buffer's own scale while it is bound, and whatever
+    /// `set_color_render_target` was told for a game-created target: one sized
+    /// to the back buffer shares its scale, anything else is the identity.
+    /// Read by [`Self::target_extent`], which every coordinate conversion goes
+    /// through, so the rule lives in exactly one field.
+    current_color_scale: RenderScale,
+    /// The bound colour attachment's size as D3D9 reports it.
+    ///
+    /// `current_color_size` is the extent Metal allocated for it, which is
+    /// not always [`Self::current_color_scale`] of this: a deeper mip level of
+    /// a scaled texture is Metal's halving of the scaled base. Held
+    /// separately rather than divided back out, because the scale rounds and a
+    /// round trip through it would not be exact, and because the encoder's
+    /// scoped `StretchRect` pass has to restore the device's binding precisely.
+    current_color_logical_size: (u32, u32),
+    /// The frame's logical resolution, the one D3D9 reports.
+    ///
+    /// `backbuffer_texture` is `render_scale` of this. Held alongside the scale
+    /// because the pair is what defines the two coordinate spaces; the size a
+    /// game-created render target is measured against is this one, not the
+    /// rasterized extent.
+    backbuffer_logical_size: (u32, u32),
+    /// Texture handles ever bound as a sampler input in any pass this frame.
+    ///
+    /// Populated in `emit_command` from fragment and vertex texture commands.
+    /// Consumed by Rule A (`ensure_pass_open`) and
+    /// `finalize_load_actions` to skip / revert `LoadAction::DontCare` on
+    /// attachments whose content a sampler reads elsewhere in the frame,
+    /// and by `finalize_store_actions` to skip `StoreAction::DontCare` on
+    /// the same. Closes a hole in the original load/store optimiser that
+    /// discarded CSM cascade content between the caster pass that wrote
+    /// it and the scene pass that sampled it. Kept across `reset_frame`,
+    /// because a cascade written in one frame is sampled in the next; an
+    /// entry leaves only through `unregister_texture`, when the `MTLTexture`
+    /// behind the handle is destroyed.
+    seen_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Depth textures whose stencil plane something has written this session.
+    ///
+    /// A stencil `Clear` load, a stencil clear-quad or a draw that can change
+    /// stencil enters its texture when `finalize_store_actions` reads the
+    /// submission's passes; a blit that can write a stencil plane (a stencil
+    /// upload, a depth transfer, a texture copy) enters its destination when
+    /// it is queued, through [`PassState::note_stencil_blit`]. While a texture
+    /// is absent its stencil plane has never held anything D3D9 defines (a new
+    /// depth-stencil surface starts undefined), so its passes load and store
+    /// that plane `DontCare`. Session-wide like `seen_sampled_textures`: an
+    /// entry leaves only through `unregister_texture`, once the GPU has
+    /// retired every submission that names the handle. A stale entry for a
+    /// reused address only keeps a store that could have been dropped.
+    stencil_written_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Texture handles bound as a sampler input so far THIS frame, in op-stream order.
+    ///
+    /// Populated at the `emit_command` funnel beside
+    /// `seen_sampled_textures`; unlike that session-wide set, this one is
+    /// cleared every `reset_frame`.
+    ///
+    /// Load-bearing for texture rename-at-overlap: upload blits land in
+    /// the frame-head leading phase (before *every* pass), so an upload
+    /// into a texture a draw already sampled this frame would rewrite
+    /// what that earlier draw reads — the per-draw D3D9 texture state
+    /// would collapse to frame-final. The encoder consults
+    /// [`Self::texture_sampled_this_frame`] at upload time and renames
+    /// the `MTLTexture` instead (fresh handle for later draws, earlier
+    /// draws keep the old one). Handle-keyed on purpose: the fresh
+    /// handle has been sampled by no earlier draw, so a rename needs no
+    /// explicit clear here. The pass scans use it too: every sampler bind in
+    /// `passes` went through `emit_command`, so a target missing here is read
+    /// by no pass's commands.
+    frame_sampled_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Every texture bind of the passes recorded so far, as `(application pass index, identity)`.
+    ///
+    /// The index counts from the first application pass, past the upload
+    /// passes, which a later upload can insert more of ahead of it. `None`
+    /// unless [`Self::record_pass_reads`] turned it on. One push per
+    /// bind command, which the per-pass bind dedup already keeps to one per
+    /// texture change; the encoder reads it once per submission to learn
+    /// which passes read which textures, then clears it.
+    pass_reads: Option<Vec<(usize, MetalHandle<MTLTextureKind>)>>,
+    /// Sampling or attachment view to resource identity, through native retirement.
+    ///
+    /// Draw bindings use the existing single alias lookup to mark the resource
+    /// sampled. Pass scans also resolve views when deciding stores and clear
+    /// coalescing. Release and rename detach attachment selection immediately,
+    /// but retain these aliases until queued pass analysis and GPU use finish.
+    texture_view_to_base: FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    /// Base texture to renderable sRGB attachment, excluding sampling-only views.
+    ///
+    /// Read when a colour attachment is bound, to answer "does this render
+    /// target have an sRGB view the pass can attach in its place". Kept by
+    /// the same register / unregister pair.
+    srgb_base_to_twin: FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    /// `D3DRS_SRGBWRITEENABLE` as the last draw or `Clear` saw it.
+    ///
+    /// The render state alone; whether it can be honoured by the attachment
+    /// is `pass_srgb_write`.
+    srgb_write_enabled: bool,
+    /// Whether the next pass binds sRGB twin views of its colour attachments.
+    ///
+    /// True when `srgb_write_enabled` is set and every colour target the
+    /// pass attaches has a twin. Metal then converts linear → sRGB *after*
+    /// the blender, which is the D3D9 order the
+    /// `D3DPMISCCAPS_POSTBLENDSRGBCONVERT` cap promises. False leaves the
+    /// encode to the pixel shader's OETF variant, which runs before the
+    /// blender and is exact only for opaque draws.
+    ///
+    /// A change ends the current pass: the view is an attachment property,
+    /// so draws on either side of the toggle cannot share one encoder.
+    pass_srgb_write: bool,
+    /// sRGB twin of the bound colour render target, null when it has none.
+    ///
+    /// Resolved through `srgb_base_to_twin` on every bind, so the per-draw
+    /// path reads a field instead of probing the map.
+    current_color_srgb_texture: MetalHandle<MTLTextureKind>,
+    /// sRGB twins of render targets 1..3, in slot order; null where absent.
+    current_extra_srgb: [MetalHandle<MTLTextureKind>; 3],
+    /// Live texture handles that were bound as a sampleable depth attachment.
+    ///
+    /// The bind runs via `set_depth_stencil_attachment(_,
+    /// is_sampleable=true)`. The `mtld3d::d3d9::cascade=trace` end-of-frame
+    /// summary uses this to classify fragment-sample binds: a
+    /// `SetFragmentTexture` of a handle in this set is a cascade-depth read,
+    /// and is counted into `frame_cascade_samples`.
+    ///
+    /// Entries outlive the frame that made them, because a cascade is
+    /// sampled frames after it was rendered, but not the texture itself:
+    /// `unregister_texture` drops a handle when the `MTLTexture` behind it is
+    /// destroyed, so a later allocation that lands on the same address is not
+    /// mistaken for the cascade that used to live there.
+    seen_sampleable_depth_textures: FxHashSet<MetalHandle<MTLTextureKind>>,
+    /// Per-frame counter: how many caster draws targeted each cascade depth handle.
+    ///
+    /// Counts the draws made this frame. Incremented in `note_caster_draw`,
+    /// drained + cleared by `take_cascade_frame_summary`.
+    frame_caster_writes: FxHashMap<MetalHandle<MTLTextureKind>, u32>,
+    /// Per-frame counter: how many `SetFragmentTexture` binds of a known cascade depth handle.
+    ///
+    /// Counts the binds emitted this frame. Incremented in `emit_command`
+    /// when the bound texture is in `seen_sampleable_depth_textures`.
+    /// Drained by `take_cascade_frame_summary`.
+    frame_cascade_samples: FxHashMap<MetalHandle<MTLTextureKind>, u32>,
+    /// Monotonic per-frame counter for the cascade-summary log line.
+    ///
+    /// Distinct from `submit_seq` (encoder-thread): incremented in
+    /// `reset_frame`.
+    frame_seq: u64,
+    /// Per-frame estimate of command-vector growth copy bytes.
+    ///
+    /// Adds the old capacity in bytes whenever `emit_command` grows a full
+    /// vector. The allocator may extend a buffer in place, so this is potential
+    /// copy volume, not measured memory traffic. Initial allocations of 64
+    /// commands are excluded. Drained by `take_cmd_vec_realloc_bytes` once per
+    /// submission and reset by `reset_frame` as a safety net.
+    cmd_vec_realloc_bytes: u64,
+    /// Free-list of `Vec<Command>`s recycled across frames.
+    ///
+    /// Retired batches return in reverse pass order so the next frame pops
+    /// capacities in its original pass order. Every allocated vector is kept:
+    /// the pool grows with maximum concurrent demand, including detached submit
+    /// payloads, and retains that command capacity until device teardown.
+    /// Stable pass workloads stop allocating once their vectors have warmed.
+    command_vec_pool: Vec<Vec<Command>>,
+
+    /// Index one past the last texture-upload pass inserted this frame.
+    ///
+    /// Upload passes are spliced into the front of `passes` rather than
+    /// appended, so they run before every draw of the frame exactly as the
+    /// frame-head upload blits do, and so an upload between two draws never
+    /// breaks the open pass. Insertions land here and bump it, which keeps
+    /// two uploads of the same mip in the order they were issued.
+    upload_pass_end: usize,
+
+    /// Per-pass VB/IB read-range tracker driving rename-at-overlap.
+    ///
+    /// Also feeds the `reorder` perf counter.
+    drawn_ranges: DrawnRangeTracker,
+
+    /// Debug-build mirror of what was actually emitted onto the current Metal encoder.
+    ///
+    /// Diffed against the encoder's `LastBoundCache` before every draw to
+    /// catch cache↔encoder desyncs. See [`DebugBoundShadow`].
+    #[cfg(debug_assertions)]
+    debug_emitted: DebugBoundShadow,
+}
+
+impl PassState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            passes: Vec::with_capacity(4),
+            current_pass_closed: true,
+            current_color_texture: MetalHandle::NULL,
+            current_color_msaa_texture: MetalHandle::NULL,
+            current_color_msaa_srgb_texture: MetalHandle::NULL,
+            current_color_sample_count: 1,
+            current_depth_sample_count: 1,
+            current_color_subresource: 0,
+            current_color_size: (0, 0),
+            // Placeholder; `reset_frame` always overwrites this before any
+            // pass opens. Chose the dominant backbuffer format rather than
+            // adding an `Unknown` variant to `PixelFormat` that would pollute
+            // every exhaustive match downstream.
+            current_color_format: PixelFormat::Bgra8Unorm,
+            current_extra_color: [ExtraColorSlot::NONE; 3],
+            current_extra_present_mask: 0,
+            current_extra_attachments: ExtraColorAttachments::NONE,
+            current_depth_texture: MetalHandle::NULL,
+            current_depth_level: 0,
+            current_depth_size: (0, 0),
+            // Placeholder; `reset_frame` reseeds these for the backbuffer, and
+            // every `SetRenderTarget` bind overwrites `COLOR_HAS_ALPHA` via
+            // `set_color_rt_has_alpha`. The dominant backbuffer is alpha-bearing
+            // (`COLOR_HAS_ALPHA` set), non-sampleable, no stencil.
+            current_attachments: CurrentAttachmentFlags::COLOR_HAS_ALPHA,
+            pending_color_clear: None,
+            pending_depth_clear: None,
+            pending_stencil_clear: None,
+            viewport_x: 0,
+            viewport_y: 0,
+            viewport_width: 0,
+            viewport_height: 0,
+            viewport_min_z: 0.0,
+            viewport_max_z: 1.0,
+            last_emitted_viewport: None,
+            pending_leading_blits: Vec::new(),
+            seen_color_rts: FxHashSet::with_capacity_and_hasher(4, FxBuildHasher),
+            seen_depth_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
+            blit_written_rts: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
+            backbuffer_texture: MetalHandle::NULL,
+            backbuffer_contents: BackbufferContents::Undefined,
+            // Placeholder; `reset_frame` reseeds it from the frame stamp.
+            // Identity means a `PassState` that never saw a frame cannot
+            // perturb a coordinate.
+            render_scale: RenderScale::IDENTITY,
+            current_color_scale: RenderScale::IDENTITY,
+            current_color_logical_size: (0, 0),
+            backbuffer_logical_size: (0, 0),
+            seen_sampled_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
+            stencil_written_textures: FxHashSet::with_capacity_and_hasher(2, FxBuildHasher),
+            frame_sampled_textures: FxHashSet::with_capacity_and_hasher(64, FxBuildHasher),
+            pass_reads: None,
+            texture_view_to_base: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
+            srgb_base_to_twin: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
+            srgb_write_enabled: false,
+            pass_srgb_write: false,
+            current_color_srgb_texture: MetalHandle::NULL,
+            current_extra_srgb: [MetalHandle::NULL; 3],
+            seen_sampleable_depth_textures: FxHashSet::with_capacity_and_hasher(8, FxBuildHasher),
+            frame_caster_writes: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
+            frame_cascade_samples: FxHashMap::with_capacity_and_hasher(8, FxBuildHasher),
+            frame_seq: 0,
+            cmd_vec_realloc_bytes: 0,
+            command_vec_pool: Vec::new(),
+            upload_pass_end: 0,
+            drawn_ranges: DrawnRangeTracker::new(),
+            #[cfg(debug_assertions)]
+            debug_emitted: DebugBoundShadow::default(),
+        }
+    }
+
+    /// Reset per-frame state.
+    ///
+    /// Seeds the default attachments (frame's backbuffer + depth) and clears
+    /// any leftover pending clears. Does not touch the sticky viewport — that
+    /// survives across frames.
+    ///
+    /// `backbuffer_size` is **logical**, the resolution D3D9 reports;
+    /// `render_scale` converts it to the size of the texture actually bound.
+    /// Callers stay in the game's coordinate space and this is the one place
+    /// the two are reconciled.
+    ///
+    /// `continues_frame` is `true` when the previous submit was a mid-frame
+    /// flush (a readback / retention drain, `NO_PRESENT`) rather than a
+    /// `Present`. The D3D9 frame the game is drawing did not end there, so the
+    /// render targets and depth surface it already wrote keep their content in
+    /// VRAM, and so do the targets a blit copied into. The per-frame "seen" and
+    /// blit-written sets are kept across the boundary so Rule A loads those
+    /// attachments on their first use in the continuation instead of
+    /// discarding them with `DontCare` (the store side is handled by
+    /// `finalize_store_actions` skipping Rule B on the flush).
+    pub fn reset_frame(&mut self, reset: &FrameReset) {
+        let &FrameReset {
+            backbuffer,
+            backbuffer_srgb,
+            backbuffer_msaa,
+            backbuffer_msaa_srgb,
+            backbuffer_sample_count,
+            backbuffer_size,
+            backbuffer_format,
+            backbuffer_contents,
+            depth_texture,
+            depth_size,
+            depth_has_stencil,
+            render_scale,
+            continues_frame,
+        } = reset;
+        // Reverse retirement keeps the first pass's capacity on top of the LIFO pool.
+        for pass in self.passes.drain(..).rev() {
+            recycle_command_vec(&mut self.command_vec_pool, pass.commands);
+        }
+        self.upload_pass_end = 0;
+        self.current_pass_closed = true;
+        // No pass open → no viewport emitted yet; the next pass's open
+        // reseeds this. (`set_viewport` only reads it inside an open pass.)
+        self.last_emitted_viewport = None;
+        self.render_scale = render_scale;
+        self.current_color_scale = render_scale;
+        self.current_color_logical_size = backbuffer_size;
+        self.backbuffer_logical_size = backbuffer_size;
+        self.current_color_texture = backbuffer;
+        self.current_color_msaa_texture = backbuffer_msaa;
+        self.current_color_msaa_srgb_texture = backbuffer_msaa_srgb;
+        // The implicit depth surface is created at the back buffer's count,
+        // which is the only pairing `CreateDevice` and `Reset` produce.
+        self.current_color_sample_count = backbuffer_sample_count.max(1);
+        self.current_depth_sample_count = backbuffer_sample_count.max(1);
+        self.current_color_subresource = 0;
+        self.current_color_size = (
+            render_scale.dimension(backbuffer_size.0),
+            render_scale.dimension(backbuffer_size.1),
+        );
+        self.current_color_format = backbuffer_format;
+        // The device re-asserts any extra render targets it holds into the
+        // fresh frame, exactly as it does render target 0.
+        self.current_extra_color = [ExtraColorSlot::NONE; 3];
+        self.current_extra_present_mask = 0;
+        self.current_extra_attachments = ExtraColorAttachments::NONE;
+        // Re-register the back buffer's sRGB twin every frame. `Reset` and an
+        // auto-resize replace the pair together and destroy the old view with
+        // the old texture, so a registration naming the retired one must not
+        // survive the swap. The test is against the incoming view rather than
+        // the incoming texture: Metal hands a freed address straight back to
+        // the next allocation, so the replacement pair can carry the address
+        // the old back buffer had with a view that is a different object, and
+        // the entry the retired view left behind would then resolve any
+        // texture landing on its address to this back buffer.
+        let stale = self.twin_of(self.backbuffer_texture);
+        if stale != backbuffer_srgb {
+            self.drop_srgb_twin(stale);
+        }
+        self.store_srgb_twin(backbuffer_srgb, backbuffer);
+        // The frame's colour binding changed wholesale; re-resolve the sRGB
+        // views the fresh binding implies.
+        self.recompute_srgb_write();
+        // The backbuffer is an alpha-bearing (`Bgra8Unorm` / A8R8G8B8) target,
+        // so destination-alpha blend factors resolve unclamped — byte-identical
+        // to the pre-`COLOR_HAS_ALPHA` behaviour. A sub-frame `SetRenderTarget`
+        // to an X8 surface overrides this via `set_color_rt_has_alpha`.
+        self.current_attachments
+            .insert(CurrentAttachmentFlags::COLOR_HAS_ALPHA);
+        self.current_depth_texture = depth_texture;
+        self.current_depth_level = 0;
+        self.current_depth_size = depth_size;
+        // The frame's default depth target is the standalone backbuffer
+        // depth surface from `CreateDepthStencilSurface` — not
+        // sampleable. Sub-frame `set_depth_stencil_attachment` calls
+        // override this flag when WoW binds a sampleable shadow map.
+        self.current_attachments
+            .remove(CurrentAttachmentFlags::DEPTH_SAMPLEABLE);
+        self.current_attachments
+            .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, depth_has_stencil);
+        // The frame's depth surface is sized with the back buffer, so the
+        // back buffer's scale reaches it too.
+        self.current_attachments.set(
+            CurrentAttachmentFlags::DEPTH_UNSCALED,
+            render_scale.is_identity(),
+        );
+        self.current_attachments
+            .remove(CurrentAttachmentFlags::RT0_DROPPED);
+        self.backbuffer_texture = backbuffer;
+        self.backbuffer_contents = backbuffer_contents;
+        self.pending_color_clear = None;
+        self.pending_depth_clear = None;
+        self.pending_stencil_clear = None;
+        self.pending_leading_blits.clear();
+        // Keep the frame-scoped seen-rt and blit-written sets across a mid-frame
+        // flush: the D3D9 frame continues, so the targets already drawn or
+        // copied into keep their VRAM content and their first use in the
+        // continuation must Load, not `DontCare`. On a real `Present`
+        // (`continues_frame` false) the frame ended and every target starts
+        // fresh.
+        if !continues_frame {
+            self.seen_color_rts.clear();
+            self.seen_depth_rts.clear();
+            self.blit_written_rts.clear();
+        }
+        self.frame_caster_writes.clear();
+        self.frame_cascade_samples.clear();
+        self.frame_sampled_textures.clear();
+        self.clear_pass_reads();
+        self.drawn_ranges.clear();
+        self.frame_seq = self.frame_seq.wrapping_add(1);
+        // Safety net: `take_cmd_vec_realloc_bytes` should already have
+        // drained this at end-of-frame. Zero again so a missed drain
+        // doesn't carry stale bytes into the next frame's accounting.
+        self.cmd_vec_realloc_bytes = 0;
+        // Do NOT clear `seen_sampled_textures`. Per-frame reset would
+        // break double-buffered cascade textures (shadow cascades):
+        // caster writes to cascade-A in frame N, receiver samples
+        // cascade-A in frame N+1. Rule B at frame-N finalize would
+        // see cascade-A "not sampled this frame" and flip
+        // `depth_store=DontCare`, letting Metal discard the depth
+        // content at pass-end — wiping the cascade content the
+        // receiver needs next frame. Rule A's first-use `DontCare`
+        // check on the load side has the same hazard. Tracking
+        // "ever sampled" across frames keeps both rules
+        // conservative for cross-frame-referenced textures at the
+        // cost of a Store/Load on first-frame-use, which is the
+        // correct trade.
+        //
+        // Memory cost: bounded by the number of distinct texture
+        // handles sampled by a live texture (~100s for WoW), because
+        // `unregister_texture` takes a handle back out when the
+        // `MTLTexture` behind it is destroyed.
+    }
+
+    #[must_use]
+    pub fn passes(&self) -> &[Pass] {
+        &self.passes
+    }
+
+    /// Take the frame's finished passes, leaving an empty, unallocated vec behind.
+    ///
+    /// The caller owns the passes for the duration of the submit stage — the
+    /// unix side reads each pass's `commands` via raw pointer — then returns
+    /// them through [`Self::recycle_passes`] so the command vecs re-enter the
+    /// pool. This is the seam that lets the finished passes outlive this
+    /// `PassState` while the next frame starts building; the synchronous
+    /// recycling `reset_frame` does inline still covers the path where passes
+    /// were never taken out (it then sees an empty vec). `mem::take` hands the
+    /// allocation to the caller, so the next frame's pass list grows again
+    /// from zero capacity.
+    pub fn take_finished_passes(&mut self) -> Vec<Pass> {
+        self.clear_pass_reads();
+        core::mem::take(&mut self.passes)
+    }
+
+    /// Record which pass binds which texture, or stop recording and forget.
+    pub fn record_pass_reads(&mut self, on: bool) {
+        self.pass_reads = on.then(Vec::new);
+    }
+
+    /// The texture binds recorded since the passes were last taken, as `(pass index, identity)`.
+    ///
+    /// Empty unless recording is on. The index is that of an application
+    /// pass, for [`Self::pass_of_read`], and holds only until a pass rule
+    /// removes or merges a pass; the identity is the base texture of an sRGB
+    /// twin or sampling view.
+    #[must_use]
+    pub fn pass_reads(&self) -> &[(usize, MetalHandle<MTLTextureKind>)] {
+        self.pass_reads.as_deref().unwrap_or(&[])
+    }
+
+    /// The pass a recorded texture bind belongs to, by the index [`Self::pass_reads`] gave.
+    #[must_use]
+    pub fn pass_of_read(&self, index: usize) -> Option<&Pass> {
+        self.passes.get(self.upload_pass_end.checked_add(index)?)
+    }
+
+    /// Forget the recorded texture binds, keeping the list's capacity.
+    pub fn clear_pass_reads(&mut self) {
+        if let Some(reads) = &mut self.pass_reads {
+            reads.clear();
+        }
+    }
+
+    /// Drain finished passes' `commands` vecs back into the recycle pool.
+    ///
+    /// The submit stage must have finished reading the taken passes. Draining
+    /// in reverse order restores their capacities to the LIFO pool in next-use
+    /// order. The pass list retains its own capacity and becomes empty.
+    pub fn recycle_passes(&mut self, passes: &mut Vec<Pass>) {
+        for pass in passes.drain(..).rev() {
+            recycle_command_vec(&mut self.command_vec_pool, pass.commands);
+        }
+    }
+
+    /// Index of the currently-open pass within the frame (zero-based).
+    ///
+    /// Callers downstream of `emit_command` are guaranteed a pass is
+    /// open, so the value equals `passes.len() - 1`. Used by the
+    /// `mtld3d::d3d9::decal` trace probe so a single trace line tells
+    /// whether two draws share an `MTLRenderCommandEncoder`.
+    /// `saturating_sub` keeps the value sane if called before the
+    /// first pass opens (returns 0).
+    #[must_use]
+    pub const fn current_pass_index(&self) -> usize {
+        self.passes.len().saturating_sub(1)
+    }
+
+    #[must_use]
+    pub const fn current_pass_closed(&self) -> bool {
+        self.current_pass_closed
+    }
+
+    /// Record that a draw this frame read `[offset, offset + size)` from VB/IB `id`.
+    ///
+    /// A `size` of 0 means to the end of the buffer. Feeds rename-at-overlap
+    /// via [`Self::drawn_range_overlaps`].
+    pub fn note_draw_range(&mut self, id: u64, offset: u32, size: u32, logical_len: u32) {
+        self.drawn_ranges.note(id, offset, size, logical_len);
+    }
+
+    /// True if buffer `id` was drawn this frame from a range overlapping half-open `[off, end)`.
+    ///
+    /// I.e. a staging upload to that range would land (frame-head) out of
+    /// order relative to a draw that already read it, so the device buffer
+    /// must be renamed.
+    #[must_use]
+    pub fn drawn_range_overlaps(&self, id: u64, off: u32, end: u32) -> bool {
+        self.drawn_ranges.overlaps(id, off, end)
+    }
+
+    /// Forget buffer `id`'s drawn range.
+    ///
+    /// Called after the encoder renames its device buffer, since the fresh
+    /// buffer has no draws yet.
+    pub fn clear_drawn_range(&mut self, id: u64) {
+        self.drawn_ranges.clear_buffer(id);
+    }
+
+    #[must_use]
+    pub const fn current_color_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.current_color_texture
+    }
+
+    /// Whether `texture` is this frame's back buffer and the frame started it undefined.
+    ///
+    /// True under the discard swap effect only: under `FLIP` and `COPY` the
+    /// back buffer keeps its contents into the next frame, like any other
+    /// target. A multisampled back buffer is bound through its companion but
+    /// keeps the resolve target as its identity, so the companion answers
+    /// through the base handle too.
+    #[must_use]
+    pub fn is_discarded_back_buffer(&self, texture: MetalHandle<MTLTextureKind>) -> bool {
+        !texture.is_null()
+            && texture == self.backbuffer_texture
+            && matches!(self.backbuffer_contents, BackbufferContents::Undefined)
+    }
+
+    /// The identity handle a view of a texture is known by: its base texture, else itself.
+    ///
+    /// An sRGB twin or a sampling view names the storage of the texture it
+    /// was made from; every record keyed on a surface uses that base.
+    #[must_use]
+    pub fn identity_of(&self, texture: MetalHandle<MTLTextureKind>) -> MetalHandle<MTLTextureKind> {
+        self.texture_view_to_base
+            .get(&texture)
+            .copied()
+            .unwrap_or(texture)
+    }
+
+    /// Render target 0 and every extra target the next pass attaches, as `(texture, subresource)`.
+    ///
+    /// The subresource packs the slice in the low half and the level in the
+    /// high half, the key a colour clear is remembered under. An extra target
+    /// sized unlike render target 0 is attached to no pass and is left out.
+    pub fn attached_color_targets(
+        &self,
+    ) -> impl Iterator<Item = (MetalHandle<MTLTextureKind>, u32)> + '_ {
+        let rt0 = (self.current_color_texture, self.current_color_subresource);
+        let extras = self
+            .current_extra_color
+            .iter()
+            .enumerate()
+            .filter(|(i, slot)| slot.is_bound() && self.current_extra_present_mask & (1 << i) != 0)
+            .map(|(_, slot)| (slot.texture, slot.subresource));
+        core::iter::once(rt0).chain(extras)
+    }
+
+    #[must_use]
+    pub const fn current_depth_texture(&self) -> MetalHandle<MTLTextureKind> {
+        self.current_depth_texture
+    }
+
+    /// Mip level of the current depth attachment.
+    #[must_use]
+    pub const fn current_depth_level(&self) -> u32 {
+        self.current_depth_level
+    }
+
+    /// Extent of the bound depth attachment's mip level, `(0, 0)` when unbound.
+    ///
+    /// Exposed so a save/restore around a one-off pass (a scoped
+    /// `StretchRect` or extra-target clear) rebinds the attachment with the
+    /// size it came in with.
+    #[must_use]
+    pub const fn current_depth_size(&self) -> (u32, u32) {
+        self.current_depth_size
+    }
+
+    /// `true` when the bound depth attachment is a combined depth+stencil Metal format.
+    ///
+    /// The combined format is `Depth32Float_Stencil8`. The clear-quad
+    /// pipelines key on this so their declared depth/stencil attachment
+    /// formats match the pass.
+    #[must_use]
+    pub const fn current_depth_has_stencil(&self) -> bool {
+        self.current_attachments
+            .contains(CurrentAttachmentFlags::DEPTH_HAS_STENCIL)
+    }
+
+    #[must_use]
+    pub const fn current_depth_is_sampleable(&self) -> bool {
+        self.current_attachments
+            .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
+    }
+
+    /// `true` when `depth_tex` is a live handle bound as a sampleable shadow map this session.
+    ///
+    /// Built for diagnostic probes that classify a handle by what it is,
+    /// independently of what the current bind says: `is_sampleable` describes
+    /// the surface bound right now, so it reads `false` for every draw that
+    /// runs while the scene depth rather than a cascade is attached.
+    #[must_use]
+    pub fn is_depth_handle_sampleable(&self, depth_tex: MetalHandle<MTLTextureKind>) -> bool {
+        self.seen_sampleable_depth_textures.contains(&depth_tex)
+    }
+
+    /// Drop every record keyed on `texture` as its `MTLTexture` is destroyed.
+    ///
+    /// A handle is an allocation address, so Metal is free to hand the same
+    /// value back for the next texture once this one is gone. Every set and
+    /// map here is keyed on that address, and an entry that outlives the
+    /// texture makes the load/store rules answer for the wrong resource:
+    /// Rule A would load a fresh surface it could discard, Rules B and C would
+    /// keep `Store` on an attachment nothing samples, and rename-at-overlap
+    /// would copy a texture no draw has read.
+    ///
+    /// Covers `seen_color_rts`, `seen_depth_rts`, `blit_written_rts`,
+    /// `seen_sampled_textures`, `frame_sampled_textures`,
+    /// `seen_sampleable_depth_textures`, `stencil_written_textures`, and the
+    /// two cascade-probe counters.
+    /// View identity also lives until this retirement boundary, so released
+    /// textures remain visible to queued pass store analysis. Current attachment
+    /// handles are bindings that [`Self::reset_frame`] reseeds.
+    ///
+    /// The caller is the encoder's retention drain, which runs when the GPU
+    /// has retired the submission that last named the handle. Pruning where
+    /// the D3D9 object is released would be too early: the passes that
+    /// reference the texture are built and their store actions are not
+    /// finalised until submit.
+    pub fn unregister_texture(&mut self, texture: MetalHandle<MTLTextureKind>) {
+        if texture.is_null() {
+            return;
+        }
+        if let Some(base) = self.texture_view_to_base.remove(&texture)
+            && self.srgb_base_to_twin.get(&base) == Some(&texture)
+        {
+            self.srgb_base_to_twin.remove(&base);
+        }
+        self.srgb_base_to_twin.remove(&texture);
+        self.seen_color_rts.retain(|&(handle, _)| handle != texture);
+        self.seen_depth_rts.remove(&texture);
+        self.blit_written_rts.remove(&texture);
+        self.seen_sampled_textures.remove(&texture);
+        self.frame_sampled_textures.remove(&texture);
+        self.seen_sampleable_depth_textures.remove(&texture);
+        self.stencil_written_textures.remove(&texture);
+        self.frame_caster_writes.remove(&texture);
+        self.frame_cascade_samples.remove(&texture);
+    }
+
+    /// Metal pixel format the next pass binds for colour attachment 0.
+    ///
+    /// The sRGB twin of the render target's format while
+    /// `D3DRS_SRGBWRITEENABLE` is honoured through the attachment view, so
+    /// the render pipeline the draw path builds declares the format the
+    /// pass actually attaches.
+    #[must_use]
+    pub const fn current_color_format(&self) -> PixelFormat {
+        self.color_attachment_format()
+    }
+
+    /// Set whether the currently bound colour RT's D3D format has a real alpha channel.
+    ///
+    /// Called by the encoder's colour-RT bind in lockstep with
+    /// `set_color_render_target` so the two never desync — the Metal pixel
+    /// format alone can't distinguish X8R8G8B8 (no alpha) from A8R8G8B8.
+    /// Attach `msaa` as render target 0's multisampled companion.
+    ///
+    /// Called in lockstep with `set_color_render_target*`, which clears both
+    /// fields when the target changes, so a single-sampled bind needs no call
+    /// at all. `msaa` NULL with a `sample_count` above 1 is the caller saying
+    /// the target is multisampled but its companion could not be created; the
+    /// pass then renders single-sampled into the resolve texture, which is
+    /// visually wrong only in that it is not antialiased.
+    pub fn set_color_msaa(
+        &mut self,
+        msaa: MetalHandle<MTLTextureKind>,
+        msaa_srgb: MetalHandle<MTLTextureKind>,
+        sample_count: u8,
+    ) {
+        let msaa_srgb = if msaa.is_null() {
+            MetalHandle::NULL
+        } else {
+            msaa_srgb
+        };
+        let sample_count = if msaa.is_null() {
+            1
+        } else {
+            sample_count.max(1)
+        };
+        // A pass freezes its attachments when it opens, and a same-target
+        // rebind leaves it open, so a companion that differs from the one it
+        // attached ends it.
+        if self.current_color_msaa_texture != msaa
+            || self.current_color_msaa_srgb_texture != msaa_srgb
+            || self.current_color_sample_count != sample_count
+        {
+            if self.pending_color_clear.is_some() {
+                self.flush_pending_clears();
+            }
+            self.end_current_pass("set_color_msaa");
+        }
+        self.current_color_msaa_texture = msaa;
+        self.current_color_msaa_srgb_texture = msaa_srgb;
+        self.current_color_sample_count = sample_count;
+        // An extra target takes part only at target 0's sample count, and the
+        // mask recompute re-resolves the sRGB views the companion carries.
+        self.recompute_extra_present_mask();
+    }
+
+    /// Sample count of the currently bound render target 0.
+    #[must_use]
+    pub const fn current_color_sample_count(&self) -> u8 {
+        self.current_color_sample_count
+    }
+
+    /// Sample count declared for the currently bound depth attachment.
+    ///
+    /// Read by callers that bind their own attachments for a scoped pass and
+    /// put the device's binding back afterwards: the depth setters reset the
+    /// count, so it has to be carried across the swap with the handle.
+    #[must_use]
+    pub const fn current_depth_sample_count(&self) -> u8 {
+        self.current_depth_sample_count
+    }
+
+    /// Whether a pass opened now carries the bound depth attachment.
+    ///
+    /// Metal takes a render pass's sample count from its attachments and
+    /// rejects a pass whose attachments disagree, so a depth surface that does
+    /// not match render target 0 is dropped from the descriptor. Every
+    /// pipeline built for such a pass then has to declare no depth and no
+    /// stencil format, and a clear of the depth or stencil plane has no
+    /// attachment to paint. One predicate so those decisions cannot drift
+    /// apart from the attachment the pass actually gets.
+    #[must_use]
+    pub const fn pass_binds_depth(&self) -> bool {
+        !self.current_depth_texture.is_null()
+            && self.current_depth_sample_count == self.current_color_sample_count
+    }
+
+    /// Declare the sample count of the depth attachment bound alongside the colour one.
+    ///
+    /// Called in lockstep with `set_depth_stencil_attachment*`, which reset it
+    /// to 1 when the surface changes. A depth attachment whose count does not
+    /// match render target 0's is dropped at pass open rather than handed to
+    /// Metal, which rejects the pass outright.
+    pub const fn set_depth_sample_count(&mut self, sample_count: u8) {
+        self.current_depth_sample_count = if sample_count == 0 { 1 } else { sample_count };
+    }
+
+    /// Declare whether the bound depth attachment is rasterized at the size D3D9 reports.
+    ///
+    /// Called in lockstep with `set_depth_stencil_attachment*`, which clear it
+    /// on every change of attachment, exactly as they reset the sample count.
+    pub fn set_depth_unscaled(&mut self, unscaled: bool) {
+        self.current_attachments
+            .set(CurrentAttachmentFlags::DEPTH_UNSCALED, unscaled);
+    }
+
+    /// Whether the bound depth attachment is rasterized at the size D3D9 reports.
+    ///
+    /// Read by callers that bind their own attachments for a scoped pass and
+    /// put the device's binding back afterwards, beside the sample count.
+    #[must_use]
+    pub const fn current_depth_unscaled(&self) -> bool {
+        self.current_attachments
+            .contains(CurrentAttachmentFlags::DEPTH_UNSCALED)
+    }
+
+    /// Whether the bindings let render target 0 be left out so the depth surface sets the extent.
+    ///
+    /// D3D9 lets a depth surface larger than render target 0 set the render
+    /// area when render target 0 is the only target bound, is a 1x1 resource
+    /// and is left unwritten. This is the binding half: level 0 of a target
+    /// that reports 1x1, no render target 1..3 bound, a depth attachment the
+    /// pass binds (same sample count) that is larger than 1x1. Both surfaces
+    /// must be unscaled, so the viewport, the scissor and every draw-time
+    /// scale read stay in one space; a scaled depth surface answers
+    /// [`Rt0DropCandidate::ScaledDepth`]. The size is tested first, so every
+    /// other target answers at the first compare.
+    #[must_use]
+    pub const fn rt0_drop_candidate(&self) -> Rt0DropCandidate {
+        if self.current_color_logical_size.0 != 1 || self.current_color_logical_size.1 != 1 {
+            return Rt0DropCandidate::No;
+        }
+        let level = self.current_color_subresource >> 16;
+        if level != 0
+            || !self.current_color_scale.is_identity()
+            || self.current_extra_color[0].is_bound()
+            || self.current_extra_color[1].is_bound()
+            || self.current_extra_color[2].is_bound()
+            || !self.pass_binds_depth()
+            || (self.current_depth_size.0 <= 1 && self.current_depth_size.1 <= 1)
+        {
+            return Rt0DropCandidate::No;
+        }
+        if self.current_depth_unscaled() {
+            Rt0DropCandidate::Yes
+        } else {
+            Rt0DropCandidate::ScaledDepth
+        }
+    }
+
+    /// Decide whether the pass the next draw lands in leaves render target 0 out.
+    ///
+    /// A pass freezes its attachments when it opens, so a change ends the
+    /// open pass first, as an sRGB-write change does. The draw path calls this
+    /// immediately before it opens or continues its pass, and the region depth
+    /// clear immediately before its own `ensure_pass_open`, so the bit never
+    /// outlives the pass it describes: `end_current_pass` clears it. Runs on
+    /// every draw, so the unchanged decision returns inline and the change
+    /// goes out of line in `change_rt0_dropped`.
+    #[inline]
+    pub fn set_rt0_dropped(&mut self, drop: bool) {
+        if self.rt0_dropped() != drop {
+            self.change_rt0_dropped(drop);
+        }
+    }
+
+    /// End the open pass and store a changed render-target-0 decision.
+    #[cold]
+    fn change_rt0_dropped(&mut self, drop: bool) {
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            trace!(
+                target: TRACE_TARGET,
+                "pass-break trigger=rt0_drop dropped={drop} color={:#x} depth={:#x}",
+                self.current_color_texture,
+                self.current_depth_texture,
+            );
+        }
+        self.end_current_pass("rt0_drop");
+        self.current_attachments
+            .set(CurrentAttachmentFlags::RT0_DROPPED, drop);
+    }
+
+    /// End the open pass if it leaves render target 0 out.
+    ///
+    /// What a colour `Clear` does first: it writes render target 0, so every
+    /// decision it makes has to see render target 0 attached. `caller` names
+    /// the trigger in the pass-break trace, as for `end_current_pass`.
+    pub fn end_rt0_dropped_pass(&mut self, caller: &'static str) {
+        if self.rt0_dropped() {
+            self.end_current_pass(caller);
+        }
+    }
+
+    /// Whether the open pass, or the one about to open, leaves render target 0 out.
+    #[must_use]
+    pub const fn rt0_dropped(&self) -> bool {
+        self.current_attachments
+            .contains(CurrentAttachmentFlags::RT0_DROPPED)
+    }
+
+    /// Whether the open pass, or the one about to open, attaches render target 0.
+    ///
+    /// The colour counterpart of [`Self::pass_binds_depth`], and what a
+    /// clear-quad pipeline has to declare a colour format for.
+    #[must_use]
+    pub const fn pass_binds_color(&self) -> bool {
+        !self.current_color_texture.is_null() && !self.rt0_dropped()
+    }
+
+    /// Whether the open pass, or the one about to open, rasterizes the whole bound depth surface.
+    ///
+    /// The live-binding twin of `Pass::color_extent_covers_depth`. Metal
+    /// rasterizes a pass over the smallest of its attachments, so a colour
+    /// target smaller than the depth surface on either axis confines every
+    /// draw, clear quad and load-action clear of the pass to its own extent.
+    /// Render target 0 stands for the whole colour set, since a render target
+    /// 1..3 takes part in a pass only at render target 0's extent. True when
+    /// the pass attaches no colour, when it attaches no depth (a sample-count
+    /// mismatch drops it), and when the depth surface is the smaller one.
+    #[must_use]
+    pub const fn pass_color_covers_depth(&self) -> bool {
+        !self.pass_binds_color()
+            || !self.pass_binds_depth()
+            || extent_covers(self.current_color_size, self.current_depth_size)
+    }
+
+    pub fn set_color_rt_has_alpha(&mut self, has_alpha: bool) {
+        self.current_attachments
+            .set(CurrentAttachmentFlags::COLOR_HAS_ALPHA, has_alpha);
+    }
+
+    /// Whether the currently bound colour RT's D3D format has a real alpha channel.
+    ///
+    /// Read at draw time into the pipeline snapshot's `COLOR_HAS_ALPHA` bit.
+    #[must_use]
+    pub const fn current_color_rt_has_alpha(&self) -> bool {
+        self.current_attachments
+            .contains(CurrentAttachmentFlags::COLOR_HAS_ALPHA)
+    }
+
+    /// Render targets 1..3 as the next pass will attach them, for the pipeline key.
+    #[must_use]
+    pub const fn extra_color_attachments(&self) -> ExtraColorAttachments {
+        self.current_extra_attachments
+    }
+
+    /// Bit `i` set ⇒ render target `i + 1` takes part in the next pass.
+    #[must_use]
+    pub const fn extra_present_mask(&self) -> u8 {
+        self.current_extra_present_mask
+    }
+
+    /// `true` when any of render targets 1..3 is bound, whether or not it matches target 0.
+    #[must_use]
+    pub fn has_extra_color_targets(&self) -> bool {
+        self.current_extra_color
+            .iter()
+            .any(ExtraColorSlot::is_bound)
+    }
+
+    /// `true` when a render target 1..3 is bound but sized unlike target 0.
+    ///
+    /// Such a target is attached to no pass and is still owed every
+    /// `Clear`; the encoder clears it on its own.
+    #[must_use]
+    pub fn has_extra_color_targets_outside_pass(&self) -> bool {
+        self.current_extra_color
+            .iter()
+            .enumerate()
+            .any(|(i, slot)| slot.is_bound() && self.current_extra_present_mask & (1 << i) == 0)
+    }
+
+    /// Bind or unbind render target `slot` (1..=3) for the next pass.
+    ///
+    /// Mirrors `set_color_render_target_subresource`: a rebind of the same
+    /// texture, subresource, format and extent is a no-op, any other change
+    /// materialises a pending colour clear and ends the pass.
+    /// `slot.logical_size` is the D3D9-reported extent and `slot.size` the
+    /// extent Metal allocated for the bound subresource, which the caller
+    /// states: a deeper mip level of a scaled texture is not `slot.scale` of
+    /// its logical size.
+    pub fn set_extra_color_render_target(&mut self, slot: usize, binding: Option<ExtraColorSlot>) {
+        let binding = binding.unwrap_or(ExtraColorSlot::NONE);
+        let index = slot - 1;
+        let current = &self.current_extra_color[index];
+        if current.texture == binding.texture
+            && current.subresource == binding.subresource
+            && current.format == binding.format
+            && current.size == binding.size
+        {
+            self.current_extra_color[index] = binding;
+            self.recompute_extra_present_mask();
+            return;
+        }
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            trace!(
+                target: TRACE_TARGET,
+                "pass-break trigger=set_color_rt{slot} prev={:#x} new={:#x} new_size={}x{}",
+                current.texture,
+                binding.texture,
+                binding.size.0,
+                binding.size.1,
+            );
+        }
+        if self.pending_color_clear.is_some() {
+            self.flush_pending_clears();
+        }
+        self.end_current_pass("set_color_rt_extra");
+        self.current_extra_color[index] = binding;
+        self.recompute_extra_present_mask();
+    }
+
+    /// Take the whole colour binding set off the state, leaving render target 0 alone bound.
+    ///
+    /// Pairs with [`Self::restore_color_attachments`]. Ends the current pass
+    /// when extras were bound, since a pass records its attachment set at
+    /// open and the caller is about to bind targets of its own. A pending
+    /// clear flushes first, while the extras it was issued against are
+    /// still bound.
+    pub fn take_color_attachments(&mut self) -> SavedColorAttachments {
+        if self.has_extra_color_targets() {
+            if self.pending_color_clear.is_some() {
+                self.flush_pending_clears();
+            }
+            self.end_current_pass("take_color_attachments");
+        }
+        let saved = SavedColorAttachments {
+            texture: self.current_color_texture,
+            msaa_texture: self.current_color_msaa_texture,
+            msaa_srgb_texture: self.current_color_msaa_srgb_texture,
+            sample_count: self.current_color_sample_count,
+            slice: self.current_color_subresource & 0xffff,
+            level: self.current_color_subresource >> 16,
+            logical_size: self.current_color_logical_size,
+            size: self.current_color_size,
+            format: self.current_color_format,
+            scale: self.current_color_scale,
+            has_alpha: self.current_color_rt_has_alpha(),
+            extra: core::mem::replace(&mut self.current_extra_color, [ExtraColorSlot::NONE; 3]),
+        };
+        self.recompute_extra_present_mask();
+        saved
+    }
+
+    /// Put back a binding set taken by [`Self::take_color_attachments`].
+    ///
+    /// Render target 0 goes through the ordinary setter (which ends the pass
+    /// when it differs from what is bound); the extras end it when they
+    /// differ from the current, usually empty, set.
+    pub fn restore_color_attachments(&mut self, saved: SavedColorAttachments) {
+        self.set_color_render_target_subresource(
+            saved.texture,
+            &TargetExtent::new(saved.scale, saved.logical_size, saved.size),
+            saved.format,
+            (saved.slice, saved.level),
+        );
+        self.set_color_rt_has_alpha(saved.has_alpha);
+        self.set_color_msaa(
+            saved.msaa_texture,
+            saved.msaa_srgb_texture,
+            saved.sample_count,
+        );
+        if self.current_extra_color != saved.extra {
+            if self.pending_color_clear.is_some() {
+                self.flush_pending_clears();
+            }
+            self.end_current_pass("restore_color_attachments");
+            self.current_extra_color = saved.extra;
+        }
+        self.recompute_extra_present_mask();
+    }
+
+    /// Re-evaluate which extras take part in a pass: bound and sized like target 0.
+    ///
+    /// A mismatched target warns once per texture; draws skip it (the D3D9
+    /// multiple-render-target rule) while `Clear` still reaches it through
+    /// the per-target path.
+    fn recompute_extra_present_mask(&mut self) {
+        let mut mask = 0u8;
+        for (i, slot) in self.current_extra_color.iter().enumerate() {
+            if !slot.is_bound() {
+                continue;
+            }
+            if slot.sample_count != self.current_color_sample_count {
+                mtld3d_shared::log_once_warn_by!(
+                    target: crate::LOG_TARGET,
+                    key: slot.texture.raw(),
+                    "render target {} is {}x multisampled but render target 0 is {}x: draws skip it",
+                    i + 1,
+                    slot.sample_count,
+                    self.current_color_sample_count,
+                );
+            } else if slot.size == self.current_color_size {
+                mask |= 1 << i;
+            } else {
+                mtld3d_shared::log_once_warn_by!(
+                    target: crate::LOG_TARGET,
+                    key: slot.texture.raw(),
+                    "render target {} is {}x{} but render target 0 is {}x{}: draws skip it, clears \
+                     still reach it",
+                    i + 1,
+                    slot.size.0,
+                    slot.size.1,
+                    self.current_color_size.0,
+                    self.current_color_size.1,
+                );
+            }
+        }
+        self.current_extra_present_mask = mask;
+        let mut has_alpha_mask = 0u8;
+        for (i, slot) in self.current_extra_color.iter().enumerate() {
+            if slot.has_alpha {
+                has_alpha_mask |= 1 << i;
+            }
+        }
+        self.current_extra_attachments = ExtraColorAttachments {
+            formats: core::array::from_fn(|i| self.current_extra_color[i].format),
+            present_mask: mask,
+            has_alpha_mask: has_alpha_mask & mask,
+        };
+        // The extras decide whether the whole attachment set can carry the
+        // sRGB views, and the formats keyed above follow that choice.
+        self.recompute_srgb_write();
+    }
+
+    /// Record that a colour texture is read back this session.
+    ///
+    /// Read back by something the in-frame load/store analysis can't see: a
+    /// `GetRenderTargetData` blit runs *after* the frame's
+    /// `finalize_store_actions`. Treated exactly like a sampled texture,
+    /// which exempts the colour store from Rule C's next-clear `DontCare`.
+    pub fn note_color_read_back(&mut self, handle: MetalHandle<MTLTextureKind>) {
+        self.note_texture_read(handle);
+    }
+
+    /// Record an attachment read that the render-command stream cannot see.
+    pub fn note_texture_read(&mut self, handle: MetalHandle<MTLTextureKind>) {
+        if !handle.is_null() {
+            self.seen_sampled_textures.insert(handle);
+        }
+    }
+
+    /// Register sampling aliases separately from the renderable sRGB attachment.
+    pub fn register_texture_views(&mut self, views: &mtld3d_shared::texture_views::TextureViews) {
+        self.register_srgb_twin(views.srgb, views.linear);
+        self.register_texture_view(views.sample_linear, views.linear);
+        self.register_texture_view(views.sample_srgb, views.linear);
+    }
+
+    /// Preserve storage identity for a sampling view without changing attachments.
+    pub fn register_texture_view(
+        &mut self,
+        view: MetalHandle<MTLTextureKind>,
+        base: MetalHandle<MTLTextureKind>,
+    ) {
+        if !view.is_null() && !base.is_null() && view != base {
+            self.texture_view_to_base.insert(view, base);
+        }
+    }
+
+    /// Force a later upload to version a destination written among application passes.
+    pub fn note_ordered_texture_write(&mut self, handle: MetalHandle<MTLTextureKind>) {
+        if !handle.is_null() {
+            self.frame_sampled_textures.insert(handle);
+        }
+    }
+
+    /// Register a live sRGB twin view for base-handle identity resolution.
+    ///
+    /// Called by the encoder whenever a texture create hands back a twin;
+    /// see the `texture_view_to_base` field for what the mapping protects.
+    pub fn register_srgb_twin(
+        &mut self,
+        twin: MetalHandle<MTLTextureKind>,
+        base: MetalHandle<MTLTextureKind>,
+    ) {
+        if self.store_srgb_twin(twin, base) {
+            self.apply_srgb_write_change();
+        }
+    }
+
+    /// Detach the renderable twin when its texture is released or renamed.
+    ///
+    /// Its storage alias survives until native retirement for queued pass analysis.
+    pub fn unregister_srgb_twin(&mut self, twin: MetalHandle<MTLTextureKind>) {
+        if self.drop_srgb_twin(twin) {
+            self.apply_srgb_write_change();
+        }
+    }
+
+    /// Record a base → twin pair in both directions; `true` when it landed.
+    ///
+    /// Split from [`Self::register_srgb_twin`] so `reset_frame`, which
+    /// re-registers the back buffer's pair every frame, can update the maps
+    /// without the pass-boundary check it is in the middle of redoing anyway.
+    fn store_srgb_twin(
+        &mut self,
+        twin: MetalHandle<MTLTextureKind>,
+        base: MetalHandle<MTLTextureKind>,
+    ) -> bool {
+        if twin.is_null() || base.is_null() {
+            return false;
+        }
+        self.texture_view_to_base.insert(twin, base);
+        self.srgb_base_to_twin.insert(base, twin);
+        true
+    }
+
+    /// Forget a base → twin pair; `true` when one was registered.
+    fn drop_srgb_twin(&mut self, twin: MetalHandle<MTLTextureKind>) -> bool {
+        if twin.is_null() {
+            return false;
+        }
+        let Some(&base) = self.texture_view_to_base.get(&twin) else {
+            return false;
+        };
+        if self.srgb_base_to_twin.get(&base) != Some(&twin) {
+            return false;
+        }
+        self.srgb_base_to_twin.remove(&base);
+        true
+    }
+
+    /// Apply `D3DRS_SRGBWRITEENABLE` as the draw or `Clear` about to run sees it.
+    ///
+    /// Ends the current pass when the attachment view this implies changes,
+    /// materialising any pending `Clear` on the outgoing view first: the
+    /// twin is chosen when the pass opens and one encoder cannot carry both.
+    pub fn set_srgb_write_enabled(&mut self, enabled: bool) {
+        if self.srgb_write_enabled == enabled {
+            return;
+        }
+        self.srgb_write_enabled = enabled;
+        self.apply_srgb_write_change();
+    }
+
+    /// Re-resolve the sRGB views, ending the current pass if the choice changed.
+    ///
+    /// A pass freezes its attachment views at open, so a change has to close
+    /// it. The close happens BEFORE the new choice is stored: a pending
+    /// `Clear` has to materialise on the outgoing views, or its colour goes
+    /// through the wrong transfer function.
+    fn apply_srgb_write_change(&mut self) {
+        if self.pass_srgb_write != (self.srgb_write_enabled && self.srgb_write_is_attachable()) {
+            if self.pending_color_clear.is_some() {
+                self.flush_pending_clears();
+            }
+            self.end_current_pass("srgb_write");
+        }
+        self.recompute_srgb_write();
+    }
+
+    /// Whether the next pass binds sRGB twin views of its colour attachments.
+    ///
+    /// Read per draw to decide between the hardware post-blend encode and
+    /// the pixel shader's OETF variant, and per `Clear` to decide whether
+    /// the clear colour is encoded on the way in.
+    #[must_use]
+    pub const fn pass_srgb_write(&self) -> bool {
+        self.pass_srgb_write
+    }
+
+    /// Re-resolve the colour attachments' twins and whether the pass uses them.
+    ///
+    /// Split from [`Self::apply_srgb_write_change`] so a caller that has
+    /// already ended the pass (every attachment rebind) pays no second
+    /// check.
+    fn recompute_srgb_write(&mut self) {
+        self.current_color_srgb_texture = self.twin_of(self.current_color_texture);
+        for i in 0..3 {
+            self.current_extra_srgb[i] = self.twin_of(self.current_extra_color[i].texture);
+        }
+        self.pass_srgb_write = self.srgb_write_enabled && self.srgb_write_is_attachable();
+        if self.srgb_write_enabled && !self.pass_srgb_write && !self.current_color_texture.is_null()
+        {
+            mtld3d_shared::log_once_info_by!(
+                target: crate::LOG_TARGET,
+                key: self.current_color_texture.raw(),
+                "colour target {:#x} has no sRGB Metal view: D3DRS_SRGBWRITEENABLE encodes in the pixel shader, before the blender",
+                self.current_color_texture,
+            );
+        }
+        // The extras' keyed formats follow the chosen views.
+        self.current_extra_attachments.formats =
+            core::array::from_fn(|i| self.extra_attachment_format(i));
+    }
+
+    /// The registered sRGB twin view of `base`, or null when it has none.
+    fn twin_of(&self, base: MetalHandle<MTLTextureKind>) -> MetalHandle<MTLTextureKind> {
+        self.srgb_base_to_twin
+            .get(&base)
+            .copied()
+            .unwrap_or(MetalHandle::NULL)
+    }
+
+    /// Whether every colour target the next pass attaches has an sRGB twin.
+    ///
+    /// `D3DRS_SRGBWRITEENABLE` is honoured through the attachment only then:
+    /// one render pass has one set of views, so a target without a twin
+    /// would have to be written linear while its neighbours encode. The
+    /// all-or-nothing rule keeps a mixed set on the shader path.
+    fn srgb_write_is_attachable(&self) -> bool {
+        !self.current_color_texture.is_null()
+            && !self.twin_of(self.current_color_texture).is_null()
+            && Self::companion_twin_present(
+                self.current_color_msaa_texture,
+                self.current_color_msaa_srgb_texture,
+            )
+            && (0..3).all(|i| {
+                self.current_extra_present_mask & (1 << i) == 0
+                    || (!self.twin_of(self.current_extra_color[i].texture).is_null()
+                        && Self::companion_twin_present(
+                            self.current_extra_color[i].msaa_texture,
+                            self.current_extra_color[i].msaa_srgb_texture,
+                        ))
+            })
+    }
+
+    /// Whether a multisampled companion, if there is one, has an sRGB twin.
+    ///
+    /// A pass attaching a companion without one would have to resolve a
+    /// linear attachment into an sRGB destination, which Metal rejects, so
+    /// such a target keeps `D3DRS_SRGBWRITEENABLE` on the shader path.
+    const fn companion_twin_present(
+        msaa: MetalHandle<MTLTextureKind>,
+        msaa_srgb: MetalHandle<MTLTextureKind>,
+    ) -> bool {
+        msaa.is_null() || !msaa_srgb.is_null()
+    }
+
+    /// Metal pixel format of the view bound for colour attachment 0.
+    ///
+    /// The sRGB twin's format while the pass encodes on write. The render
+    /// pipeline and every clear-quad pipeline must declare exactly this, or
+    /// Metal rejects them against the pass.
+    const fn color_attachment_format(&self) -> PixelFormat {
+        if self.pass_srgb_write
+            && let Some(twin) = self.current_color_format.srgb_twin()
+        {
+            return twin;
+        }
+        self.current_color_format
+    }
+
+    /// [`Self::color_attachment_format`] for render target `index + 1`.
+    const fn extra_attachment_format(&self, index: usize) -> PixelFormat {
+        let format = self.current_extra_color[index].format;
+        if self.pass_srgb_write
+            && self.current_extra_present_mask & (1 << index) != 0
+            && let Some(twin) = format.srgb_twin()
+        {
+            return twin;
+        }
+        format
+    }
+
+    /// Whether preservation must follow a texture write ordered among application passes.
+    #[must_use]
+    pub fn texture_written_by_blit_this_frame(&self, handle: MetalHandle<MTLTextureKind>) -> bool {
+        self.blit_written_rts.contains(&handle)
+    }
+
+    /// True when `handle` was bound as a sampler input by an earlier draw this frame.
+    ///
+    /// Drives texture rename-at-overlap: an upload into such a texture must go
+    /// to a fresh `MTLTexture` (the upload blit executes frame-head, before
+    /// the draw that already sampled the old content). Stream-exact by
+    /// construction — a texture uploaded before its first sample this frame is
+    /// absent and correctly skips the rename.
+    #[must_use]
+    pub fn texture_sampled_this_frame(&self, handle: MetalHandle<MTLTextureKind>) -> bool {
+        self.frame_sampled_textures.contains(&handle)
+    }
+
+    #[must_use]
+    pub const fn current_color_size(&self) -> (u32, u32) {
+        self.current_color_size
+    }
+
+    #[must_use]
+    pub const fn pending_color_clear(&self) -> Option<(u32, u32, u32, u32)> {
+        self.pending_color_clear
+    }
+
+    #[must_use]
+    pub const fn pending_depth_clear(&self) -> Option<u32> {
+        self.pending_depth_clear
+    }
+
+    #[must_use]
+    pub const fn viewport(&self) -> (u32, u32, u32, u32) {
+        (
+            self.viewport_x,
+            self.viewport_y,
+            self.viewport_width,
+            self.viewport_height,
+        )
+    }
+
+    /// The viewport's depth-range near/far (`D3DVIEWPORT9.MinZ`/`MaxZ`).
+    ///
+    /// Exposed so a save/restore around a one-off pass (the scaling
+    /// `StretchRect` render path) can preserve the game's depth range
+    /// rather than clobber it to the default `[0, 1]`.
+    #[must_use]
+    pub const fn viewport_depth_range(&self) -> (f32, f32) {
+        (self.viewport_min_z, self.viewport_max_z)
+    }
+
+    /// Viewport with the `ensure_pass_open` fallback.
+    ///
+    /// When width or height is zero (game never called `SetViewport`),
+    /// substitute the current rt's size at origin. Used by pass-open viewport
+    /// emission and by `emit_scissor` so both see the same rect. Exposed so
+    /// the encoder's clear-quad emit path can resolve the same scissor as the
+    /// rest of the pass machine.
+    #[must_use]
+    pub fn effective_viewport(&self) -> (u32, u32, u32, u32) {
+        if self.viewport_width != 0 && self.viewport_height != 0 {
+            // The stored viewport is the game's own; convert against whatever
+            // is bound *now* rather than baking the scale in at `set_viewport`,
+            // so a viewport that outlives a render-target change is read in the
+            // space of the target it is actually clipping.
+            self.target_extent().rect(
+                self.viewport_x,
+                self.viewport_y,
+                self.viewport_width,
+                self.viewport_height,
+            )
+        } else if self.rt0_dropped() {
+            (0, 0, self.current_depth_size.0, self.current_depth_size.1)
+        } else {
+            // Already the bound texture's own size, so no conversion.
+            (0, 0, self.current_color_size.0, self.current_color_size.1)
+        }
+    }
+
+    /// True when the current viewport covers (or exceeds) the whole bound color attachment.
+    ///
+    /// I.e. a `Clear(NULL rects)` need not be viewport-bounded and can fold to
+    /// a fast full-attachment `loadAction = Clear`. False only for a strict
+    /// sub-region viewport (origin off (0,0) or smaller than the attachment),
+    /// where the clear must be scissored to the viewport. With no color
+    /// attachment bound there is nothing to bound, so fold.
+    #[must_use]
+    pub fn viewport_covers_color_attachment(&self) -> bool {
+        self.region_covers_color_attachment(self.effective_viewport())
+    }
+
+    /// True when `region` covers (or exceeds) the whole bound color attachment.
+    ///
+    /// `region` is `(x, y, w, h)` in the bound texture's own space, as
+    /// [`Self::effective_viewport`] and a clipped `Clear` rect are, so the
+    /// comparison against the texture extent holds under `render.scale`. A
+    /// covering region clears exactly what a whole-target clear does. With no
+    /// color attachment bound there is nothing to bound, so it covers.
+    #[must_use]
+    pub const fn region_covers_color_attachment(&self, region: (u32, u32, u32, u32)) -> bool {
+        self.current_color_texture.is_null()
+            || region_covers_extent(region, self.current_color_size)
+    }
+
+    /// True when the current viewport covers (or exceeds) the whole bound depth attachment.
+    ///
+    /// The depth-stencil mirror of [`Self::viewport_covers_color_attachment`],
+    /// answering the same question for a `Clear(NULL rects)` of the depth
+    /// and/or stencil plane: cover means the clear may fold to a fast
+    /// full-attachment `loadAction = Clear`, and a strict sub-region viewport
+    /// means it must be scissored to that region. Greater-or-equal for the
+    /// same reason: D3D9 clips the viewport to the attachment, so an oversized
+    /// viewport still covers. With no depth attachment bound there is nothing
+    /// to bound, so fold.
+    #[must_use]
+    pub fn viewport_covers_depth_attachment(&self) -> bool {
+        self.region_covers_depth_attachment(self.effective_viewport())
+    }
+
+    /// True when `region` covers (or exceeds) the whole bound depth attachment.
+    ///
+    /// The depth-stencil mirror of [`Self::region_covers_color_attachment`],
+    /// measured against the depth attachment's own extent: D3D9 permits a
+    /// depth surface larger than render target 0, and a region clipped to a
+    /// viewport inside render target 0 leaves the rest of such a surface out.
+    #[must_use]
+    pub const fn region_covers_depth_attachment(&self, region: (u32, u32, u32, u32)) -> bool {
+        self.current_depth_texture.is_null()
+            || region_covers_extent(region, self.current_depth_size)
+    }
+
+    /// Whether the encoder may leave out a draw running with `writes`.
+    ///
+    /// True when the gate is on and [`draw_writes_nothing`] holds, unless a
+    /// clear is still pending with no pass open: the draw would have opened
+    /// the pass that carries that clear as its load action, and a leading
+    /// blit queued without landing the pending clears first (an ordered
+    /// texture upload) would then run ahead of the clear. Such a draw is
+    /// emitted as before.
+    #[must_use]
+    pub fn skip_dead_draw(&self, writes: &DrawWrites<'_>) -> bool {
+        if !ENABLE_SKIP_DEAD_DRAWS || !draw_writes_nothing(writes) {
+            return false;
+        }
+        let pass_open = !self.current_pass_closed && !self.passes.is_empty();
+        let clear_pending = self.pending_color_clear.is_some()
+            || self.pending_depth_clear.is_some()
+            || self.pending_stencil_clear.is_some();
+        if clear_pending && !pass_open {
+            return false;
+        }
+        mtld3d_shared::log_once_info!(
+            target: TRACE_TARGET,
+            "passes: leaving out draws that can write nothing (colour masked, no depth or \
+             stencil write, no counting query)"
+        );
+        true
+    }
+
+    /// Tag the current pass with "color writes happened" iff `mask != 0`.
+    ///
+    /// Called by the PE encoder right before emitting the per-draw
+    /// `SetRenderPipelineState` so the pass closes with an accurate
+    /// "every draw had `COLORWRITEENABLE == 0`" signal for Rule H. Opens
+    /// a pass first if none is live (mirrors the `emit_command` contract).
+    pub fn note_draw_color_write_mask(&mut self, mask: u32) {
+        self.ensure_pass_open();
+        if mask != 0
+            && let Some(pass) = self.passes.last_mut()
+        {
+            pass.color_flags.insert(PassColorFlags::WRITES_OBSERVED);
+        }
+    }
+
+    /// Record what a draw about to be emitted does with the pass's depth-stencil attachment.
+    ///
+    /// `depth_stencil` is the state the draw runs with, already gated on the
+    /// stencil plane the pass attaches, and `attach` carries the planes the
+    /// pipeline declares (`HAS_DEPTH`, `HAS_STENCIL`). Tags the pass `USED`
+    /// when the draw reads or writes depth (`DepthStencilSnapshot::uses_depth`:
+    /// a test that always passes without a depth write does neither) or
+    /// enables the stencil test on a plane it attaches, and `STENCIL_WRITTEN`
+    /// when it can change stencil. Opens a pass first if none is live (mirrors
+    /// the `emit_command` contract).
+    pub fn note_draw_depth_stencil(
+        &mut self,
+        depth_stencil: &DepthStencilSnapshot,
+        attach: PipelineAttachFlags,
+    ) {
+        self.ensure_pass_open();
+        let uses_depth =
+            attach.contains(PipelineAttachFlags::HAS_DEPTH) && depth_stencil.uses_depth();
+        let tests_stencil =
+            attach.contains(PipelineAttachFlags::HAS_STENCIL) && depth_stencil.stencil_enable != 0;
+        if let Some(pass) = self.passes.last_mut() {
+            if uses_depth || tests_stencil {
+                pass.depth_flags.insert(PassDepthFlags::USED);
+            }
+            if draw_writes_stencil(depth_stencil, attach) {
+                pass.depth_flags.insert(PassDepthFlags::STENCIL_WRITTEN);
+            }
+        }
+    }
+
+    /// Record a depth or stencil clear-quad about to be emitted into the pass.
+    ///
+    /// The quad writes the planes it clears, so the pass uses its attachment,
+    /// and a quad that clears stencil writes the stencil plane.
+    pub fn note_depth_stencil_clear_quad(&mut self, clears_stencil: bool) {
+        self.ensure_pass_open();
+        if let Some(pass) = self.passes.last_mut() {
+            pass.depth_flags.insert(PassDepthFlags::USED);
+            if clears_stencil {
+                pass.depth_flags.insert(PassDepthFlags::STENCIL_WRITTEN);
+            }
+        }
+    }
+
+    /// Enter the destination of a blit that can write a stencil plane into the written set.
+    ///
+    /// A stencil upload writes it outright; a depth transfer carries it when
+    /// both ends have one, and a texture copy of a combined texture copies
+    /// it too. Neither records the formats, so both count. Every queued
+    /// leading blit passes through here; the encoder calls it for the blits
+    /// it puts at the head of the frame instead.
+    pub fn note_stencil_blit(&mut self, blit: &BlitCommand) {
+        let writes_stencil = matches!(
+            BlitCommandType::from_repr(blit.cmd),
+            Some(
+                BlitCommandType::CopyBufferToStencil
+                    | BlitCommandType::TransferDepth
+                    | BlitCommandType::CopyTextureToTexture
+            )
+        );
+        if writes_stencil && let Some(dst) = blit_written_texture(blit) {
+            self.stencil_written_textures.insert(dst);
+        }
+    }
+
+    /// Note a draw targeting the given depth handle.
+    ///
+    /// Increments the per-frame caster-writes counter iff the handle was ever
+    /// bound as a sampleable shadow map this session — i.e. it's a known
+    /// cascade texture. Filtering on `seen_sampleable_depth_textures` rather
+    /// than the per-binding `current_depth_is_sampleable` flag is what makes
+    /// the counter a property of the texture: the caller has one depth handle
+    /// and no idea whether it names a cascade, so it calls unconditionally
+    /// and non-cascade binds filter out here.
+    pub fn note_caster_draw(&mut self, depth_tex: MetalHandle<MTLTextureKind>) {
+        if !log_enabled!(target: CASCADE_PROBE_TARGET, Level::Trace) {
+            return;
+        }
+        if depth_tex.is_null() || !self.seen_sampleable_depth_textures.contains(&depth_tex) {
+            return;
+        }
+        *self.frame_caster_writes.entry(depth_tex).or_insert(0) += 1;
+    }
+
+    /// Drain the per-frame cascade summary.
+    ///
+    /// Returns `(frame_seq, [(cascade_tex, caster_writes, sample_binds)])`
+    /// covering every cascade-depth handle that received caster writes AND
+    /// every cascade-depth handle that was sampled this frame (union).
+    /// Counters are cleared.
+    ///
+    /// The union shape matters: a cascade with `caster_writes=0 AND
+    /// sample_binds>0` is the smoking gun for "receiver sampled a
+    /// cascade with no fresh caster content this frame".
+    #[must_use]
+    pub fn take_cascade_frame_summary(
+        &mut self,
+    ) -> (u64, Vec<(MetalHandle<MTLTextureKind>, u32, u32)>) {
+        let mut keys: FxHashSet<MetalHandle<MTLTextureKind>> = FxHashSet::with_capacity_and_hasher(
+            self.frame_caster_writes.len() + self.frame_cascade_samples.len(),
+            FxBuildHasher,
+        );
+        keys.extend(self.frame_caster_writes.keys().copied());
+        keys.extend(self.frame_cascade_samples.keys().copied());
+        let mut rows: Vec<(MetalHandle<MTLTextureKind>, u32, u32)> = keys
+            .into_iter()
+            .map(|tex| {
+                (
+                    tex,
+                    self.frame_caster_writes.get(&tex).copied().unwrap_or(0),
+                    self.frame_cascade_samples.get(&tex).copied().unwrap_or(0),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|(tex, _, _)| tex.raw());
+        self.frame_caster_writes.clear();
+        self.frame_cascade_samples.clear();
+        (self.frame_seq, rows)
+    }
+
+    /// Capture the command index where a color clear-quad block is about to be emitted.
+    ///
+    /// Returns the start index for the caller to thread into
+    /// `close_color_clear_quad_block` after the clear-quad's `emit_command`
+    /// calls.
+    ///
+    /// Deliberately does NOT tag `color_writes_observed`: a clear-quad's
+    /// output is a fixed RGBA over a viewport, and if the pass closes
+    /// with no other color-writing draws and Rule C discards its colour
+    /// stores, Rule H drops the block along with the color attachment
+    /// (both are dead work). Opens a pass
+    /// first if none is live (mirrors the `emit_command` contract).
+    pub fn open_color_clear_quad_block(&mut self) -> usize {
+        self.ensure_pass_open();
+        self.passes.last().map_or(0, |p| p.commands.len())
+    }
+
+    /// Record the command range covered by the just-emitted color clear-quad.
+    ///
+    /// Caller passes the value returned by the matching
+    /// `open_color_clear_quad_block` call. Zero-length ranges (caller emitted
+    /// no commands between the open/close pair) are ignored.
+    pub fn close_color_clear_quad_block(&mut self, start: usize) {
+        if let Some(pass) = self.passes.last_mut() {
+            let end = pass.commands.len();
+            if end > start {
+                pass.color_clear_quad_ranges.push((start, end));
+            }
+        }
+    }
+
+    pub fn emit_command(&mut self, cmd: Command) {
+        self.ensure_pass_open();
+        // Mirror every pushed command into the debug shadow at the single
+        // funnel, so `FrameEncoder::debug_assert_cache_in_sync` can catch a
+        // cached-slot emit that bypassed its `LastBoundCache` gate.
+        #[cfg(debug_assertions)]
+        self.debug_emitted.record(&cmd);
+        if let Some(tex) = command_sampled_texture(&cmd) {
+            self.seen_sampled_textures.insert(tex);
+            self.frame_sampled_textures.insert(tex);
+            // An sRGB twin bind reads its base texture's storage — record the
+            // base too so rename-at-overlap and the store-action rules see the
+            // read under the handle they key on.
+            let base = self.texture_view_to_base.get(&tex).copied();
+            if let Some(base) = base {
+                self.seen_sampled_textures.insert(base);
+                self.frame_sampled_textures.insert(base);
+            }
+            if let Some(reads) = &mut self.pass_reads {
+                let pass = self
+                    .passes
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_sub(self.upload_pass_end);
+                reads.push((pass, base.unwrap_or(tex)));
+            }
+            // Cascade-sample counter: gated on the probe target so the
+            // HashMap inc is skipped at default `RUST_LOG`. The map
+            // stays empty when off; `take_cascade_frame_summary` then
+            // returns an empty Vec and the encoder-side summary block
+            // short-circuits without further work.
+            if cmd.cmd == CommandType::SetFragmentTexture as u32
+                && log_enabled!(target: CASCADE_PROBE_TARGET, Level::Trace)
+                && self.seen_sampleable_depth_textures.contains(&tex)
+            {
+                *self.frame_cascade_samples.entry(tex).or_insert(0) += 1;
+            }
+        }
+        let mut realloc_bytes: u64 = 0;
+        if let Some(pass) = self.passes.last_mut() {
+            if cmd.cmd == CommandType::SetVisibilityResultMode as u32
+                && cmd.param_a == VisibilityResultMode::Counting as u32
+            {
+                pass.has_counting_visibility = true;
+            }
+            // Count old capacity at growth as potential copy volume. An
+            // allocator may grow in place; this does not measure actual copies.
+            if pass.commands.len() == pass.commands.capacity() {
+                let bytes = pass
+                    .commands
+                    .capacity()
+                    .saturating_mul(size_of::<Command>());
+                realloc_bytes = bytes as u64;
+            }
+            pass.commands.push(cmd);
+        }
+        if realloc_bytes != 0 {
+            self.cmd_vec_realloc_bytes = self.cmd_vec_realloc_bytes.saturating_add(realloc_bytes);
+        }
+    }
+
+    /// Debug-build accessor for the emitted-command shadow.
+    ///
+    /// Diffed against the encoder's `LastBoundCache` before each draw.
+    #[cfg(debug_assertions)]
+    #[must_use]
+    pub const fn debug_emitted(&self) -> &DebugBoundShadow {
+        &self.debug_emitted
+    }
+
+    /// Forget the emitted-command shadow.
+    ///
+    /// Call in lockstep with `LastBoundCache::reset` whenever a fresh Metal
+    /// encoder opens, so the shadow and cache share the same "nothing bound
+    /// yet" baseline.
+    #[cfg(debug_assertions)]
+    pub fn debug_reset_emitted(&mut self) {
+        self.debug_emitted = DebugBoundShadow::default();
+    }
+
+    /// Drain the command-vector growth copy estimate for this submission.
+    ///
+    /// Sums old capacity bytes at growth, excluding initial allocations and
+    /// without distinguishing in-place growth from copies. Called by the
+    /// encoder's `log_perf_summary`; zeroes the counter for the next submission.
+    pub const fn take_cmd_vec_realloc_bytes(&mut self) -> u64 {
+        let bytes = self.cmd_vec_realloc_bytes;
+        self.cmd_vec_realloc_bytes = 0;
+        bytes
+    }
+
+    /// Sum command-vector capacity bytes in the submitted pass list.
+    ///
+    /// Counts only the supplied payload's passes, excluding idle pooled vectors
+    /// and other outstanding payloads. Call after detaching the passes from this
+    /// state. This is reused capacity, not allocation volume; potential growth copies are
+    /// tracked separately by [`Self::take_cmd_vec_realloc_bytes`].
+    #[must_use]
+    pub fn cmd_vec_capacity_bytes(passes: &[Pass]) -> u64 {
+        let elem = core::mem::size_of::<Command>() as u64;
+        passes
+            .iter()
+            .map(|p| p.commands.capacity() as u64 * elem)
+            .sum()
+    }
+
+    /// The depth flags a pass opened now starts with: what the bound attachment is.
+    const fn pass_depth_flags(&self) -> PassDepthFlags {
+        let mut flags = PassDepthFlags::empty();
+        if self
+            .current_attachments
+            .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
+        {
+            flags = flags.union(PassDepthFlags::SAMPLEABLE);
+        }
+        if self
+            .current_attachments
+            .contains(CurrentAttachmentFlags::DEPTH_HAS_STENCIL)
+        {
+            flags = flags.union(PassDepthFlags::HAS_STENCIL);
+        }
+        flags
+    }
+
+    /// Ensure a pass is live for the next command.
+    ///
+    /// Runs before every emitted command, and a pass is already open for
+    /// nearly all of them, so that test stays inline at the caller and
+    /// opening a pass is the out-of-line `open_pass`.
+    #[inline]
+    pub fn ensure_pass_open(&mut self) {
+        if self.opens_pass() {
+            self.open_pass();
+        }
+    }
+
+    /// Whether the next command opens a pass rather than joining the open one.
+    #[inline]
+    const fn opens_pass(&self) -> bool {
+        self.current_pass_closed || self.passes.is_empty()
+    }
+
+    /// Ensure a pass is live for a draw that writes every pixel and sample of render target 0.
+    ///
+    /// The caller vouches for the draw, which has to be the next one the pass
+    /// records. Only a pass this call opens is marked
+    /// `PassColorFlags::FIRST_DRAW_COVERS`: a pass already open has draws
+    /// of its own, and its load serves them. Nor is a pass with other colour
+    /// targets beside render target 0, which the draw does not write. The pass
+    /// opens with the load action any other opening gives it; Rule K
+    /// ([`Self::discard_covered_color_loads`]) acts on the mark once the other
+    /// rules have run.
+    pub fn open_pass_for_covering_draw(&mut self) {
+        let opens = self.opens_pass();
+        self.ensure_pass_open();
+        if opens
+            && let Some(pass) = self.passes.last_mut()
+            && !pass.color_texture.is_null()
+            && !pass.extra_color.iter().any(PassColorAttachment::is_bound)
+        {
+            debug_assert_eq!(
+                pass.viewport,
+                (0, 0, pass.color_size.0, pass.color_size.1),
+                "a draw that covers render target 0 runs under a viewport that covers it"
+            );
+            pass.color_flags.insert(PassColorFlags::FIRST_DRAW_COVERS);
+        }
+    }
+
+    /// Open a new `Pass` for the next command.
+    ///
+    /// Called when the previous one was closed (or for the first command of
+    /// the frame); consumes any pending clears and emits the current viewport
+    /// as the first command of the new pass.
+    ///
+    /// Rule A — first-use `DontCare`: when an attachment has not been
+    /// seen yet this frame AND there is no pending clear AND no queued
+    /// leading-blit writes the same attachment, the load action is
+    /// `DontCare` instead of `Load`. Saves the TBDR tile-fill cost on
+    /// passes that will fully overwrite undefined contents anyway. On the
+    /// colour side only the back buffer's contents are undefined at the
+    /// start of a frame, and only under the discard swap effect; any other
+    /// colour target still holds what the previous frame left in it, so it
+    /// loads.
+    ///
+    /// A pass that leaves render target 0 out ([`CurrentAttachmentFlags::RT0_DROPPED`])
+    /// first lands a pending colour clear in a colour-only pass of its own,
+    /// then opens with the depth attachment alone. A pass whose colour target
+    /// is smaller than the depth surface ([`Self::pass_color_covers_depth`])
+    /// first lands a pending depth or stencil clear in a depth-only pass at
+    /// the depth surface's extent, so the clear is not confined to the area
+    /// the pass rasterizes. The pass itself then loads the same clear values:
+    /// the whole surface holds them by then, and a load-action clear of its
+    /// own area saves loading them back. Either extra pass is the first one
+    /// pushed and takes the queued leading blits.
+    #[cold]
+    fn open_pass(&mut self) {
+        if self.rt0_dropped() {
+            debug_assert!(
+                self.pass_binds_depth(),
+                "render target 0 is left out only over a depth attachment the pass binds"
+            );
+            if self.pending_color_clear.is_some() {
+                self.push_pass(&PassAttach::ColorOnly);
+                self.current_pass_closed = true;
+            }
+            self.push_pass(&PassAttach::DepthOnly);
+        } else {
+            if (self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some())
+                && !self.pass_color_covers_depth()
+            {
+                let (depth, stencil) = (self.pending_depth_clear, self.pending_stencil_clear);
+                self.push_depth_clear_pass();
+                self.pending_depth_clear = depth;
+                self.pending_stencil_clear = stencil;
+            }
+            self.push_pass(&PassAttach::Both);
+        }
+    }
+
+    /// Push and open a pass on the current attachments, or on the half of them `attach` names.
+    ///
+    /// Consumes the pending clears of the attachments it takes and the queued
+    /// leading blits. A colour-only pass spans render target 0 and has no
+    /// extras; a depth-only pass takes the depth attachment's extent.
+    fn push_pass(&mut self, attach: &PassAttach) {
+        let attach_color = !matches!(attach, PassAttach::DepthOnly);
+        let attach_depth = !matches!(attach, PassAttach::ColorOnly);
+        let (vpx, vpy, vpw, vph) = if attach_depth {
+            self.effective_viewport()
+        } else {
+            (0, 0, self.current_color_size.0, self.current_color_size.1)
+        };
+        let leading_blits = core::mem::take(&mut self.pending_leading_blits);
+
+        // Rule A (FIRST_USE_DONTCARE) is only safe when the new pass
+        // will WRITE the entire attachment — otherwise `DontCare` lets
+        // Metal trash the un-rendered region. Sub-rect viewports (e.g.
+        // a shared shadow cascade tile atlas, where one frame
+        // renders a few 683x683 tiles into a 2048x2048 atlas while
+        // expecting the other tiles from the previous frame to
+        // survive) need `Load` so prior content carries forward — real
+        // D3D9 drivers preserve depth content across frames; MTLD3D
+        // must match.
+        //
+        // Each plane is judged against its own attachment's extent. D3D9 only
+        // requires the depth-stencil surface to be at least as large as the
+        // render target, so a viewport that covers render target 0 exactly can
+        // still leave a larger depth surface partly un-rendered.
+        let viewport_covers_color_extent = vpx == 0
+            && vpy == 0
+            && vpw == self.current_color_size.0
+            && vph == self.current_color_size.1;
+        let pending_color_clear = if attach_color {
+            self.pending_color_clear.take()
+        } else {
+            None
+        };
+        // Shared by render target 0 and every extra: a pending clear lands on
+        // all of them (D3D9 clears every bound target), and the Rule A
+        // first-use predicate is evaluated per attachment. Only the back
+        // buffer qualifies, and only when `Present` under the discard swap
+        // effect left it undefined; every other target, and the back buffer
+        // under `FLIP` or `COPY`, keeps its contents into the next frame.
+        let backbuffer = self.backbuffer_texture;
+        let backbuffer_undefined =
+            matches!(self.backbuffer_contents, BackbufferContents::Undefined);
+        let color_load_for =
+            |texture: MetalHandle<MTLTextureKind>, subresource: u32| match pending_color_clear {
+                Some((r, g, b, a)) => ColorLoad::Clear { r, g, b, a },
+                None if ENABLE_FIRST_USE_DONTCARE
+                    && viewport_covers_color_extent
+                    && !texture.is_null()
+                    && texture == backbuffer
+                    && backbuffer_undefined
+                    && !self.seen_color_rts.contains(&(texture, subresource))
+                    && !self.seen_sampled_textures.contains(&texture)
+                    && !self.blit_written_rts.contains(&texture) =>
+                {
+                    ColorLoad::DontCare
+                }
+                None => ColorLoad::Load,
+            };
+        let color_load = color_load_for(self.current_color_texture, self.current_color_subresource);
+        let extra_color: [PassColorAttachment; 3] = core::array::from_fn(|i| {
+            let slot = &self.current_extra_color[i];
+            if !attach_color || self.current_extra_present_mask & (1 << i) == 0 {
+                return PassColorAttachment::NONE;
+            }
+            PassColorAttachment {
+                texture: slot.texture,
+                srgb_texture: if self.pass_srgb_write {
+                    self.current_extra_srgb[i]
+                } else {
+                    MetalHandle::NULL
+                },
+                msaa_texture: slot.msaa_texture,
+                msaa_srgb_texture: if self.pass_srgb_write {
+                    slot.msaa_srgb_texture
+                } else {
+                    MetalHandle::NULL
+                },
+                resolve_texture: MetalHandle::NULL,
+                subresource: slot.subresource,
+                size: slot.size,
+                format: self.extra_attachment_format(i),
+                load: color_load_for(slot.texture, slot.subresource),
+                store: StoreAction::Store,
+            }
+        });
+        // Metal takes the sample count of a render pass from its attachments
+        // and rejects one where they disagree, so a depth surface that does
+        // not match render target 0 is dropped instead of crashing the pass.
+        // D3D9 calls the pairing invalid too, but returns an error from
+        // `SetDepthStencilSurface` rather than failing the draw, and titles do
+        // reach here after switching render targets without rebinding depth.
+        let depth_texture = if !attach_depth {
+            MetalHandle::NULL
+        } else if self.pass_binds_depth() {
+            self.current_depth_texture
+        } else {
+            if !self.current_depth_texture.is_null() {
+                mtld3d_shared::log_once_warn_by!(
+                    target: crate::LOG_TARGET,
+                    key: self.current_depth_texture.raw(),
+                    "depth attachment {:#x} is {}x multisampled but render target 0 is {}x: \
+                     dropping depth for this pass",
+                    self.current_depth_texture,
+                    self.current_depth_sample_count,
+                    self.current_color_sample_count,
+                );
+            }
+            MetalHandle::NULL
+        };
+        // The depth texture's first use this frame under a viewport that
+        // covers it: the Rule A predicate, shared by the depth plane and the
+        // stencil plane because both live in that one texture. Coverage is
+        // measured against the depth attachment's own extent, greater-or-equal
+        // because D3D9 clips the viewport to the render target, so an oversized
+        // viewport still covers everything the pass can write.
+        let depth_first_use = self.viewport_covers_depth_attachment()
+            && !depth_texture.is_null()
+            && !self
+                .current_attachments
+                .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
+            && !self.seen_depth_rts.contains(&depth_texture)
+            && !self.seen_sampled_textures.contains(&depth_texture)
+            && !self.blit_written_rts.contains(&depth_texture);
+        // A pass that dropped the depth surface has nowhere to apply a pending
+        // depth or stencil clear, so both stay pending for the next pass that
+        // attaches the surface, or for `flush_pending_clears`.
+        let (pending_depth, pending_stencil) = if depth_texture.is_null() {
+            (None, None)
+        } else {
+            (
+                self.pending_depth_clear.take(),
+                self.pending_stencil_clear.take(),
+            )
+        };
+        let depth_load = match pending_depth {
+            Some(value) => DepthLoad::Clear { value },
+            None if ENABLE_FIRST_USE_DONTCARE && depth_first_use => DepthLoad::DontCare,
+            None => DepthLoad::Load,
+        };
+        let stencil_load = match pending_stencil {
+            Some(value) => StencilLoad::Clear { value },
+            None if ENABLE_FIRST_USE_STENCIL_DONTCARE && depth_first_use => StencilLoad::DontCare,
+            None => StencilLoad::Load,
+        };
+        if attach_color && !self.current_color_texture.is_null() {
+            let key = (self.current_color_texture, self.current_color_subresource);
+            self.seen_color_rts.insert(key);
+        }
+        for attachment in extra_color.iter().filter(|a| a.is_bound()) {
+            let key = (attachment.texture, attachment.subresource);
+            self.seen_color_rts.insert(key);
+        }
+        if !depth_texture.is_null() {
+            self.seen_depth_rts.insert(depth_texture);
+        }
+
+        // Reuse a `Vec<Command>` recycled from a previous frame's pass
+        // (capacity preserved by `reset_frame`); fall back to a small
+        // fresh allocation on the cold-start frame or after the pool
+        // has been drained by a high-pass-count frame.
+        let commands = self
+            .command_vec_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(64));
+        let mut pass = Pass {
+            color_texture: self.current_color_texture,
+            color_srgb_texture: if self.pass_srgb_write {
+                self.current_color_srgb_texture
+            } else {
+                MetalHandle::NULL
+            },
+            color_msaa_texture: self.current_color_msaa_texture,
+            color_msaa_srgb_texture: if self.pass_srgb_write {
+                self.current_color_msaa_srgb_texture
+            } else {
+                MetalHandle::NULL
+            },
+            color_resolve_texture: MetalHandle::NULL,
+            color_subresource: self.current_color_subresource,
+            color_size: self.current_color_size,
+            color_format: self.color_attachment_format(),
+            color_load,
+            color_store: StoreAction::Store,
+            depth_texture,
+            depth_level: self.current_depth_level,
+            depth_size: if depth_texture.is_null() {
+                (0, 0)
+            } else {
+                self.current_depth_size
+            },
+            depth_load,
+            stencil_load,
+            depth_store: StoreAction::Store,
+            stencil_store: StoreAction::Store,
+            viewport: (vpx, vpy, vpw, vph),
+            commands,
+            leading_blits,
+            has_counting_visibility: false,
+            depth_flags: self.pass_depth_flags(),
+            color_flags: PassColorFlags::empty(),
+            color_clear_quad_ranges: Vec::new(),
+            extra_color,
+        };
+        if !attach_depth {
+            // Nothing about a depth surface the pass does not attach applies.
+            pass.depth_flags = PassDepthFlags::empty();
+        }
+        if !attach_color {
+            pass.drop_color_attachment();
+            pass.color_size = pass.depth_size;
+        }
+        debug_assert!(
+            !pass.clears_depth_past_its_area()
+                || self
+                    .passes
+                    .last()
+                    .is_some_and(|prev| pass.repeats_depth_clear_of(prev)),
+            "a pass smaller than its depth surface loads a depth or stencil Clear only after the \
+             depth-only pass that cleared the whole surface to it"
+        );
+        pass.commands.push(Command::set_viewport(
+            vpx,
+            vpy,
+            vpw,
+            vph,
+            self.viewport_min_z,
+            self.viewport_max_z,
+        ));
+        // Seed the dedup with the viewport just emitted as this encoder's
+        // first command, so a mid-pass `set_viewport` with the same value
+        // (games re-set an unchanged viewport every frame) is skipped.
+        self.last_emitted_viewport = Some((
+            vpx,
+            vpy,
+            vpw,
+            vph,
+            self.viewport_min_z.to_bits(),
+            self.viewport_max_z.to_bits(),
+        ));
+        self.passes.push(pass);
+        self.current_pass_closed = false;
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            // The pushed pass's own attachments: a colour-only or depth-only
+            // pass attaches less than is bound.
+            let idx = self.passes.len() - 1;
+            let opened = &self.passes[idx];
+            let extra = opened
+                .extra_color
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.is_bound())
+                .fold(0u8, |mask, (i, _)| mask | (1 << i));
+            trace!(
+                target: TRACE_TARGET,
+                "pass-open  idx={idx} color={:#x} srgb={:#x} depth={:#x} \
+                 size={}x{} color_load={:?} depth_load={:?} viewport={vpx},{vpy}+{vpw}x{vph} \
+                 extra={extra:#x}",
+                opened.color_texture,
+                opened.color_srgb_texture,
+                opened.depth_texture,
+                opened.color_size.0,
+                opened.color_size.1,
+                opened.color_load,
+                opened.depth_load,
+            );
+        }
+    }
+
+    /// Splice one texture-upload pass into the front of the frame.
+    ///
+    /// `commands` is the upload quad's binding + draw sequence; the viewport
+    /// scoping the pass to `rect` is prepended here so the pass carries it as
+    /// its first command, the way `ensure_pass_open` does. The pass takes no
+    /// depth attachment and is never the current pass, so the caller's own
+    /// render-target binding, viewport and per-draw dedup cache are all
+    /// untouched.
+    ///
+    /// `leading_blits` carries the uploads and preservation copies issued
+    /// since the preceding upload pass, so both upload forms keep API order.
+    /// The upload lands at the head of the frame, where the blit uploads it
+    /// replaces already land: a draw earlier in the frame that sampled the
+    /// destination is served by the encoder's texture rename, exactly as
+    /// before. The load action discards only when `rect` covers the whole
+    /// mip, which the quad then fully overwrites.
+    ///
+    /// The destination is also entered into the read/write model the
+    /// load/store rules reason over: `blit_written_rts` so a later pass loads
+    /// the attachment instead of discarding it (Rule A), and the sampled set
+    /// so the pass's own colour store survives Rule C even in a frame where
+    /// nothing samples the texture.
+    pub fn push_upload_pass(
+        &mut self,
+        target: &UploadPassTarget,
+        commands: &[Command],
+        leading_blits: Vec<BlitCommand>,
+    ) {
+        self.push_upload_pass_with_order::<false>(target, commands, leading_blits);
+    }
+
+    /// Build an upload pass at the frame head or in application order.
+    ///
+    /// Ordered callers first close the application pass and supply its pending
+    /// blits, so an upload follows every earlier read and write of its texture.
+    pub fn push_upload_pass_with_order<const ORDERED: bool>(
+        &mut self,
+        target: &UploadPassTarget,
+        commands: &[Command],
+        leading_blits: Vec<BlitCommand>,
+    ) {
+        let (x, y, w, h) = target.rect;
+        let covers = x == 0 && y == 0 && w == target.size.0 && h == target.size.1;
+        let color_load = if ENABLE_FIRST_USE_DONTCARE && covers {
+            ColorLoad::DontCare
+        } else {
+            ColorLoad::Load
+        };
+        let (slice, level) = target.subresource;
+        let subresource = slice | (level << 16);
+        let mut cmds = self
+            .command_vec_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(16));
+        cmds.clear();
+        cmds.push(Command::set_viewport(x, y, w, h, 0.0, 1.0));
+        cmds.extend_from_slice(commands);
+        let pass = Pass {
+            color_texture: target.texture,
+            // The quad writes the expanded texels bit-exactly, so the pass
+            // never renders through the sRGB twin.
+            color_srgb_texture: MetalHandle::NULL,
+            // An upload target is a D3D9 texture, which cannot be
+            // multisampled, so the pass has no companion and takes no resolve.
+            color_msaa_texture: MetalHandle::NULL,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: MetalHandle::NULL,
+            color_subresource: subresource,
+            color_size: target.size,
+            color_format: target.format,
+            color_load,
+            color_store: StoreAction::Store,
+            depth_texture: MetalHandle::NULL,
+            depth_level: 0,
+            depth_size: (0, 0),
+            depth_load: DepthLoad::DontCare,
+            stencil_load: StencilLoad::DontCare,
+            depth_store: StoreAction::DontCare,
+            stencil_store: StoreAction::DontCare,
+            viewport: (x, y, w, h),
+            commands: cmds,
+            leading_blits,
+            has_counting_visibility: false,
+            depth_flags: PassDepthFlags::empty(),
+            // The quad writes colour, so Rule H must not strip the attachment
+            // it renders into.
+            color_flags: PassColorFlags::WRITES_OBSERVED,
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: [PassColorAttachment::NONE; 3],
+        };
+        let pass_index = if ORDERED {
+            self.passes.len()
+        } else {
+            self.upload_pass_end
+        };
+        if ORDERED {
+            self.passes.push(pass);
+        } else {
+            self.passes.insert(self.upload_pass_end, pass);
+            self.upload_pass_end += 1;
+        }
+        self.seen_color_rts.insert((target.texture, subresource));
+        if ORDERED {
+            self.blit_written_rts.insert(target.texture);
+        }
+        self.seen_sampled_textures.insert(target.texture);
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            trace!(
+                target: TRACE_TARGET,
+                "upload-pass idx={} color={:#x} slice={slice} level={level} \
+                 size={}x{} rect={x},{y}+{w}x{h} load={color_load:?}",
+                pass_index,
+                target.texture,
+                target.size.0,
+                target.size.1,
+            );
+        }
+    }
+
+    /// Number of upload passes preceding the application's passes.
+    #[must_use]
+    pub const fn upload_pass_count(&self) -> usize {
+        self.upload_pass_end
+    }
+
+    /// Queue a blit to run before the *next* pass that opens.
+    ///
+    /// Caller should `end_current_pass()` immediately before pushing so that
+    /// any in-flight render encoder closes first — the queued blit then orders
+    /// correctly between the just-ended pass's draws and the next pass's
+    /// draws. If no further pass opens this frame, `submit` drains the queue
+    /// into a synthetic trailing blit-only pass via
+    /// `take_pending_leading_blits`.
+    ///
+    /// The blit is also entered into the read/write model the load/store rules
+    /// reason over. A texture-to-texture copy or a depth transfer reads its
+    /// source from device memory after every pass that wrote it, so the source
+    /// counts as read
+    /// (`seen_sampled_textures`, which Rules B/C consult before discarding a
+    /// store). The destination of any texture-writing blit goes into
+    /// `blit_written_rts` so Rule A loads it instead of discarding the copy,
+    /// and one that can write a stencil plane into `stencil_written_textures`.
+    pub fn push_pending_leading_blit(&mut self, blit: BlitCommand) {
+        if let Some(src) = blit_read_texture(&blit) {
+            self.note_texture_read(src);
+        }
+        if let Some(dst) = blit_written_texture(&blit) {
+            self.blit_written_rts.insert(dst);
+        }
+        self.note_stencil_blit(&blit);
+        self.pending_leading_blits.push(blit);
+    }
+
+    /// Queue `blit` after everything D3D9 ordered before it, clears included.
+    ///
+    /// A clear still waiting for a pass is materialised first (as a
+    /// depth-only pass when render target 0 cannot carry the depth surface,
+    /// see [`Self::flush_pending_clears`]) and the pass open at the time
+    /// ends, so the blit, which leads the next pass, reads what the clear
+    /// left rather than what it replaced, and a clear of its destination
+    /// cannot land on top of what it wrote. `caller` names the trigger in
+    /// the pass-break trace.
+    pub fn push_leading_blit_after_clears(&mut self, blit: BlitCommand, caller: &'static str) {
+        self.flush_pending_clears();
+        self.end_current_pass(caller);
+        self.push_pending_leading_blit(blit);
+    }
+
+    /// Drain any leading blits queued after the last pass ended.
+    ///
+    /// Used by `submit` to synthesise a trailing blit-only pass when a
+    /// `StretchRect` lands after the final draw of the frame.
+    pub fn take_pending_leading_blits(&mut self) -> Vec<BlitCommand> {
+        core::mem::take(&mut self.pending_leading_blits)
+    }
+
+    /// Close the current render pass.
+    ///
+    /// The next `emit_command` / `ensure_pass_open` opens a fresh pass using
+    /// the attachments and pending clears in effect at that point. `caller` is
+    /// a static identifier (e.g. `"set_color_rt"`, `"stretch_rect"`) emitted
+    /// into the `mtld3d::d3d9::passes` trace probe so a frame log shows which
+    /// trigger drove each pass break. Clears
+    /// [`CurrentAttachmentFlags::RT0_DROPPED`] unconditionally, with or without
+    /// an open pass.
+    pub fn end_current_pass(&mut self, caller: &'static str) {
+        // The render-target-0 decision describes the pass that ends here, so
+        // it goes with it, whether or not a pass was open.
+        self.current_attachments
+            .remove(CurrentAttachmentFlags::RT0_DROPPED);
+        if !self.passes.is_empty() && !self.current_pass_closed {
+            self.current_pass_closed = true;
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                let idx = self.passes.len() - 1;
+                let last = &self.passes[idx];
+                let draws = last.commands.iter().filter(|c| c.is_draw()).count();
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-close idx={idx} caller={caller} color={:#x} depth={:#x} cmds={} draws={draws}",
+                    last.color_texture,
+                    last.depth_texture,
+                    last.commands.len()
+                );
+            }
+        }
+    }
+
+    /// Materialize any pending clears as a standalone pass on the current attachments.
+    ///
+    /// D3D9 semantics: `Clear()` applies to whichever rt is bound at call
+    /// time; if the game then changes rt (or calls Present without drawing),
+    /// the original target must still be cleared. This is a no-op when there
+    /// are no pending clears.
+    ///
+    /// A depth or stencil clear the current attachments cannot carry (render
+    /// target 0 disagrees with the depth surface on samples), or would carry
+    /// only over part of the surface (a colour target smaller than it), is
+    /// materialised as a depth-only pass on the bound depth surface. Nothing
+    /// is left pending afterwards, so the depth setters, which flush before
+    /// they rebind, never let a clear reach a different surface.
+    pub fn flush_pending_clears(&mut self) {
+        let depth_pending =
+            self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some();
+        if self.pending_color_clear.is_some()
+            || (depth_pending && self.pass_binds_depth() && self.pass_color_covers_depth())
+        {
+            self.ensure_pass_open();
+            self.end_current_pass("flush_pending_clears");
+        }
+        if self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some() {
+            self.push_depth_clear_pass();
+        }
+    }
+
+    /// Record the pending depth and stencil clears as a closed pass with no colour attachment.
+    ///
+    /// No draws, the whole depth surface as its extent, and the load actions
+    /// doing the work. A pending clear
+    /// with no depth surface bound has nothing to land on and is dropped.
+    fn push_depth_clear_pass(&mut self) {
+        let depth_texture = self.current_depth_texture;
+        let depth_load = self
+            .pending_depth_clear
+            .take()
+            .map_or(DepthLoad::Load, |value| DepthLoad::Clear { value });
+        let stencil_load = self
+            .pending_stencil_clear
+            .take()
+            .map_or(StencilLoad::Load, |value| StencilLoad::Clear { value });
+        if depth_texture.is_null() {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "pending depth/stencil clear with no depth attachment bound → dropped"
+            );
+            return;
+        }
+        self.end_current_pass("depth_clear");
+        let (width, height) = self.current_depth_size;
+        let commands = self
+            .command_vec_pool
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(64));
+        self.passes.push(Pass {
+            color_texture: MetalHandle::NULL,
+            color_srgb_texture: MetalHandle::NULL,
+            color_msaa_texture: MetalHandle::NULL,
+            color_msaa_srgb_texture: MetalHandle::NULL,
+            color_resolve_texture: MetalHandle::NULL,
+            color_subresource: 0,
+            color_size: (width, height),
+            color_format: self.current_color_format,
+            color_load: ColorLoad::DontCare,
+            color_store: StoreAction::DontCare,
+            depth_texture,
+            depth_level: self.current_depth_level,
+            depth_size: (width, height),
+            depth_load,
+            stencil_load,
+            depth_store: StoreAction::Store,
+            stencil_store: StoreAction::Store,
+            viewport: (0, 0, width, height),
+            commands,
+            leading_blits: core::mem::take(&mut self.pending_leading_blits),
+            has_counting_visibility: false,
+            depth_flags: self.pass_depth_flags(),
+            color_flags: PassColorFlags::empty(),
+            color_clear_quad_ranges: Vec::new(),
+            extra_color: core::array::from_fn(|_| PassColorAttachment::NONE),
+        });
+        self.current_pass_closed = true;
+        self.seen_depth_rts.insert(depth_texture);
+    }
+
+    /// Rebind the color attachment for the next pass.
+    ///
+    /// No-op if the new texture, subresource, format and extent all match what
+    /// is bound (games often re-assert the backbuffer between scenes).
+    ///
+    /// Only flushes pending clears when a *color* clear is pending: the
+    /// color attachment is about to change, so the pending color clear
+    /// must materialise on the outgoing rt (D3D9's
+    /// Clear-then-SetRenderTarget ordering). A companion pending depth
+    /// clear gets folded into the same materialised pass.
+    ///
+    /// If only a depth clear is pending (color clear is None), leave
+    /// both pending and skip the flush — the depth attachment is
+    /// unchanged across this setter, so the depth clear is still
+    /// associated with the right surface and applies to the next
+    /// user-issued pass. Without this gate the typical cascade-init
+    /// sequence `SetRT(C) → Clear(TARGET) → SetDST(D) → Clear(ZBUFFER)
+    /// → Draw` produced a spurious 1-cmd clear-only pass at the
+    /// `SetDST` site.
+    pub fn set_color_render_target(
+        &mut self,
+        texture: MetalHandle<MTLTextureKind>,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        scale: RenderScale,
+    ) {
+        self.set_color_render_target_subresource(
+            texture,
+            &TargetExtent::whole(scale, (width, height)),
+            format,
+            (0, 0),
+        );
+    }
+
+    /// Rebind a color attachment slice and mip level for the next pass.
+    ///
+    /// `extent` pairs the size D3D9 reports for the subresource with the one
+    /// Metal allocated for it, which `current_color_size` records: every
+    /// coverage test, scissor and viewport fallback measures against the
+    /// texture itself, and a deeper mip level of a scaled texture is Metal's
+    /// halving of the scaled base rather than the scale of its logical size.
+    pub fn set_color_render_target_subresource(
+        &mut self,
+        texture: MetalHandle<MTLTextureKind>,
+        extent: &TargetExtent,
+        format: PixelFormat,
+        subresource: (u32, u32),
+    ) {
+        let scale = extent.scale();
+        let logical_size = extent.logical();
+        self.warn_if_scale_wasted(logical_size.0, logical_size.1, scale);
+        let (width, height) = extent.texture();
+        let (slice, level) = subresource;
+        let packed_subresource = slice | (level << 16);
+        // A pass freezes the attachment's format and extent when it opens, so
+        // the binding is only unchanged when both still match: a same-handle
+        // rebind that moves either one leaves the descriptor carrying one pair
+        // while the draws that follow build their pipelines against the other.
+        if self.current_color_texture == texture
+            && self.current_color_subresource == packed_subresource
+            && self.current_color_format == format
+            && self.current_color_size == (width, height)
+        {
+            // The same target keeps its companion and sample count; the
+            // caller's `set_color_msaa` restates them.
+            self.current_color_scale = scale;
+            self.current_color_logical_size = logical_size;
+            if self.has_extra_color_targets() {
+                self.recompute_extra_present_mask();
+            } else {
+                self.recompute_srgb_write();
+            }
+            return;
+        }
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            trace!(
+                target: TRACE_TARGET,
+                "pass-break trigger=set_color_rt prev={:#x} new={:#x} slice={slice} level={level} new_size={width}x{height}",
+                self.current_color_texture,
+                texture,
+            );
+        }
+        // The pending clears belong to the outgoing target, so they flush
+        // before any of its state is replaced.
+        if self.pending_color_clear.is_some() {
+            self.flush_pending_clears();
+        }
+        self.end_current_pass("set_color_rt");
+        // A target binds without multisampling unless the caller says
+        // otherwise in the same breath, so a single-sampled target can never
+        // inherit the previous one's companion. Mirrors how
+        // `set_color_rt_has_alpha` is paired with this setter.
+        self.current_color_msaa_texture = MetalHandle::NULL;
+        self.current_color_msaa_srgb_texture = MetalHandle::NULL;
+        self.current_color_sample_count = 1;
+        self.current_color_scale = scale;
+        self.current_color_logical_size = logical_size;
+        self.current_color_texture = texture;
+        self.current_color_subresource = packed_subresource;
+        self.current_color_size = (width, height);
+        self.current_color_format = format;
+        if self.has_extra_color_targets() {
+            self.recompute_extra_present_mask();
+        } else {
+            self.recompute_srgb_write();
+        }
+    }
+
+    /// Rebind the depth/stencil attachment for the next pass.
+    ///
+    /// Mirrors `set_color_render_target`: only flushes pending clears when a
+    /// pending *depth* clear exists (depth attachment is about to change). A
+    /// solo pending color clear stays pending for the unchanged color
+    /// attachment. `size` is the attachment's extent in its own space, `(0, 0)`
+    /// for an unbind.
+    pub fn set_depth_stencil_attachment(
+        &mut self,
+        texture: MetalHandle<MTLTextureKind>,
+        size: (u32, u32),
+        is_sampleable: bool,
+        has_stencil: bool,
+    ) {
+        self.set_depth_stencil_attachment_level(texture, 0, size, is_sampleable, has_stencil);
+    }
+
+    /// Bind mip `level` of `texture` as the depth/stencil attachment.
+    ///
+    /// A different level of the same texture is a different attachment and
+    /// ends the pass the way a different texture does. `size` is that level's
+    /// own extent, not level 0's: it is what
+    /// [`Self::viewport_covers_depth_attachment`] measures the viewport
+    /// against.
+    pub fn set_depth_stencil_attachment_level(
+        &mut self,
+        texture: MetalHandle<MTLTextureKind>,
+        level: u32,
+        size: (u32, u32),
+        is_sampleable: bool,
+        has_stencil: bool,
+    ) {
+        // Sampleability is a property of the texture, so the caller must
+        // report the same answer for every bind of one handle: the D3D9
+        // boundary derives the flag from the surface's owning texture, not
+        // from which bind path the surface took. Were a handle to come back
+        // with the flag cleared, the rebind would break the pass (an encoder
+        // close/open, Load+Store of every attachment) and drop Rule B's
+        // keep-Store exemption for a cascade that is still sampled later.
+        debug_assert!(
+            is_sampleable
+                || texture.is_null()
+                || !self.seen_sampleable_depth_textures.contains(&texture),
+            "depth handle {texture:#x} rebound as non-sampleable after a sampleable bind",
+        );
+        if is_sampleable && !texture.is_null() {
+            self.seen_sampleable_depth_textures.insert(texture);
+        }
+        if self.current_depth_texture == texture
+            && self.current_depth_level == level
+            && self
+                .current_attachments
+                .contains(CurrentAttachmentFlags::DEPTH_SAMPLEABLE)
+                == is_sampleable
+        {
+            // `has_stencil` is a property of the bound texture's format, so a
+            // repeat bind of the same texture carries the same value. Same
+            // handle and level, so the same extent and sample count too: a
+            // repeat bind carries nothing new for either.
+            self.current_attachments
+                .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
+            return;
+        }
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            trace!(
+                target: TRACE_TARGET,
+                "pass-break trigger=set_depth_attach prev={:#x}:{} new={:#x}:{}",
+                self.current_depth_texture,
+                self.current_depth_level,
+                texture,
+                level,
+            );
+        }
+        // The pending clears belong to the outgoing surface, so they flush
+        // before any of its state is replaced.
+        if self.pending_depth_clear.is_some() || self.pending_stencil_clear.is_some() {
+            self.flush_pending_clears();
+        }
+        self.end_current_pass("set_depth_attach");
+        // A depth surface binds single-sampled and scaled unless the caller
+        // declares otherwise in the same breath, exactly as a colour target
+        // does its sample count. Scaled is the answer that keeps render
+        // target 0 in every pass.
+        self.current_depth_sample_count = 1;
+        self.current_attachments
+            .remove(CurrentAttachmentFlags::DEPTH_UNSCALED);
+        self.current_attachments
+            .set(CurrentAttachmentFlags::DEPTH_HAS_STENCIL, has_stencil);
+        self.current_attachments
+            .set(CurrentAttachmentFlags::DEPTH_SAMPLEABLE, is_sampleable);
+        self.current_depth_texture = texture;
+        self.current_depth_level = level;
+        self.current_depth_size = size;
+    }
+
+    /// Unbind a depth texture whose storage is on its way to the retention queue.
+    ///
+    /// Called when the standalone surface that owns the texture finalizes.
+    /// Only the attachment goes here: the handle-keyed records stay until
+    /// [`Self::unregister_texture`] drops them at the retirement boundary,
+    /// since the passes this frame has built still name the texture and
+    /// their store actions are not final until submit. A depth `StretchRect`
+    /// out of the texture marked it read, and that mark is what keeps the
+    /// store of its last pass; dropping it here would discard the depth the
+    /// queued transfer reads.
+    ///
+    /// The unbind is the ordinary case rather than an error. A surface
+    /// finalizes when the device drops the reference it holds while bound,
+    /// and the device drops that reference before it pushes the op that
+    /// binds the replacement, so the attachment still names the retiring
+    /// texture when this runs. Going through
+    /// [`Self::set_depth_stencil_attachment`] keeps a pending depth or
+    /// stencil clear materialising against the outgoing attachment, exactly
+    /// as the replacement bind would have done.
+    pub fn retire_depth_texture(&mut self, texture: MetalHandle<MTLTextureKind>) {
+        if !texture.is_null() && self.current_depth_texture == texture {
+            self.set_depth_stencil_attachment(MetalHandle::NULL, (0, 0), false, false);
+        }
+    }
+
+    /// Apply a whole-target colour clear.
+    ///
+    /// The caller has decided the clear covers every colour attachment of the
+    /// pass (the viewport, or a clipped rect, spans the whole extent), so a
+    /// full-attachment `loadAction = Clear` is D3D9's result whatever the
+    /// targets held before. If the current pass already has draws, the clear
+    /// lands after them as a clear-quad inside the pass, or, under an armed
+    /// counting visibility query, the pass ends first so the quad cannot
+    /// count. Otherwise an open pass with no work takes the clear as its load
+    /// action, and with no pass open it waits as pending for the next
+    /// `ensure_pass_open`. A strict sub-region never comes here: the region
+    /// path owns it, since a load action would wipe the pixels outside.
+    pub fn clear_color(&mut self, r: u32, g: u32, b: u32, a: u32) -> ColorClearOutcome {
+        let color_texture = self.current_color_texture;
+        if self.current_pass_has_work() {
+            // Visibility-counting passes (occlusion queries active) fall back
+            // to the legacy pass-break: see comment in `clear_depth`.
+            if self.current_pass_has_counting_visibility() {
+                mtld3d_shared::log_once_trace_by!(
+                    target: DEPTH_TRACE_TARGET,
+                    key: color_texture.raw(),
+                    "clear-quad color: visibility-active → legacy pass-break (tex={color_texture:#x})"
+                );
+                self.end_current_pass("clear_color_vis_fallback");
+            } else {
+                let vp = self.effective_viewport();
+                mtld3d_shared::log_once_trace_by!(
+                    target: DEPTH_TRACE_TARGET,
+                    key: color_texture.raw().rotate_left(13) ^ pack_viewport_key(vp),
+                    "clear-quad color: EmitQuad tex={color_texture:#x} viewport=({},{},{}x{})",
+                    vp.0, vp.1, vp.2, vp.3
+                );
+                return ColorClearOutcome::EmitQuad {
+                    rgba: (r, g, b, a),
+                    viewport: vp,
+                    color_format: self.color_attachment_format(),
+                };
+            }
+        }
+        debug_assert!(
+            self.viewport_covers_color_attachment(),
+            "a colour clear folds only when it covers the attachment"
+        );
+        if !self.current_pass_closed
+            && let Some(pass) = self.passes.last_mut()
+        {
+            pass.color_load = ColorLoad::Clear { r, g, b, a };
+            for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
+                attachment.load = ColorLoad::Clear { r, g, b, a };
+            }
+            self.pending_color_clear = None;
+            mtld3d_shared::log_once_trace_by!(
+                target: DEPTH_TRACE_TARGET,
+                key: color_texture.raw(),
+                "clear-quad color: Folded(amend) tex={color_texture:#x} (first Clear in pass — load action set)"
+            );
+            return ColorClearOutcome::Folded;
+        }
+        self.pending_color_clear = Some((r, g, b, a));
+        mtld3d_shared::log_once_trace_by!(
+            target: DEPTH_TRACE_TARGET,
+            key: color_texture.raw().rotate_left(7),
+            "clear-quad color: Folded(pending) tex={color_texture:#x} (no pass open — stashed for next ensure_pass_open)"
+        );
+        ColorClearOutcome::Folded
+    }
+
+    /// Open (or reuse) the colour pass for a `Clear` with explicit `pRects` sub-regions.
+    ///
+    /// Prior tile content is preserved. A rect-clear that leaves part of the
+    /// attachment out can never fold into a full-attachment
+    /// `loadAction = Clear` (that wipes pixels outside the rects), so open
+    /// the pass with `Load`. The caller then emits one scissored clear-quad
+    /// per clipped rect via `emit_clear_quad_color_inner`, reusing the
+    /// proven clear-quad path (so there is no fresh draw-without-encoder
+    /// hazard). Returns the bound colour format for the quad pipeline
+    /// key.
+    pub fn begin_region_color_clear(&mut self) -> PixelFormat {
+        // A clear-quad is a draw; under an active occlusion query, break the
+        // pass first so the synthetic draw can't pollute the visibility count
+        // (mirrors `clear_color`'s visibility fallback).
+        if self.current_pass_has_counting_visibility() {
+            self.end_current_pass("region_color_clear_vis");
+        }
+        // A pending whole-RT colour clear (a prior `Clear(NULL)` not yet
+        // realised) MUST land under the rect quads — per the D3D9 spec,
+        // `Clear(NULL, white)` then `Clear(rects, red)` yields white
+        // everywhere outside the rects. `ensure_pass_open` turns that pending
+        // clear into `loadAction = Clear`; keep it so the whole RT clears
+        // first, then the rect quads overwrite the rects. Only when there is
+        // NO pending clear must the freshly opened pass load as `Load`: the
+        // rect quads write only the rects, so every other pixel shows the
+        // load action's result. That covers Rule A's first-use `DontCare` too
+        // — a region clear as the frame's first touch of the attachment
+        // otherwise presents undefined tile memory outside the rects.
+        //
+        // Crucially, only touch the load action when WE freshly opened the pass.
+        // If a pass is already open — e.g. a sequence of region clears in one
+        // frame like `Clear(NULL,green)` then `Clear(rect,red)` under a scissor
+        // — its load action is already committed (and may carry an earlier
+        // realised whole-RT Clear); rewriting it to Load here would drop that
+        // clear and the prior frame's content would load through instead.
+        let was_closed = self.current_pass_closed();
+        let had_pending_clear = self.pending_color_clear.is_some();
+        self.ensure_pass_open();
+        if was_closed
+            && !had_pending_clear
+            && let Some(pass) = self.passes.last_mut()
+        {
+            if matches!(
+                pass.color_load,
+                ColorLoad::Clear { .. } | ColorLoad::DontCare
+            ) {
+                pass.color_load = ColorLoad::Load;
+            }
+            for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
+                if matches!(
+                    attachment.load,
+                    ColorLoad::Clear { .. } | ColorLoad::DontCare
+                ) {
+                    attachment.load = ColorLoad::Load;
+                }
+            }
+        }
+        self.color_attachment_format()
+    }
+
+    /// Open (or reuse) the pass for a depth/stencil `Clear` with explicit `pRects` sub-regions.
+    ///
+    /// The depth/stencil mirror of [`Self::begin_region_color_clear`]: a
+    /// rect-clear can never fold into a whole-attachment `loadAction =
+    /// Clear`, so a freshly opened pass loads both planes unless a pending
+    /// whole-attachment clear is due to land under the rect quads (which
+    /// `ensure_pass_open` has just turned into the load action, and which
+    /// must stay). A pass that was already open keeps its committed load
+    /// actions. The caller then paints one scissored clear-quad per clipped
+    /// rect. Returns whether the pass carries a colour attachment and its
+    /// format, which the quad pipeline key needs; `None` when no
+    /// depth-stencil is bound, or the pass will drop the one that is
+    /// (nothing to clear).
+    ///
+    /// Every rect lies inside the viewport. A viewport that reaches past a
+    /// colour target smaller than the depth surface gets a pass without
+    /// colour ([`CurrentAttachmentFlags::RT0_DROPPED`]), so the depth
+    /// surface, not the colour target, bounds what the quads reach. The next
+    /// draw that needs colour ends that pass. Under `render.scale` the rects
+    /// arrive in the colour target's space, which a pass without colour does
+    /// not share, so a scaled colour target or depth surface keeps the pass
+    /// and its clipping, warned once.
+    pub fn begin_region_depth_stencil_clear(&mut self) -> Option<(bool, PixelFormat)> {
+        if !self.pass_binds_depth() {
+            return None;
+        }
+        if self.current_pass_has_counting_visibility() {
+            self.end_current_pass("region_depth_clear_vis");
+        }
+        if !self.pass_color_covers_depth() && !self.viewport_inside_color_attachment() {
+            if self.current_color_scale.is_identity() && self.current_depth_unscaled() {
+                self.set_rt0_dropped(true);
+            } else {
+                mtld3d_shared::log_once_warn!(
+                    target: crate::LOG_TARGET,
+                    "region depth or stencil clear past a colour target smaller than the depth \
+                     surface under render.scale: clipped to the colour target's extent"
+                );
+            }
+        }
+        let was_closed = self.current_pass_closed();
+        let had_pending_depth = self.pending_depth_clear.is_some();
+        let had_pending_stencil = self.pending_stencil_clear.is_some();
+        self.ensure_pass_open();
+        if was_closed && let Some(pass) = self.passes.last_mut() {
+            if !had_pending_depth
+                && matches!(
+                    pass.depth_load,
+                    DepthLoad::Clear { .. } | DepthLoad::DontCare
+                )
+            {
+                pass.depth_load = DepthLoad::Load;
+            }
+            if !had_pending_stencil
+                && matches!(
+                    pass.stencil_load,
+                    StencilLoad::Clear { .. } | StencilLoad::DontCare
+                )
+            {
+                pass.stencil_load = StencilLoad::Load;
+            }
+        }
+        Some((self.pass_binds_color(), self.color_attachment_format()))
+    }
+
+    /// Whether the viewport covers no pixel, as one that rounds to nothing at render resolution.
+    ///
+    /// D3D9 clears nothing under it. At the identity scale a zero viewport
+    /// means unset and reads as the whole target, so this only answers yes
+    /// under `render.scale`.
+    fn viewport_has_no_area(&self) -> bool {
+        let (_, _, w, h) = self.effective_viewport();
+        w == 0 || h == 0
+    }
+
+    /// Whether the viewport lies inside the bound colour target.
+    ///
+    /// Both are in the colour target's own space, as
+    /// [`Self::effective_viewport`] converts it.
+    fn viewport_inside_color_attachment(&self) -> bool {
+        let (x, y, w, h) = self.effective_viewport();
+        extent_covers(
+            self.current_color_size,
+            (x.saturating_add(w), y.saturating_add(h)),
+        )
+    }
+
+    /// End an open pass whose colour target is smaller than the depth surface.
+    ///
+    /// A whole-surface depth or stencil clear must reach the whole depth
+    /// surface, but a quad painted into, or a load action folded into, such a
+    /// pass is confined to the colour target's area. With the pass ended the
+    /// clear goes pending, and the next pass takes it: a pass without colour
+    /// as its load action, any other through the depth-only pass `open_pass`
+    /// lands first. Rule E can still move a colour clear of the ended pass
+    /// into the pass after the depth-only one. A pass without colour, or one
+    /// whose colour target covers the depth surface, stays open and takes the
+    /// clear itself.
+    fn end_small_color_pass_for_depth_clear(&mut self) {
+        if !self.current_pass_closed && !self.pass_color_covers_depth() {
+            self.end_current_pass("small_color_depth_clear");
+        }
+    }
+
+    /// Apply a depth clear.
+    ///
+    /// Mirrors `clear_color` semantics for the depth attachment's load
+    /// action, under the same contract: the caller has decided the clear
+    /// covers the whole depth attachment. A zero-area viewport is an explicit
+    /// `NoOp` before anything else: D3D9 clears nothing, so no pass ends and
+    /// no quad or load action is recorded. An open pass whose colour target
+    /// is smaller than the depth surface ends next, since it reaches only that
+    /// target's area. Then routes through one of three paths, checked in
+    /// order:
+    ///
+    /// 1. Active pass with draws → emit a clear-quad (or fall back to
+    ///    pass-break under visibility counting).
+    /// 2. Open pass with no draws yet → amend its load action to Clear.
+    /// 3. No open pass → stash as `pending_depth_clear`, which the next pass
+    ///    takes as its load action, through a depth-only pass of its own when
+    ///    that pass's colour target is smaller than the depth surface.
+    pub fn clear_depth(&mut self, value: u32) -> DepthClearOutcome {
+        let depth_texture = self.current_depth_texture;
+        if !self.pass_binds_depth() {
+            // Nothing is attached to clear. Folding would carry the clear
+            // onto whatever texture the next pass attaches, and a quad would
+            // want a depth-declaring pipeline the pass has no attachment for.
+            return DepthClearOutcome::NoOp;
+        }
+        if self.viewport_has_no_area() {
+            return DepthClearOutcome::NoOp;
+        }
+        self.end_small_color_pass_for_depth_clear();
+        if self.current_pass_has_work()
+            && let Some(outcome) = self.clear_depth_in_active_pass(value, depth_texture)
+        {
+            return outcome;
+        }
+        debug_assert!(
+            self.viewport_covers_depth_attachment(),
+            "a depth clear folds only when it covers the attachment"
+        );
+        if let Some(outcome) = self.clear_depth_amend_open(value, depth_texture) {
+            return outcome;
+        }
+        self.clear_depth_stash_pending(value, depth_texture)
+    }
+
+    /// Active-pass branch.
+    ///
+    /// Returns `Some(EmitQuad)` on the normal path or `None` if a
+    /// visibility-counting query forced the legacy pass-break fallback
+    /// (caller falls through to the amend / stash chain). The caller has
+    /// already answered a zero-area viewport with `NoOp`, so the quad always
+    /// covers pixels.
+    ///
+    /// Falling through to `end_current_pass` here would open a new
+    /// encoder with `loadAction = Clear`, which on Metal clears the
+    /// WHOLE depth attachment regardless of viewport — wiping prior
+    /// tile draws under a shared shadow-atlas pattern.
+    /// `FrameEncoder::clear_depth` paints the constant clear value via
+    /// a scissored fullscreen quad inside the live encoder instead.
+    ///
+    /// Visibility-active exception: a clear-quad's draw would falsely
+    /// increment the fragment counter, so the legacy pass-break is
+    /// retained until full save/restore of the
+    /// `SetVisibilityResultMode` offset lands.
+    fn clear_depth_in_active_pass(
+        &mut self,
+        value: u32,
+        depth_texture: MetalHandle<MTLTextureKind>,
+    ) -> Option<DepthClearOutcome> {
+        if self.current_pass_has_counting_visibility() {
+            mtld3d_shared::log_once_trace_by!(
+                target: DEPTH_TRACE_TARGET,
+                key: depth_texture.raw(),
+                "clear-quad depth: visibility-active → legacy pass-break (tex={depth_texture:#x})"
+            );
+            self.end_current_pass("clear_depth_vis_fallback");
+            return None;
+        }
+        let vp = self.effective_viewport();
+        mtld3d_shared::log_once_trace_by!(
+            target: DEPTH_TRACE_TARGET,
+            key: depth_texture.raw().rotate_left(13) ^ pack_viewport_key(vp),
+            "clear-quad depth: EmitQuad tex={depth_texture:#x} viewport=({},{},{}x{}) value={:?}",
+            vp.0, vp.1, vp.2, vp.3, f32::from_bits(value)
+        );
+        Some(DepthClearOutcome::EmitQuad {
+            value,
+            viewport: vp,
+            has_color: self.pass_binds_color(),
+            color_format: self.color_attachment_format(),
+        })
+    }
+
+    /// Apply a stencil clear.
+    ///
+    /// Mirrors `clear_depth`, under the same whole-attachment contract and the
+    /// same zero-area `NoOp`: fold into the pass's `loadAction` unless the
+    /// pass already holds draws the clear must land after, and paint a quad
+    /// inside the pass then. Depth keeps its own load action throughout, so a
+    /// stencil-only clear never disturbs the depth plane the two share.
+    pub fn clear_stencil(&mut self, value: u32) -> StencilClearOutcome {
+        if !self.pass_binds_depth() {
+            // Nothing is attached to clear. Folding would carry the clear
+            // onto whatever texture the next pass attaches, and a quad would
+            // want a depth-declaring pipeline the pass has no attachment for.
+            return StencilClearOutcome::NoOp;
+        }
+        if self.viewport_has_no_area() {
+            return StencilClearOutcome::NoOp;
+        }
+        self.end_small_color_pass_for_depth_clear();
+        if self.current_pass_has_work()
+            && let Some(outcome) = self.clear_stencil_in_active_pass(value)
+        {
+            return outcome;
+        }
+        debug_assert!(
+            self.viewport_covers_depth_attachment(),
+            "a stencil clear folds only when it covers the attachment"
+        );
+        if let Some(outcome) = self.clear_stencil_amend_open(value) {
+            return outcome;
+        }
+        self.clear_stencil_stash_pending(value)
+    }
+
+    /// Active-pass branch: paint into the live encoder.
+    ///
+    /// Returns `None` only when a visibility-counting query is armed, since
+    /// the quad's own fragments would inflate the occlusion counter; that path
+    /// ends the pass first, so the folding chain sees a closed pass and cannot
+    /// amend one that already holds draws. The caller has already answered a
+    /// zero-area viewport with `NoOp`, which falling through here would turn
+    /// into a full-attachment clear folded ahead of the pass's recorded draws.
+    fn clear_stencil_in_active_pass(&mut self, value: u32) -> Option<StencilClearOutcome> {
+        if self.current_pass_has_counting_visibility() {
+            self.end_current_pass("clear_stencil_vis_fallback");
+            return None;
+        }
+        let vp = self.effective_viewport();
+        Some(StencilClearOutcome::EmitQuad {
+            value,
+            viewport: vp,
+            has_color: self.pass_binds_color(),
+            color_format: self.color_attachment_format(),
+        })
+    }
+
+    /// Amend branch: a pass is open with no draws, so its load action is free.
+    ///
+    /// A pass that already holds draws is never amended: its load action
+    /// runs before those draws, so the clear would land ahead of them.
+    fn clear_stencil_amend_open(&mut self, value: u32) -> Option<StencilClearOutcome> {
+        if self.current_pass_closed || self.current_pass_has_work() {
+            return None;
+        }
+        let pass = self.passes.last_mut()?;
+        debug_assert!(
+            pass.color_extent_covers_depth(),
+            "a stencil clear amends only a pass that rasterizes the whole depth surface"
+        );
+        pass.stencil_load = StencilLoad::Clear { value };
+        self.pending_stencil_clear = None;
+        Some(StencilClearOutcome::Folded)
+    }
+
+    /// Stash branch: no pass to amend, so the next `ensure_pass_open` takes it.
+    const fn clear_stencil_stash_pending(&mut self, value: u32) -> StencilClearOutcome {
+        self.pending_stencil_clear = Some(value);
+        StencilClearOutcome::Folded
+    }
+
+    /// Fallback for when the clear-quad pipeline cannot be built.
+    ///
+    /// Ends the pass so the next one carries the clear in its load action.
+    pub fn clear_stencil_legacy_break(&mut self, value: u32) {
+        self.end_current_pass("clear_stencil_legacy_fallback");
+        self.pending_stencil_clear = Some(value);
+    }
+
+    /// Amend branch.
+    ///
+    /// If a pass is open with no draws yet, set its depth load action to
+    /// `Clear` and clear any pending fallback. A pass that already holds
+    /// draws is never amended: its load action runs before those draws, so
+    /// the clear would land ahead of them.
+    fn clear_depth_amend_open(
+        &mut self,
+        value: u32,
+        depth_texture: MetalHandle<MTLTextureKind>,
+    ) -> Option<DepthClearOutcome> {
+        if self.current_pass_closed || self.current_pass_has_work() {
+            return None;
+        }
+        let pass = self.passes.last_mut()?;
+        debug_assert!(
+            pass.color_extent_covers_depth(),
+            "a depth clear amends only a pass that rasterizes the whole depth surface"
+        );
+        pass.depth_load = DepthLoad::Clear { value };
+        self.pending_depth_clear = None;
+        mtld3d_shared::log_once_trace_by!(
+            target: DEPTH_TRACE_TARGET,
+            key: depth_texture.raw(),
+            "clear-quad depth: Folded(amend) tex={depth_texture:#x} (first Clear in pass — load action set)"
+        );
+        Some(DepthClearOutcome::Folded)
+    }
+
+    /// Stash branch.
+    ///
+    /// No open pass to amend, so record the clear as pending and the next
+    /// `ensure_pass_open` opens the pass with `loadAction = Clear`.
+    fn clear_depth_stash_pending(
+        &mut self,
+        value: u32,
+        depth_texture: MetalHandle<MTLTextureKind>,
+    ) -> DepthClearOutcome {
+        self.pending_depth_clear = Some(value);
+        mtld3d_shared::log_once_trace_by!(
+            target: DEPTH_TRACE_TARGET,
+            key: depth_texture.raw().rotate_left(7),
+            "clear-quad depth: Folded(pending) tex={depth_texture:#x} (no pass open — stashed for next ensure_pass_open)"
+        );
+        DepthClearOutcome::Folded
+    }
+
+    /// Whether the live pass already carries a Counting-mode visibility set.
+    ///
+    /// A closed pass answers `false`: the pass a command opens next starts
+    /// with Metal's own default, which counts nothing.
+    #[must_use]
+    pub fn current_pass_has_counting_visibility(&self) -> bool {
+        if self.current_pass_closed {
+            return false;
+        }
+        self.passes
+            .last()
+            .is_some_and(|p| p.has_counting_visibility)
+    }
+
+    /// Legacy "end pass on Clear" fallback for when the clear-quad pipeline create fails.
+    ///
+    /// Used by the encoder layer. Restores the pre-clear-quad
+    /// behaviour: end the current pass, then either amend the next
+    /// pass's load action (if a fresh pass is already opened later in
+    /// the frame) or stash as `pending_depth_clear` so the next
+    /// pass-open consumes it.
+    pub fn clear_depth_legacy_break(&mut self, value: u32) {
+        self.end_current_pass("clear_depth_legacy_fallback");
+        self.pending_depth_clear = Some(value);
+    }
+
+    /// Color mirror of `clear_depth_legacy_break`.
+    pub fn clear_color_legacy_break(&mut self, r: u32, g: u32, b: u32, a: u32) {
+        self.end_current_pass("clear_color_legacy_fallback");
+        self.pending_color_clear = Some((r, g, b, a));
+    }
+
+    /// Warn once when a near-full-screen target renders at full resolution anyway.
+    ///
+    /// A game-created target inherits the back buffer's scale only when it was
+    /// created at exactly the reported back-buffer size. One that is merely
+    /// *close* to it — a scene target rounded to a power of two, say — misses
+    /// that test and still costs full price, so `render.scale` buys much less
+    /// than the setting implies. Silence there reads as "the knob did nothing",
+    /// which is the one failure mode a user cannot diagnose from the output.
+    ///
+    /// Kept free of false positives by construction: it needs a non-default
+    /// scale, a target that did *not* inherit it, and coverage of most of the
+    /// back buffer on *both* axes. Shadow maps, glow chains and every other
+    /// sub-size intermediate stay quiet. Fires once per process.
+    fn warn_if_scale_wasted(&self, width: u32, height: u32, scale: RenderScale) {
+        /// Percent of each back-buffer axis a target must cover to count as full-screen.
+        ///
+        /// Below this it is an intermediate, not the scene.
+        const FULL_SCREEN_PERCENT: u64 = 90;
+
+        if self.render_scale.is_identity() || !scale.is_identity() {
+            return;
+        }
+        let (bw, bh) = self.backbuffer_logical_size;
+        let covers = |extent: u32, full: u32| {
+            full != 0 && u64::from(extent) * 100 >= u64::from(full) * FULL_SCREEN_PERCENT
+        };
+        if covers(width, bw) && covers(height, bh) {
+            mtld3d_shared::log_once_warn!(
+                target: crate::LOG_TARGET,
+                "render.scale = {}% saves less than it looks like here: the game renders into its \
+                 own {width}x{height} target, which is close to the {bw}x{bh} back buffer but not \
+                 equal to it, so it keeps its own size and rasterizes at full resolution",
+                self.render_scale.percent(),
+            );
+        }
+    }
+
+    /// The scale to apply to a game-supplied coordinate for the *currently bound* target.
+    ///
+    /// `render.scale` shrinks the back buffer alone, so this is the back
+    /// buffer's scale while it is bound and the identity otherwise. Keying on
+    /// handle identity (rather than on whether the D3D9 layer happens to hold a
+    /// null render-target pointer) is what makes the rule hold through an
+    /// explicit `SetRenderTarget` back to the back buffer.
+    #[must_use]
+    pub const fn target_scale(&self) -> RenderScale {
+        self.current_color_scale
+    }
+
+    /// The bound colour attachment's extent in both spaces.
+    ///
+    /// What every game-supplied rect converts through on its way to a Metal
+    /// command, so a rect spanning the bound subresource's reported extent
+    /// spans the texture Metal allocated for it. While render target 0 is
+    /// left out, the depth attachment's extent: the pass rasterizes that.
+    #[must_use]
+    pub const fn target_extent(&self) -> TargetExtent {
+        if self.rt0_dropped() {
+            // Only an unscaled depth surface lets render target 0 go, so its
+            // reported and allocated extents are one.
+            return TargetExtent::new(
+                RenderScale::IDENTITY,
+                self.current_depth_size,
+                self.current_depth_size,
+            );
+        }
+        TargetExtent::new(
+            self.current_color_scale,
+            self.current_color_logical_size,
+            self.current_color_size,
+        )
+    }
+
+    /// The bound colour attachment's size as D3D9 reports it, with its scale.
+    ///
+    /// Pairs with [`Self::target_scale`] for a caller that binds a target of
+    /// its own and must put the device's binding back exactly as it was.
+    #[must_use]
+    pub const fn current_color_logical_size(&self) -> (u32, u32) {
+        self.current_color_logical_size
+    }
+
+    /// Resolve the `(x, y, w, h)` rect that `emit_scissor` would emit for the given inputs.
+    ///
+    /// Exposed so the encoder wrapper can dedup against the *resolved*
+    /// rect — when scissor test is disabled, the rect falls back to the
+    /// current viewport, which can change mid-pass. With the test on, an
+    /// empty rect stays empty and the draw writes no pixel.
+    ///
+    /// `rect` arrives in the game's coordinate space and comes back in the
+    /// bound texture's, so the dedup upstream compares post-conversion rects.
+    #[must_use]
+    pub fn resolved_scissor_rect(&self, test_enable: bool, rect: [u32; 4]) -> (u32, u32, u32, u32) {
+        if test_enable {
+            self.target_extent()
+                .rect(rect[0], rect[1], rect[2], rect[3])
+        } else {
+            self.effective_viewport()
+        }
+    }
+
+    /// Test-only direct emit of `setScissorRect`.
+    ///
+    /// Production code goes through `FrameEncoder::emit_scissor`
+    /// (`encoder.rs`), which calls `resolved_scissor_rect` for the rect
+    /// math and routes the emit through `LastBoundCache` for dedup. A
+    /// bypass here would let a caller silently re-introduce
+    /// cache-vs-encoder drift the clear-quad `LastBoundCache` routing
+    /// already closes.
+    #[cfg(test)]
+    fn emit_scissor(&mut self, test_enable: bool, rect: [u32; 4]) {
+        let (x, y, w, h) = self.resolved_scissor_rect(test_enable, rect);
+        self.emit_command(Command::set_scissor_rect(x, y, w, h));
+    }
+
+    /// Update the tracked viewport.
+    ///
+    /// If the render pass is already open, also emit a `setViewport`
+    /// command so later draws see the change.
+    pub fn set_viewport(
+        &mut self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        min_z: f32,
+        max_z: f32,
+    ) {
+        self.viewport_x = x;
+        self.viewport_y = y;
+        self.viewport_width = width;
+        self.viewport_height = height;
+        self.viewport_min_z = min_z;
+        self.viewport_max_z = max_z;
+        // The fields above keep the game's own numbers so a later render-target
+        // change re-reads them in the new target's space; only what reaches
+        // Metal is converted.
+        let rect = self.target_extent().rect(x, y, width, height);
+        self.emit_viewport_if_changed(rect, min_z, max_z);
+    }
+
+    /// Override just the depth range Metal holds, keeping the viewport rect.
+    ///
+    /// `Clear` writes a raw depth value that D3D9's `MinZ`/`MaxZ` do not
+    /// touch, but the clear quad writes its value as the vertex's clip-space
+    /// z, which Metal's viewport transform would remap. The clear-quad emit
+    /// path therefore brackets its draw with `[0, 1]` and then the game's own
+    /// range. Only the emitted range moves: the sticky viewport rect and the
+    /// coordinate space it is read in stay exactly as the game left them,
+    /// which a `set_viewport` round trip could not promise (it takes the
+    /// game's rect, and a game that never called `SetViewport` has none).
+    pub fn set_emitted_depth_range(&mut self, min_z: f32, max_z: f32) {
+        self.viewport_min_z = min_z;
+        self.viewport_max_z = max_z;
+        let rect = self.effective_viewport();
+        self.emit_viewport_if_changed(rect, min_z, max_z);
+    }
+
+    /// Push `setViewport` onto the open pass unless the encoder already holds it.
+    ///
+    /// Re-emit only on an actual change. A fresh `set_viewport` whose value
+    /// matches what was last emitted on this encoder would be a redundant
+    /// Metal bind (Xcode's "bound … when it was already bound"); the z-range
+    /// is part of the key, compared by bits so a depth-range-only change (sky
+    /// / weapon, or the clear quad's bracket) still re-emits. `rect` is
+    /// already in the bound texture's space, which is what the encoder holds.
+    fn emit_viewport_if_changed(&mut self, rect: (u32, u32, u32, u32), min_z: f32, max_z: f32) {
+        let (sx, sy, sw, sh) = rect;
+        let key = (sx, sy, sw, sh, min_z.to_bits(), max_z.to_bits());
+        if !self.current_pass_closed
+            && self.last_emitted_viewport != Some(key)
+            && let Some(pass) = self.passes.last_mut()
+        {
+            pass.commands
+                .push(Command::set_viewport(sx, sy, sw, sh, min_z, max_z));
+            pass.viewport = (sx, sy, sw, sh);
+            self.last_emitted_viewport = Some(key);
+        }
+    }
+
+    /// Bind the real pipeline in place of every placeholder, or remove what a failed one binds.
+    ///
+    /// A draw whose pipeline was still building when it was encoded binds a
+    /// placeholder ([`DeferredPipelineId::placeholder`]) instead of a
+    /// handle. Once the submission has waited for those builds, `answer`
+    /// names the pipeline each placeholder stands for, and the placeholder
+    /// becomes that handle. For a placeholder `answer` has no pipeline for
+    /// (its build failed, or it names no record) the bind and every draw
+    /// bound under it, up to the next pipeline bind, are removed: a draw
+    /// with no pipeline bound faults at submit. Every other command stays,
+    /// the binds such a draw emitted included, since later draws rely on
+    /// them through the dedup, and so do the pass's tags, which then
+    /// overstate what the pass does and cost at most a kept load or store.
+    /// The colour clear-quad ranges are re-indexed over the removal.
+    /// Answers how many draws were removed.
+    ///
+    /// Must run before every pass rule and before the debug replay of the
+    /// draw states: Rule H looks up a pipeline's no-colour sibling by its
+    /// real handle, and Rules H and J move command indices.
+    pub fn resolve_pending_pipelines(
+        &mut self,
+        answer: impl Fn(&DeferredPipelineId) -> Option<MetalHandle<MTLRenderPipelineStateKind>>,
+    ) -> u32 {
+        let mut removed = 0;
+        for pass in &mut self.passes {
+            removed += pass.resolve_pending_pipelines(&answer);
+        }
+        removed
+    }
+
+    /// Rule G: strip the colour attachments a clear-only pass leaves unchanged.
+    ///
+    /// In a pass with no draws and no leading blits an attachment changes its
+    /// texture only through a stored `Clear` load or a multisample resolve
+    /// (`PassColorAttachment::written_without_draws`). Every other colour
+    /// attachment is dropped, render target 0 and the extras alike, whatever
+    /// its store: a `Load` stores back what it loaded, a `DontCare` load
+    /// stores contents that were undefined already, and a cleared attachment
+    /// whose store Rule C discarded writes nothing. Render target 0 stays
+    /// when the pass has no depth attachment, since the pass needs one;
+    /// Rule F culls that pass when nothing in it writes. A depth-clear pass
+    /// that also bound a colour target becomes a depth-only Metal render
+    /// pass on the unix side.
+    ///
+    /// Must run after `finalize_store_actions` so the Store decisions
+    /// are stable, but before `cull_dead_clear_only_passes` so the
+    /// cull sees the stripped attachments.
+    pub fn strip_dead_color_in_clear_only_passes(&mut self) {
+        if !ENABLE_STRIP_DEAD_COLOR_IN_CLEAR_ONLY {
+            return;
+        }
+        for pass in &mut self.passes {
+            let has_draw = pass.commands.iter().any(Command::is_draw);
+            if has_draw || !pass.leading_blits.is_empty() {
+                continue;
+            }
+            for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
+                if !attachment.written_without_draws() {
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-strip color={:#x} load={:?} → dropped (clear-only pass, extra target)",
+                            attachment.texture,
+                            attachment.load,
+                        );
+                    }
+                    *attachment = PassColorAttachment::NONE;
+                }
+            }
+            if !pass.color_texture.is_null()
+                && !pass.color_written_without_draws()
+                && !pass.depth_texture.is_null()
+            {
+                let stripped = pass.color_texture;
+                let load = pass.color_load;
+                pass.drop_color_attachment();
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-strip color={stripped:#x} load={load:?} → depth-only (clear-only pass)",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rule H — strip the color attachment from passes-with-draws.
+    ///
+    /// Applies where every real (non-clear-quad) draw ran with
+    /// `D3DRS_COLORWRITEENABLE == 0`. Symmetric to Rule G but for the
+    /// with-draws case. The pass's `SetRenderPipelineState` commands
+    /// have their `param_b` rewritten from the original (with-color)
+    /// pipeline handle to the matching no-color variant via `alt`, the
+    /// color clear-quad blocks (if any) are removed entirely, and the
+    /// color attachment is dropped — the unix `encode_pass` already
+    /// supports the `color_texture == 0 && depth_texture != 0` shape
+    /// (Rule G is the existing precedent).
+    ///
+    /// Color clear-quad blocks are walked separately: their pipelines
+    /// declare a color output (they have to, to write the clear value)
+    /// and would fail Metal's pipeline-vs-RP format validation against
+    /// the stripped descriptor. A clear-quad is real colour content that
+    /// D3D9 keeps across `Present`, so a pass carrying one is stripped
+    /// only when every colour store of the pass is already `DontCare`
+    /// after `finalize_store_actions` (Rule C: the next pass on each
+    /// target clears it in full). Otherwise the pass keeps its colour
+    /// attachment and its with-colour pipelines. A `Clear` load action is
+    /// the same kind of write and follows the same test per attachment,
+    /// the one Rule G applies (`written_without_draws`): a stored `Clear`
+    /// or a resolve keeps the pass, a `Clear` Rule C discarded does not.
+    /// That is the cascade caster shape, where every caster pass opens by
+    /// clearing a shared colour placeholder that only the last pass
+    /// stores. Without a colour write the strip is content-preserving: the
+    /// texture keeps what a `Load` would have carried through (and a
+    /// `DontCare` load stored undefined contents anyway).
+    ///
+    /// If the side-map is missing an entry for a non-clear-quad `SetPSO`
+    /// inside a candidate pass, the strip is skipped for that pass (one
+    /// `log_once_info!` line per process). A miss is expected: the no-colour
+    /// twin builds asynchronously and nothing waits for it, so passes drawn
+    /// with a freshly built pipeline find no entry until the twin lands, and
+    /// a pipeline whose twin failed or that queues none never has one. The
+    /// pass keeps its colour attachment, its store actions and its
+    /// with-colour pipelines, so it renders as it would without Rule H; the
+    /// only cost is that pass's colour load and store bandwidth.
+    ///
+    /// Must run after `finalize_store_actions`, whose store decisions the
+    /// clear-quad check reads, and after `strip_dead_color_in_clear_only_passes`
+    /// (Rule G) so clear-only passes are already handled, and before
+    /// `cull_dead_clear_only_passes` (Rule F) — though Rule F won't
+    /// touch the pass anyway because it still has draws.
+    pub fn strip_color_from_no_color_draw_passes(
+        &mut self,
+        alt: &FxHashMap<u64, MetalHandle<MTLRenderPipelineStateKind>>,
+    ) {
+        if !ENABLE_NO_COLOR_PASS_FOR_DRAWS {
+            return;
+        }
+        for pass in &mut self.passes {
+            if pass.color_flags.contains(PassColorFlags::WRITES_OBSERVED)
+                || pass.color_texture.is_null()
+                || pass.depth_texture.is_null()
+                // Without the colour attachment the depth attachment alone
+                // would set the render area, so a smaller colour target keeps
+                // the pass inside the area D3D9 rasterizes.
+                || !pass.color_extent_covers_depth()
+                // A stored `Clear` load is a real colour write even with no
+                // draw to tag `color_writes_observed` (a back-buffer Clear
+                // that shares a pass with a depth clear-quad, say): stripping
+                // it would leave a later `Load` reading the old contents. A
+                // resolve writes the single-sample twin every later reader
+                // looks at. A `Clear` whose store Rule C discarded writes
+                // nothing anyone observes, so it does not keep the pass.
+                || pass.color_written_without_draws()
+                || pass
+                    .extra_color
+                    .iter()
+                    .any(PassColorAttachment::written_without_draws)
+            {
+                continue;
+            }
+            // Local copy so we can mutate `pass.commands` below while
+            // still classifying indices.
+            let cq_ranges = pass.color_clear_quad_ranges.clone();
+            let in_clear_quad =
+                |idx: usize| -> bool { cq_ranges.iter().any(|(s, e)| idx >= *s && idx < *e) };
+            // A "real" draw is a draw command outside every clear-quad
+            // block. A pass with only clear-quad blocks is somebody
+            // else's territory (Rule F / Rule G).
+            let has_real_draw = pass
+                .commands
+                .iter()
+                .enumerate()
+                .any(|(idx, c)| !in_clear_quad(idx) && c.is_draw());
+            if !has_real_draw {
+                continue;
+            }
+            // Confirm every non-clear-quad SetPSO has a no-color sibling
+            // in the side-map. Clear-quad SetPSOs are exempt because the
+            // block is about to be removed.
+            let all_resolvable = pass.commands.iter().enumerate().all(|(idx, c)| {
+                c.cmd != CommandType::SetRenderPipelineState as u32
+                    || in_clear_quad(idx)
+                    || alt.contains_key(&c.param_b)
+            });
+            if !all_resolvable {
+                mtld3d_shared::log_once_info!(target: crate::LOG_TARGET,
+                    "strip_color_from_no_color_draw_passes: a pipeline has no no-colour twin mapped → pass keeps its colour attachment");
+                continue;
+            }
+            // The mask-0 draws write no colour, so dropping the attachment
+            // loses nothing of theirs: the texture keeps what the pass would
+            // have loaded and stored. A colour clear-quad does write, and D3D9
+            // keeps render-target contents across `Present`, so its result may
+            // be read after this submission (a later frame's sampler,
+            // `StretchRect` or readback) where nothing here can see it. It
+            // can only go when Rule C already discards every colour store of
+            // the pass, i.e. a later pass of this submission clears each
+            // target in full before anything reads it.
+            if !cq_ranges.is_empty()
+                && pass
+                    .bound_color_attachments()
+                    .iter()
+                    .any(|attachment| matches!(attachment.store, StoreAction::Store))
+            {
+                continue;
+            }
+            // Rewrite non-clear-quad SetPSO handles to the no-color
+            // variant. Clear-quad SetPSOs are about to be removed
+            // wholesale, so leave them alone here.
+            for (idx, c) in pass.commands.iter_mut().enumerate() {
+                if in_clear_quad(idx) {
+                    continue;
+                }
+                if c.cmd == CommandType::SetRenderPipelineState as u32
+                    && let Some(&no_color) = alt.get(&c.param_b)
+                {
+                    c.param_b = no_color.raw();
+                }
+            }
+            // Remove clear-quad blocks in reverse order so earlier
+            // ranges' indices stay valid as we drain.
+            let dropped_cmds: usize = cq_ranges.iter().map(|(s, e)| e - s).sum();
+            for (start, end) in cq_ranges.iter().rev() {
+                pass.commands.drain(*start..*end);
+            }
+            pass.color_clear_quad_ranges.clear();
+            let stripped = pass.color_texture;
+            let load = pass.color_load;
+            pass.drop_color_attachment();
+            // The no-colour twin declares no colour attachment at all, so
+            // render targets 1..3 go with target 0.
+            pass.extra_color = [PassColorAttachment::NONE; 3];
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-strip color={stripped:#x} load={load:?} → depth-only \
+                     (all draws color_write_mask=0; dropped {dropped_cmds} clear-quad cmds)",
+                );
+            }
+        }
+    }
+
+    /// Rule F — cull clear-only passes that perform no observable work.
+    ///
+    /// Runs after Rules B/C finalise and Rule G strips. A pass with zero draw
+    /// commands and no leading blits changes an attachment only through a
+    /// stored `Clear` load (of the stencil plane too, which is stored apart
+    /// from depth) or a multisample resolve; when none of its
+    /// attachments does either
+    /// (`PassColorAttachment::written_without_draws`), whatever their store
+    /// actions, the pass exists purely as encoder overhead plus a load and
+    /// store of every attachment, and it goes. Typical cases: a cascade init
+    /// clear-only pass whose depth Rule B discards and whose colour Rule C
+    /// discards; a pass a render-target change closed with nothing in it but
+    /// its viewport and an occlusion query's `SetVisibilityResultMode`; a pass
+    /// a draw opened before the draw itself was dropped.
+    ///
+    /// Culling a visibility command is safe. The frame's visibility buffer is
+    /// zeroed when it is installed and lives in shared storage, a slot only
+    /// takes a count from draws that run while it is armed, and a query sums
+    /// its slots once the GPU has retired the frame: a slot armed in a pass
+    /// with no draws reads zero whether or not the pass runs. The Metal
+    /// encoder state such a pass sets does not reach the next pass, which
+    /// opens its own encoder and arms its own slot at its first draw.
+    ///
+    /// Must run after `finalize_load_actions` / `finalize_store_actions`
+    /// so the load and store decisions are stable.
+    pub fn cull_dead_clear_only_passes(&mut self) {
+        if !ENABLE_CULL_DEAD_CLEAR_PASSES {
+            return;
+        }
+        let before = self.passes.len();
+        self.passes.retain_mut(|p| {
+            let has_draw = p.commands.iter().any(Command::is_draw);
+            if has_draw || !p.leading_blits.is_empty() {
+                return true;
+            }
+            let keep = p.color_written_without_draws()
+                || p.extra_color
+                    .iter()
+                    .any(|a| a.is_bound() && a.written_without_draws())
+                || p.depth_written_without_draws();
+            if !keep {
+                recycle_command_vec(&mut self.command_vec_pool, core::mem::take(&mut p.commands));
+            }
+            keep
+        });
+        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+            let dropped = before - self.passes.len();
+            if dropped > 0 {
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-cull dropped={dropped} dead clear-only passes",
+                );
+            }
+        }
+    }
+
+    /// Rule J: fuse a pass into the one before it when both bind the same attachments.
+    ///
+    /// Two adjacent passes on identical attachments (every view, subresource,
+    /// extent and format of render targets 0..3, the depth texture and level)
+    /// are one Metal render pass split in two, with a full store and a full
+    /// load of every attachment between the halves. That split is what a
+    /// render-target change undone before anything is drawn leaves, or an sRGB
+    /// toggle undone the same way, or a borrowed binding put back. The second
+    /// pass joins the first when the join changes nothing D3D9 can see
+    /// (`merge_join` has the conditions): it has no leading blits and loads
+    /// every attachment the first stores unresolved (a depth plane it discards
+    /// on load may have any store before it), and the second samples none of
+    /// them, since a sample reads memory the
+    /// first pass's stores no longer reach before the joined pass ends. The
+    /// joined pass keeps the first pass's load actions, takes the second's
+    /// store actions and resolves, and runs the second's commands after the
+    /// first's.
+    ///
+    /// The second pass's commands were recorded against a fresh encoder, and
+    /// the per-draw dedup cache left out every state a fresh encoder already
+    /// holds. Where the first pass leaves one of those states changed and the
+    /// second draws before setting it, the join emits the fresh value
+    /// (`fresh_state_command`): the triangle fill mode, the depth bias, the
+    /// stencil reference, the blend colour and the visibility result mode. A
+    /// state with no such command (the viewport, the pipeline, the
+    /// depth-stencil state, the cull mode, the scissor) keeps the passes apart
+    /// in that case instead. Every binding the second pass's draws read is
+    /// bound inside the second pass, so a binding the first pass leaves behind
+    /// is one nothing reads.
+    ///
+    /// Only adjacent passes join, walked front to back so a run of them
+    /// becomes one pass. The upload prefix is left alone: it is submitted in a
+    /// command buffer of its own. Runs after Rule F has taken out the empty
+    /// passes that would otherwise separate two joinable ones, and before
+    /// Rule K, so a pass that loads can still join the one before it.
+    pub fn merge_adjacent_identical_passes(&mut self) {
+        if !ENABLE_MERGE_ADJACENT_PASSES {
+            return;
+        }
+        let start = self.upload_pass_end;
+        if self.passes.len() < start + 2 {
+            return;
+        }
+        let mut write = start;
+        for read in start + 1..self.passes.len() {
+            let Some(join) = merge_join(
+                &self.passes[write],
+                &self.passes[read],
+                &self.texture_view_to_base,
+                &self.frame_sampled_textures,
+            ) else {
+                write += 1;
+                self.passes.swap(write, read);
+                continue;
+            };
+            let (head, tail) = self.passes.split_at_mut(read);
+            let (prev, next) = (&mut head[write], &mut tail[0]);
+            prev.absorb(next, &join);
+            recycle_command_vec(
+                &mut self.command_vec_pool,
+                core::mem::take(&mut next.commands),
+            );
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-merge idx={read} → idx={write} color={:#x} depth={:#x} restored={}",
+                    prev.color_texture,
+                    prev.depth_texture,
+                    join.len,
+                );
+            }
+        }
+        self.passes.truncate(write + 1);
+    }
+
+    /// Rule K: discard the load of render target 0 under a first draw that covers it.
+    ///
+    /// Acts on the passes [`Self::open_pass_for_covering_draw`] marked whose
+    /// render target 0 still loads. A `Clear` Rule E folded into such a pass
+    /// stays, since a clear load costs no more than a discard, and a pass
+    /// Rule J joined onto the one before it is no longer one of them. Runs
+    /// after every other rule, which therefore all reasoned over the `Load`:
+    /// a covered pass that discarded from the start would stop Rule E from
+    /// folding a clear into it and Rule J from joining it onto the pass before,
+    /// and Rule A's correction would put the load back whenever anything
+    /// samples the attachment, though no pixel of the result reads it.
+    pub fn discard_covered_color_loads(&mut self) {
+        if !ENABLE_COVERED_COLOR_DONTCARE {
+            return;
+        }
+        for pass in &mut self.passes {
+            if pass.color_flags.contains(PassColorFlags::FIRST_DRAW_COVERS)
+                && !pass.color_texture.is_null()
+                && matches!(pass.color_load, ColorLoad::Load)
+            {
+                pass.color_load = ColorLoad::DontCare;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load color={:#x} Load → DontCare (its first draw covers it)",
+                        pass.color_texture,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rule I: drop clear-only passes whose every cleared target is overwritten before a read.
+    ///
+    /// The candidates and the overwrites are the ones the
+    /// `ENABLE_DROP_OVERWRITTEN_CLEAR_PASSES` gate lists. Each cleared attachment
+    /// is followed through the later passes in submission order, and per pass
+    /// in the order the GPU runs it: the leading blits one by one, then the
+    /// render pass's sampler binds, attachments and colour resolves. The
+    /// first of those that touches the texture decides: a full overwrite
+    /// clears the attachment for removal, anything else keeps the pass. A
+    /// partial write (a blit onto part of the level, or onto another level)
+    /// reads nothing and decides nothing, because the full overwrite that has
+    /// to follow replaces it along with the clear.
+    ///
+    /// A colour target can only be overwritten by the copy. A multisample
+    /// resolve into it does not count: the pass that takes the resolve
+    /// attaches the target, which the scan treats as a read, and a clear on a
+    /// multisampled target lands on its companion, so such a pass is no
+    /// candidate in the first place. A stencil clear keeps its pass: a depth
+    /// transfer carries the stencil plane only when both ends are
+    /// `Depth32FloatStencil8`, and the blit does not record the source's
+    /// format, so the scan cannot show that the stencil is overwritten.
+    ///
+    /// Walked back to front, so a removal leaves the indices still to visit in
+    /// place and a later dead clear of the same texture is gone before an
+    /// earlier one is judged against it. The scan of one candidate is linear
+    /// in the commands and blits after it, and only clear-only passes pay it.
+    pub fn drop_overwritten_clear_only_passes(&mut self) {
+        if !ENABLE_DROP_OVERWRITTEN_CLEAR_PASSES {
+            return;
+        }
+        for i in (0..self.passes.len()).rev() {
+            let Some(targets) = dead_clear_candidate(&self.passes[i]) else {
+                continue;
+            };
+            if !targets
+                .iter()
+                .all(|target| self.overwritten_before_read(i, target))
+            {
+                continue;
+            }
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                let p = &self.passes[i];
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-dead-clear drop idx={i} color={:#x} depth={:#x}:{} \
+                     (every cleared target overwritten before a read)",
+                    p.color_texture,
+                    p.depth_texture,
+                    p.depth_level,
+                );
+            }
+            let retired = self.passes.remove(i);
+            recycle_command_vec(&mut self.command_vec_pool, retired.commands);
+        }
+    }
+
+    /// Whether `target` is fully overwritten after pass `start` before anything reads it.
+    fn overwritten_before_read(&self, start: usize, target: &ClearedTarget) -> bool {
+        // An extent nobody recorded cannot be shown to be covered.
+        if target.size.0 == 0 || target.size.1 == 0 {
+            return false;
+        }
+        let views = &self.texture_view_to_base;
+        for cand in &self.passes[start + 1..] {
+            for blit in &cand.leading_blits {
+                match blit_effect_on(blit, target, views) {
+                    BlitEffect::Reads => return false,
+                    BlitEffect::Overwrites => return true,
+                    BlitEffect::Neither => {}
+                }
+            }
+            if pass_samples_texture(cand, target.texture, views, &self.frame_sampled_textures)
+                || pass_attaches_texture(cand, target.texture)
+                || pass_resolves_into(cand, target.texture, views)
+            {
+                return false;
+            }
+        }
+        false
+    }
+
+    /// Rule E — coalesce clear-only passes into the load action of the next pass.
+    ///
+    /// The merge target is the next pass that attaches the same texture.
+    /// `WoW`'s frame pattern commonly does `Clear(target) → SetRT(other)
+    /// → … → SetRT(target) → Draw`, which currently produces a spurious
+    /// 1-cmd clear-only pass at the `SetRT(other)` site that just clears
+    /// the original target in isolation (with a Load on whatever else
+    /// was attached). Folding that Clear into the next pass on the same
+    /// target removes the spurious pass entirely.
+    ///
+    /// A merge is safe iff no intervening pass reads the target (as a
+    /// fragment or vertex sampler input, or as a blit source). If anything in
+    /// between *would* observe the cleared content, the clear-only
+    /// pass must materialise where it was originally placed.
+    ///
+    /// "Clear-only" means the pass has no draw commands; any setviewport /
+    /// setscissor / setpipeline / setBlendColor that the encoder pushed without
+    /// a subsequent draw still counts as clear-only here. A pass carrying
+    /// leading blits is never a candidate: the blits are real work that the
+    /// merge would drop along with the pass.
+    pub fn coalesce_clear_only_passes(&mut self) {
+        let mut i = 0;
+        while i < self.passes.len() {
+            let p = &self.passes[i];
+            let has_draw = !p.leading_blits.is_empty() || p.commands.iter().any(Command::is_draw);
+            // Any colour target of the pass with a Clear makes the colour
+            // side a candidate; the whole set then moves together.
+            let needs_color = !has_draw
+                && (matches!(p.color_load, ColorLoad::Clear { .. })
+                    || p.extra_color
+                        .iter()
+                        .any(|a| a.is_bound() && matches!(a.load, ColorLoad::Clear { .. })));
+            let needs_depth = !has_draw && matches!(p.depth_load, DepthLoad::Clear { .. });
+            let needs_stencil = !has_draw
+                && !p.depth_texture.is_null()
+                && matches!(p.stencil_load, StencilLoad::Clear { .. });
+            if !needs_color && !needs_depth && !needs_stencil {
+                i += 1;
+                continue;
+            }
+            let target_color = p.color_texture;
+            let target_color_srgb = p.color_srgb_texture;
+            let target_color_subresource = p.color_subresource;
+            let target_extra: [(MetalHandle<MTLTextureKind>, u32); 3] =
+                core::array::from_fn(|k| (p.extra_color[k].texture, p.extra_color[k].subresource));
+            let target_depth = p.depth_texture;
+            let target_depth_level = p.depth_level;
+            let color_load = p.color_load;
+            let extra_loads: [ColorLoad; 3] = core::array::from_fn(|k| p.extra_color[k].load);
+            let depth_load = p.depth_load;
+            let stencil_load = p.stencil_load;
+            // Pass has only Clear load actions; no real draws / state.
+            // Look ahead for a merge target. Both attachments (if Clear)
+            // must match the target pass's attachments AND that pass
+            // must currently be Loading them (so the move is observable
+            // and lossless). Bail on any intervening read of either.
+            let target_idx = self.find_clear_merge_target(
+                i,
+                &ClearMerge {
+                    color: target_color,
+                    color_srgb: target_color_srgb,
+                    color_subresource: target_color_subresource,
+                    extra: target_extra,
+                    depth: target_depth,
+                    depth_level: target_depth_level,
+                    needs_color,
+                    needs_depth,
+                    needs_stencil,
+                },
+            );
+            if let Some(t) = target_idx {
+                if needs_color {
+                    self.passes[t].color_load = color_load;
+                    for (k, load) in extra_loads.iter().enumerate() {
+                        if self.passes[t].extra_color[k].is_bound() {
+                            self.passes[t].extra_color[k].load = *load;
+                        }
+                    }
+                }
+                if needs_depth {
+                    self.passes[t].depth_load = depth_load;
+                }
+                if needs_stencil {
+                    self.passes[t].stencil_load = stencil_load;
+                }
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-coalesce drop idx={i} (clear-only) → fold into idx={t} color={target_color:#x} depth={target_depth:#x}",
+                    );
+                }
+                let retired = self.passes.remove(i);
+                recycle_command_vec(&mut self.command_vec_pool, retired.commands);
+                // Don't increment i — what was at i+1 is now at i.
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Walk `passes[start+1..]` looking for the first pass that reattaches the target.
+    ///
+    /// The target color/depth must come back with `Load` so we can move
+    /// Rule E's Clear into it. Bail on any intervening pass that reads
+    /// the target as a fragment or vertex sampler input, as a blit source, or
+    /// attaches it in any colour slot without being the merge target (such a
+    /// pass either overwrites whatever we'd move or draws content the move
+    /// would wipe), and on any intervening leading blit or multisample
+    /// resolve that writes the target: the copy landed after the clear, so a
+    /// clear moved past it would wipe it.
+    fn find_clear_merge_target(&self, start: usize, want: &ClearMerge) -> Option<usize> {
+        let ClearMerge {
+            color: target_color,
+            color_srgb: target_color_srgb,
+            color_subresource: target_color_subresource,
+            extra: target_extra,
+            depth: target_depth,
+            depth_level: target_depth_level,
+            needs_color,
+            needs_depth,
+            needs_stencil,
+        } = *want;
+        let attaches_target_depth = |cand: &Pass| {
+            cand.depth_texture == target_depth && cand.depth_level == target_depth_level
+        };
+        for j in (start + 1)..self.passes.len() {
+            let cand = &self.passes[j];
+            // Intervening read on a side we care about kills the merge.
+            if needs_color
+                && pass_reads_texture(
+                    cand,
+                    target_color,
+                    &self.texture_view_to_base,
+                    &self.frame_sampled_textures,
+                )
+            {
+                return None;
+            }
+            if needs_color
+                && target_extra.iter().any(|&(tex, _)| {
+                    !tex.is_null()
+                        && pass_reads_texture(
+                            cand,
+                            tex,
+                            &self.texture_view_to_base,
+                            &self.frame_sampled_textures,
+                        )
+                })
+            {
+                return None;
+            }
+            // Intervening blit write on a side we care about kills the merge
+            // too: the copy is ordered after our clear.
+            if needs_color
+                && (blit_list_writes(&cand.leading_blits, target_color)
+                    || target_extra
+                        .iter()
+                        .any(|&(tex, _)| blit_list_writes(&cand.leading_blits, tex)))
+            {
+                return None;
+            }
+            if (needs_depth || needs_stencil) && blit_list_writes(&cand.leading_blits, target_depth)
+            {
+                return None;
+            }
+            // So does a colour resolve, on any of the pass's attachments: the
+            // multisampled companion it reduces holds content the clear would
+            // otherwise land on top of.
+            if needs_color
+                && (pass_resolves_into(cand, target_color, &self.texture_view_to_base)
+                    || target_extra
+                        .iter()
+                        .any(|&(tex, _)| pass_resolves_into(cand, tex, &self.texture_view_to_base)))
+            {
+                return None;
+            }
+            // Render targets 1..3 travel as a set: only a candidate with
+            // exactly this set can take the colour clears. One with a
+            // different set that attaches any of our extra textures, clearing
+            // or loading them, either supersedes or consumes the clear; one
+            // that touches none of them is simply not the target.
+            let cand_extra: [(MetalHandle<MTLTextureKind>, u32); 3] = core::array::from_fn(|k| {
+                (cand.extra_color[k].texture, cand.extra_color[k].subresource)
+            });
+            let same_set = cand_extra == target_extra;
+            if needs_color {
+                let touches_extra = target_extra.iter().any(|&(tex, _)| {
+                    !tex.is_null()
+                        && (cand.color_texture == tex
+                            || cand.extra_color.iter().any(|a| a.texture == tex))
+                });
+                if !same_set && touches_extra {
+                    return None;
+                }
+                if same_set
+                    && cand
+                        .extra_color
+                        .iter()
+                        .any(|a| a.is_bound() && !matches!(a.load, ColorLoad::Load))
+                {
+                    // Same set, but an extra is cleared or first-used there:
+                    // that pass supersedes the move for the whole set.
+                    return None;
+                }
+            }
+            if (needs_depth || needs_stencil)
+                && pass_reads_texture(
+                    cand,
+                    target_depth,
+                    &self.texture_view_to_base,
+                    &self.frame_sampled_textures,
+                )
+            {
+                return None;
+            }
+            // Intervening Clear on the same attachment supersedes ours.
+            if needs_color
+                && cand.color_texture == target_color
+                && cand.color_subresource == target_color_subresource
+                && matches!(cand.color_load, ColorLoad::Clear { .. })
+            {
+                return None;
+            }
+            if needs_depth
+                && attaches_target_depth(cand)
+                && matches!(cand.depth_load, DepthLoad::Clear { .. })
+            {
+                return None;
+            }
+            if needs_stencil
+                && attaches_target_depth(cand)
+                && matches!(cand.stencil_load, StencilLoad::Clear { .. })
+            {
+                return None;
+            }
+            // A pass whose colour attachments are smaller than the depth
+            // surface rasterizes only their area, so a whole-surface depth or
+            // stencil clear moved into its load action need not reach the
+            // rest. The clear-only pass stays where it was recorded.
+            if (needs_depth || needs_stencil)
+                && attaches_target_depth(cand)
+                && !cand.color_extent_covers_depth()
+            {
+                return None;
+            }
+            // Match: same attachments, currently loading.
+            let color_ok = !needs_color
+                || (same_set
+                    && cand.color_texture == target_color
+                    && cand.color_srgb_texture == target_color_srgb
+                    && cand.color_subresource == target_color_subresource
+                    && matches!(cand.color_load, ColorLoad::Load));
+            let depth_ok = !needs_depth
+                || (attaches_target_depth(cand) && matches!(cand.depth_load, DepthLoad::Load));
+            // A `DontCare` candidate cannot occur here: the clear-only pass
+            // was this texture's first use of the frame, so every later pass
+            // on it opened with `Load` or its own `Clear`.
+            let stencil_ok = !needs_stencil
+                || (attaches_target_depth(cand) && matches!(cand.stencil_load, StencilLoad::Load));
+            if color_ok && depth_ok && stencil_ok {
+                return Some(j);
+            }
+            // This pass consumes one of the to-be-cleared attachments but is
+            // NOT a full merge target (the other side doesn't match).
+            // Folding the combined Clear into a later pass would let it
+            // leapfrog this consumer, which then loads uninitialised content
+            // (a render-to-texture pass that depth-tests against the auto-DS
+            // sits between the clear-only pass and the final backbuffer pass).
+            // Bail so the clear-only pass materialises and this consumer
+            // loads the real cleared content. WoW's pattern is unaffected:
+            // its first Load pass matches BOTH sides and returns above.
+            //
+            // The colour side asks the question of every slot, not just
+            // render target 0. A pass that attaches one of the cleared
+            // textures as an extra render target draws into it there, so a
+            // clear moved past that pass wipes those writes.
+            let consumes_color = needs_color
+                && core::iter::once((target_color, target_color_subresource))
+                    .chain(target_extra)
+                    .any(|(tex, sub)| pass_attaches_color(cand, tex, sub));
+            let consumes_depth = needs_depth
+                && attaches_target_depth(cand)
+                && matches!(cand.depth_load, DepthLoad::Load);
+            let consumes_stencil = needs_stencil
+                && attaches_target_depth(cand)
+                && matches!(cand.stencil_load, StencilLoad::Load);
+            if consumes_color || consumes_depth || consumes_stencil {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// Rule A correction: revert `Load = DontCare` on attachments a sampler reads.
+    ///
+    /// The revert fires whenever the attachment's content is read
+    /// elsewhere in this frame. `ensure_pass_open` decides the load
+    /// action eagerly without lookahead, so a pass that attaches a
+    /// texture first AND lacks a pending clear gets `DontCare`; if a
+    /// later pass then samples that texture (CSM cascade rendered then
+    /// sampled by the scene PS), the sampler reads tile memory that was
+    /// never loaded. Conservative: reverts even when the sampler bind
+    /// happened earlier in the frame than the attachment (sampler
+    /// already completed against VRAM), trading one tile load for
+    /// safety.
+    pub fn finalize_load_actions(&mut self) {
+        if !ENABLE_FIRST_USE_DONTCARE && !ENABLE_FIRST_USE_STENCIL_DONTCARE {
+            return;
+        }
+        for pass in &mut self.passes {
+            if matches!(pass.color_load, ColorLoad::DontCare)
+                && self.seen_sampled_textures.contains(&pass.color_texture)
+            {
+                pass.color_load = ColorLoad::Load;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load color={:#x} DontCare → Load (sampled this frame)",
+                        pass.color_texture,
+                    );
+                }
+            }
+            for attachment in pass.extra_color.iter_mut().filter(|a| a.is_bound()) {
+                if matches!(attachment.load, ColorLoad::DontCare)
+                    && self.seen_sampled_textures.contains(&attachment.texture)
+                {
+                    attachment.load = ColorLoad::Load;
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-load color={:#x} DontCare → Load (sampled this frame)",
+                            attachment.texture,
+                        );
+                    }
+                }
+            }
+            if matches!(pass.depth_load, DepthLoad::DontCare)
+                && self.seen_sampled_textures.contains(&pass.depth_texture)
+            {
+                pass.depth_load = DepthLoad::Load;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load depth={:#x} DontCare → Load (sampled this frame)",
+                        pass.depth_texture,
+                    );
+                }
+            }
+            if matches!(pass.stencil_load, StencilLoad::DontCare)
+                && self.seen_sampled_textures.contains(&pass.depth_texture)
+            {
+                pass.stencil_load = StencilLoad::Load;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load stencil={:#x} DontCare → Load (sampled this frame)",
+                        pass.depth_texture,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Rules B and C: discard the stores nothing later reads.
+    ///
+    /// Scoped to this frame. D3D9 keeps depth and stencil across `Present`
+    /// unless the game set `D3DPRESENTFLAG_DISCARD_DEPTHSTENCIL` or created
+    /// the surface with `Discard = TRUE`; this rule discards them regardless,
+    /// as a kept divergence that saves the final flush back to device memory
+    /// on TBDR (see `ENABLE_LAST_USE_DEPTH_DONTCARE`).
+    ///
+    /// Also flips `color_store` to `DontCare` on a pass whose very
+    /// next consumer of the same color rt this frame begins with a
+    /// full-attachment `Clear` (Rule C) — the next pass's `Clear`
+    /// provably overwrites the prior contents, so storing them is
+    /// wasted bandwidth.
+    ///
+    /// Both rules skip the flip when the texture is bound as a sampler
+    /// somewhere in the frame (`seen_sampled_textures`): the
+    /// sampler reads VRAM at draw time, so `DontCare` would discard the
+    /// content it expects (CSM cascade written here, sampled in the
+    /// scene pass).
+    ///
+    /// Called once at frame submit, after `end_current_pass`, before
+    /// the unix-side thunk is dispatched.
+    ///
+    /// Each rule is one reverse walk over `passes`:
+    /// - Rule B (`discard_last_depth_stores`): the first pass we see with a
+    ///   given `depth_texture` is the last in forward order; flip it, and
+    ///   keep flipping earlier passes on the texture while every pass after
+    ///   them uses neither depth nor stencil.
+    /// - Rule C: maintain `next_color_use: HashMap<u64, usize>` from
+    ///   color texture to the most-recently-seen pass (i.e. the next
+    ///   in forward order). For pass `i`, if `next_color_use[i.color]`
+    ///   resolves and that next pass's `color_load` is `Clear`, flip
+    ///   `i.color_store`. Then update the map with `i`.
+    ///
+    /// A colour target's last use in the frame keeps its `Store`. D3D9 keeps render-target
+    /// contents across `Present`, and the read that needs them (a sampler, a `StretchRect`, a
+    /// readback, a draw that blends over them) may come in a later frame, where nothing this
+    /// submission holds can see it.
+    ///
+    /// `frame_continues` marks a mid-frame flush (a readback or retention drain, not
+    /// `Present`): the D3D9 frame keeps going afterwards, so a depth surface may still be
+    /// tested against. Rule B is therefore suppressed, since it would discard depth the
+    /// continuation still needs. Rule C (next-clear) still runs, since a pass that a later
+    /// pass *in this submission* clears is provably overwritten regardless of whether the
+    /// frame ends here.
+    ///
+    /// After Rules B and C come Rule C's depth arm (a depth or stencil store the next
+    /// pass on the plane clears), the discard of stencil nothing has written, the
+    /// discard of depth loads in a pass that never uses depth, and the multisample
+    /// resolves, which on a presenting submit also drop the back buffer's samples.
+    pub fn finalize_store_actions(&mut self, frame_continues: bool) {
+        if ENABLE_LAST_USE_DEPTH_DONTCARE && !frame_continues {
+            self.discard_last_depth_stores();
+        }
+        if ENABLE_NEXT_CLEAR_COLOR_DONTCARE {
+            // Value: `(pass index, attachment slot)` of the next use in
+            // forward order, so the load action consulted is the one of the
+            // slot the texture is bound to there.
+            let mut next_color_use: FxHashMap<(MetalHandle<MTLTextureKind>, u32), (usize, usize)> =
+                FxHashMap::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
+            for i in (0..self.passes.len()).rev() {
+                let attachments = self.passes[i].bound_color_attachments();
+                for attachment in attachments.iter() {
+                    let (slot, rt) = (attachment.slot, attachment.texture);
+                    let key = (rt, attachment.subresource);
+                    if let Some(&(next, next_slot)) = next_color_use.get(&key)
+                        && matches!(
+                            self.passes[next].color_load_of(next_slot),
+                            ColorLoad::Clear { .. }
+                        )
+                        && !self.seen_sampled_textures.contains(&rt)
+                    {
+                        self.passes[i].set_color_store_of(slot, StoreAction::DontCare);
+                        if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                            trace!(
+                                target: TRACE_TARGET,
+                                "pass-store idx={i} color={rt:#x} → DontCare (next-clear at idx={next})",
+                            );
+                        }
+                    }
+                    next_color_use.insert(key, (i, slot));
+                }
+            }
+        }
+        if ENABLE_NEXT_CLEAR_DEPTH_DONTCARE {
+            self.discard_depth_stores_before_clears();
+        }
+        if ENABLE_UNWRITTEN_STENCIL_DONTCARE {
+            self.discard_unwritten_stencil();
+        }
+        if ENABLE_UNUSED_DEPTH_LOAD_DONTCARE {
+            self.discard_unused_depth_loads();
+        }
+        self.assign_multisample_resolves(!frame_continues);
+    }
+
+    /// Rule B: discard the depth and stencil stores nothing later in the frame reads.
+    ///
+    /// Walked back to front. A depth texture's last pass discards both
+    /// stores. So does an earlier pass on it when every later pass on the
+    /// texture discards its stores and leaves depth and stencil unused (not
+    /// tagged `USED`), and nothing running in between touches the texture
+    /// (`depth_touched_between`): those later passes read nothing of what it
+    /// stores, and `discard_unused_depth_loads` then drops their loads too.
+    /// The chain stops at the first pass from the end that uses a plane,
+    /// which keeps its `Store` for the passes before it. Sampleable and
+    /// ever-sampled textures keep every store: a sampler, a blit source or a
+    /// readback reads device memory. The caller skips this on a mid-frame
+    /// flush, where the frame goes on.
+    fn discard_last_depth_stores(&mut self) {
+        // Value: the next pass on the texture in forward order while every
+        // pass on it from there on discards its stores and uses neither plane,
+        // `None` once one of them keeps a store or uses a plane.
+        let mut unused_tail: FxHashMap<MetalHandle<MTLTextureKind>, Option<usize>> =
+            FxHashMap::with_capacity_and_hasher(self.seen_depth_rts.len(), FxBuildHasher);
+        for i in (0..self.passes.len()).rev() {
+            let texture = self.passes[i].depth_texture;
+            if texture.is_null() {
+                continue;
+            }
+            let reason = match unused_tail.get(&texture) {
+                None => Some("last-use"),
+                Some(&Some(next)) if !self.depth_touched_between(i, next, texture) => {
+                    Some("later passes never use depth")
+                }
+                Some(_) => None,
+            };
+            let pass = &mut self.passes[i];
+            let mut discarded = false;
+            if let Some(reason) = reason {
+                if pass.depth_flags.contains(PassDepthFlags::SAMPLEABLE) {
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store depth={texture:#x} → keep Store (sampleable shadow map)",
+                        );
+                    }
+                } else if self.seen_sampled_textures.contains(&texture) {
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store depth={texture:#x} → keep Store (ever sampled)",
+                        );
+                    }
+                } else {
+                    pass.depth_store = StoreAction::DontCare;
+                    pass.stencil_store = StoreAction::DontCare;
+                    discarded = true;
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store idx={i} depth={texture:#x} → DontCare ({reason})",
+                        );
+                    }
+                }
+            }
+            let unused = discarded && !pass.depth_flags.contains(PassDepthFlags::USED);
+            unused_tail.insert(texture, unused.then_some(i));
+        }
+    }
+
+    /// Rule C's depth arm: discard a depth or stencil store the next pass on that plane clears.
+    ///
+    /// Keyed by `(depth texture, mip level)`, walked back to front like the
+    /// colour arm. Pass `i`'s depth store becomes `DontCare` when the next
+    /// pass in the submission on the same texture and level opens with
+    /// `DepthLoad::Clear`, and its stencil store when that pass opens with
+    /// `StencilLoad::Clear` on a texture that has a stencil plane; the two
+    /// planes are decided apart. Such a load action is only reached by a
+    /// clear that covers the whole attachment, so the next pass overwrites
+    /// every texel of the plane before anything can read it, provided its
+    /// render area spans the depth surface: a pass whose colour attachments
+    /// are smaller clears only their area, and the store before it keeps the
+    /// rest.
+    ///
+    /// Skipped for a sampleable or ever-sampled texture (a sampler, a blit
+    /// source or a readback reads device memory), and when anything that
+    /// runs between the store and the clear touches the texture: a pass in
+    /// between that samples it, resolves into it or carries a leading blit
+    /// reading or writing it, or a leading blit of the clearing pass itself,
+    /// which runs before that pass's load action. The walk stays inside one
+    /// submission, so unlike Rule B it also runs on a mid-frame flush.
+    fn discard_depth_stores_before_clears(&mut self) {
+        let mut next_depth_use: FxHashMap<(MetalHandle<MTLTextureKind>, u32), usize> =
+            FxHashMap::with_capacity_and_hasher(self.seen_depth_rts.len(), FxBuildHasher);
+        for i in (0..self.passes.len()).rev() {
+            let texture = self.passes[i].depth_texture;
+            if texture.is_null() {
+                continue;
+            }
+            let key = (texture, self.passes[i].depth_level);
+            if let Some(&next) = next_depth_use.get(&key)
+                && !self.passes[i]
+                    .depth_flags
+                    .contains(PassDepthFlags::SAMPLEABLE)
+                && !self.seen_sampled_textures.contains(&texture)
+                && !self.depth_touched_between(i, next, texture)
+                && self.passes[next].color_extent_covers_depth()
+            {
+                let depth_cleared = matches!(self.passes[next].depth_load, DepthLoad::Clear { .. });
+                let stencil_cleared =
+                    matches!(self.passes[next].stencil_load, StencilLoad::Clear { .. });
+                let pass = &mut self.passes[i];
+                if depth_cleared {
+                    pass.depth_store = StoreAction::DontCare;
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store idx={i} depth={texture:#x} → DontCare (next-clear at idx={next})",
+                        );
+                    }
+                }
+                if stencil_cleared && pass.depth_flags.contains(PassDepthFlags::HAS_STENCIL) {
+                    pass.stencil_store = StoreAction::DontCare;
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store idx={i} stencil={texture:#x} → DontCare (next-clear at idx={next})",
+                        );
+                    }
+                }
+            }
+            next_depth_use.insert(key, i);
+        }
+    }
+
+    /// Whether anything running after pass `first` and before `next`'s load touches `texture`.
+    ///
+    /// The passes strictly between the two, and the leading blits of `next`,
+    /// which run before its render pass begins. `next`'s sampler binds run
+    /// after its load and are counted too, which only keeps a store.
+    fn depth_touched_between(
+        &self,
+        first: usize,
+        next: usize,
+        texture: MetalHandle<MTLTextureKind>,
+    ) -> bool {
+        let views = &self.texture_view_to_base;
+        self.passes[first + 1..=next].iter().any(|pass| {
+            pass_reads_texture(pass, texture, views, &self.frame_sampled_textures)
+                || blit_list_writes(&pass.leading_blits, texture)
+                || pass_resolves_into(pass, texture, views)
+        })
+    }
+
+    /// Discard the stencil plane of every pass on a texture whose stencil nothing has written.
+    ///
+    /// First enters every texture a pass of this submission writes stencil
+    /// into (a stencil `Clear` load, or a draw or clear-quad tagged
+    /// `STENCIL_WRITTEN`) into `stencil_written_textures`, so a write
+    /// anywhere in the submission keeps every pass on that texture as it was.
+    /// A pass whose texture has a stencil plane and is still absent then
+    /// loads and stores that plane `DontCare`: the plane holds nothing D3D9
+    /// defines, and no pass reads it.
+    fn discard_unwritten_stencil(&mut self) {
+        for pass in &self.passes {
+            if !pass.depth_texture.is_null()
+                && (pass.depth_flags.contains(PassDepthFlags::STENCIL_WRITTEN)
+                    || matches!(pass.stencil_load, StencilLoad::Clear { .. }))
+            {
+                self.stencil_written_textures.insert(pass.depth_texture);
+            }
+        }
+        for pass in &mut self.passes {
+            if pass.depth_texture.is_null()
+                || !pass.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
+                || self.stencil_written_textures.contains(&pass.depth_texture)
+            {
+                continue;
+            }
+            if matches!(pass.stencil_load, StencilLoad::Load) {
+                pass.stencil_load = StencilLoad::DontCare;
+            }
+            pass.stencil_store = StoreAction::DontCare;
+            if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                trace!(
+                    target: TRACE_TARGET,
+                    "pass-stencil depth={:#x} → DontCare load and store (stencil never written)",
+                    pass.depth_texture,
+                );
+            }
+        }
+    }
+
+    /// Discard the depth and stencil loads of a pass that neither uses nor keeps them.
+    ///
+    /// A pass not tagged `USED` has no draw or clear-quad that tests or
+    /// writes depth or stencil. Where such a pass also discards a plane's
+    /// store, the plane's contents after the pass are undefined whatever it
+    /// loads, and nothing inside it reads them, so a `Load` of that plane
+    /// becomes `DontCare`. Each plane is decided on its own store; a `Clear`
+    /// load stays, since it reads nothing. Runs after the store rules, so it
+    /// sees their decisions, and after `finalize_load_actions`, so the
+    /// sampled-texture revert there does not undo it.
+    fn discard_unused_depth_loads(&mut self) {
+        for pass in &mut self.passes {
+            if pass.depth_texture.is_null() || pass.depth_flags.contains(PassDepthFlags::USED) {
+                continue;
+            }
+            if matches!(pass.depth_store, StoreAction::DontCare)
+                && matches!(pass.depth_load, DepthLoad::Load)
+            {
+                pass.depth_load = DepthLoad::DontCare;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load depth={:#x} Load → DontCare (pass never uses depth or stencil)",
+                        pass.depth_texture,
+                    );
+                }
+            }
+            if pass.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
+                && matches!(pass.stencil_store, StoreAction::DontCare)
+                && matches!(pass.stencil_load, StencilLoad::Load)
+            {
+                pass.stencil_load = StencilLoad::DontCare;
+                if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                    trace!(
+                        target: TRACE_TARGET,
+                        "pass-load stencil={:#x} Load → DontCare (pass never uses depth or stencil)",
+                        pass.depth_texture,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Give each multisampled attachment its resolve on the submission's last use of it.
+    ///
+    /// Everything outside a render pass (Present, `StretchRect`,
+    /// `GetRenderTargetData`, `LockRect`, a sampler bind) reads the
+    /// single-sample twin, so the twin has to hold the frame's result by the
+    /// time the command buffer ends. Taking the resolve on the last pass
+    /// rather than on every pass keeps the multisample content live for the
+    /// passes in between (a scene drawn in several passes before the interface
+    /// goes over it) and pays for one resolve per target per submission.
+    ///
+    /// Runs on a mid-frame flush too: a flush is the boundary a readback and
+    /// a synchronous blit observe, so the twin must be current there as well.
+    /// A read that happens between two passes of the same submission is
+    /// covered by [`Self::note_msaa_read`] instead.
+    ///
+    /// On a presenting submit (`presenting`) under the discard swap effect,
+    /// the back buffer's resolving pass also drops its multisampled samples
+    /// (store `DontCare`, so the descriptor carries `MultisampleResolve`).
+    /// D3D9 allows a multisampled back buffer only with
+    /// `D3DSWAPEFFECT_DISCARD`, which leaves its contents undefined after
+    /// `Present`, and everything outside a render pass reads the resolved
+    /// twin. A mid-frame flush keeps the samples, since the frame goes on and
+    /// a later pass may load them, and so does every other target, whose
+    /// contents D3D9 keeps across `Present`.
+    fn assign_multisample_resolves(&mut self, presenting: bool) {
+        let discard_backbuffer_samples = presenting
+            && matches!(self.backbuffer_contents, BackbufferContents::Undefined)
+            && !self.backbuffer_texture.is_null();
+        let backbuffer = self.backbuffer_texture;
+        let mut resolved: FxHashSet<(MetalHandle<MTLTextureKind>, u32)> =
+            FxHashSet::with_capacity_and_hasher(self.seen_color_rts.len(), FxBuildHasher);
+        for pass in self.passes.iter_mut().rev() {
+            if !pass.color_msaa_texture.is_null()
+                && resolved.insert((pass.color_texture, pass.color_subresource))
+            {
+                pass.color_resolve_texture = pass.color_resolve_view();
+                if discard_backbuffer_samples && pass.color_texture == backbuffer {
+                    pass.color_store = StoreAction::DontCare;
+                    if log_enabled!(target: TRACE_TARGET, Level::Trace) {
+                        trace!(
+                            target: TRACE_TARGET,
+                            "pass-store color={backbuffer:#x} → resolve without store (presented back buffer)",
+                        );
+                    }
+                }
+            }
+            for attachment in &mut pass.extra_color {
+                if !attachment.msaa_texture.is_null()
+                    && resolved.insert((attachment.texture, attachment.subresource))
+                {
+                    attachment.resolve_texture = attachment.resolve_view();
+                    if discard_backbuffer_samples && attachment.texture == backbuffer {
+                        attachment.store = StoreAction::DontCare;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve `texture` now, because something is about to read it mid-submission.
+    ///
+    /// `texture` is the single-sample twin, the handle every reader knows.
+    /// The most recent pass that rendered into its multisampled companion
+    /// takes the resolve; a target with no multisampled companion, or one no
+    /// pass has touched yet, is a no-op. Called from the `StretchRect` path,
+    /// which orders its blit after the passes already recorded.
+    pub fn note_msaa_read(&mut self, texture: MetalHandle<MTLTextureKind>) {
+        if texture.is_null() {
+            return;
+        }
+        for pass in self.passes.iter_mut().rev() {
+            if pass.color_texture == texture && !pass.color_msaa_texture.is_null() {
+                pass.color_resolve_texture = pass.color_resolve_view();
+                return;
+            }
+            for attachment in &mut pass.extra_color {
+                if attachment.texture == texture && !attachment.msaa_texture.is_null() {
+                    attachment.resolve_texture = attachment.resolve_view();
+                    return;
+                }
+            }
+        }
+    }
+
+    fn current_pass_has_work(&self) -> bool {
+        if self.current_pass_closed {
+            return false;
+        }
+        self.passes.last().is_some_and(|p| p.commands.len() > 1)
+    }
+}
+
+/// `true` when a draw running with `ds` can change the stencil plane it attaches.
+///
+/// It needs a stencil plane (`HAS_STENCIL` in `attach`), the stencil test on,
+/// a nonzero write mask, and an operation other than `KEEP` on either face.
+/// Operations are compared after translation, so they read exactly as the
+/// `MTLDepthStencilState` the draw would get.
+fn draw_writes_stencil(ds: &DepthStencilSnapshot, attach: PipelineAttachFlags) -> bool {
+    let face_keeps = |face: StencilFaceState| {
+        [face.fail_op, face.depth_fail_op, face.pass_op]
+            .iter()
+            .all(|&op| d3d_to_metal_stencil_op(u32::from(op)) == StencilOp::Keep)
+    };
+    attach.contains(PipelineAttachFlags::HAS_STENCIL)
+        && ds.stencil_enable != 0
+        && ds.write_mask & STENCIL_MASK_BITS != 0
+        && !(face_keeps(ds.front) && face_keeps(ds.back))
+}
+
+/// The commands Rule J emits between the command lists of two passes it joins.
+///
+/// At most one per entry of [`JOIN_STATES`], each putting a state back to the
+/// value a fresh encoder starts with.
+struct PassJoin {
+    commands: [Command; JOIN_STATES.len()],
+    len: usize,
+}
+
+impl PassJoin {
+    const fn new() -> Self {
+        Self {
+            commands: [Command::set_triangle_fill_mode(TriangleFillMode::Fill); JOIN_STATES.len()],
+            len: 0,
+        }
+    }
+
+    const fn push(&mut self, cmd: Command) {
+        self.commands[self.len] = cmd;
+        self.len += 1;
+    }
+
+    fn commands(&self) -> &[Command] {
+        &self.commands[..self.len]
+    }
+}
+
+/// The join that fuses `next` into `prev` under Rule J, `None` when the two must stay apart.
+///
+/// The passes stay apart unless they bind identical attachments, `next` has
+/// no leading blits, every attachment carries over ([`color_carries_over`],
+/// [`depth_carries_over`]), and no sampler bind in `next` reads an
+/// attachment. Then every state of [`JOIN_STATES`] that `next` reads before
+/// setting it (it has a draw ahead of its first command for the state) must
+/// read what a fresh encoder holds: when `prev` leaves it changed, the join
+/// puts the fresh value back, or keeps the passes apart where no command can
+/// (`fresh_state_command`).
+fn merge_join(
+    prev: &Pass,
+    next: &Pass,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
+) -> Option<PassJoin> {
+    if !attachments_match(prev, next)
+        || !next.leading_blits.is_empty()
+        || !color_carries_over(prev, next)
+        || !depth_carries_over(prev, next)
+    {
+        return None;
+    }
+    let attached = [prev.color_texture, prev.depth_texture]
+        .into_iter()
+        .chain(prev.extra_color.iter().map(PassColorAttachment::texture));
+    for texture in attached {
+        if pass_samples_texture(next, texture, texture_view_to_base, frame_sampled) {
+            return None;
+        }
+    }
+    let mut join = PassJoin::new();
+    let Some(first_draw) = next.commands.iter().position(Command::is_draw) else {
+        return Some(join);
+    };
+    // One walk over each list: the states `next` sets ahead of its first
+    // draw, and the command that last set each state in `prev`.
+    let mut set_before_draw = [false; JOIN_STATES.len()];
+    for cmd in &next.commands[..first_draw] {
+        if let Some(state) = JOIN_STATES.iter().position(|&kind| kind as u32 == cmd.cmd) {
+            set_before_draw[state] = true;
+        }
+    }
+    let mut last_set: [Option<&Command>; JOIN_STATES.len()] = [None; JOIN_STATES.len()];
+    let mut pending = set_before_draw.iter().filter(|&&set| !set).count();
+    for cmd in prev.commands.iter().rev() {
+        if pending == 0 {
+            break;
+        }
+        if let Some(state) = JOIN_STATES.iter().position(|&kind| kind as u32 == cmd.cmd)
+            && !set_before_draw[state]
+            && last_set[state].is_none()
+        {
+            last_set[state] = Some(cmd);
+            pending -= 1;
+        }
+    }
+    for last in last_set.into_iter().flatten() {
+        if !sets_fresh_value(last) {
+            join.push(fresh_state_command(last)?);
+        }
+    }
+    Some(join)
+}
+
+/// Whether `a` and `b` bind the same attachments, view for view, and bind at least one.
+///
+/// A multisampled companion's identity carries its sample count, so equal
+/// companions agree on it. The extent and format of render target 0 count
+/// only while it is bound: a stripped attachment keeps its old extent and
+/// format, which no pass descriptor reads.
+fn attachments_match(a: &Pass, b: &Pass) -> bool {
+    let color = a.color_texture == b.color_texture
+        && (a.color_texture.is_null()
+            || (a.color_srgb_texture == b.color_srgb_texture
+                && a.color_msaa_texture == b.color_msaa_texture
+                && a.color_msaa_srgb_texture == b.color_msaa_srgb_texture
+                && a.color_subresource == b.color_subresource
+                && a.color_size == b.color_size
+                && a.color_format == b.color_format));
+    let extras = a.extra_color.iter().zip(&b.extra_color).all(|(x, y)| {
+        x.texture == y.texture
+            && (x.texture.is_null()
+                || (x.srgb_texture == y.srgb_texture
+                    && x.msaa_texture == y.msaa_texture
+                    && x.msaa_srgb_texture == y.msaa_srgb_texture
+                    && x.subresource == y.subresource
+                    && x.size == y.size
+                    && x.format == y.format))
+    });
+    let depth = a.depth_texture == b.depth_texture
+        && (a.depth_texture.is_null()
+            || (a.depth_level == b.depth_level
+                && a.depth_size == b.depth_size
+                && a.depth_flags
+                    .intersection(PassDepthFlags::SAMPLEABLE | PassDepthFlags::HAS_STENCIL)
+                    == b.depth_flags
+                        .intersection(PassDepthFlags::SAMPLEABLE | PassDepthFlags::HAS_STENCIL)));
+    let binds_any = !a.color_texture.is_null()
+        || !a.depth_texture.is_null()
+        || a.extra_color.iter().any(PassColorAttachment::is_bound);
+    color && extras && depth && binds_any
+}
+
+/// Whether `next` carries forward every colour attachment `prev` leaves.
+///
+/// `prev` stores each one unresolved and `next` loads it.
+fn color_carries_over(prev: &Pass, next: &Pass) -> bool {
+    (prev.color_texture.is_null()
+        || (matches!(prev.color_store, StoreAction::Store)
+            && prev.color_resolve_texture.is_null()
+            && matches!(next.color_load, ColorLoad::Load)))
+        && prev
+            .extra_color
+            .iter()
+            .zip(&next.extra_color)
+            .all(|(mine, theirs)| {
+                !mine.is_bound()
+                    || (matches!(mine.store, StoreAction::Store)
+                        && mine.resolve_texture.is_null()
+                        && matches!(theirs.load, ColorLoad::Load))
+            })
+}
+
+/// Whether joining `next` onto `prev` keeps each depth plane what `next` would have found.
+///
+/// A plane `next` loads must have been stored by `prev`. A plane `next` loads
+/// `DontCare` (a stencil plane nothing has written, a pass that never uses
+/// depth) starts undefined, so `prev`'s contents serve as well, and the
+/// joined pass takes `next`'s store for it. A plane `next` clears keeps the
+/// passes apart. The stencil plane counts only where the texture has one.
+fn depth_carries_over(prev: &Pass, next: &Pass) -> bool {
+    let plane = |store: StoreAction, loads: bool, discards: bool| {
+        discards || (loads && matches!(store, StoreAction::Store))
+    };
+    prev.depth_texture.is_null()
+        || (plane(
+            prev.depth_store,
+            matches!(next.depth_load, DepthLoad::Load),
+            matches!(next.depth_load, DepthLoad::DontCare),
+        ) && (!prev.depth_flags.contains(PassDepthFlags::HAS_STENCIL)
+            || plane(
+                prev.stencil_store,
+                matches!(next.stencil_load, StencilLoad::Load),
+                matches!(next.stencil_load, StencilLoad::DontCare),
+            )))
+}
+
+/// Whether `a` and `b` are the same command, field for field.
+const fn same_command(a: &Command, b: &Command) -> bool {
+    a.cmd == b.cmd
+        && a.param_a == b.param_a
+        && a.param_b == b.param_b
+        && a.param_c == b.param_c
+        && a.param_d == b.param_d
+}
+
+/// Whether `cmd` sets its state to the value a fresh Metal render encoder starts with.
+///
+/// Answers for the states whose fresh value the per-draw dedup cache starts
+/// each pass at (`LastBoundCache::reset`): solid fill, no depth bias, stencil
+/// reference zero, the zero blend colour of [`FRESH_BLEND_COLOR`], and
+/// visibility counting off, whatever offset the disarm names. Every other
+/// command answers `false`.
+fn sets_fresh_value(cmd: &Command) -> bool {
+    if cmd.cmd == CommandType::SetVisibilityResultMode as u32 {
+        return cmd.param_a == VisibilityResultMode::Disabled as u32;
+    }
+    let fresh = [
+        Command::set_triangle_fill_mode(TriangleFillMode::Fill),
+        Command::set_depth_bias(0.0, 0.0),
+        Command::set_stencil_reference(0),
+        fresh_blend_color_command(),
+    ];
+    fresh.iter().any(|value| same_command(cmd, value))
+}
+
+/// `SetBlendColor` with a fresh encoder's blend colour, [`FRESH_BLEND_COLOR`].
+fn fresh_blend_color_command() -> Command {
+    let [r, g, b, a] = crate::convert::d3dcolor_to_rgba_f32(FRESH_BLEND_COLOR);
+    Command::set_blend_color(r, g, b, a)
+}
+
+/// The command that puts the state `last` set back to a fresh encoder's value.
+///
+/// `None` for the other states of [`JOIN_STATES`]. The viewport and the
+/// pipeline have no fresh value a draw may read, and the rule holds no handle
+/// for a fresh depth-stencil state. The cull mode and the scissor start unset
+/// in the dedup cache, so a draw recorded through it sets both itself; a path
+/// that reads their fresh values without setting them keeps its pass apart.
+/// A disarm of visibility counting keeps the offset `last` armed, which lies
+/// inside the pass's visibility buffer.
+fn fresh_state_command(last: &Command) -> Option<Command> {
+    match CommandType::from_repr(last.cmd)? {
+        CommandType::SetTriangleFillMode => {
+            Some(Command::set_triangle_fill_mode(TriangleFillMode::Fill))
+        }
+        CommandType::SetDepthBias => Some(Command::set_depth_bias(0.0, 0.0)),
+        CommandType::SetStencilReference => Some(Command::set_stencil_reference(0)),
+        CommandType::SetBlendColor => Some(fresh_blend_color_command()),
+        CommandType::SetVisibilityResultMode => Some(Command::set_visibility_result_mode(
+            VisibilityResultMode::Disabled,
+            u32::try_from(last.param_b).expect("a visibility offset is a u32 on the wire"),
+        )),
+        // The remaining states of `JOIN_STATES`, the only commands passed in.
+        _ => None,
+    }
+}
+
+/// Whether an attachment whose load clears (`clears`) keeps the cleared contents at pass end.
+const fn clear_is_stored(clears: bool, store: StoreAction) -> bool {
+    clears && matches!(store, StoreAction::Store)
+}
+
+/// True if `pass` would observe the contents of `target_handle`.
+///
+/// Either as a fragment- or vertex-sampler input inside the pass, or as a
+/// leading blit's source texture. Used by
+/// `coalesce_clear_only_passes` to decide whether moving a Clear past
+/// this pass is safe: if the pass reads the pre-Clear contents, the
+/// merge changes observable behaviour and is rejected.
+///
+/// `target_handle == 0` is treated as "no read" since 0 is the unset
+/// sentinel for texture handles.
+fn pass_reads_texture(
+    pass: &Pass,
+    target_handle: MetalHandle<MTLTextureKind>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
+) -> bool {
+    if target_handle.is_null() {
+        return false;
+    }
+    if pass_samples_texture(pass, target_handle, texture_view_to_base, frame_sampled) {
+        return true;
+    }
+    pass.leading_blits.iter().any(|b| {
+        blit_read_texture(b).is_some_and(|texture| {
+            texture == target_handle || texture_view_to_base.get(&texture) == Some(&target_handle)
+        })
+    })
+}
+
+/// True if a fragment- or vertex-sampler bind inside `pass` reads `target_handle` or a view of it.
+fn pass_samples_texture(
+    pass: &Pass,
+    target_handle: MetalHandle<MTLTextureKind>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+    frame_sampled: &FxHashSet<MetalHandle<MTLTextureKind>>,
+) -> bool {
+    if target_handle.is_null() {
+        return false;
+    }
+    // Every sampler bind in a pass of this submission went through
+    // `emit_command`, which puts the bound texture and the storage it views
+    // into `frame_sampled`, so a target missing there is sampled by no pass
+    // and the command scan is skipped.
+    if !frame_sampled.contains(&target_handle) {
+        debug_assert!(
+            !commands_sample_texture(pass, target_handle, texture_view_to_base),
+            "a pass samples {target_handle:#x}, which no bind this submission marked"
+        );
+        return false;
+    }
+    commands_sample_texture(pass, target_handle, texture_view_to_base)
+}
+
+/// Scan `pass`'s commands for a sampler bind of `target_handle` or a view of it.
+fn commands_sample_texture(
+    pass: &Pass,
+    target_handle: MetalHandle<MTLTextureKind>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> bool {
+    pass.commands.iter().any(|command| {
+        let Some(texture) = command_sampled_texture(command) else {
+            return false;
+        };
+        if texture == target_handle {
+            return true;
+        }
+        // A bind of the target's sRGB twin view reads the same storage.
+        !texture_view_to_base.is_empty()
+            && texture_view_to_base.get(&texture) == Some(&target_handle)
+    })
+}
+
+/// True if `pass` attaches `texture` anywhere: any colour slot at any subresource, or as depth.
+fn pass_attaches_texture(pass: &Pass, texture: MetalHandle<MTLTextureKind>) -> bool {
+    !texture.is_null()
+        && (pass.color_texture == texture
+            || pass.depth_texture == texture
+            || pass.extra_color.iter().any(|a| a.texture == texture))
+}
+
+/// True if the texture handle `raw` is `target` or a view of it.
+///
+/// `raw` must come from a field that carries a texture handle; 0 names nothing.
+fn handle_names_texture(
+    raw: u64,
+    target: MetalHandle<MTLTextureKind>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> bool {
+    if raw == 0 || target.is_null() {
+        return false;
+    }
+    if raw == target.raw() {
+        return true;
+    }
+    if texture_view_to_base.is_empty() {
+        return false;
+    }
+    // SAFETY: callers pass only texture-typed fields (a texture blit's
+    // `src_handle` / `dst_handle`), each packed from
+    // the encoder's typed cache via `.raw()` and checked non-zero above.
+    let handle = unsafe { MetalHandle::<MTLTextureKind>::new(raw) };
+    texture_view_to_base.get(&handle) == Some(&target)
+}
+
+/// Which of the current attachments `PassState::push_pass` opens a pass on.
+enum PassAttach {
+    /// Render target 0 and its extras, with the depth attachment.
+    Both,
+    /// Render target 0 alone, for a pending colour clear ahead of a depth-only pass.
+    ColorOnly,
+    /// The depth attachment alone, while render target 0 is left out.
+    DepthOnly,
+}
+
+/// What one leading blit does to the texture a Rule I scan follows.
+enum BlitEffect {
+    Reads,
+    Overwrites,
+    Neither,
+}
+
+/// Classify `blit` against `target` for Rule I.
+///
+/// A blit that takes the texture as its source reads it, and so does a
+/// mipmap regeneration, which reads level 0 to write the rest. A
+/// texture-to-texture copy overwrites the target when it lands on the same
+/// slice and level at origin zero, one plane deep, with the region the size
+/// of that level. A depth transfer overwrites a depth target when it lands
+/// on the same level: the unix encoder (`metal::depth_transfer::encode`)
+/// ignores the region fields and always writes slice 0 of `dst_mip_level`
+/// from origin zero at that level's full extent, resampling the source when
+/// the sizes differ. It writes the depth plane in every case and the stencil
+/// plane only when both ends carry one, which is why a stencil clear is no
+/// candidate. Every other write (a partial copy, a buffer upload) counts as
+/// neither. An unknown variant touching the texture at either end is a read.
+fn blit_effect_on(
+    blit: &BlitCommand,
+    target: &ClearedTarget,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> BlitEffect {
+    match BlitCommandType::from_repr(blit.cmd) {
+        Some(BlitCommandType::CopyTextureToTexture) => {
+            if handle_names_texture(blit.src_handle, target.texture, texture_view_to_base) {
+                BlitEffect::Reads
+            } else if handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base)
+                && blit.dst_mip_level == target.level
+                && blit.dst_slice == target.slice
+                && blit.dst_offset == 0
+                && blit.depth <= 1
+                && (blit.region_w, blit.region_h) == target.size
+            {
+                BlitEffect::Overwrites
+            } else {
+                BlitEffect::Neither
+            }
+        }
+        Some(BlitCommandType::TransferDepth) => {
+            if handle_names_texture(blit.src_handle, target.texture, texture_view_to_base) {
+                BlitEffect::Reads
+            } else if target.depth
+                && target.slice == 0
+                && handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base)
+                && blit.dst_mip_level == target.level
+            {
+                BlitEffect::Overwrites
+            } else {
+                BlitEffect::Neither
+            }
+        }
+        Some(BlitCommandType::GenerateMipmaps) => {
+            if handle_names_texture(blit.dst_handle, target.texture, texture_view_to_base) {
+                BlitEffect::Reads
+            } else {
+                BlitEffect::Neither
+            }
+        }
+        Some(
+            BlitCommandType::CopyBufferToTexture
+            | BlitCommandType::CopyBufferToDepth
+            | BlitCommandType::CopyBufferToStencil
+            | BlitCommandType::CopyBufferToBuffer
+            | BlitCommandType::NotifyBufferDidModifyRange,
+        ) => BlitEffect::Neither,
+        None => {
+            let raw = target.texture.raw();
+            if blit.src_handle == raw || blit.dst_handle == raw {
+                BlitEffect::Reads
+            } else {
+                BlitEffect::Neither
+            }
+        }
+    }
+}
+
+/// The attachments a Rule I candidate clears, or `None` when the pass is no candidate.
+///
+/// A candidate draws nothing, carries no leading blit, no colour resolve and
+/// no counting query, has no multisampled colour attachment (a clear there lands
+/// on the companion later passes load), and clears no stencil plane. Its
+/// uncleared attachments are ignored: a `Load` stores back what it loaded,
+/// and a `DontCare` load stores undefined contents that leaving the texture
+/// alone can only improve on.
+fn dead_clear_candidate(pass: &Pass) -> Option<ClearedTargets> {
+    if !pass.leading_blits.is_empty()
+        || pass.has_counting_visibility
+        || pass.commands.iter().any(Command::is_draw)
+        || !pass.color_resolve_texture.is_null()
+        || !pass.color_msaa_texture.is_null()
+        || pass
+            .extra_color
+            .iter()
+            .any(|a| !a.resolve_texture.is_null() || !a.msaa_texture.is_null())
+        || (!pass.depth_texture.is_null() && matches!(pass.stencil_load, StencilLoad::Clear { .. }))
+    {
+        return None;
+    }
+    let mut targets = ClearedTargets {
+        items: [ClearedTarget::NONE; 5],
+        len: 0,
+    };
+    if !pass.color_texture.is_null() && matches!(pass.color_load, ColorLoad::Clear { .. }) {
+        targets.push(ClearedTarget {
+            texture: pass.color_texture,
+            slice: pass.color_slice(),
+            level: pass.color_level(),
+            size: pass.color_size,
+            depth: false,
+        });
+    }
+    for a in &pass.extra_color {
+        if a.is_bound() && matches!(a.load, ColorLoad::Clear { .. }) {
+            targets.push(ClearedTarget {
+                texture: a.texture,
+                slice: a.slice(),
+                level: a.level(),
+                size: a.size,
+                depth: false,
+            });
+        }
+    }
+    if !pass.depth_texture.is_null() && matches!(pass.depth_load, DepthLoad::Clear { .. }) {
+        targets.push(ClearedTarget {
+            texture: pass.depth_texture,
+            slice: 0,
+            level: pass.depth_level,
+            size: pass.depth_size,
+            depth: true,
+        });
+    }
+    (targets.len > 0).then_some(targets)
+}
+
+/// Return the texture view a real sampler bind reads.
+const fn command_sampled_texture(command: &Command) -> Option<MetalHandle<MTLTextureKind>> {
+    let is_texture_bind = command.cmd == CommandType::SetFragmentTexture as u32
+        || command.cmd == CommandType::SetVertexTexture as u32;
+    if !is_texture_bind || command.param_b == 0 {
+        return None;
+    }
+    // SAFETY: Both texture-bind commands store a non-null MTLTexture handle
+    // in param_b, packed from the encoder's typed cache via .raw().
+    Some(unsafe { MetalHandle::new(command.param_b) })
+}
+
+/// True if `pass` resolves one of its colour attachments into `target_handle`.
+///
+/// A resolve carries the view it writes rather than the target's identity,
+/// which is the sRGB twin on a pass that encodes on write, so each candidate
+/// is mapped back to the base handle every rule keys on.
+///
+/// `target_handle == 0` is treated as "no resolve" since 0 is the unset
+/// sentinel for texture handles.
+fn pass_resolves_into(
+    pass: &Pass,
+    target_handle: MetalHandle<MTLTextureKind>,
+    texture_view_to_base: &FxHashMap<MetalHandle<MTLTextureKind>, MetalHandle<MTLTextureKind>>,
+) -> bool {
+    if target_handle.is_null() {
+        return false;
+    }
+    core::iter::once(pass.color_resolve_texture)
+        .chain(pass.extra_color.iter().map(|a| a.resolve_texture))
+        .any(|view| {
+            !view.is_null()
+                && (view == target_handle
+                    || texture_view_to_base.get(&view) == Some(&target_handle))
+        })
+}
+
+/// True if `pass` binds `(texture, subresource)` as one of its colour attachments.
+///
+/// Render target 0 and the extras 1..3 answer the same question: whichever
+/// slot the texture sits in, the pass draws into that subresource. Identity
+/// is asked with the attachment's base handle, the one every rule, sampler
+/// bind and blit sees; the sRGB twin view a pass may write through is
+/// carried beside it and never stands in for it.
+///
+/// `texture == 0` is treated as "not attached" since 0 is the unset sentinel
+/// for texture handles.
+fn pass_attaches_color(
+    pass: &Pass,
+    texture: MetalHandle<MTLTextureKind>,
+    subresource: u32,
+) -> bool {
+    if texture.is_null() {
+        return false;
+    }
+    (pass.color_texture == texture && pass.color_subresource == subresource)
+        || pass
+            .extra_color
+            .iter()
+            .any(|a| a.texture == texture && a.subresource == subresource)
+}
+
+/// The texture a blit writes, if it writes one.
+///
+/// `NotifyBufferDidModifyRange` and `CopyBufferToBuffer` carry buffer
+/// handles in `src_handle`/`dst_handle`, never texture handles, so they
+/// write no texture. An unknown variant on the wire is conservatively
+/// treated as texture-writing. The exhaustive match makes any new
+/// `BlitCommandType` a compile error here, forcing the author to classify it.
+const fn blit_written_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
+    let writes_texture = match BlitCommandType::from_repr(blit.cmd) {
+        Some(
+            BlitCommandType::CopyBufferToTexture
+            | BlitCommandType::CopyBufferToDepth
+            | BlitCommandType::CopyBufferToStencil
+            | BlitCommandType::TransferDepth
+            | BlitCommandType::CopyTextureToTexture
+            | BlitCommandType::GenerateMipmaps,
+        )
+        | None => true,
+        Some(BlitCommandType::CopyBufferToBuffer | BlitCommandType::NotifyBufferDidModifyRange) => {
+            false
+        }
+    };
+    if !writes_texture || blit.dst_handle == 0 {
+        return None;
+    }
+    // SAFETY: a texture-writing blit carries a non-null MTLTexture handle in
+    // `dst_handle`, packed from the encoder's typed cache via `.raw()`.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(blit.dst_handle) })
+}
+
+/// The texture a blit reads, if it reads one.
+///
+/// A texture copy and a depth transfer read their source; mipmap generation
+/// reads level 0 of the texture it writes. The buffer-sourced variants read
+/// no texture. An unknown variant on the wire carries no known source and is
+/// treated as reading none. The exhaustive match makes any new
+/// `BlitCommandType` a compile error here, forcing the author to classify it.
+const fn blit_read_texture(blit: &BlitCommand) -> Option<MetalHandle<MTLTextureKind>> {
+    let handle = match BlitCommandType::from_repr(blit.cmd) {
+        Some(BlitCommandType::CopyTextureToTexture | BlitCommandType::TransferDepth) => {
+            blit.src_handle
+        }
+        Some(BlitCommandType::GenerateMipmaps) => blit.dst_handle,
+        Some(
+            BlitCommandType::CopyBufferToTexture
+            | BlitCommandType::CopyBufferToDepth
+            | BlitCommandType::CopyBufferToStencil
+            | BlitCommandType::CopyBufferToBuffer
+            | BlitCommandType::NotifyBufferDidModifyRange,
+        )
+        | None => 0,
+    };
+    if handle == 0 {
+        return None;
+    }
+    // SAFETY: a texture-reading blit carries a non-null MTLTexture handle in
+    // the field chosen above, packed from the encoder's typed cache via `.raw()`.
+    Some(unsafe { MetalHandle::<MTLTextureKind>::new(handle) })
+}
+
+/// True if any blit in `blits` writes to texture `target_handle`.
+///
+/// Used by Rule E to refuse moving a clear past a pass whose leading blits
+/// write the cleared target (`StretchRect`'s typical pattern: copy A → B,
+/// then render onto B; a clear folded into that render pass would wipe the
+/// copy).
+fn blit_list_writes(blits: &[BlitCommand], target_handle: MetalHandle<MTLTextureKind>) -> bool {
+    if target_handle.is_null() {
+        return false;
+    }
+    blits
+        .iter()
+        .any(|b| blit_written_texture(b) == Some(target_handle))
+}
+
+impl Default for PassState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What `LastBoundCache::vertex_buffer_changed` decided for a stream slot.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VertexBufferBind {
+    /// The same wrapper at the same offset is bound: no command.
+    Same,
+    /// A different binding: emit `setVertexBuffer`.
+    Changed,
+    /// Same handle and offset over another backing generation: emit.
+    ///
+    /// The handle is a reused object address, so the wrapper it named
+    /// before was destroyed inside this pass; the caller reports it.
+    ReusedHandle,
+}
+
+/// Last-bound immutable byte snapshot for one encoder slot.
+///
+/// Retains the latest token instead of copying its bytes. Tokens must return
+/// the same immutable slice for their entire cached lifetime. Arena-backed
+/// tokens must be reset before their arena is cleared, reused or transferred
+/// to another owner. A fresh render encoder also requires a reset.
+pub struct SnapshotBytesCache<T: AsRef<[u8]>> {
+    snapshot: Option<T>,
+}
+
+impl<T: AsRef<[u8]>> SnapshotBytesCache<T> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { snapshot: None }
+    }
+
+    /// Forget the token before its backing storage can be retired or reused.
+    pub fn reset(&mut self) {
+        self.snapshot = None;
+    }
+
+    /// Record a nonempty snapshot and report whether its binding changed.
+    ///
+    /// Equal pointers and lengths identify an unchanged immutable snapshot.
+    /// Distinct snapshots compare bytewise, preserving NaN payloads and signed
+    /// zero. Even an equal snapshot replaces the token so subsequent draws can
+    /// use its identity. Empty snapshots leave the existing binding untouched.
+    #[inline]
+    pub fn changed(&mut self, snapshot: T) -> bool {
+        let bytes = snapshot.as_ref();
+        if bytes.is_empty() {
+            return false;
+        }
+        let changed = self.snapshot.as_ref().is_none_or(|previous| {
+            let previous = previous.as_ref();
+            !(core::ptr::eq(previous, bytes) || previous == bytes)
+        });
+        self.snapshot = Some(snapshot);
+        changed
+    }
+}
+
+impl<T: AsRef<[u8]>> Default for SnapshotBytesCache<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Per-render-pass last-bound state cache.
+///
+/// Skips redundant `setFragmentSamplerState` / `setFragmentTexture` /
+/// `setRenderPipelineState` / `setDepthStencilState` / `setCullMode`
+/// emissions when the value matches what was last bound on the same
+/// `MTLRenderCommandEncoder`. State persists across draws within a Metal
+/// render encoder, so the cache is sound as long as `reset` is called on
+/// every new-pass entry.
+///
+/// `0` is the unset sentinel for the `u64` handles — Metal object pointers
+/// are never zero, so the first emission of a real handle always reports
+/// "changed". `cull_mode` uses `Option<CullMode>` because `CullMode::None`
+/// (value 0) is a valid binding distinct from "not yet bound".
+pub struct LastBoundCache {
+    fragment_samplers: [u64; LAST_BOUND_MAX_STAGES],
+    fragment_textures: [u64; LAST_BOUND_MAX_STAGES],
+    /// Vertex texture fetch slots 0..3.
+    ///
+    /// `MTLTexture` / `MTLSamplerState` handles bound on the vertex
+    /// stage; `0` is the unset sentinel.
+    vertex_textures: [u64; VERTEX_SAMPLER_SLOTS],
+    vertex_samplers: [u64; VERTEX_SAMPLER_SLOTS],
+    pipeline: u64,
+    depth_stencil: u64,
+    stencil_reference: u32,
+    cull_mode: Option<CullMode>,
+    triangle_fill_mode: TriangleFillMode,
+    /// VS pos-fixup slot — half-pixel rasterization fixup `(1/vp_w, -1/vp_h, 0, 0)`.
+    ///
+    /// Re-bound only when the viewport dims change (rare), so the per-draw
+    /// cost is a length-then-memcmp against 16 bytes.
+    vs_pos_fixup: Vec<u8>,
+    /// VS draw slot — the per-draw `VsDraw` uniform (point and clip state).
+    ///
+    /// Re-bound only when a point state, a clip plane or the view matrix
+    /// changes, so the per-draw cost is a length-then-memcmp against
+    /// `vs_draw::VS_DRAW_BYTES`.
+    vs_draw: Vec<u8>,
+    /// VS LOD slot: the per-vertex-sampler explicit-LOD rows.
+    ///
+    /// Set only for a draw whose vertex shader samples a slot that needs its
+    /// row; `sampler_state::VS_LOD_BYTES`.
+    vs_lod: Vec<u8>,
+    /// PS slot 14 — alpha-test reference float, when alpha test is enabled.
+    ps_alpha_ref: Vec<u8>,
+    /// PS slot 13 — fog colour vec4, when fog is enabled.
+    ps_fog_color: Vec<u8>,
+    /// PS slot 12 — per-stage bump-environment matrix.
+    ///
+    /// Set when the bound PS uses `texbem`/`texbeml`/`bem`.
+    ps_bump_env: Vec<u8>,
+    /// PS LOD-bias slot: per-sampler-slot `D3DSAMP_MIPMAPLODBIAS`.
+    ///
+    /// Set only while a bound stage carries a non-zero bias.
+    ps_lod_bias: Vec<u8>,
+    /// PS draw slot: the per-draw `PsDraw` uniform (the render scale a `vPos` read applies).
+    ///
+    /// Set only for a draw whose shader declares `vPos` into a scaled target;
+    /// `ps_draw::PS_DRAW_BYTES`.
+    ps_draw: Vec<u8>,
+    /// Vertex stream slots 0..16 — bound `MTLBuffer` handle, byte offset, backing generation.
+    ///
+    /// Indexed by Metal vertex buffer slot: D3D9 stream `n` binds at slot `n`,
+    /// and a crossing attribute at a slot of its own (`streams::CrossingFetch`).
+    /// `(0, _, _)` is the unset sentinel (Metal buffer handles are never
+    /// zero). The generation is the backing allocation's identity behind the
+    /// handle: a handle is a raw object address, and an address reused by a
+    /// later wrapper must not read as the same binding.
+    vertex_buffers: [(u64, u32, u64); VERTEX_STREAM_SLOTS as usize],
+    /// Resolved `(x, y, w, h)` scissor rect.
+    ///
+    /// `None` is the unset sentinel — a brand-new render encoder has no
+    /// scissor bound, so the first `emit_scissor` on a new pass must
+    /// always go through.
+    scissor_rect: Option<(u32, u32, u32, u32)>,
+    /// `D3DRS_BLENDFACTOR` as a `D3DCOLOR` u32.
+    ///
+    /// Starts each pass at [`FRESH_BLEND_COLOR`], the value a fresh Metal
+    /// encoder blends with, so the first draw of a pass at any other factor,
+    /// the D3D9 default opaque white included, emits its `SetBlendColor`.
+    blend_color: u32,
+    /// The `setDepthBias` pair.
+    ///
+    /// Only the application's `D3DRS_SLOPESCALEDEPTHBIAS` is non-zero in
+    /// practice: the constant `D3DRS_DEPTHBIAS` term reaches the
+    /// vertex shader through `pos_fixup` instead. Stored as raw bits so the
+    /// comparison is exact (no NaN ambiguity) and the slot has a
+    /// definite "not yet bound" sentinel — `(0, 0)` matches Metal's
+    /// fresh-encoder default.
+    depth_bias_bits: (u32, u32),
+}
+
+impl LastBoundCache {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            fragment_samplers: [0; LAST_BOUND_MAX_STAGES],
+            fragment_textures: [0; LAST_BOUND_MAX_STAGES],
+            vertex_textures: [0; VERTEX_SAMPLER_SLOTS],
+            vertex_samplers: [0; VERTEX_SAMPLER_SLOTS],
+            pipeline: 0,
+            depth_stencil: 0,
+            stencil_reference: 0,
+            cull_mode: None,
+            triangle_fill_mode: TriangleFillMode::Fill,
+            vs_pos_fixup: Vec::new(),
+            vs_draw: Vec::new(),
+            vs_lod: Vec::new(),
+            ps_alpha_ref: Vec::new(),
+            ps_fog_color: Vec::new(),
+            ps_bump_env: Vec::new(),
+            ps_lod_bias: Vec::new(),
+            ps_draw: Vec::new(),
+            vertex_buffers: [(0, 0, 0); VERTEX_STREAM_SLOTS as usize],
+            scissor_rect: None,
+            blend_color: FRESH_BLEND_COLOR,
+            depth_bias_bits: (0, 0),
+        }
+    }
+
+    /// Forget every binding.
+    ///
+    /// Call on new-pass entry — Metal resets state across `endEncoding`
+    /// / fresh `renderCommandEncoder` boundaries. Byte-blob slots keep
+    /// their backing allocation via `Vec::clear`, so steady-state passes
+    /// don't reallocate.
+    pub fn reset(&mut self) {
+        self.fragment_samplers = [0; LAST_BOUND_MAX_STAGES];
+        self.fragment_textures = [0; LAST_BOUND_MAX_STAGES];
+        self.vertex_textures = [0; VERTEX_SAMPLER_SLOTS];
+        self.vertex_samplers = [0; VERTEX_SAMPLER_SLOTS];
+        self.pipeline = 0;
+        self.depth_stencil = 0;
+        self.stencil_reference = 0;
+        self.cull_mode = None;
+        self.triangle_fill_mode = TriangleFillMode::Fill;
+        self.vs_pos_fixup.clear();
+        self.vs_draw.clear();
+        self.vs_lod.clear();
+        self.ps_alpha_ref.clear();
+        self.ps_fog_color.clear();
+        self.ps_bump_env.clear();
+        self.ps_lod_bias.clear();
+        self.ps_draw.clear();
+        self.vertex_buffers = [(0, 0, 0); VERTEX_STREAM_SLOTS as usize];
+        self.scissor_rect = None;
+        self.blend_color = FRESH_BLEND_COLOR;
+        self.depth_bias_bits = (0, 0);
+    }
+
+    #[inline]
+    pub const fn fragment_sampler_changed(&mut self, stage: u32, handle: u64) -> bool {
+        let slot = &mut self.fragment_samplers[stage as usize];
+        if *slot == handle {
+            false
+        } else {
+            *slot = handle;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn vertex_texture_changed(&mut self, slot: u32, handle: u64) -> bool {
+        let s = &mut self.vertex_textures[slot as usize];
+        if *s == handle {
+            false
+        } else {
+            *s = handle;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn vertex_sampler_changed(&mut self, slot: u32, handle: u64) -> bool {
+        let s = &mut self.vertex_samplers[slot as usize];
+        if *s == handle {
+            false
+        } else {
+            *s = handle;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn fragment_texture_changed(&mut self, stage: u32, handle: u64) -> bool {
+        let slot = &mut self.fragment_textures[stage as usize];
+        if *slot == handle {
+            false
+        } else {
+            *slot = handle;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn pipeline_changed(&mut self, handle: u64) -> bool {
+        if self.pipeline == handle {
+            false
+        } else {
+            self.pipeline = handle;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn depth_stencil_changed(&mut self, handle: u64) -> bool {
+        if self.depth_stencil == handle {
+            false
+        } else {
+            self.depth_stencil = handle;
+            true
+        }
+    }
+
+    /// Emit only changes from the native encoder's initial solid fill.
+    pub fn triangle_fill_mode_changed(&mut self, mode: TriangleFillMode) -> bool {
+        if self.triangle_fill_mode == mode {
+            return false;
+        }
+        self.triangle_fill_mode = mode;
+        true
+    }
+
+    #[inline]
+    pub const fn cull_mode_changed(&mut self, mode: CullMode) -> bool {
+        // `Option::eq` / `PartialEq` aren't const-stable for `Option<CullMode>`,
+        // so destructure manually and compare via the `u32` repr.
+        if let Some(prev) = self.cull_mode
+            && prev as u32 == mode as u32
+        {
+            return false;
+        }
+        self.cull_mode = Some(mode);
+        true
+    }
+
+    /// Whether vertex stream `slot` needs a `setVertexBuffer` for `(handle, offset)`.
+    ///
+    /// Records the binding when it does. `slot` is the D3D9 stream index,
+    /// below [`VERTEX_STREAM_SLOTS`]. `generation` is the backing allocation
+    /// behind `handle`: the same handle and offset over a different
+    /// generation is a reused object address, and the bind is re-emitted
+    /// rather than deduplicated onto the wrapper the address used to name.
+    #[inline]
+    pub const fn vertex_buffer_changed(
+        &mut self,
+        slot: u32,
+        handle: u64,
+        offset: u32,
+        generation: u64,
+    ) -> VertexBufferBind {
+        let cur = &mut self.vertex_buffers[slot as usize];
+        if cur.0 == handle && cur.1 == offset {
+            if cur.2 == generation {
+                return VertexBufferBind::Same;
+            }
+            *cur = (handle, offset, generation);
+            return VertexBufferBind::ReusedHandle;
+        }
+        *cur = (handle, offset, generation);
+        VertexBufferBind::Changed
+    }
+
+    /// Forget the vertex buffer bound at stream slot 0.
+    ///
+    /// Forces the next `vertex_buffer_changed(0, ..)` to report a change.
+    /// Call after binding slot 0 with inline bytes
+    /// (`setVertexBytes(..., index 0)`): that clobbers the real Metal
+    /// vertex-buffer binding while leaving this cache pointing at the
+    /// previously bound buffer, so without this a following bound draw
+    /// with the same `(handle, offset)` would skip its `setVertexBuffer`
+    /// and read the inline payload as vertices. Resets to the `(0, _)`
+    /// unset sentinel (Metal buffer handles are never zero).
+    #[inline]
+    pub const fn invalidate_vertex_buffer(&mut self) {
+        self.invalidate_vertex_buffer_slot(0);
+    }
+
+    /// Forget the vertex buffer bound at stream `slot`.
+    ///
+    /// The per-slot form of [`Self::invalidate_vertex_buffer`], for a stream
+    /// the draw path fed inline zero bytes because nothing was bound to it.
+    #[inline]
+    pub const fn invalidate_vertex_buffer_slot(&mut self, slot: u32) {
+        self.vertex_buffers[slot as usize] = (0, 0, 0);
+    }
+
+    #[inline]
+    pub const fn scissor_rect_changed(&mut self, rect: (u32, u32, u32, u32)) -> bool {
+        // `PartialEq` on tuples isn't const-stable; destructure manually.
+        if let Some(prev) = self.scissor_rect
+            && prev.0 == rect.0
+            && prev.1 == rect.1
+            && prev.2 == rect.2
+            && prev.3 == rect.3
+        {
+            return false;
+        }
+        self.scissor_rect = Some(rect);
+        true
+    }
+
+    #[inline]
+    pub const fn stencil_reference_changed(&mut self, value: u32) -> bool {
+        if self.stencil_reference == value {
+            false
+        } else {
+            self.stencil_reference = value;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn blend_color_changed(&mut self, d3dcolor: u32) -> bool {
+        if self.blend_color == d3dcolor {
+            false
+        } else {
+            self.blend_color = d3dcolor;
+            true
+        }
+    }
+
+    #[inline]
+    pub const fn depth_bias_changed(&mut self, depth_bias: f32, slope_scale: f32) -> bool {
+        let bits = (depth_bias.to_bits(), slope_scale.to_bits());
+        if self.depth_bias_bits.0 == bits.0 && self.depth_bias_bits.1 == bits.1 {
+            false
+        } else {
+            self.depth_bias_bits = bits;
+            true
+        }
+    }
+
+    #[inline]
+    pub fn vs_pos_fixup_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.vs_pos_fixup, bytes)
+    }
+
+    #[inline]
+    pub fn vs_draw_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.vs_draw, bytes)
+    }
+
+    /// Record the vertex LOD table; true when it differs from the last bound.
+    #[inline]
+    pub fn vs_lod_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.vs_lod, bytes)
+    }
+
+    #[inline]
+    pub fn ps_alpha_ref_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.ps_alpha_ref, bytes)
+    }
+
+    #[inline]
+    pub fn ps_fog_color_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.ps_fog_color, bytes)
+    }
+
+    #[inline]
+    pub fn ps_bump_env_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.ps_bump_env, bytes)
+    }
+
+    #[inline]
+    pub fn ps_lod_bias_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.ps_lod_bias, bytes)
+    }
+
+    /// Record the `PsDraw` uniform; true when it differs from the last bound.
+    #[inline]
+    pub fn ps_draw_changed(&mut self, bytes: &[u8]) -> bool {
+        update_inline_bytes(&mut self.ps_draw, bytes)
+    }
+}
+
+impl Default for LastBoundCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Returns `true` and updates `cache` iff `bytes` differs from `cache`.
+///
+/// `Vec<u8> == [u8]` is a length-then-memcmp; the update path retains the
+/// Vec's capacity so the typical "constants change once, then stick" pattern
+/// allocates exactly once per (slot, pass) pair.
+fn update_inline_bytes(cache: &mut Vec<u8>, bytes: &[u8]) -> bool {
+    if cache.as_slice() == bytes {
+        false
+    } else {
+        cache.clear();
+        cache.extend_from_slice(bytes);
+        true
+    }
+}
+
+/// Debug-only mirror of what was last emitted onto the current encoder.
+///
+/// Tracks each cache-covered slot whose `Command` embeds a directly comparable
+/// value. Updated at the single command funnel (`PassState::emit_command`) and
+/// diffed against [`LastBoundCache`] before every draw via
+/// [`LastBoundCache::debug_assert_in_sync`].
+///
+/// A correct gated emit calls `<slot>_changed(v)` (advancing the cache to `v`)
+/// immediately before pushing `set_<slot>(v)` (advancing this shadow to `v`),
+/// so cache and shadow agree at every draw. A *bypass* — a `set_<slot>` pushed
+/// without its `_changed` gate — advances the shadow while the cache stays
+/// stale, and the next `debug_assert_in_sync` catches it. A clear-quad emitted
+/// mid-pass is the usual source of such a bypass, since it binds pipeline /
+/// depth-stencil / scissor / vertex-buffer state outside the per-draw gates.
+///
+/// `blend_color` (the command carries four `f32` lanes; the cache a packed
+/// `D3DCOLOR`) and the four inline-bytes slots (the command carries a pointer +
+/// length, not the bytes the cache holds) are deliberately not mirrored — they
+/// are emitted solely from `emit_draw`, never a clear-quad, so the clear-quad
+/// bypass surface (pipeline / depth-stencil / scissor / vertex buffer) stays
+/// fully covered. Multi-field slots keep their command's *packed* `param_*`
+/// form so decoding never needs a truncating cast; `debug_assert_in_sync`
+/// re-packs the cache side with widening casts only.
+/// Last-bound sentinel a null-texture bind records for its texture slot.
+///
+/// A `SetFragmentNullTexture` command binds the shared opaque-black texture, not
+/// a game texture, so the per-slot dedup stores a reserved value — never a Metal
+/// handle pointer, and distinct per kind so a slot's declared type changing
+/// re-emits. Shared by the draw path and the in-sync shadow so the two agree.
+#[must_use]
+pub const fn null_texture_tex_sentinel(kind: u64) -> u64 {
+    u64::MAX - kind
+}
+
+/// Last-bound sentinel for the default sampler a null-texture bind installs.
+///
+/// Reserved, never a Metal sampler pointer; recorded so a later real sampler
+/// bind to the slot is not deduped away.
+pub const NULL_TEXTURE_SAMPLER_SENTINEL: u64 = u64::MAX - 8;
+
+/// The last-bound key for a sampler handle about to be bound.
+///
+/// Handle 0 is a sampler state the device declined to create; the bind
+/// command still goes out and the unix side installs the default sampler in
+/// its place, so the cache records the default's sentinel rather than the 0
+/// every slot starts at, which would swallow the bind.
+#[must_use]
+pub const fn sampler_cache_key(handle: u64) -> u64 {
+    if handle == 0 {
+        NULL_TEXTURE_SAMPLER_SENTINEL
+    } else {
+        handle
+    }
+}
+
+#[cfg(debug_assertions)]
+#[derive(Default)]
+pub struct DebugBoundShadow {
+    fragment_samplers: [u64; LAST_BOUND_MAX_STAGES],
+    fragment_textures: [u64; LAST_BOUND_MAX_STAGES],
+    pipeline: u64,
+    depth_stencil: u64,
+    /// Raw `CullMode` discriminant (`Command::param_a`).
+    cull_mode: Option<u32>,
+    triangle_fill_mode: u32,
+    /// Per vertex stream slot `(handle, offset)`, `offset` kept as the command's `u64` param.
+    vertex_buffers: [(u64, u64); VERTEX_STREAM_SLOTS as usize],
+    /// Raw `(param_a, param_b, param_c)` of `Command::set_scissor_rect`.
+    scissor_rect: Option<(u32, u64, u64)>,
+    /// Raw `(param_a, param_b)` of `Command::set_depth_bias`.
+    depth_bias: (u32, u64),
+}
+
+#[cfg(debug_assertions)]
+impl DebugBoundShadow {
+    /// Mirror a just-pushed `Command` into its slot.
+    ///
+    /// Untracked command types (viewport, draws, blend color, fragment
+    /// bytes, inline vertex bytes at a uniform slot, visibility) are
+    /// ignored.
+    const fn record(&mut self, cmd: &Command) {
+        let t = cmd.cmd;
+        if t == CommandType::SetRenderPipelineState as u32 {
+            self.pipeline = cmd.param_b;
+        } else if t == CommandType::SetDepthStencilState as u32 {
+            self.depth_stencil = cmd.param_b;
+        } else if t == CommandType::SetCullMode as u32 {
+            self.cull_mode = Some(cmd.param_a);
+        } else if t == CommandType::SetTriangleFillMode as u32 {
+            self.triangle_fill_mode = cmd.param_a;
+        } else if t == CommandType::SetFragmentTexture as u32 {
+            self.fragment_textures[cmd.param_a as usize] = cmd.param_b;
+        } else if t == CommandType::SetFragmentSamplerState as u32 {
+            self.fragment_samplers[cmd.param_a as usize] = sampler_cache_key(cmd.param_b);
+        } else if t == CommandType::SetFragmentNullTexture as u32 {
+            // Binds the opaque-black texture + default sampler; mirror the same
+            // sentinels the draw path records so the cache and shadow agree.
+            self.fragment_textures[cmd.param_a as usize] = null_texture_tex_sentinel(cmd.param_b);
+            self.fragment_samplers[cmd.param_a as usize] = NULL_TEXTURE_SAMPLER_SENTINEL;
+        } else if t == CommandType::SetScissorRect as u32 {
+            self.scissor_rect = Some((cmd.param_a, cmd.param_b, cmd.param_c));
+        } else if t == CommandType::SetVertexBuffer as u32 {
+            // The cache tracks the vertex stream slots; the uniform slots
+            // above them are never bound through `SetVertexBuffer`.
+            if cmd.param_a < VERTEX_STREAM_SLOTS {
+                self.vertex_buffers[cmd.param_a as usize] = (cmd.param_b, cmd.param_c);
+            }
+        } else if t == CommandType::SetDepthBias as u32 {
+            self.depth_bias = (cmd.param_a, cmd.param_b);
+        } else if (t == CommandType::SetVertexBytes as u32
+            || t == CommandType::SetVertexBytesAt as u32)
+            && cmd.param_a < VERTEX_STREAM_SLOTS
+        {
+            // An inline bind at a stream slot clobbers the real Metal vertex
+            // buffer there; mirror `LastBoundCache::invalidate_vertex_buffer_slot`
+            // so both forget it.
+            self.vertex_buffers[cmd.param_a as usize] = (0, 0);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl LastBoundCache {
+    /// Assert every mirrored slot matches what was actually emitted onto the encoder (`shadow`).
+    ///
+    /// Debug-build only; called before each draw from `FrameEncoder`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a cache↔encoder desync — a `set_*` that bypassed its
+    /// `_changed` gate, or a gate that advanced the cache to a value the
+    /// matching emit didn't carry. That panic is the guard doing its job.
+    pub fn debug_assert_in_sync(&self, shadow: &DebugBoundShadow) {
+        assert_eq!(
+            self.pipeline, shadow.pipeline,
+            "pipeline cache desync (cache vs encoder-emitted)"
+        );
+        assert_eq!(
+            self.depth_stencil, shadow.depth_stencil,
+            "depth-stencil cache desync (cache vs encoder-emitted)"
+        );
+        assert_eq!(
+            self.cull_mode.map(|c| c as u32),
+            shadow.cull_mode,
+            "cull-mode cache desync (cache vs encoder-emitted)"
+        );
+        assert_eq!(
+            self.triangle_fill_mode as u32, shadow.triangle_fill_mode,
+            "triangle fill cache desync (cache vs encoder-emitted)"
+        );
+        // The generation behind the handle is a cache-side key only; the
+        // emitted command carries handle and offset.
+        for (slot, (&(cache_h, cache_off, _), &emitted)) in self
+            .vertex_buffers
+            .iter()
+            .zip(&shadow.vertex_buffers)
+            .enumerate()
+        {
+            assert_eq!(
+                (cache_h, u64::from(cache_off)),
+                emitted,
+                "vertex-buffer[{slot}] cache desync (cache vs encoder-emitted)"
+            );
+        }
+        assert_eq!(
+            self.scissor_rect.map(|(x, y, w, h)| (
+                x,
+                u64::from(y),
+                (u64::from(w) << 32) | u64::from(h)
+            )),
+            shadow.scissor_rect,
+            "scissor cache desync (cache vs encoder-emitted)"
+        );
+        assert_eq!(
+            (self.depth_bias_bits.0, u64::from(self.depth_bias_bits.1)),
+            shadow.depth_bias,
+            "depth-bias cache desync (cache vs encoder-emitted)"
+        );
+        for (stage, (&cache_h, &emitted_h)) in self
+            .fragment_textures
+            .iter()
+            .zip(&shadow.fragment_textures)
+            .enumerate()
+        {
+            assert_eq!(
+                cache_h, emitted_h,
+                "fragment-texture[{stage}] cache desync (cache vs encoder-emitted)"
+            );
+        }
+        for (stage, (&cache_h, &emitted_h)) in self
+            .fragment_samplers
+            .iter()
+            .zip(&shadow.fragment_samplers)
+            .enumerate()
+        {
+            assert_eq!(
+                cache_h, emitted_h,
+                "fragment-sampler[{stage}] cache desync (cache vs encoder-emitted)"
+            );
+        }
+    }
+}
+
+/// Return allocated command storage after its consumer has finished.
+fn recycle_command_vec(pool: &mut Vec<Vec<Command>>, mut commands: Vec<Command>) {
+    // Synthetic blit-only passes have no command allocation to retain.
+    if commands.capacity() != 0 {
+        commands.clear();
+        pool.push(commands);
+    }
+}
+
+#[cfg(test)]
+mod tests;
