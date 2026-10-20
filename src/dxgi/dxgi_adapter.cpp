@@ -176,10 +176,14 @@ public:
 
     pDesc->SubSysId = 0;
     pDesc->Revision = 0;
+    uint64_t video = device_.recommendedMaxWorkingSetSize();
     if (device_.hasUnifiedMemory())
-      pDesc->DedicatedVideoMemory = device_.recommendedMaxWorkingSetSize() / 2; // FIXME: use a more appropriate value
-    else
-      pDesc->DedicatedVideoMemory = device_.recommendedMaxWorkingSetSize();
+      video /= 2; // FIXME: use a more appropriate value
+    // A 32-bit build's SIZE_T: at most 3 GiB, as DXVK reports it to 32-bit
+    // games, rather than its low 32 bits (near zero on some Macs).
+    if (sizeof(SIZE_T) < 8 && video > 0xC0000000ull)
+      video = 0xC0000000ull;
+    pDesc->DedicatedVideoMemory = (SIZE_T)video;
     pDesc->DedicatedSystemMemory = 0;
     pDesc->SharedSystemMemory = 0;
     pDesc->AdapterLuid = GetAdapterLuid(device_);
