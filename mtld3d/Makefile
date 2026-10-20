@@ -196,7 +196,11 @@ endif
 # has no winebuild or archives. One shell line that exits 2 with a message on
 # the first thing missing.
 WINE_SDK_FILES_x86_64 := lib/wine/i386-windows/libwinecrt0.a lib/wine/x86_64-windows/libwinecrt0.a
-WINE_SDK_FILES_arm64  := lib/wine/aarch64-unix/compatdb.so $(WINE_SDK_FILES_x86_64) \
+# A stock arm64 Wine, one without compatdb.so (MacNeutron's, built with --enable-archs=arm64ec,aarch64), loads mtld3d
+# out of its own lib/wine, as INSTALL.md's builtin route does, and carries only the ARM64X archives: the arm64 mode
+# asks it for those and for no mtld3d tree, and only the ARM64X pair and the unix library are built for it.
+WINE_SDK_STOCK_arm64  := $(if $(wildcard $(WINE_SDK)/lib/wine/aarch64-unix/compatdb.so),,1)
+WINE_SDK_FILES_arm64  := $(if $(WINE_SDK_STOCK_arm64),,lib/wine/aarch64-unix/compatdb.so $(WINE_SDK_FILES_x86_64)) \
 	lib/wine/aarch64-windows/libwinecrt0.a lib/wine/aarch64-windows/libntdll.a
 WINE_SDK_KIND_x86_64  := an x86_64 Wine built with its link libraries, such as a wine-build x86_64 release
 WINE_SDK_KIND_arm64   := a wine-build arm64 Wine built with its link libraries (an x86_64 Wine holds lib/wine/x86_64-unix)
@@ -209,7 +213,7 @@ for file in $(WINE_SDK_FILES_$(WINE_SDK_MODE)); do \
 done$(WINE_SDK_TREE_REQUIRE_$(WINE_SDK_MODE))
 endef
 define WINE_SDK_TREE_REQUIRE_arm64
-; [ -d '$(WINE_SDK)/lib/wine/d3d9/mtld3d' ] || { echo "WINE_SDK=$(WINE_SDK) has no lib/wine/d3d9/mtld3d tree; it names a wine-build arm64 Wine, which loads mtld3d from there" >&2; exit 2; }
+$(if $(WINE_SDK_STOCK_arm64),,; [ -d '$(WINE_SDK)/lib/wine/d3d9/mtld3d' ] || { echo "WINE_SDK=$(WINE_SDK) has no lib/wine/d3d9/mtld3d tree; it names a wine-build arm64 Wine, which loads mtld3d from there" >&2; exit 2; })
 endef
 # What a target that only the arm64 mode has checks first: the ARM64X build and
 # its lint, and the legs that run it. $(1) = what needs it.
