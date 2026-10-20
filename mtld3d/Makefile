@@ -745,11 +745,18 @@ endef
 # `thread_local` destructor through llvm-mingw's `__tlregdtor`, which never
 # runs one. An snmalloc upgrade that trips either has to be read before the
 # list moves.
-ARM64X_STATIC_GUARDS := ??_B?1??initialise_for_singleton@PALWindows@snmalloc@@CAXPEA_K@Z@51
+# ARM64X_CXX_ABI names the C++ ABI of the halves' C++ (snmalloc-sys): msvc, built for the -msvc triples against
+# xwin's headers, or mingw, built for the mingw triples against llvm-mingw's own (a toolchain with no Microsoft SDK).
+# The one guard snmalloc's function-local static leaves is mangled after it; in either ABI a thread-safe static would
+# call into a runtime the link lacks (MSVC's _Init_thread_*, the Itanium ABI's __cxa_guard_*).
+ARM64X_CXX_ABI ?= msvc
+ARM64X_STATIC_GUARDS_msvc  := ??_B?1??initialise_for_singleton@PALWindows@snmalloc@@CAXPEA_K@Z@51
+ARM64X_STATIC_GUARDS_mingw := _ZGVZN8snmalloc10PALWindows24initialise_for_singletonEPyE4tidy
+ARM64X_STATIC_GUARDS := $(ARM64X_STATIC_GUARDS_$(ARM64X_CXX_ABI))
 define ARM64X_CHECK_ARCHIVES
 for lib in $(OUT_arm64)/d3d9.lib $(OUT_arm64ec)/d3d9.lib; do \
 	symbols=$$($(LLVM_MINGW)/bin/llvm-nm $$lib 2>/dev/null) || { echo "ARM64X: llvm-nm cannot read $$lib" >&2; exit 1; }; \
-	guards=$$(echo "$$symbols" | awk '{ print $$NF }' | grep -E '^#?(\?\?_B|\?\$$TSS|_Init_thread_)' | sort -u); \
+	guards=$$(echo "$$symbols" | awk '{ print $$NF }' | grep -E '^#?(\?\?_B|\?\$$TSS|_Init_thread_|_ZGV|__cxa_guard_)' | sort -u); \
 	[ "$$guards" = '$(ARM64X_STATIC_GUARDS)' ] || { echo "ARM64X: $$lib carries the static guards [$$guards] where the C++ built with -fno-threadsafe-statics may only carry [$(ARM64X_STATIC_GUARDS)]" >&2; exit 1; }; \
 	echo "$$symbols" | grep -qE ' T #?_malloc_thread_cleanup$$' || { echo "ARM64X: $$lib defines no _malloc_thread_cleanup, so no thread exit would tear its allocator down" >&2; exit 1; }; \
 	! echo "$$symbols" | grep -qE ' #?__tlregdtor$$' || { echo "ARM64X: $$lib registers a thread_local destructor through __tlregdtor, which llvm-mingw never runs" >&2; exit 1; }; \
@@ -782,8 +789,10 @@ windows-arm64x:
 	$(call arm64x_link,mtld3d,shim/mtld3d.def)
 	$(call arm64x_link,d3d9,d3d9/d3d9.def)
 	$(WINEBUILD) --builtin $(OUT_arm64x)/mtld3d.dll
-	$(WINEBUILD) --fake-module -o $(OUT_arm64x)/mtld3d.fake.dll -b aarch64-windows -marm64x --dll $(OUT_arm64x)/mtld3d.dll
-	$(call HYBRID_PLACEHOLDER_CHECK,$(OUT_arm64x)/mtld3d.fake.dll)
+	# A stock arm64 Wine's wineboot copies each builtin it finds into a prefix as its marker, so the bundle's hybrid
+	# placeholder has no use there, and its winebuild writes none (no ARM64EC metadata in a -marm64x fake module).
+	$(if $(WINE_SDK_STOCK_arm64),,$(WINEBUILD) --fake-module -o $(OUT_arm64x)/mtld3d.fake.dll -b aarch64-windows -marm64x --dll $(OUT_arm64x)/mtld3d.dll)
+	$(if $(WINE_SDK_STOCK_arm64),,$(call HYBRID_PLACEHOLDER_CHECK,$(OUT_arm64x)/mtld3d.fake.dll))
 
 # On Mach-O the DWARF stays behind in the compiler's `.o` files, with only a
 # debug map in the dylib pointing at them by absolute path; `dsymutil` walks
