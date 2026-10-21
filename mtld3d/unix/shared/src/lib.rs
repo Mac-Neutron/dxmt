@@ -39,6 +39,7 @@ pub use ffi_boundary::{
 pub use log_filter::{init_logger, init_logger_to, init_logger_to_filter};
 pub use mtl_handle::MetalHandle;
 pub use params::{
+    AllocPagesParams, FreePagesParams,
     AttachMetalLayerParams, BlitTextureToBufferParams, BufferCreateDesc, CreateBackbufferParams,
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
     DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams, ExtraColorDesc,
@@ -73,6 +74,9 @@ pub enum Thunks {
     CreateShaderProgram,
     CancelShaderProgram,
     PresentClientSurface,
+    /// MacNeutron: `PageBox` pages from the Unix side (`DeviceCapsFlags::PAGES_FROM_UNIX`).
+    AllocPages,
+    FreePages,
 }
 
 pub trait Thunk {

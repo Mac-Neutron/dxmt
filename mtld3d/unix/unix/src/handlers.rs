@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use log::{debug, error, info, warn};
 use mtld3d_shared::{
+    AllocPagesParams, FreePagesParams,
     AttachMetalLayerParams, BlitTextureToBufferParams, CreateBackbufferParams,
     CreateColorTargetParams, CreateCommandQueueParams, CreateDepthTextureParams,
     DestroyCommandQueueParams, DestroyResourcesBulkParams, DetachMetalLayerParams,
@@ -197,6 +198,9 @@ pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
     if let Some((name, registry_id, caps)) = metal::default_device_info() {
         params.registry_id = registry_id;
         params.caps = caps;
+        // MacNeutron: under the winemetal facade PageBox pages come from here (the VM's guest Metal takes no others).
+        #[cfg(mtl_facade)]
+        params.caps.insert(mtld3d_shared::mtl::DeviceCapsFlags::PAGES_FROM_UNIX);
 
         if params.name_ptr != 0 && params.name_buf_len > 0 {
             let buf_len =
@@ -221,6 +225,29 @@ pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
         );
     }
 
+    STATUS_SUCCESS
+}
+
+/// MacNeutron: zeroed pages for a PageBox (`DeviceCapsFlags::PAGES_FROM_UNIX`): under the winemetal facade, memory
+/// Metal can be made over: winemetal's guest allocator in the VM (`WMTMemoryAlloc`), anonymous pages on macOS.
+pub extern "C" fn alloc_pages_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *mut AllocPagesParams.
+    let Some(mut params) = (unsafe { InPtrMut::<AllocPagesParams>::opt(args) }) else {
+        return -1;
+    };
+    params.ptr = usize::try_from(params.len).ok().map_or(0, |len| metal::alloc_pages(len) as u64);
+    STATUS_SUCCESS
+}
+
+/// MacNeutron: gives back pages `alloc_pages_handler` handed out.
+pub extern "C" fn free_pages_handler(args: *mut c_void) -> i32 {
+    // SAFETY: unix-call handler params; PE side passes *mut FreePagesParams.
+    let Some(params) = (unsafe { InPtr::<FreePagesParams>::opt(args) }) else {
+        return -1;
+    };
+    if let Ok(len) = usize::try_from(params.len) {
+        metal::free_pages(params.ptr as usize as *mut u8, len);
+    }
     STATUS_SUCCESS
 }
 

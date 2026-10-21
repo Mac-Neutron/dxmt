@@ -788,6 +788,11 @@ bitflags! {
         /// waits for the last submitted command buffer before it copies
         /// out of a resolve target when this is set.
         const RESOLVE_NEEDS_RETIRE = 1 << 6;
+        /// MacNeutron: `PageBox` pages come from the Unix side (`AllocPages`/`FreePages`).
+        ///
+        /// Set by the winemetal facade's build (D3D9 spec §5.1): in the VM's guest a buffer made over memory must
+        /// be over memory winemetal handed out, which the PE side's own allocator never is.
+        const PAGES_FROM_UNIX = 1 << 7;
     }
 }
 

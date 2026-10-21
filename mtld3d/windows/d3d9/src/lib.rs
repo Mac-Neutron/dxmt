@@ -302,6 +302,7 @@ fn create_interface(extended: bool) -> *mut Direct3D9 {
     // interface names it again and the unix side keeps the file it has.
     let cfg = config::load();
     log_sink::open(&cfg);
+    direct3d9::install_page_allocator();
     // The page-box pool is one per process; the interface resolved most
     // recently sizes it.
     page_box_pool::PAGEBOX_POOL

@@ -3823,17 +3823,23 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
     // CPU read on `waitUntilCompleted` return. On UMA the storage mode
     // collapses to Shared semantics and synchronize is a no-op, so
     // there's no Apple-Silicon overhead.
+    // MacNeutron: under the winemetal facade the GPU writes a staging buffer of its own, copied into the caller's
+    // memory once complete: in the VM the caller's pages are guest memory Metal can't be given.
+    #[cfg(mtl_facade)]
+    let dst_buffer = device.newBufferWithLength_options(to_usize(dst_len), MTLResourceOptions::StorageModeShared);
     // SAFETY: `ptr` is the PE-supplied dst pointer (non-null by the check
     // above); `dst_len` matches its allocation; deallocator is None so the
     // PE allocation is never freed by Metal.
-    let Some(dst_buffer) = (unsafe {
+    #[cfg(not(mtl_facade))]
+    let dst_buffer = unsafe {
         device.newBufferWithBytesNoCopy_length_options_deallocator(
             ptr,
             to_usize(dst_len),
             MTLResourceOptions::StorageModeManaged,
             None,
         )
-    }) else {
+    };
+    let Some(dst_buffer) = dst_buffer else {
         error!(target: LOG_TARGET, "blit_texture_to_buffer: newBufferWithBytesNoCopy failed");
         return false;
     };
@@ -4029,11 +4035,26 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
     let status = cmd_buf.status();
     diagnostics::completion(&cmd_buf, status, None, "readback-wait");
     // The wrapper owns no pages; the caller keeps the destination allocation.
-    readback_completed(status, || {
+    let completed = readback_completed(status, || {
         let error = cmd_buf.error();
         diagnostics::failure(&cmd_buf, None, "readback-wait", error.as_deref());
         error
-    })
+    });
+    #[cfg(mtl_facade)]
+    if completed {
+        // SAFETY: the staging buffer's `dst_len` bytes, written by the completed blit, into the caller's
+        // allocation of that length.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                dst_buffer.contents().as_ptr().cast::<u8>(),
+                ptr.as_ptr().cast::<u8>(),
+                to_usize(dst_len),
+            );
+        }
+    }
+    #[cfg(not(mtl_facade))]
+    let _ = ptr;
+    completed
 }
 
 /// Accept a readback only after Metal reports successful completion.

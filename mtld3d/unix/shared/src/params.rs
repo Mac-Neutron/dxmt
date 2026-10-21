@@ -170,6 +170,28 @@ impl Thunk for GetDeviceInfoParams {
     const CODE: u32 = Thunks::GetDeviceInfo as u32;
 }
 
+/// MacNeutron: `len` bytes of zeroed pages for a `PageBox`, from the Unix side (`ptr` 0 on failure).
+#[repr(C, align(8))]
+pub struct AllocPagesParams {
+    pub len: u64,
+    pub ptr: u64, // out
+}
+
+impl Thunk for AllocPagesParams {
+    const CODE: u32 = Thunks::AllocPages as u32;
+}
+
+/// MacNeutron: gives back what `AllocPages` handed out.
+#[repr(C, align(8))]
+pub struct FreePagesParams {
+    pub ptr: u64,
+    pub len: u64,
+}
+
+impl Thunk for FreePagesParams {
+    const CODE: u32 = Thunks::FreePages as u32;
+}
+
 #[repr(C, align(8))]
 pub struct CreateCommandQueueParams {
     pub device_handle: MetalHandle<MTLDeviceKind>, // out

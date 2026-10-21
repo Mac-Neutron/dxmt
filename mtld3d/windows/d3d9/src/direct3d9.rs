@@ -756,6 +756,25 @@ fn device_info() -> &'static CachedDeviceInfo {
     &INFO
 }
 
+/// MacNeutron: `PageBox` pages from the Unix side when it asks (`PAGES_FROM_UNIX`, the winemetal facade's build):
+/// installed at the first interface, before any page.
+pub fn install_page_allocator() {
+    if !device_info().caps.contains(DeviceCapsFlags::PAGES_FROM_UNIX) {
+        return;
+    }
+    fn alloc(len: usize) -> Option<core::ptr::NonNull<u8>> {
+        let mut params = mtld3d_shared::AllocPagesParams { len: len as u64, ptr: 0 };
+        unix_call(&mut params);
+        core::ptr::NonNull::new(params.ptr as usize as *mut u8)
+    }
+    fn free(ptr: core::ptr::NonNull<u8>, len: usize) {
+        let mut params = mtld3d_shared::FreePagesParams { ptr: ptr.as_ptr() as usize as u64, len: len as u64 };
+        unix_call(&mut params);
+    }
+    mtld3d_core::page_box::set_page_allocator(mtld3d_core::page_box::PageAllocator { alloc, free });
+    log::info!(target: LOG_TARGET, "page boxes: pages from the unix side (winemetal)");
+}
+
 /// Whether the Metal device can create border-colour samplers.
 ///
 /// `GetDeviceCaps` strips `D3DPTADDRESSCAPS_BORDER` when it cannot

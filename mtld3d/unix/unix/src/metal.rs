@@ -58,3 +58,25 @@ pub use texture::{
 };
 pub use upload_quad::ensure_upload_pipeline;
 pub use upscale::is_supported as upscale_is_supported;
+
+/// MacNeutron: `len` bytes of zeroed pages Metal can be made over, or null (the `AllocPages` thunk).
+///
+/// macOS (the facade's loopback build, and the product build, which never asks): anonymous pages, 16 KiB-aligned as
+/// the kernel maps them on Apple Silicon. The VM's guest: winemetal's own allocator (M2b).
+#[must_use]
+pub fn alloc_pages(len: usize) -> *mut u8 {
+    // SAFETY: an anonymous private mapping; nothing else names the range.
+    let ptr = unsafe {
+        libc::mmap(core::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+    };
+    if ptr == libc::MAP_FAILED { core::ptr::null_mut() } else { ptr.cast() }
+}
+
+/// MacNeutron: gives back `alloc_pages`' pages (the `FreePages` thunk).
+pub fn free_pages(ptr: *mut u8, len: usize) {
+    if !ptr.is_null() {
+        // SAFETY: a mapping alloc_pages made of `len` bytes, no longer used (the PE side frees a PageBox once
+        // Metal no longer reads it).
+        unsafe { libc::munmap(ptr.cast(), len) };
+    }
+}

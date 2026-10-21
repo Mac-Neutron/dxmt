@@ -270,9 +270,31 @@ pub struct PageBox {
     readers: AtomicU32,
 }
 
+/// MacNeutron: where `PageBox` pages come from when the Unix side asks for them (`PAGES_FROM_UNIX`): the VM's guest
+/// Metal is made only over memory winemetal handed out. Zeroed pages of a whole number of [`PAGE_SIZE`]s.
+#[derive(Clone, Copy)]
+pub struct PageAllocator {
+    pub alloc: fn(usize) -> Option<NonNull<u8>>,
+    pub free: fn(NonNull<u8>, usize),
+}
+
+/// The allocator `set_page_allocator` installed.
+///
+/// Process-wide by necessity: every `PageBox` constructor reads it, from any device and thread, and the Unix side's
+/// answer it follows is one per process (the `GetDeviceInfo` cache). Set once, before the first page.
+static PAGE_ALLOCATOR: std::sync::OnceLock<PageAllocator> = std::sync::OnceLock::new();
+
+/// Installs the Unix side's page allocator for every `PageBox` made from here on (each keeps the allocator it came
+/// from: one made before is freed as it was made).
+pub fn set_page_allocator(allocator: PageAllocator) {
+    let _ = PAGE_ALLOCATOR.set(allocator);
+}
+
 /// The runtime responsible for releasing a page allocation.
 enum PageOwnership {
     Native(Layout),
+    /// MacNeutron: pages from the [`PageAllocator`].
+    Hooked,
     #[cfg(not(windows))]
     Guest {
         completion: LeaseCompletionPtr,
@@ -337,6 +359,9 @@ impl PageBox {
     /// staging.
     #[must_use]
     pub fn try_new_uninit(logical_len: usize) -> Option<Self> {
+        if let Some(allocator) = PAGE_ALLOCATOR.get() {
+            return Self::try_new_hooked(allocator, logical_len);
+        }
         let (len, layout) = Self::try_layout_for(logical_len)?;
         // SAFETY: `try_layout_for` returns a non-zero-size, page-aligned Layout.
         let ptr = NonNull::new(unsafe { alloc::alloc(layout) })?;
@@ -348,10 +373,22 @@ impl PageBox {
     /// The same fallback-only contract as [`Self::try_new_uninit`].
     #[must_use]
     pub fn try_new_zeroed(logical_len: usize) -> Option<Self> {
+        if let Some(allocator) = PAGE_ALLOCATOR.get() {
+            return Self::try_new_hooked(allocator, logical_len);
+        }
         let (len, layout) = Self::try_layout_for(logical_len)?;
         // SAFETY: `try_layout_for` returns a non-zero-size, page-aligned Layout.
         let ptr = NonNull::new(unsafe { alloc::alloc_zeroed(layout) })?;
         Some(Self::adopt(ptr, len, logical_len, layout))
+    }
+
+    /// MacNeutron: zeroed pages from the installed allocator, counted as `adopt` counts.
+    fn try_new_hooked(allocator: &PageAllocator, logical_len: usize) -> Option<Self> {
+        let (len, _) = Self::try_layout_for(logical_len)?;
+        let ptr = (allocator.alloc)(len)?;
+        let mut page_box = Self::adopt(ptr, len, logical_len, Layout::new::<u8>());
+        page_box.ownership = PageOwnership::Hooked;
+        Some(page_box)
     }
 
     /// Wrap a fresh allocation of `layout` and count it.
@@ -418,7 +455,7 @@ impl PageBox {
     /// Whether the allocating runtime can park this box in its recycle pool.
     #[must_use]
     pub const fn is_native_owned(&self) -> bool {
-        matches!(self.ownership, PageOwnership::Native(_))
+        matches!(self.ownership, PageOwnership::Native(_) | PageOwnership::Hooked)
     }
 
     /// Address of the fixed-width reader count kept alive by a page lease.
@@ -429,7 +466,7 @@ impl PageBox {
 
     const fn reader_count(&self) -> &AtomicU32 {
         match &self.ownership {
-            PageOwnership::Native(_) => &self.readers,
+            PageOwnership::Native(_) | PageOwnership::Hooked => &self.readers,
             #[cfg(not(windows))]
             PageOwnership::Guest { readers, .. } => {
                 // SAFETY: from_guest_lease pins the original aligned counter until Drop.
@@ -544,6 +581,14 @@ impl Drop for PageBox {
     fn drop(&mut self) {
         let layout = match &self.ownership {
             PageOwnership::Native(layout) => *layout,
+            PageOwnership::Hooked => {
+                note_free(self.len);
+                PAGEBOX_LIVE_BYTES.fetch_sub(self.len as u64, core::sync::atomic::Ordering::Relaxed);
+                if let Some(allocator) = PAGE_ALLOCATOR.get() {
+                    (allocator.free)(self.ptr, self.len);
+                }
+                return;
+            }
             #[cfg(not(windows))]
             PageOwnership::Guest { completion, .. } => {
                 // SAFETY: from_guest_lease keeps this cell alive until this final acknowledgment.

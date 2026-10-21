@@ -104,6 +104,8 @@ const fn dispatch(code: Thunks) -> UnixCallFn {
         Thunks::DetachMetalLayer => arp!(handlers::detach_metal_layer_handler),
         Thunks::SetPresentWaitPolicy => arp!(handlers::set_present_wait_policy_handler),
         Thunks::PresentClientSurface => arp!(handlers::present_client_surface_handler),
+        Thunks::AllocPages => arp!(handlers::alloc_pages_handler),
+        Thunks::FreePages => arp!(handlers::free_pages_handler),
     }
 }
 
