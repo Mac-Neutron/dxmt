@@ -97,7 +97,7 @@ impl NSString {
 pub(crate) fn winemetal_string(handle: u64) -> String {
     let mut length = wmt::ObjU64U64Ret { handle, arg: wmt::UTF8_STRING_ENCODING, ret: 0 };
     // SAFETY: slot 27 reads a live string.
-    unsafe { table::call(27, &mut length) };
+    unsafe { table::call(wmt::NSSTRING_LENGTH_OF_BYTES, &mut length) };
     let mut buffer = vec![0u8; usize::try_from(length.ret).unwrap_or(0) + 1];
     let mut params = wmt::NSStringGetCString {
         str: handle,
@@ -188,10 +188,13 @@ impl NSError {
         }
     }
 
-    /// Foundation's error code: winemetal doesn't carry one.
+    /// Foundation's error code, which winemetal doesn't carry: a hash of the description instead (FNV-1a, 31 bits,
+    /// never 0), so that errors that read differently stay apart where mtld3d keys its once-only logs by code.
     #[must_use]
-    pub const fn code(&self) -> NSInteger {
-        0
+    pub fn code(&self) -> NSInteger {
+        let text = self.localizedDescription().to_rust();
+        let hash = text.bytes().fold(0x811c_9dc5_u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
+        NSInteger::try_from((hash & 0x7fff_ffff) | 1).unwrap_or(1)
     }
 }
 

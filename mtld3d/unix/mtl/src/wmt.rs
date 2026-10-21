@@ -17,6 +17,7 @@ pub const DEVICE_RECOMMENDED_MAX_WORKING_SET_SIZE: u32 = 5;
 pub const DEVICE_CURRENT_ALLOCATED_SIZE: u32 = 6;
 pub const DEVICE_NAME: u32 = 7;
 pub const NSSTRING_GET_CSTRING: u32 = 8;
+pub const NSSTRING_LENGTH_OF_BYTES: u32 = 27;
 pub const DEVICE_NEW_COMMAND_QUEUE: u32 = 9;
 pub const AUTORELEASE_POOL_ALLOC_INIT: u32 = 10;
 pub const QUEUE_COMMAND_BUFFER: u32 = 11;
@@ -93,6 +94,7 @@ pub const SLOTS: &[(u32, &str)] = &[
     (DEVICE_CURRENT_ALLOCATED_SIZE, "_MTLDevice_currentAllocatedSize"),
     (DEVICE_NAME, "_MTLDevice_name"),
     (NSSTRING_GET_CSTRING, "_NSString_getCString"),
+    (NSSTRING_LENGTH_OF_BYTES, "_NSString_lengthOfBytesUsingEncoding"),
     (DEVICE_NEW_COMMAND_QUEUE, "_MTLDevice_newCommandQueue"),
     (AUTORELEASE_POOL_ALLOC_INIT, "_NSAutoreleasePool_alloc_init"),
     (QUEUE_COMMAND_BUFFER, "_MTLCommandQueue_commandBuffer"),
@@ -454,7 +456,7 @@ pub struct RenderPassInfo {
 #[derive(Default, Clone, Copy)]
 pub struct Origin { pub x: u64, pub y: u64, pub z: u64 }
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub struct Size { pub width: u64, pub height: u64, pub depth: u64 }
 
 #[repr(C)]

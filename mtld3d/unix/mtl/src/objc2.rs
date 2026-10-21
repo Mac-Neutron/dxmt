@@ -162,25 +162,18 @@ pub mod rc {
     /// objc2's `AutoreleasePool` marker.
     pub struct AutoreleasePool<'p>(PhantomData<&'p ()>);
 
-    /// Runs `f` inside an autorelease pool: winemetal's on macOS (slot 10, drained by its release), none on Linux,
-    /// where the VM's host owns the pools of the calls it runs.
+    /// Runs `f` inside winemetal's autorelease pool (slot 10, drained by its release). In the VM's guest too: an
+    /// autoreleased return made with no pool open lives until the process ends, on both sides.
     pub fn autoreleasepool<R>(f: impl for<'p> FnOnce(AutoreleasePool<'p>) -> R) -> R {
-        #[cfg(target_vendor = "apple")]
-        {
-            use crate::{table, wmt};
-            let mut params = wmt::ObjRet::default();
-            // SAFETY: slot 10 takes and fills this struct.
-            unsafe { table::call(wmt::AUTORELEASE_POOL_ALLOC_INIT, &mut params) };
-            let result = f(AutoreleasePool(PhantomData));
-            let mut release = wmt::ObjNoRet { handle: params.ret };
-            // SAFETY: the pool made above, released (drained) on the thread that made it.
-            unsafe { table::call(wmt::RELEASE, &mut release) };
-            result
-        }
-        #[cfg(not(target_vendor = "apple"))]
-        {
-            f(AutoreleasePool(PhantomData))
-        }
+        use crate::{table, wmt};
+        let mut params = wmt::ObjRet::default();
+        // SAFETY: slot 10 takes and fills this struct.
+        unsafe { table::call(wmt::AUTORELEASE_POOL_ALLOC_INIT, &mut params) };
+        let result = f(AutoreleasePool(PhantomData));
+        let mut release = wmt::ObjNoRet { handle: params.ret };
+        // SAFETY: the pool made above, released (drained) on the thread that made it.
+        unsafe { table::call(wmt::RELEASE, &mut release) };
+        result
     }
 }
 
@@ -245,7 +238,11 @@ pub mod runtime {
         }
         unsafe fn release_raw(ptr: *const Self) {
             let handle = ptr as usize as u64;
-            meta::release(handle);
+            if let Some(entry) = meta::release(handle) {
+                // The facade's last reference: what it keeps beside the object goes first, while it still lives.
+                crate::metal::forget(handle, &entry);
+                crate::metal_fx::forget(handle);
+            }
             let mut params = wmt::ObjNoRet { handle };
             // SAFETY: a reference given up.
             unsafe { table::call(wmt::RELEASE, &mut params) };

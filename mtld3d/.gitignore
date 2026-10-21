@@ -3,6 +3,7 @@
 /unix/target
 /unix/target-wm
 /unix/target-linux
+/windows/target-native
 /.wine-isolated
 .DS_Store
 

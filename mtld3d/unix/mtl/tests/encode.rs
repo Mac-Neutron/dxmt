@@ -124,6 +124,65 @@ const LEFT: [f32; 6] = [-1.0, -1.0, -1.0, 1.0, -0.1, 0.0];
 /// The right half's triangle: whichever face its winding makes it, exactly one of `Front` and `Back` culls it.
 const RIGHT_CCW: [f32; 6] = [0.1, 0.0, 1.0, -1.0, 1.0, 1.0];
 
+const SAMPLE_SOURCE: &str = r"
+#include <metal_stdlib>
+using namespace metal;
+vertex float4 vs(uint vid [[vertex_id]]) { return float4(vid == 1 ? 3.0 : -1.0, vid == 2 ? 3.0 : -1.0, 0, 1); }
+fragment float4 fs(texture2d<float> tex [[texture(0)]], sampler s [[sampler(0)]]) { return tex.sample(s, float2(0.75, 0.5)); }
+";
+
+/// A sampler from a descriptor with nothing set reads as Metal's default one: normalized coordinates (u 0.75 of a
+/// 2x1 texture is its second texel; unnormalized, the first), nearest filtering.
+#[test]
+fn a_default_sampler_reads_normalized_coordinates() {
+    let device = common::device();
+    let library = device.newLibraryWithSource_options_error(&NSString::from_str(SAMPLE_SOURCE), None).expect("a library");
+    let desc = MTLRenderPipelineDescriptor::new();
+    desc.setVertexFunction(library.newFunctionWithName(&NSString::from_str("vs")).as_deref());
+    desc.setFragmentFunction(library.newFunctionWithName(&NSString::from_str("fs")).as_deref());
+    // SAFETY: index < 8.
+    unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) }.setPixelFormat(MTLPixelFormat::RGBA8Unorm);
+    let pso = device.newRenderPipelineStateWithDescriptor_error(&desc).expect("a pipeline");
+    let sampler = device.newSamplerStateWithDescriptor(&MTLSamplerDescriptor::new()).expect("a sampler");
+    let source = texture(&device, 2, 1, MTLTextureUsage::ShaderRead);
+    let texels: [u8; 8] = [255, 0, 0, 255, 0, 255, 0, 255];
+    let region = MTLRegion { origin: MTLOrigin { x: 0, y: 0, z: 0 }, size: MTLSize { width: 2, height: 1, depth: 1 } };
+    // SAFETY: eight bytes for a 2x1 RGBA8 texture.
+    unsafe { source.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(region, 0, 0, NonNull::from(&texels).cast(), 8, 8) };
+    let target = texture(&device, 64, 64, MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead);
+    let readback = device.newBufferWithLength_options(64 * 64 * 4, MTLResourceOptions::StorageModeShared).expect("a buffer");
+    let queue = device.newCommandQueue().expect("a queue");
+    let cb = queue.commandBuffer().expect("a command buffer");
+    let pass = MTLRenderPassDescriptor::new();
+    // SAFETY: index < 8.
+    let color = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
+    color.setTexture(Some(&target));
+    color.setLoadAction(MTLLoadAction::Clear);
+    color.setStoreAction(MTLStoreAction::Store);
+    let encoder = cb.renderCommandEncoderWithDescriptor(&pass).expect("an encoder");
+    encoder.setRenderPipelineState(&pso);
+    // SAFETY: binds of live objects; one triangle over the target.
+    unsafe {
+        encoder.setFragmentTexture_atIndex(Some(&source), 0);
+        encoder.setFragmentSamplerState_atIndex(Some(&sampler), 0);
+        encoder.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+    }
+    encoder.endEncoding();
+    let blit = cb.blitCommandEncoder().expect("a blit encoder");
+    // SAFETY: the whole target into a buffer of its size.
+    unsafe {
+        blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
+            &target, 0, 0, MTLOrigin { x: 0, y: 0, z: 0 }, MTLSize { width: 64, height: 64, depth: 1 }, &readback, 0, 256, 256 * 64,
+        );
+    }
+    blit.endEncoding();
+    cb.commit();
+    cb.waitUntilCompleted();
+    // SAFETY: the buffer's own bytes, written by the completed blit.
+    let image = unsafe { core::slice::from_raw_parts(readback.contents().as_ptr().cast::<u8>(), 64 * 64 * 4) };
+    assert_eq!(pixel(image, 32, 32), [0, 255, 0, 255], "u 0.75 read the first texel: unnormalized coordinates");
+}
+
 #[test]
 fn a_triangle_through_the_direct_binds_reads_back() {
     let device = common::device();
@@ -173,6 +232,52 @@ fn completion_handlers_run_once_each_in_commit_order() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert_eq!(*seen.lock().unwrap(), (0..100).collect::<Vec<_>>());
+}
+
+/// Metal's waitUntilCompleted returns once the buffer's completed handlers have run; mtld3d frees what they capture
+/// after it (its CPU-submit failure path).
+#[test]
+fn wait_until_completed_returns_after_its_handlers() {
+    let device = common::device();
+    let queue = device.newCommandQueue().expect("a queue");
+    let cb = queue.commandBuffer().expect("a command buffer");
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&ran);
+    let handler = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        seen.store(true, std::sync::atomic::Ordering::Release);
+    });
+    // SAFETY: a live block; the facade keeps its own reference.
+    unsafe { cb.addCompletedHandler(RcBlock::as_ptr(&handler)) };
+    cb.commit();
+    cb.waitUntilCompleted();
+    assert!(ran.load(std::sync::atomic::Ordering::Acquire), "waitUntilCompleted returned before the handler ran");
+}
+
+/// A buffer given up uncommitted runs its handlers then (mtld3d's return early on an unended buffer), and a later
+/// buffer, at the same address or not, runs none of them.
+#[test]
+fn an_uncommitted_buffer_runs_its_handlers_once_when_dropped() {
+    let device = common::device();
+    let queue = device.newCommandQueue().expect("a queue");
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for _ in 0..8 {
+        let cb = queue.commandBuffer().expect("a command buffer");
+        let seen = Arc::clone(&runs);
+        let handler = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        });
+        // SAFETY: a live block.
+        unsafe { cb.addCompletedHandler(RcBlock::as_ptr(&handler)) };
+        drop(cb);
+    }
+    assert_eq!(runs.load(std::sync::atomic::Ordering::Acquire), 8, "each dropped buffer runs its handler once");
+    for _ in 0..8 {
+        let cb = queue.commandBuffer().expect("a command buffer");
+        cb.commit();
+        cb.waitUntilCompleted();
+    }
+    assert_eq!(runs.load(std::sync::atomic::Ordering::Acquire), 8, "a later buffer ran a dropped one's handler");
 }
 
 #[test]

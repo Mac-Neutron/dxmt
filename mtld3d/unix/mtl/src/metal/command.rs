@@ -8,8 +8,9 @@
 
 use core::{cell::RefCell, ffi::c_void, ptr::NonNull};
 use std::{
-    collections::HashMap,
-    sync::{Mutex, OnceLock, mpsc},
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    sync::{Condvar, Mutex, OnceLock, mpsc},
     time::Instant,
 };
 
@@ -126,6 +127,8 @@ struct EncoderState {
     slot: u32,
     nodes: Nodes,
     raster: Raster,
+    /// A compute encoder's current pipeline (a dispatch with another size needs a node of its own for it).
+    compute_pso: u64,
 }
 
 thread_local! {
@@ -146,7 +149,7 @@ fn record(encoder: u64, f: impl FnOnce(&mut EncoderState)) {
 
 fn begin(encoder: u64, slot: u32) {
     ENCODERS.with(|map| {
-        map.borrow_mut().insert(encoder, EncoderState { slot, nodes: Nodes::default(), raster: METAL_RASTER });
+        map.borrow_mut().insert(encoder, EncoderState { slot, nodes: Nodes::default(), raster: METAL_RASTER, compute_pso: 0 });
     });
 }
 
@@ -565,6 +568,7 @@ pub unsafe trait MTLComputeCommandEncoder: MTLCommandEncoder {
     fn setComputePipelineState(&self, state: &ProtocolObject<dyn MTLComputePipelineState>) {
         let pso = state.handle();
         record(handle_of(self), |s| {
+            s.compute_pso = pso;
             s.nodes.push(COMPUTE_SET_PSO, ComputePso { pso, threadgroup_size: wmt::Size::default() });
         });
     }
@@ -587,12 +591,19 @@ pub unsafe trait MTLComputeCommandEncoder: MTLCommandEncoder {
         let groups = size(threadgroups_per_grid);
         let threads = size(threads_per_threadgroup);
         record(handle_of(self), |s| {
-            // The size rides on the pipeline node winemetal reads it from: patch the newest one.
-            if let Some(&start) = s.nodes.starts.iter().rev().find(|&&start| s.nodes.words[start] as u16 == COMPUTE_SET_PSO) {
-                // SAFETY: the node at `start` is a ComputePso.
-                unsafe {
-                    let node = s.nodes.words.as_mut_ptr().add(start).cast::<Node<ComputePso>>();
-                    (*node).body.threadgroup_size = threads;
+            // The size rides on the pipeline node winemetal reads it from: the newest one's if it is still unsized,
+            // else a new node for the same pipeline (also after a flush, which left the list without one).
+            let newest = s.nodes.starts.iter().rev().find(|&&start| s.nodes.words[start] as u16 == COMPUTE_SET_PSO).copied();
+            // SAFETY: a node at a recorded start whose type is COMPUTE_SET_PSO is a ComputePso.
+            let node = newest.map(|start| unsafe { s.nodes.words.as_mut_ptr().add(start).cast::<Node<ComputePso>>() });
+            // SAFETY: as above.
+            match node.map(|n| unsafe { (*n).body }) {
+                Some(body) if body.threadgroup_size == wmt::Size::default() || body.threadgroup_size == threads => {
+                    // SAFETY: as above.
+                    unsafe { (*node.unwrap()).body.threadgroup_size = threads };
+                }
+                _ => {
+                    s.nodes.push(COMPUTE_SET_PSO, ComputePso { pso: s.compute_pso, threadgroup_size: threads });
                 }
             }
             s.nodes.push(COMPUTE_DISPATCH, Dispatch { size: groups });
@@ -665,6 +676,19 @@ unsafe impl Send for Committed {}
 /// The retirement thread of each queue that has had a handler: commits arrive in commit order.
 static RETIRERS: Mutex<Option<HashMap<u64, mpsc::Sender<Committed>>>> = Mutex::new(None);
 
+/// Committed buffers whose completed handlers haven't all run yet, which `waitUntilCompleted` waits out as Metal's
+/// does. The caller has no object to reach: a retirement thread clears what a commit on any thread added.
+static RETIRING: (Mutex<Option<HashSet<u64>>>, Condvar) = (Mutex::new(None), Condvar::new());
+
+thread_local! {
+    /// On a retirement thread: a handler that waits on a buffer must not wait for handlers this thread runs.
+    static RETIRER: Cell<bool> = const { Cell::new(false) };
+}
+
+fn retiring() -> std::sync::MutexGuard<'static, Option<HashSet<u64>>> {
+    RETIRING.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn retirer(queue: u64) -> mpsc::Sender<Committed> {
     let mut map = RETIRERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     map.get_or_insert_with(HashMap::new)
@@ -674,22 +698,10 @@ fn retirer(queue: u64) -> mpsc::Sender<Committed> {
             std::thread::Builder::new()
                 .name("mtld3d-mtl-retire".to_owned())
                 .spawn(move || {
+                    RETIRER.with(|r| r.set(true));
+                    // Ends when the queue's last facade reference drops its sender (forget), after what was sent.
                     for done in rx {
-                        let cb = done.cb.handle();
-                        let mut wait = wmt::ObjNoRet { handle: cb };
-                        // SAFETY: slot 13 waits on a committed buffer the message holds.
-                        unsafe { table::call(wmt::COMMAND_BUFFER_WAIT_UNTIL_COMPLETED, &mut wait) };
-                        for handler in done.handlers {
-                            match handler {
-                                Handler::Completed(h) => (h.0)(NonNull::from(&*done.cb)),
-                                Handler::Presented(drawable, h) => {
-                                    meta::with(drawable, |e| e.presented_time = now());
-                                    // SAFETY: the drawable is kept alive by the presenting buffer's reference below.
-                                    (h.0)(NonNull::from(unsafe { ProtocolObject::<dyn MTLDrawable>::from_handle(drawable) }));
-                                    release_drawable(drawable);
-                                }
-                            }
-                        }
+                        objc2::rc::autoreleasepool(|_| retire(done));
                     }
                 })
                 .expect("a retirement thread");
@@ -698,17 +710,68 @@ fn retirer(queue: u64) -> mpsc::Sender<Committed> {
         .clone()
 }
 
+/// Waits for a committed buffer, then runs its handlers in the order they were added.
+fn retire(done: Committed) {
+    let cb = done.cb.handle();
+    let mut wait = wmt::ObjNoRet { handle: cb };
+    // SAFETY: slot 13 waits on a committed buffer the message holds.
+    unsafe { table::call(wmt::COMMAND_BUFFER_WAIT_UNTIL_COMPLETED, &mut wait) };
+    run_handlers(cb, done.handlers, now());
+    if let Some(set) = retiring().as_mut() {
+        set.remove(&cb);
+    }
+    RETIRING.1.notify_all();
+}
+
+/// Runs `cb`'s handlers: completed ones with the buffer, presented ones with their drawable presented at `time` (0: not
+/// presented), each drawable then given back.
+fn run_handlers(cb: u64, handlers: Vec<Handler>, time: f64) {
+    for handler in handlers {
+        match handler {
+            // SAFETY: the buffer lives for the call (a message's reference, or the caller's last one).
+            Handler::Completed(h) => (h.0)(NonNull::from(unsafe { ProtocolObject::<dyn MTLCommandBuffer>::from_handle(cb) })),
+            Handler::Presented(drawable, h) => {
+                meta::with(drawable, |e| e.presented_time = time);
+                // SAFETY: the drawable is kept alive by the reference taken for the handler, given back below.
+                (h.0)(NonNull::from(unsafe { ProtocolObject::<dyn MTLDrawable>::from_handle(drawable) }));
+                release_drawable(drawable);
+            }
+        }
+    }
+}
+
 fn now() -> f64 {
     static START: OnceLock<Instant> = OnceLock::new();
     // Never 0: mtld3d reads 0 as "not presented".
     1.0 + START.get_or_init(Instant::now).elapsed().as_secs_f64()
 }
 
+/// Gives back the reference `keep_drawable` took for a presented handler.
 fn release_drawable(drawable: u64) {
-    meta::release(drawable);
-    let mut params = wmt::ObjNoRet { handle: drawable };
-    // SAFETY: the reference presentDrawable took for the handler.
-    unsafe { table::call(wmt::RELEASE, &mut params) };
+    // SAFETY: that reference.
+    unsafe { <ProtocolObject<dyn MTLDrawable> as objc2::Message>::release_raw(drawable as usize as *const _) };
+}
+
+/// A reference on `drawable` for a presented handler, until it has run (release_drawable).
+fn keep_drawable(drawable: u64) {
+    // SAFETY: a live drawable.
+    unsafe { <ProtocolObject<dyn MTLDrawable> as objc2::Message>::retain_raw(drawable as usize as *const _) };
+}
+
+/// The facade's last reference to `handle` (objc2.rs): a buffer or drawable given up with handlers pending runs them
+/// now, as an uncommitted Metal buffer's run (mtld3d's return early on a buffer that never ran; a drawable never
+/// presented has presented time 0); a queue's retirement thread ends after what it was sent; a test status goes.
+pub(crate) fn forget(handle: u64, entry: &meta::Entry) {
+    let handlers = take_pending(handle);
+    if !handlers.is_empty() {
+        run_handlers(handle, handlers, if entry.presented_by != 0 { now() } else { 0.0 });
+    }
+    if let Some(map) = RETIRERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+        map.remove(&handle);
+    }
+    if let Some(map) = STATUS_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+        map.remove(&handle);
+    }
 }
 
 /// The status a test makes a buffer report (`set_status_for_test`), in place of winemetal's.
@@ -718,6 +781,17 @@ static STATUS_OVERRIDE: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
 #[doc(hidden)]
 pub fn set_status_for_test(cb: &ProtocolObject<dyn MTLCommandBuffer>, status: MTLCommandBufferStatus) {
     STATUS_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(cb.handle(), status.0 as u64);
+}
+
+/// Commits in the order their retirement runs (Metal runs a queue's handlers in commit order).
+static COMMIT_ORDER: Mutex<()> = Mutex::new(());
+
+/// Hands `cb` and its `handlers` to its queue's retirement thread.
+fn send_retire(cb: u64, handlers: Vec<Handler>) {
+    let queue = meta::read(cb, |e| e.map_or(0, |e| e.queue));
+    let committed = Committed { cb: retained(cb).expect("a committed buffer"), handlers };
+    retiring().get_or_insert_with(HashSet::new).insert(cb);
+    let _ = retirer(queue).send(committed);
 }
 
 // --- Queues and command buffers.
@@ -771,25 +845,29 @@ pub unsafe trait MTLCommandBuffer: NSObjectProtocol {
         set_label_of(handle_of(self), label);
     }
     fn GPUStartTime(&self) -> CFTimeInterval {
-        gpu_time(handle_of(self), 0)
+        gpu_time(handle_of(self), GPU_START_TIME)
     }
     fn GPUEndTime(&self) -> CFTimeInterval {
-        gpu_time(handle_of(self), 1)
+        gpu_time(handle_of(self), GPU_END_TIME)
     }
     /// Commit order is the queue's order already; winemetal has no enqueue.
     fn enqueue(&self) {}
     fn commit(&self) {
         let cb = handle_of(self);
+        // Commit and retirement in one order. ponytail: one lock for every queue's commits; per queue if it shows.
+        let _order = COMMIT_ORDER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut params = wmt::ObjNoRet { handle: cb };
         // SAFETY: slot 12 commits a live buffer.
         unsafe { table::call(wmt::COMMAND_BUFFER_COMMIT, &mut params) };
-        let handlers = take_pending(cb);
-        if handlers.is_empty() {
-            return;
+        let handlers = {
+            // Marked under the pending lock, which a presented handler added now checks it under.
+            let mut map = pending();
+            meta::with(cb, |e| e.committed = true);
+            map.as_mut().and_then(|map| map.remove(&cb)).unwrap_or_default()
+        };
+        if !handlers.is_empty() {
+            send_retire(cb, handlers);
         }
-        let queue = meta::read(cb, |e| e.map_or(0, |e| e.queue));
-        let committed = Committed { cb: retained(cb).expect("a committed buffer"), handlers };
-        let _ = retirer(queue).send(committed);
     }
     fn presentDrawable(&self, drawable: &ProtocolObject<dyn MTLDrawable>) {
         let mut params = wmt::ObjObjNoRet { handle: handle_of(self), arg: drawable.handle() };
@@ -807,10 +885,20 @@ pub unsafe trait MTLCommandBuffer: NSObjectProtocol {
         // SAFETY: a live block (objc2's contract).
         add_pending(handle_of(self), Handler::Completed(unsafe { Kept::from_block(block) }));
     }
+    /// Returns once the buffer has completed and, as Metal's does, its completed handlers have run (unless called
+    /// from one of them).
     fn waitUntilCompleted(&self) {
-        let mut params = wmt::ObjNoRet { handle: handle_of(self) };
+        let cb = handle_of(self);
+        let mut params = wmt::ObjNoRet { handle: cb };
         // SAFETY: slot 13 waits on a live buffer.
         unsafe { table::call(wmt::COMMAND_BUFFER_WAIT_UNTIL_COMPLETED, &mut params) };
+        if RETIRER.with(Cell::get) {
+            return;
+        }
+        let mut set = retiring();
+        while set.as_ref().is_some_and(|s| s.contains(&cb)) {
+            set = RETIRING.1.wait(set).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
     fn status(&self) -> MTLCommandBufferStatus {
         let cb = handle_of(self);
@@ -847,24 +935,25 @@ pub unsafe trait MTLCommandBuffer: NSObjectProtocol {
 
 unsafe impl MTLCommandBuffer for ProtocolObject<dyn MTLCommandBuffer> {}
 
-/// A command buffer's GPU start (0) or end (1) time in seconds (winemetal's property slot answers nanoseconds).
+/// `WMTCommandBufferPropertyGPUStartTime` and `GPUEndTime` (0 and 1 are the kernel's times).
+const GPU_START_TIME: u64 = 2;
+const GPU_END_TIME: u64 = 3;
+
+/// A command buffer's GPU start or end time in seconds (winemetal's property slot answers nanoseconds).
 fn gpu_time(cb: u64, which: u64) -> CFTimeInterval {
     super::query_u64_arg(wmt::COMMAND_BUFFER_PROPERTY, cb, which) as f64 / 1e9
 }
 
-/// A drawable's presented handlers go with the buffer that presents it; the buffer holds the drawable for them.
+/// A drawable's presented handlers go with the buffer that presents it, each with a reference on the drawable; the
+/// drawable remembers that buffer for handlers added after (addPresentedHandler).
 fn move_presented(cb: u64, drawable: u64) {
-    let handlers = take_pending(drawable);
-    if handlers.is_empty() {
-        return;
-    }
+    let mut map = pending();
+    meta::with(drawable, |e| e.presented_by = cb);
+    let handlers = map.as_mut().and_then(|map| map.remove(&drawable)).unwrap_or_default();
     for handler in handlers {
         if let Handler::Presented(_, h) = handler {
-            meta::retain(drawable);
-            let mut params = wmt::ObjNoRet { handle: drawable };
-            // SAFETY: kept until the handler has run (release_drawable).
-            unsafe { table::call(wmt::RETAIN, &mut params) };
-            add_pending(cb, Handler::Presented(drawable, h));
+            keep_drawable(drawable);
+            map.get_or_insert_with(HashMap::new).entry(cb).or_default().push(Handler::Presented(drawable, h));
         }
     }
 }
@@ -875,9 +964,27 @@ pub unsafe trait MTLDrawable: NSObjectProtocol {
     fn present(&self) {
         log::warn!(target: "mtld3d::mtl", "MTLDrawable::present without a command buffer: not presented");
     }
+    /// Before present the handler waits with the drawable; after, it goes with the presenting buffer: into its
+    /// pending handlers while uncommitted (mtld3d adds its own then), else to its queue's retirement thread, which
+    /// runs it once the buffer has completed.
     unsafe fn addPresentedHandler(&self, block: MTLDrawablePresentedHandler) {
+        let drawable = handle_of(self);
         // SAFETY: a live block (objc2's contract).
-        add_pending(handle_of(self), Handler::Presented(handle_of(self), unsafe { Kept::from_block(block) }));
+        let handler = unsafe { Kept::from_block(block) };
+        let mut map = pending();
+        let cb = meta::read(drawable, |e| e.map_or(0, |e| e.presented_by));
+        if cb == 0 {
+            map.get_or_insert_with(HashMap::new).entry(drawable).or_default().push(Handler::Presented(drawable, handler));
+            return;
+        }
+        keep_drawable(drawable);
+        if !meta::read(cb, |e| e.is_some_and(|e| e.committed)) {
+            map.get_or_insert_with(HashMap::new).entry(cb).or_default().push(Handler::Presented(drawable, handler));
+            return;
+        }
+        drop(map);
+        // ponytail: the presenting buffer is taken to still be alive, as mtld3d's own present path keeps it.
+        send_retire(cb, vec![Handler::Presented(drawable, handler)]);
     }
     fn presentedTime(&self) -> CFTimeInterval {
         meta::read(handle_of(self), |e| e.map_or(0.0, |e| e.presented_time))

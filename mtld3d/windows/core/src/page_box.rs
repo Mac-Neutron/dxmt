@@ -278,16 +278,25 @@ pub struct PageAllocator {
     pub free: fn(NonNull<u8>, usize),
 }
 
-/// The allocator `set_page_allocator` installed.
+/// Where the allocator comes from, `set_page_allocator_source`'s; asked at the first page.
 ///
 /// Process-wide by necessity: every `PageBox` constructor reads it, from any device and thread, and the Unix side's
 /// answer it follows is one per process (the `GetDeviceInfo` cache). Set once, before the first page.
-static PAGE_ALLOCATOR: std::sync::OnceLock<PageAllocator> = std::sync::OnceLock::new();
+static PAGE_ALLOCATOR_SOURCE: std::sync::OnceLock<fn() -> Option<PageAllocator>> = std::sync::OnceLock::new();
 
-/// Installs the Unix side's page allocator for every `PageBox` made from here on (each keeps the allocator it came
-/// from: one made before is freed as it was made).
-pub fn set_page_allocator(allocator: PageAllocator) {
-    let _ = PAGE_ALLOCATOR.set(allocator);
+/// The source's answer, latched at the first page after it was set: a machine fact, immutable after.
+static PAGE_ALLOCATOR: std::sync::OnceLock<Option<PageAllocator>> = std::sync::OnceLock::new();
+
+/// Names where the Unix side's page allocator comes from, asked at the first `PageBox` (so that nothing queries the
+/// device before a page is needed); `None` there keeps the native pages. Each page keeps the allocator it came from.
+pub fn set_page_allocator_source(source: fn() -> Option<PageAllocator>) {
+    let _ = PAGE_ALLOCATOR_SOURCE.set(source);
+}
+
+/// The allocator pages come from, once a source is set; `None` for native pages.
+fn page_allocator() -> Option<&'static PageAllocator> {
+    let source = PAGE_ALLOCATOR_SOURCE.get()?;
+    PAGE_ALLOCATOR.get_or_init(source).as_ref()
 }
 
 /// The runtime responsible for releasing a page allocation.
@@ -359,7 +368,7 @@ impl PageBox {
     /// staging.
     #[must_use]
     pub fn try_new_uninit(logical_len: usize) -> Option<Self> {
-        if let Some(allocator) = PAGE_ALLOCATOR.get() {
+        if let Some(allocator) = page_allocator() {
             return Self::try_new_hooked(allocator, logical_len);
         }
         let (len, layout) = Self::try_layout_for(logical_len)?;
@@ -373,7 +382,7 @@ impl PageBox {
     /// The same fallback-only contract as [`Self::try_new_uninit`].
     #[must_use]
     pub fn try_new_zeroed(logical_len: usize) -> Option<Self> {
-        if let Some(allocator) = PAGE_ALLOCATOR.get() {
+        if let Some(allocator) = page_allocator() {
             return Self::try_new_hooked(allocator, logical_len);
         }
         let (len, layout) = Self::try_layout_for(logical_len)?;
@@ -584,7 +593,7 @@ impl Drop for PageBox {
             PageOwnership::Hooked => {
                 note_free(self.len);
                 PAGEBOX_LIVE_BYTES.fetch_sub(self.len as u64, core::sync::atomic::Ordering::Relaxed);
-                if let Some(allocator) = PAGE_ALLOCATOR.get() {
+                if let Some(allocator) = page_allocator() {
                     (allocator.free)(self.ptr, self.len);
                 }
                 return;

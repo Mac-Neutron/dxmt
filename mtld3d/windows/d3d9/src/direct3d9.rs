@@ -757,10 +757,16 @@ fn device_info() -> &'static CachedDeviceInfo {
 }
 
 /// MacNeutron: `PageBox` pages from the Unix side when it asks (`PAGES_FROM_UNIX`, the winemetal facade's build):
-/// installed at the first interface, before any page.
+/// the question named at the first interface, asked at the first page.
 pub fn install_page_allocator() {
+    mtld3d_core::page_box::set_page_allocator_source(page_allocator);
+}
+
+/// The Unix side's page allocator when it asks for one (`PAGES_FROM_UNIX`): asked at the first `PageBox`, which is
+/// when the device is first queried, as it was before the hook.
+fn page_allocator() -> Option<mtld3d_core::page_box::PageAllocator> {
     if !device_info().caps.contains(DeviceCapsFlags::PAGES_FROM_UNIX) {
-        return;
+        return None;
     }
     fn alloc(len: usize) -> Option<core::ptr::NonNull<u8>> {
         let mut params = mtld3d_shared::AllocPagesParams { len: len as u64, ptr: 0 };
@@ -771,8 +777,8 @@ pub fn install_page_allocator() {
         let mut params = mtld3d_shared::FreePagesParams { ptr: ptr.as_ptr() as usize as u64, len: len as u64 };
         unix_call(&mut params);
     }
-    mtld3d_core::page_box::set_page_allocator(mtld3d_core::page_box::PageAllocator { alloc, free });
     log::info!(target: LOG_TARGET, "page boxes: pages from the unix side (winemetal)");
+    Some(mtld3d_core::page_box::PageAllocator { alloc, free })
 }
 
 /// Whether the Metal device can create border-colour samplers.

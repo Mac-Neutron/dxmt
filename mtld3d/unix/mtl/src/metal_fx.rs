@@ -105,6 +105,11 @@ fn textures<R>(f: impl FnOnce(&mut HashMap<u64, (u64, u64)>) -> R) -> R {
     f(TEXTURES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new))
 }
 
+/// A scaler's last facade reference: its textures go with it.
+pub(crate) fn forget(handle: u64) {
+    textures(|map| map.remove(&handle));
+}
+
 /// objc2-metal-fx's `MTLFXSpatialScalerBase`.
 pub unsafe trait MTLFXSpatialScalerBase: NSObjectProtocol {
     unsafe fn colorTextureUsage(&self) -> MTLTextureUsage {

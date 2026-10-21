@@ -13,9 +13,13 @@ use mtld3d_mtl::{
         MTLStencilOperation, MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureSwizzle,
         MTLTextureSwizzleChannels, MTLTextureType, MTLTextureUsage, MTLVertexDescriptor, MTLVertexFormat,
     },
-    table::Table,
 };
+#[cfg(target_os = "linux")]
+use mtld3d_mtl::objc2_metal::MTLCommandQueue;
+#[cfg(target_vendor = "apple")]
+use mtld3d_mtl::table::Table;
 
+#[cfg(target_vendor = "apple")]
 #[repr(C)]
 struct DlInfo {
     fname: *const c_char,
@@ -24,6 +28,7 @@ struct DlInfo {
     saddr: *mut c_void,
 }
 
+#[cfg(target_vendor = "apple")]
 unsafe extern "C" {
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
 }
@@ -81,6 +86,49 @@ fn winemetal_memory_makes_no_copy_buffers() {
     assert_eq!(buffer.contents().as_ptr().cast::<u8>(), pages);
     drop(buffer);
     mtld3d_mtl::memory::free(pages);
+}
+
+/// The VM guest's winemetal.so counts its context's live handles (`mn_wm_stats`).
+#[cfg(target_os = "linux")]
+fn guest_live_handles() -> u64 {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Stats {
+        live: u64,
+        deferred: u64,
+        failures: u64,
+    }
+    unsafe extern "C" {
+        fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
+        fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+    }
+    let path = std::ffi::CString::new(std::env::var("MTLD3D_WINEMETAL").unwrap()).unwrap();
+    // SAFETY: the library the facade loaded (the same handle again); RTLD_NOW.
+    let lib = unsafe { dlopen(path.as_ptr(), 2) };
+    // SAFETY: a lookup in it.
+    let f = unsafe { dlsym(lib, c"mn_wm_stats".as_ptr()) };
+    assert!(!f.is_null(), "the guest winemetal.so has no mn_wm_stats");
+    // SAFETY: int mn_wm_stats(struct mn_wm_stats *).
+    let f: unsafe extern "C" fn(*mut Stats) -> c_int = unsafe { core::mem::transmute(f) };
+    let mut stats = Stats::default();
+    // SAFETY: a struct of its layout.
+    assert_eq!(unsafe { f(&raw mut stats) }, 0);
+    stats.live
+}
+
+/// The VM's guest: an autoreleased return goes with the pool it was made in (with none open it would live until the
+/// process ends, on both sides).
+#[cfg(target_os = "linux")]
+#[test]
+fn autoreleased_returns_go_with_their_pool() {
+    let device = common::device();
+    let queue = device.newCommandQueue().expect("a queue");
+    let before = guest_live_handles();
+    for _ in 0..100 {
+        mtld3d_mtl::objc2::rc::autoreleasepool(|_| drop(queue.commandBuffer().expect("a command buffer")));
+    }
+    let after = guest_live_handles();
+    assert!(after < before + 10, "{} handles left of 100 command buffers", after - before);
 }
 
 #[test]
