@@ -91,18 +91,20 @@ macro_rules! arp {
 /// A 32-bit process's table.
 ///
 /// The 64-bit one but for `InitLogger`, the first thunk any process makes (`DllMain`), which first
-/// marks the process 32-bit for the winemetal facade (`mtl::mark_wow64`) before any Metal call
-/// loads winemetal's table. ponytail: marks at the first thunk only; every entry would mark if one
-/// ever ran first.
+/// marks the process 32-bit for the winemetal facade (`mtl::mark_wow64`), then runs the 64-bit
+/// entry: the mark comes before that entry's autorelease pool, whose slot is the first Metal call
+/// and loads winemetal's table. ponytail: marks at the first thunk only; every entry would mark if
+/// one ever ran first.
 const WOW64_DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = {
     let mut table = DISPATCH_TABLE;
-    table[Thunks::InitLogger as usize] = arp!(wow64_init_logger);
+    table[Thunks::InitLogger as usize] = wow64_init_logger;
     table
 };
 
-fn wow64_init_logger(args: *mut c_void) -> i32 {
+extern "C" fn wow64_init_logger(args: *mut c_void) -> i32 {
     mtl::mark_wow64();
-    handlers::init_logger_handler(args)
+    // SAFETY: the 64-bit table's InitLogger entry, with the caller's params.
+    unsafe { DISPATCH_TABLE[Thunks::InitLogger as usize](args) }
 }
 
 const fn dispatch(code: Thunks) -> UnixCallFn {
