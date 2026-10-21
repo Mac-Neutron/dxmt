@@ -50,7 +50,7 @@ pub static __wine_unix_call_wow64_funcs: [UnixCallFn; Thunks::COUNT] = WOW64_DIS
 
 type UnixCallFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
-const DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = build_dispatch_table();
+const DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = build_dispatch_table::<false>();
 
 
 /// Every native Rust allocation goes through snmalloc, the allocator the PE side uses.
@@ -79,64 +79,58 @@ static ALLOCATOR: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 /// are its main-thread twins: every closure the layer dispatches there runs
 /// in a pool of its own for the same reason.
 macro_rules! arp {
-    ($inner:path) => {{
-        extern "C" fn arp_wrap(args: *mut c_void) -> i32 {
+    ($wow64:ident, $inner:path) => {{
+        extern "C" fn arp_wrap<const WOW64: bool>(args: *mut c_void) -> i32 {
+            // A 32-bit process's entries mark it before anything else (see `WOW64_DISPATCH_TABLE`).
+            if WOW64 {
+                mtl::mark_wow64();
+            }
             mtld3d_shared::crumb!(stringify!($inner), args as usize as u64);
             crate::mtl::objc2::rc::autoreleasepool(|_| $inner(args))
         }
-        arp_wrap as UnixCallFn
+        arp_wrap::<$wow64> as UnixCallFn
     }};
 }
 
 /// A 32-bit process's table.
 ///
-/// The 64-bit one but for `InitLogger`, the first thunk any process makes (`DllMain`), which first
-/// marks the process 32-bit for the winemetal facade (`mtl::mark_wow64`), then runs the 64-bit
-/// entry: the mark comes before that entry's autorelease pool, whose slot is the first Metal call
-/// and loads winemetal's table. ponytail: marks at the first thunk only; every entry would mark if
-/// one ever ran first.
-const WOW64_DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = {
-    let mut table = DISPATCH_TABLE;
-    table[Thunks::InitLogger as usize] = wow64_init_logger;
-    table
-};
+/// The 64-bit one's handlers, each of which first marks the process 32-bit for the winemetal facade
+/// (`mtl::mark_wow64`): the mark has to come before the first Metal call (the first entry's
+/// autorelease pool), which loads winemetal's table, and the first thunk a process makes isn't
+/// always `InitLogger` (a call at process start came first in the VM's guest, and the process got
+/// winemetal's 64-bit table and memory its i386 side can't reach).
+const WOW64_DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = build_dispatch_table::<true>();
 
-extern "C" fn wow64_init_logger(args: *mut c_void) -> i32 {
-    mtl::mark_wow64();
-    // SAFETY: the 64-bit table's InitLogger entry, with the caller's params.
-    unsafe { DISPATCH_TABLE[Thunks::InitLogger as usize](args) }
-}
-
-const fn dispatch(code: Thunks) -> UnixCallFn {
+const fn dispatch<const W: bool>(code: Thunks) -> UnixCallFn {
     match code {
-        Thunks::CreateShaderProgram => arp!(shader_programs::create_handler),
-        Thunks::CancelShaderProgram => arp!(shader_programs::cancel_handler),
-        Thunks::SubmitEncoderFrame => arp!(encoder_service::submit_handler),
-        Thunks::EncoderControl => arp!(encoder_service::control_handler),
-        Thunks::CreateEncoder => arp!(encoder_service::create_handler),
-        Thunks::DestroyEncoder => arp!(encoder_service::destroy_handler),
-        Thunks::InitLogger => arp!(handlers::init_logger_handler),
-        Thunks::GetDeviceInfo => arp!(handlers::get_device_info_handler),
-        Thunks::CreateCommandQueue => arp!(handlers::create_command_queue_handler),
-        Thunks::AttachMetalLayer => arp!(handlers::attach_metal_layer_handler),
-        Thunks::DestroyCommandQueue => arp!(handlers::destroy_command_queue_handler),
-        Thunks::CreateBackbuffer => arp!(handlers::create_backbuffer_handler),
-        Thunks::CreateDepthTexture => arp!(handlers::create_depth_texture_handler),
-        Thunks::CreateColorTarget => arp!(handlers::create_color_target_handler),
-        Thunks::BlitTextureToBuffer => arp!(handlers::blit_texture_to_buffer_handler),
-        Thunks::DestroyResourcesBulk => arp!(handlers::destroy_resources_bulk_handler),
-        Thunks::WriteLog => arp!(handlers::write_log_handler),
-        Thunks::OpenLog => arp!(handlers::open_log_handler),
-        Thunks::SetCursorOverlay => arp!(handlers::set_cursor_overlay_handler),
-        Thunks::DetachMetalLayer => arp!(handlers::detach_metal_layer_handler),
-        Thunks::SetPresentWaitPolicy => arp!(handlers::set_present_wait_policy_handler),
-        Thunks::PresentClientSurface => arp!(handlers::present_client_surface_handler),
-        Thunks::AllocPages => arp!(handlers::alloc_pages_handler),
-        Thunks::FreePages => arp!(handlers::free_pages_handler),
+        Thunks::CreateShaderProgram => arp!(W, shader_programs::create_handler),
+        Thunks::CancelShaderProgram => arp!(W, shader_programs::cancel_handler),
+        Thunks::SubmitEncoderFrame => arp!(W, encoder_service::submit_handler),
+        Thunks::EncoderControl => arp!(W, encoder_service::control_handler),
+        Thunks::CreateEncoder => arp!(W, encoder_service::create_handler),
+        Thunks::DestroyEncoder => arp!(W, encoder_service::destroy_handler),
+        Thunks::InitLogger => arp!(W, handlers::init_logger_handler),
+        Thunks::GetDeviceInfo => arp!(W, handlers::get_device_info_handler),
+        Thunks::CreateCommandQueue => arp!(W, handlers::create_command_queue_handler),
+        Thunks::AttachMetalLayer => arp!(W, handlers::attach_metal_layer_handler),
+        Thunks::DestroyCommandQueue => arp!(W, handlers::destroy_command_queue_handler),
+        Thunks::CreateBackbuffer => arp!(W, handlers::create_backbuffer_handler),
+        Thunks::CreateDepthTexture => arp!(W, handlers::create_depth_texture_handler),
+        Thunks::CreateColorTarget => arp!(W, handlers::create_color_target_handler),
+        Thunks::BlitTextureToBuffer => arp!(W, handlers::blit_texture_to_buffer_handler),
+        Thunks::DestroyResourcesBulk => arp!(W, handlers::destroy_resources_bulk_handler),
+        Thunks::WriteLog => arp!(W, handlers::write_log_handler),
+        Thunks::OpenLog => arp!(W, handlers::open_log_handler),
+        Thunks::SetCursorOverlay => arp!(W, handlers::set_cursor_overlay_handler),
+        Thunks::DetachMetalLayer => arp!(W, handlers::detach_metal_layer_handler),
+        Thunks::SetPresentWaitPolicy => arp!(W, handlers::set_present_wait_policy_handler),
+        Thunks::PresentClientSurface => arp!(W, handlers::present_client_surface_handler),
+        Thunks::AllocPages => arp!(W, handlers::alloc_pages_handler),
+        Thunks::FreePages => arp!(W, handlers::free_pages_handler),
     }
 }
 
-const fn build_dispatch_table() -> [UnixCallFn; Thunks::COUNT] {
+const fn build_dispatch_table<const W: bool>() -> [UnixCallFn; Thunks::COUNT] {
     extern "C" fn unimplemented_thunk(_args: *mut c_void) -> i32 {
         unimplemented!("Called unimplemented thunk.")
     }
@@ -145,7 +139,7 @@ const fn build_dispatch_table() -> [UnixCallFn; Thunks::COUNT] {
     let variants = Thunks::VARIANTS;
     let mut i = 0;
     while i < variants.len() {
-        table[variants[i] as usize] = dispatch(variants[i]);
+        table[variants[i] as usize] = dispatch::<W>(variants[i]);
         i += 1;
     }
     table

@@ -36,7 +36,7 @@ static TABLE: LazyLock<Result<Table, String>> = LazyLock::new(Table::load);
 /// Whether the process is 32-bit.
 ///
 /// The resource is process-wide (one 32-bit address space) and a machine fact, latched once:
-/// mtld3d.so's own WoW64 table sets it at its first thunk, before any Metal call, and the table
+/// every entry of mtld3d.so's own WoW64 table sets it first, before any Metal call, and the table
 /// reads it once when it loads.
 static WOW64: AtomicBool = AtomicBool::new(false);
 
@@ -44,7 +44,10 @@ static WOW64: AtomicBool = AtomicBool::new(false);
 ///
 /// Called before the table's first use.
 pub fn mark_wow64() {
-    WOW64.store(true, Ordering::Relaxed);
+    // Every entry of a 32-bit process's table marks: a read, but for the first.
+    if !WOW64.load(Ordering::Relaxed) {
+        WOW64.store(true, Ordering::Relaxed);
+    }
 }
 
 unsafe extern "C" {
