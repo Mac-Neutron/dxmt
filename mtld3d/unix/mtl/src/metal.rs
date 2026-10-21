@@ -35,7 +35,7 @@ pub type Deallocator = block2::DynBlock<dyn Fn(NonNull<c_void>, NSUInteger)>;
 
 /// The handle of any facade object reference.
 pub fn handle_of<T: ?Sized>(obj: &T) -> u64 {
-    core::ptr::from_ref(obj).cast::<u8>() as usize as u64
+    objc2::handle_at(core::ptr::from_ref(obj).cast::<u8>() as usize)
 }
 
 /// `handle`, retained, as `Retained<ProtocolObject<P>>`; `None` for 0.
@@ -44,7 +44,7 @@ pub fn retained<P: ?Sized>(handle: u64) -> Option<Retained<ProtocolObject<P>>> {
         return None;
     }
     // SAFETY: a live object the facade knows.
-    unsafe { Retained::retain(handle as usize as *mut ProtocolObject<P>) }
+    unsafe { Retained::retain(objc2::addr_of(handle) as *mut ProtocolObject<P>) }
 }
 
 /// The device an object was made on (its entry), else the default device.

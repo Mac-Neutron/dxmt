@@ -800,13 +800,13 @@ fn now() -> f64 {
 /// Gives back the reference `keep_drawable` took for a presented handler.
 fn release_drawable(drawable: u64) {
     // SAFETY: that reference.
-    unsafe { <ProtocolObject<dyn MTLDrawable> as objc2::Message>::release_raw(drawable as usize as *const _) };
+    unsafe { <ProtocolObject<dyn MTLDrawable> as objc2::Message>::release_raw(objc2::addr_of(drawable) as *const _) };
 }
 
 /// A reference on `drawable` for a presented handler, until it has run (release_drawable).
 fn keep_drawable(drawable: u64) {
     // SAFETY: a live drawable.
-    unsafe { <ProtocolObject<dyn MTLDrawable> as objc2::Message>::retain_raw(drawable as usize as *const _) };
+    unsafe { <ProtocolObject<dyn MTLDrawable> as objc2::Message>::retain_raw(objc2::addr_of(drawable) as *const _) };
 }
 
 /// The facade's last reference to `handle` (objc2.rs).

@@ -33,6 +33,13 @@ use attachment::{AttachLatches, Attachment};
 /// The rate a vsync request caps presents at: winemetal reports no panel rate.
 const PANEL_HZ: f64 = 60.0;
 
+/// The winemetal handle of an object mtld3d keeps by its address (a `MetalHandle`).
+///
+/// The facade's `addr_of`: a 32-bit process's addresses can't hold the VM guest's handles.
+fn handle_at(raw: u64) -> u64 {
+    usize::try_from(raw).map_or(0, crate::mtl::objc2::handle_at)
+}
+
 /// The guest's vsync ask plus the user's frame-rate ceiling (as macOS's).
 pub struct PresentPacing {
     pub vsync_requested: bool,
@@ -96,7 +103,7 @@ pub fn attach_metal_layer(
         return None;
     }
     // SAFETY: a live device handle from the PE side.
-    let device = unsafe { ProtocolObject::<dyn MTLDevice>::from_handle(device_handle.raw()) };
+    let device = unsafe { ProtocolObject::<dyn MTLDevice>::from_handle(handle_at(device_handle.raw())) };
     let Some((view, layer)) = create_metal_view(hwnd, device) else {
         log::warn!(target: crate::LOG_TARGET, "present: winemetal made no view for window {hwnd:#x}");
         return None;
@@ -129,14 +136,15 @@ pub fn attach_metal_layer(
         #[cfg(test)]
         client_surface: 0,
     };
-    let att = attachment::register(usize::try_from(view).expect("a 64-bit address"), layer_handle, &latches);
+    let view_addr = crate::mtl::objc2::addr_of(view);
+    let att = attachment::register(view_addr, layer_handle, &latches);
     att.set_min_present_duration(min_present_duration(&pacing));
     log::info!(
         target: crate::LOG_TARGET,
         "present: winemetal view {view:#x} layer {layer_handle:#x} for window {hwnd:#x}, {width}x{height} (sRGB, {PANEL_HZ} Hz assumed)"
     );
     // SAFETY: a view winemetal just made; its layer's +1 rides with it until retire.
-    let view_handle = unsafe { MetalHandle::new(view) };
+    let view_handle = unsafe { MetalHandle::new(view_addr as u64) };
     // SAFETY: the layer winemetal just made, as above.
     let layer_handle = unsafe { MetalHandle::new(layer_handle as u64) };
     Some((view_handle, layer_handle, DisplayCaps { backing_scale: scale, software_cursor_active: false }))
@@ -158,7 +166,7 @@ pub fn retire_metal_view(view_handle: MetalHandle<NSViewKind>, record: Option<&A
         // SAFETY: the +1 attach kept on the layer.
         drop(unsafe { crate::mtl::objc2::rc::Retained::from_raw(att.layer() as *mut CAMetalLayer) });
     }
-    release_metal_view(view_handle.raw());
+    release_metal_view(handle_at(view_handle.raw()));
 }
 
 /// No client surface under the facade.

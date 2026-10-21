@@ -59,7 +59,7 @@ impl CAMetalLayer {
             return None;
         }
         // SAFETY: a live layer.
-        unsafe { Retained::retain(handle as usize as *mut Self) }
+        unsafe { Retained::retain(crate::objc2::addr_of(handle) as *mut Self) }
     }
 
     fn props(&self) -> wmt::LayerProps {

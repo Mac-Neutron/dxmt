@@ -5,11 +5,59 @@
 //! picked): the type is zero-sized and never read, so code that turns objects into `u64`s and back
 //! works unchanged. `Retained<T>` holds +1 of it; its release goes to winemetal when the facade's
 //! own count of the object's references reaches zero. Descriptors and strings the facade makes are
-//! Rust objects behind the same `Retained` (`Message` says how each is kept).
+//! Rust objects behind the same `Retained` (`Message` says how each is kept). A 32-bit process's
+//! addresses can't hold the guest's handles: [`addr_of`] and [`handle_at`] convert.
 
 use core::{fmt, marker::PhantomData, ops::Deref, ptr::NonNull};
 
 use crate::meta;
+
+/// A winemetal handle as its object's address here.
+///
+/// The handle itself in a 64-bit process. In a 32-bit one (old WoW64's i686 mtld3d.so in the
+/// VM's guest), whose addresses can't hold the guest's handles (`generation << 32 | index`), the
+/// handle's index, unique among live handles, with the handle kept for [`handle_at`].
+#[must_use]
+pub fn addr_of(handle: u64) -> usize {
+    #[cfg(target_pointer_width = "32")]
+    {
+        let index = (handle & 0xffff_ffff) as usize;
+        if let Some(slot) = guest_handles().get(index) {
+            slot.store(handle, core::sync::atomic::Ordering::Release);
+        }
+        index
+    }
+    #[cfg(not(target_pointer_width = "32"))]
+    {
+        handle as usize
+    }
+}
+
+/// The winemetal handle of the object at `addr` (see [`addr_of`]).
+#[must_use]
+pub fn handle_at(addr: usize) -> u64 {
+    #[cfg(target_pointer_width = "32")]
+    {
+        guest_handles().get(addr).map_or(0, |slot| slot.load(core::sync::atomic::Ordering::Acquire))
+    }
+    #[cfg(not(target_pointer_width = "32"))]
+    {
+        addr as u64
+    }
+}
+
+/// Every live handle by its index, in a 32-bit process.
+///
+/// The resource is process-wide: the VM guest's handle table is one per process (winemetal.so's,
+/// `MN_H_MAX` indexes), as the 32-bit address space its objects' addresses come from.
+#[cfg(target_pointer_width = "32")]
+fn guest_handles() -> &'static [core::sync::atomic::AtomicU64] {
+    static HANDLES: std::sync::LazyLock<Box<[core::sync::atomic::AtomicU64]>> = std::sync::LazyLock::new(|| {
+        // SAFETY: zero is a valid AtomicU64 (no handle); the pages stay untouched until used.
+        unsafe { Box::new_zeroed_slice(1 << 20).assume_init() }
+    });
+    &HANDLES
+}
 
 /// How an object is retained and released: winemetal for Metal objects, a Rust count otherwise.
 ///
@@ -215,7 +263,7 @@ pub mod runtime {
         /// The object's winemetal handle.
         #[must_use]
         pub fn handle(&self) -> u64 {
-            core::ptr::from_ref(self) as usize as u64
+            super::handle_at(core::ptr::from_ref(self) as usize)
         }
 
         /// The object with handle `handle`, borrowed (no reference taken).
@@ -225,7 +273,7 @@ pub mod runtime {
         #[must_use]
         pub unsafe fn from_handle<'a>(handle: u64) -> &'a Self {
             // SAFETY: a zero-sized type at a non-null address.
-            unsafe { &*(handle as usize as *const Self) }
+            unsafe { &*(super::addr_of(handle) as *const Self) }
         }
     }
 
@@ -233,14 +281,14 @@ pub mod runtime {
     // the last reference.
     unsafe impl<P: ?Sized> Message for ProtocolObject<P> {
         unsafe fn retain_raw(ptr: *const Self) {
-            let handle = ptr as usize as u64;
+            let handle = super::handle_at(ptr as usize);
             meta::retain(handle);
             let mut params = wmt::ObjNoRet { handle };
             // SAFETY: a live object.
             unsafe { table::call(wmt::RETAIN, &mut params) };
         }
         unsafe fn release_raw(ptr: *const Self) {
-            let handle = ptr as usize as u64;
+            let handle = super::handle_at(ptr as usize);
             if let Some(entry) = meta::release(handle) {
                 // The facade's last reference: what it keeps beside the object goes first, while it still lives.
                 crate::metal::forget(handle, &entry);
@@ -273,7 +321,7 @@ pub mod runtime {
         ///
         /// The references this process holds, which is what a retain-discipline test compares.
         fn retainCount(&self) -> usize {
-            meta::refs(core::ptr::from_ref(self).cast::<u8>() as usize as u64)
+            meta::refs(super::handle_at(core::ptr::from_ref(self).cast::<u8>() as usize))
         }
     }
     impl<P: ?Sized> NSObjectProtocol for ProtocolObject<P> {}
@@ -286,7 +334,7 @@ pub fn from_plus_one<P: ?Sized>(handle: u64) -> Option<Retained<runtime::Protoco
     }
     meta::adopt(handle);
     // SAFETY: a +1 handle the slot handed over.
-    unsafe { Retained::from_raw(handle as usize as *mut runtime::ProtocolObject<P>) }
+    unsafe { Retained::from_raw(addr_of(handle) as *mut runtime::ProtocolObject<P>) }
 }
 
 /// An autoreleased (+0) winemetal handle from a slot, retained as a `Retained`; `None` for 0.
@@ -295,5 +343,5 @@ pub fn from_autoreleased<P: ?Sized>(handle: u64) -> Option<Retained<runtime::Pro
         return None;
     }
     // SAFETY: a live object (its pool hasn't drained: we're inside the call that returned it).
-    unsafe { Retained::retain(handle as usize as *mut runtime::ProtocolObject<P>) }
+    unsafe { Retained::retain(addr_of(handle) as *mut runtime::ProtocolObject<P>) }
 }
