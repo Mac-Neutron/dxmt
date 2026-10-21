@@ -1,6 +1,5 @@
 // MacNeutron: the winemetal facade's builds (the loopback and the Linux one) leave out macOS's window code, the
-// cursor overlay and the crash reporter's Mach half; what only those call stays for the product build.
-#![cfg_attr(mtl_facade, allow(dead_code, reason = "code only the product macOS build's window paths reach"))]
+// cursor overlay and the crash reporter's Mach half; what only those call is `cfg(not(mtl_facade))`.
 
 use core::ffi::c_void;
 
@@ -89,9 +88,12 @@ macro_rules! arp {
     }};
 }
 
-/// MacNeutron: a 32-bit process's table, the 64-bit one but for `InitLogger`, the first thunk any process makes
-/// (`DllMain`), which first marks the process 32-bit for the winemetal facade (`mtl::mark_wow64`) before any Metal
-/// call loads winemetal's table. ponytail: marks at the first thunk only; every entry would mark if one ever ran first.
+/// A 32-bit process's table.
+///
+/// The 64-bit one but for `InitLogger`, the first thunk any process makes (`DllMain`), which first
+/// marks the process 32-bit for the winemetal facade (`mtl::mark_wow64`) before any Metal call
+/// loads winemetal's table. ponytail: marks at the first thunk only; every entry would mark if one
+/// ever ran first.
 const WOW64_DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = {
     let mut table = DISPATCH_TABLE;
     table[Thunks::InitLogger as usize] = arp!(wow64_init_logger);

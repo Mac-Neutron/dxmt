@@ -756,14 +756,18 @@ fn device_info() -> &'static CachedDeviceInfo {
     &INFO
 }
 
-/// MacNeutron: `PageBox` pages from the Unix side when it asks (`PAGES_FROM_UNIX`, the winemetal facade's build):
-/// the question named at the first interface, asked at the first page.
+/// `PageBox` pages from the Unix side when it asks.
+///
+/// The `PAGES_FROM_UNIX` case of the winemetal facade's build: the question is named at the first
+/// interface and asked at the first page.
 pub fn install_page_allocator() {
     mtld3d_core::page_box::set_page_allocator_source(page_allocator);
 }
 
-/// The Unix side's page allocator when it asks for one (`PAGES_FROM_UNIX`): asked at the first `PageBox`, which is
-/// when the device is first queried, as it was before the hook.
+/// The Unix side's page allocator when it asks for one (`PAGES_FROM_UNIX`).
+///
+/// Asked at the first `PageBox`, which is when the device is first queried, as it was before the
+/// hook.
 fn page_allocator() -> Option<mtld3d_core::page_box::PageAllocator> {
     if !device_info().caps.contains(DeviceCapsFlags::PAGES_FROM_UNIX) {
         return None;

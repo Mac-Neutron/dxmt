@@ -1,5 +1,7 @@
-//! objc2-quartz-core's `CAMetalLayer` and `CAMetalDrawable` over winemetal's layer slots: a layer is the one
-//! `CreateMetalViewFromHWND` made for a window; its properties are winemetal's `WMTLayerProps`.
+//! objc2-quartz-core's `CAMetalLayer` and `CAMetalDrawable` over winemetal's layer slots.
+//!
+//! A layer is the one `CreateMetalViewFromHWND` made for a window; its properties are winemetal's
+//! `WMTLayerProps`.
 
 #![allow(non_snake_case)]
 
@@ -16,7 +18,7 @@ use crate::{
 
 /// objc2-core-foundation's `CGSize`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Debug, Default, PartialEq)]
 pub struct CGSize {
     pub width: f64,
     pub height: f64,
@@ -140,6 +142,9 @@ impl CAMetalLayer {
 }
 
 /// objc2-quartz-core's `CAMetalDrawable`.
+///
+/// # Safety
+/// Implemented for the facade's drawables only, as objc2 requires.
 pub unsafe trait CAMetalDrawable: MTLDrawable {
     fn texture(&self) -> Retained<ProtocolObject<dyn MTLTexture>> {
         let mut params = wmt::ObjObjRet { handle: handle_of(self), ret: 0 };
@@ -155,8 +160,10 @@ pub unsafe trait CAMetalDrawable: MTLDrawable {
 unsafe impl MTLDrawable for ProtocolObject<dyn CAMetalDrawable> {}
 unsafe impl CAMetalDrawable for ProtocolObject<dyn CAMetalDrawable> {}
 
-/// A metal view over the client area of window `hwnd` for `device` (winemetal's `CreateMetalViewFromHWND`, slot 72):
-/// the view's handle and its layer, or `None` when the window has no view to give (winemetal found no window data).
+/// A metal view over the client area of window `hwnd` for `device`.
+///
+/// Winemetal's `CreateMetalViewFromHWND` (slot 72) makes it. Returns the view's handle and its
+/// layer, or `None` when winemetal found no window data and so has no view to give.
 #[must_use]
 pub fn create_metal_view(hwnd: u64, device: &ProtocolObject<dyn MTLDevice>) -> Option<(u64, Retained<CAMetalLayer>)> {
     let mut params = wmt::CreateMetalView { hwnd, device: device.handle(), ret_view: 0, ret_layer: 0 };
@@ -179,7 +186,9 @@ pub fn release_metal_view(view: u64) {
 }
 
 impl CAMetalLayer {
-    /// sRGB, standard range (winemetal's `MetalLayer_setColorSpace`, slot 93): the facade's only layer mode.
+    /// sRGB, standard range (winemetal's `MetalLayer_setColorSpace`, slot 93).
+    ///
+    /// The facade's only layer mode.
     pub fn set_srgb(&self) {
         let mut params = wmt::ObjU64U64Ret { handle: handle_of(self), arg: 0, ret: 0 };
         // SAFETY: slot 93 on a live layer; 0 is WMTColorSpaceSRGB.

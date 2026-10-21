@@ -65,7 +65,9 @@ use crate::{
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 const DLL_PROCESS_DETACH: u32 = 0;
-/// The reason a thread's exit gives a TLS callback, which only the DLLs on llvm-mingw's CRT install.
+/// The reason a thread's exit gives a TLS callback.
+///
+/// Which only the DLLs on llvm-mingw's CRT install.
 #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec", mingw_crt))]
 const DLL_THREAD_DETACH: u32 = 3;
 

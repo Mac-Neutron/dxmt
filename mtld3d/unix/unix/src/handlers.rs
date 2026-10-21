@@ -236,8 +236,10 @@ pub extern "C" fn get_device_info_handler(args: *mut c_void) -> i32 {
     STATUS_SUCCESS
 }
 
-/// MacNeutron: zeroed pages for a PageBox (`DeviceCapsFlags::PAGES_FROM_UNIX`): under the winemetal facade, memory
-/// Metal can be made over: winemetal's guest allocator in the VM (`WMTMemoryAlloc`), anonymous pages on macOS.
+/// Zeroed pages for a `PageBox` (`DeviceCapsFlags::PAGES_FROM_UNIX`).
+///
+/// Under the winemetal facade, memory Metal can be made over: winemetal's guest allocator in the VM
+/// (`WMTMemoryAlloc`), anonymous pages on macOS.
 pub extern "C" fn alloc_pages_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *mut AllocPagesParams.
     let Some(mut params) = (unsafe { InPtrMut::<AllocPagesParams>::opt(args) }) else {
@@ -247,14 +249,14 @@ pub extern "C" fn alloc_pages_handler(args: *mut c_void) -> i32 {
     STATUS_SUCCESS
 }
 
-/// MacNeutron: gives back pages `alloc_pages_handler` handed out.
+/// Gives back pages `alloc_pages_handler` handed out.
 pub extern "C" fn free_pages_handler(args: *mut c_void) -> i32 {
     // SAFETY: unix-call handler params; PE side passes *mut FreePagesParams.
     let Some(params) = (unsafe { InPtr::<FreePagesParams>::opt(args) }) else {
         return -1;
     };
-    if let Ok(len) = usize::try_from(params.len) {
-        metal::free_pages(params.ptr as usize as *mut u8, len);
+    if let (Ok(len), Ok(ptr)) = (usize::try_from(params.len), usize::try_from(params.ptr)) {
+        metal::free_pages(ptr as *mut u8, len);
     }
     STATUS_SUCCESS
 }
@@ -343,11 +345,17 @@ pub extern "C" fn attach_metal_layer_handler(args: *mut c_void) -> i32 {
             vsync_requested: params.display_sync_enabled != 0,
             max_fps: params.max_fps,
         },
+        #[cfg(not(mtl_facade))]
         hdr_enable: params.hdr_enable != 0,
+        #[cfg(any(not(mtl_facade), test))]
         color_space: params.color_space,
+        #[cfg(any(not(mtl_facade), test))]
         backing_scale_sink_ptr: params.backing_scale_ptr,
+        #[cfg(any(not(mtl_facade), test))]
         cursor_kick_sink_ptr: params.cursor_kick_ptr,
+        #[cfg(any(not(mtl_facade), test))]
         client_surface_request_sink_ptr: params.client_surface_request_ptr,
+        #[cfg(not(mtl_facade))]
         software_cursor: params.software_cursor,
     };
     if let Some((view, layer, caps)) = metal::attach_metal_layer(params.device_handle, request) {
@@ -547,7 +555,7 @@ pub fn malloc_in_use() -> u64 {
     u64::try_from(stats.size_in_use).unwrap_or(u64::MAX)
 }
 
-/// MacNeutron: the VM's guest: resident pages (`/proc/self/statm`), 0 when it can't be read.
+/// The VM's guest: resident pages (`/proc/self/statm`), 0 when it can't be read.
 #[cfg(target_os = "linux")]
 pub fn process_footprint() -> u64 {
     let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
@@ -557,7 +565,7 @@ pub fn process_footprint() -> u64 {
     resident.saturating_mul(page)
 }
 
-/// MacNeutron: the VM's guest: glibc's `malloc` bytes in use, its arenas' and its mapped blocks'.
+/// The VM's guest: glibc's `malloc` bytes in use, its arenas' and its mapped blocks'.
 #[cfg(target_os = "linux")]
 pub fn malloc_in_use() -> u64 {
     // SAFETY: mallinfo2 only reads glibc's allocator statistics.

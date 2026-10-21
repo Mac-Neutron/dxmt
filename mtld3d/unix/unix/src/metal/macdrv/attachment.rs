@@ -32,19 +32,25 @@
 //! the registry lock sits at the bottom of every order. It is not taken
 //! anywhere else.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(any(not(mtl_facade), test))]
+use core::sync::atomic::AtomicUsize;
 use std::{
     sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
-use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
+#[cfg(any(not(mtl_facade), test))]
+use mtld3d_shared::mtl::ClientSurfaceRequest;
+#[cfg(any(not(mtl_facade), test))]
+use mtld3d_shared::mtl::ColorSpacePolicy;
 #[cfg(not(mtl_facade))]
 use objc2::{MainThreadMarker, rc::Retained};
 use rustc_hash::FxHashMap;
 
 use crate::metal::command::{GeometryStreak, PresentGeometry};
 
+#[cfg(any(not(mtl_facade), test))]
 /// How many presents may pass between headroom refreshes.
 ///
 /// Refreshing every present would put a main-queue block in every frame for
@@ -94,7 +100,9 @@ pub struct AttachLatches {
     ///
     /// Names the window the view is kept for once the device is gone.
     pub hwnd: u64,
+    #[cfg(any(not(mtl_facade), test))]
     pub flags: AttachFlags,
+    #[cfg(any(not(mtl_facade), test))]
     /// `color.space` from `mtld3d.conf`.
     ///
     /// Reconfiguring the layer for a new screen has to pick the colorspace
@@ -102,14 +110,19 @@ pub struct AttachLatches {
     pub color_space: ColorSpacePolicy,
     /// The guest's vsync ask and the user's frame cap, as `pack_pacing` folds them.
     pub pacing_bits: u64,
+    #[cfg(any(not(mtl_facade), test))]
     /// The Wine layer's contents scale as attach read it, already published.
     pub backing_scale: u32,
+    #[cfg(any(not(mtl_facade), test))]
     /// Address of the PE-side `AtomicU32` a changed backing scale is published into, `0` = none.
     pub backing_scale_sink: usize,
+    #[cfg(any(not(mtl_facade), test))]
     /// Address of the PE-side `AtomicU32` a cursor re-apply is asked through, `0` = none.
     pub cursor_kick_sink: usize,
+    #[cfg(any(not(mtl_facade), test))]
     /// Address of the PE-side `AtomicU32` a client surface present is asked through, `0` = none.
     pub client_surface_request_sink: usize,
+    #[cfg(any(not(mtl_facade), test))]
     /// Wine's client surface the view sits in, `0` = none.
     ///
     /// The record owns one reference on it, taken at attach and given back
@@ -124,20 +137,26 @@ pub struct AttachLatches {
 /// presenting thread reads per present. See the module doc for which of
 /// them may be dereferenced, and where.
 pub struct Attachment {
+    #[cfg(any(not(mtl_facade), test))]
     /// Raw `NSView*`, the registry key.
     view: usize,
     /// Raw `CAMetalLayer*` of that view.
     layer: usize,
     /// See [`AttachLatches::hwnd`].
     hwnd: u64,
+    #[cfg(any(not(mtl_facade), test))]
     /// See [`AttachLatches::backing_scale_sink`].
     backing_scale_sink: usize,
+    #[cfg(any(not(mtl_facade), test))]
     /// See [`AttachLatches::cursor_kick_sink`].
     cursor_kick_sink: usize,
+    #[cfg(any(not(mtl_facade), test))]
     /// See [`AttachLatches::client_surface_request_sink`].
     client_surface_request_sink: usize,
+    #[cfg(any(not(mtl_facade), test))]
     /// See [`AttachLatches::client_surface`].
     client_surface: usize,
+    #[cfg(not(mtl_facade))]
     /// The main-thread watch on the hidden state of the view's client view, `0` = none.
     ///
     /// An address `client_view_watch` hands out and takes back, dereferenced
@@ -146,13 +165,17 @@ pub struct Attachment {
     client_view_watch: AtomicUsize,
     /// When the record was registered, which orders the devices on one window.
     attached_at: Instant,
+    #[cfg(any(not(mtl_facade), test))]
     flags: AttachFlags,
+    #[cfg(any(not(mtl_facade), test))]
     color_space: ColorSpacePolicy,
+    #[cfg(any(not(mtl_facade), test))]
     /// Raw `NSWindow*` the occlusion observer filters notifications by.
     ///
     /// Written on the main thread, compared against the notification's own
     /// live object, never dereferenced. `0` while the view has no window.
     window: AtomicUsize,
+    #[cfg(any(not(mtl_facade), test))]
     /// Whether the layer currently carries the EDR configuration.
     ///
     /// Written at attach and again on the main thread whenever the window's
@@ -178,17 +201,20 @@ pub struct Attachment {
     /// shader treats as the identity curve, so the presents before the first
     /// refresh lands are correct rather than merely safe.
     current_headroom_bits: AtomicU32,
+    #[cfg(any(not(mtl_facade), test))]
     /// Last headroom an `info!` line was emitted for, as `f32::to_bits`.
     ///
     /// `0` = never logged; the first refresh always logs to establish a
     /// baseline distinct from the attach-time line. Written only on the main
     /// thread.
     last_logged_headroom_bits: AtomicU32,
+    #[cfg(any(not(mtl_facade), test))]
     /// Whether a headroom refresh is already queued on the main thread.
     ///
     /// Bounds the main queue to one outstanding refresh per record no matter
     /// how far ahead the presenting thread runs.
     headroom_refresh_pending: AtomicBool,
+    #[cfg(any(not(mtl_facade), test))]
     /// Presents since the last headroom refresh was queued.
     ///
     /// Starts already due so the first present after attach queues a refresh
@@ -227,6 +253,7 @@ pub struct Attachment {
     /// packed word rather than two atomics, so a Reset landing between two
     /// reads cannot hand the reconciliation half of each.
     present_pacing_bits: AtomicU64,
+    #[cfg(any(not(mtl_facade), test))]
     /// Backing scale last published to the PE side.
     ///
     /// Compared against before publishing, so the PE side only hears about
@@ -245,30 +272,44 @@ pub struct Attachment {
 }
 
 impl Attachment {
-    fn new(view: usize, layer: usize, latches: &AttachLatches) -> Self {
+    fn new(#[cfg(any(not(mtl_facade), test))] view: usize, layer: usize, latches: &AttachLatches) -> Self {
         Self {
+            #[cfg(any(not(mtl_facade), test))]
             view,
             layer,
             hwnd: latches.hwnd,
+            #[cfg(any(not(mtl_facade), test))]
             backing_scale_sink: latches.backing_scale_sink,
+            #[cfg(any(not(mtl_facade), test))]
             cursor_kick_sink: latches.cursor_kick_sink,
+            #[cfg(any(not(mtl_facade), test))]
             client_surface_request_sink: latches.client_surface_request_sink,
+            #[cfg(any(not(mtl_facade), test))]
             client_surface: latches.client_surface,
+            #[cfg(not(mtl_facade))]
             client_view_watch: AtomicUsize::new(0),
             attached_at: Instant::now(),
+            #[cfg(any(not(mtl_facade), test))]
             flags: latches.flags,
+            #[cfg(any(not(mtl_facade), test))]
             color_space: latches.color_space,
+            #[cfg(any(not(mtl_facade), test))]
             window: AtomicUsize::new(0),
+            #[cfg(any(not(mtl_facade), test))]
             hdr_active: AtomicBool::new(latches.flags.contains(AttachFlags::HDR_ACTIVE)),
             window_occluded: AtomicBool::new(false),
             current_headroom_bits: AtomicU32::new(1.0_f32.to_bits()),
+            #[cfg(any(not(mtl_facade), test))]
             last_logged_headroom_bits: AtomicU32::new(0),
+            #[cfg(any(not(mtl_facade), test))]
             headroom_refresh_pending: AtomicBool::new(false),
+            #[cfg(any(not(mtl_facade), test))]
             presents_since_headroom_refresh: AtomicU64::new(HEADROOM_REFRESH_PRESENTS),
             min_present_duration_bits: AtomicU64::new(0),
             unshown_release_ns: AtomicU64::new(0),
             undisplayed_paced: AtomicU32::new(0),
             present_pacing_bits: AtomicU64::new(latches.pacing_bits),
+            #[cfg(any(not(mtl_facade), test))]
             current_backing_scale: AtomicU32::new(latches.backing_scale),
             present_streak: GeometryStreak::new(),
             gamma_active: AtomicBool::new(false),
@@ -290,6 +331,7 @@ impl Attachment {
         self.gamma_active.store(active, Ordering::Release);
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// The raw `NSView*` address this record is keyed by; compared, never dereferenced here.
     #[must_use]
     pub const fn view(&self) -> usize {
@@ -308,49 +350,58 @@ impl Attachment {
         self.hwnd
     }
 
+    #[cfg(not(mtl_facade))]
     /// Wine's client surface the record holds a reference on, `0` = none.
     #[must_use]
     pub const fn client_surface(&self) -> usize {
         self.client_surface
     }
 
+    #[cfg(not(mtl_facade))]
     /// Hand the record the address of its client view watch, giving back any it held.
     pub fn replace_client_view_watch(&self, watch: usize) -> usize {
         self.client_view_watch.swap(watch, Ordering::AcqRel)
     }
 
+    #[cfg(not(mtl_facade))]
     /// Take the client view watch address out of the record, `0` when it holds none.
     pub fn take_client_view_watch(&self) -> usize {
         self.client_view_watch.swap(0, Ordering::AcqRel)
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// `color.hdr.enable` as the attach carried it.
     #[must_use]
     pub const fn hdr_enable_requested(&self) -> bool {
         self.flags.contains(AttachFlags::HDR_ENABLE_REQUESTED)
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// `color.space` as the attach carried it.
     #[must_use]
     pub const fn color_space(&self) -> ColorSpacePolicy {
         self.color_space
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// The raw `NSWindow*` the occlusion observer matches, `0` = none.
     #[must_use]
     pub fn window(&self) -> usize {
         self.window.load(Ordering::Relaxed)
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     pub fn set_window(&self, window: usize) {
         self.window.store(window, Ordering::Relaxed);
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     #[must_use]
     pub fn hdr_active(&self) -> bool {
         self.hdr_active.load(Ordering::Relaxed)
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     pub fn set_hdr_active(&self, active: bool) {
         self.hdr_active.store(active, Ordering::Relaxed);
     }
@@ -360,6 +411,7 @@ impl Attachment {
         self.window_occluded.load(Ordering::Relaxed)
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     pub fn set_window_occluded(&self, occluded: bool) {
         self.window_occluded.store(occluded, Ordering::Relaxed);
     }
@@ -370,11 +422,13 @@ impl Attachment {
         f32::from_bits(self.current_headroom_bits.load(Ordering::Relaxed))
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     pub fn set_headroom(&self, headroom: f32) {
         self.current_headroom_bits
             .store(headroom.to_bits(), Ordering::Relaxed);
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// The headroom last logged, `None` = never logged.
     #[must_use]
     pub fn last_logged_headroom(&self) -> Option<f32> {
@@ -384,11 +438,13 @@ impl Attachment {
         }
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     pub fn set_last_logged_headroom(&self, headroom: f32) {
         self.last_logged_headroom_bits
             .store(headroom.to_bits(), Ordering::Relaxed);
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// Count one present and say whether it is this record's turn to queue a headroom refresh.
     ///
     /// `true` at most once per [`HEADROOM_REFRESH_PRESENTS`] presents, and
@@ -413,12 +469,14 @@ impl Attachment {
         true
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// The queued headroom refresh has run; the next due present may queue another.
     pub fn end_headroom_refresh(&self) {
         self.headroom_refresh_pending
             .store(false, Ordering::Release);
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// A Reset re-paced this record: make a reconciliation due now, and say whether to queue it.
     ///
     /// The pacing the record now carries reaches the present throttle only
@@ -503,6 +561,7 @@ impl Attachment {
         self.undisplayed_paced.load(Ordering::Relaxed) >= UNDISPLAYED_PACED_LIMIT
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// The pacing word `pack_pacing` produced.
     #[must_use]
     pub fn pacing_bits(&self) -> u64 {
@@ -513,12 +572,14 @@ impl Attachment {
         self.present_pacing_bits.store(bits, Ordering::Relaxed);
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     /// The backing scale last published to the PE side.
     #[must_use]
     pub fn backing_scale(&self) -> u32 {
         self.current_backing_scale.load(Ordering::Relaxed)
     }
 
+    #[cfg(any(not(mtl_facade), test))]
     pub fn set_backing_scale(&self, scale: u32) {
         self.current_backing_scale.store(scale, Ordering::Relaxed);
     }
@@ -535,6 +596,7 @@ fn lock() -> std::sync::MutexGuard<'static, FxHashMap<usize, Arc<Attachment>>> {
         .expect("attachment registry mutex poisoned")
 }
 
+#[cfg(any(not(mtl_facade), test))]
 /// Whether `att` is the record the registry holds for its view.
 ///
 /// The liveness check every dereference in this file rests on; `map` is the
@@ -590,7 +652,7 @@ pub const fn undisplayed_run_edge(before: u32, displayed: bool) -> Option<bool> 
 /// the view again, giving back what that record held, so the insert here
 /// replaces nothing.
 pub fn register(view: usize, layer: usize, latches: &AttachLatches) -> Arc<Attachment> {
-    let att = Arc::new(Attachment::new(view, layer, latches));
+    let att = Arc::new(Attachment::new(#[cfg(any(not(mtl_facade), test))] view, layer, latches));
     lock().insert(view, Arc::clone(&att));
     att
 }
@@ -637,6 +699,7 @@ pub fn find_by_layer(layer: usize) -> Option<Arc<Attachment>> {
     lock().values().find(|att| att.layer == layer).cloned()
 }
 
+#[cfg(any(not(mtl_facade), test))]
 /// The client surface of the newest live record on `hwnd`, retained through `retain`.
 ///
 /// `retain` takes a reference on the surface while the record is live under
@@ -651,6 +714,7 @@ pub fn retain_newest_surface_on(hwnd: u64, retain: impl FnOnce(usize) -> usize) 
     retained.filter(|&surface| surface != 0)
 }
 
+#[cfg(any(not(mtl_facade), test))]
 /// Ask the device that owns `view` to have Wine show its window's client surface again.
 ///
 /// ORs `reason` into the record's PE-side request word, which the device
@@ -682,6 +746,7 @@ pub fn request_client_surface(view: usize, reason: ClientSurfaceRequest) -> bool
     true
 }
 
+#[cfg(any(not(mtl_facade), test))]
 /// The newest live record on `hwnd` that holds a client surface; `map` is the locked registry.
 fn newest_with_surface_on(
     map: &FxHashMap<usize, Arc<Attachment>>,
@@ -692,6 +757,7 @@ fn newest_with_surface_on(
         .max_by_key(|att| att.attached_at)
 }
 
+#[cfg(any(not(mtl_facade), test))]
 /// A snapshot of every live record, for a main-thread observer to walk.
 #[must_use]
 pub fn live() -> Vec<Arc<Attachment>> {
@@ -741,6 +807,7 @@ pub fn retain_layer(
     unsafe { Retained::retain(att.layer as *mut objc2_quartz_core::CAMetalLayer) }
 }
 
+#[cfg(any(not(mtl_facade), test))]
 /// Publish a backing scale into the record's PE-side sink, while the record is live.
 ///
 /// The store is `Relaxed`: the value stands alone, the PE side reads it once
@@ -760,6 +827,7 @@ pub fn publish_backing_scale(att: &Arc<Attachment>, scale: u32) {
     sink.store(scale, Ordering::Relaxed);
 }
 
+#[cfg(any(not(mtl_facade), test))]
 /// Ask every live device to re-apply its cursor through Wine.
 ///
 /// Called when the pointer comes back after another process held it. The

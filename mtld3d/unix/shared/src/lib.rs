@@ -74,7 +74,7 @@ pub enum Thunks {
     CreateShaderProgram,
     CancelShaderProgram,
     PresentClientSurface,
-    /// MacNeutron: `PageBox` pages from the Unix side (`DeviceCapsFlags::PAGES_FROM_UNIX`).
+    /// `PageBox` pages from the Unix side (`DeviceCapsFlags::PAGES_FROM_UNIX`).
     AllocPages,
     FreePages,
 }

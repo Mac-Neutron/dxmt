@@ -1,16 +1,17 @@
 //! objc2's object model, as far as mtld3d uses it, over winemetal handles.
 //!
-//! A Metal object is a `ProtocolObject<dyn MTLX>` reference whose address is its winemetal handle (on macOS the
-//! Objective-C object's address, as in objc2; in the VM's guest a number the guest picked): the type is zero-sized and
-//! never read, so code that turns objects into `u64`s and back works unchanged. `Retained<T>` holds +1 of it; its
-//! release goes to winemetal when the facade's own count of the object's references reaches zero. Descriptors and
-//! strings the facade makes are Rust objects behind the same `Retained` (`Message` says how each is kept).
+//! A Metal object is a `ProtocolObject<dyn MTLX>` reference whose address is its winemetal handle
+//! (on macOS the Objective-C object's address, as in objc2; in the VM's guest a number the guest
+//! picked): the type is zero-sized and never read, so code that turns objects into `u64`s and back
+//! works unchanged. `Retained<T>` holds +1 of it; its release goes to winemetal when the facade's
+//! own count of the object's references reaches zero. Descriptors and strings the facade makes are
+//! Rust objects behind the same `Retained` (`Message` says how each is kept).
 
 use core::{fmt, marker::PhantomData, ops::Deref, ptr::NonNull};
 
 use crate::meta;
 
-/// How an object is retained and released: winemetal for Metal objects, a Rust count for the facade's own.
+/// How an object is retained and released: winemetal for Metal objects, a Rust count otherwise.
 ///
 /// # Safety
 /// `retain_raw`/`release_raw` keep the object alive exactly as long as its references.
@@ -162,8 +163,10 @@ pub mod rc {
     /// objc2's `AutoreleasePool` marker.
     pub struct AutoreleasePool<'p>(PhantomData<&'p ()>);
 
-    /// Runs `f` inside winemetal's autorelease pool (slot 10, drained by its release). In the VM's guest too: an
-    /// autoreleased return made with no pool open lives until the process ends, on both sides.
+    /// Runs `f` inside winemetal's autorelease pool (slot 10, drained by its release).
+    ///
+    /// In the VM's guest too: an autoreleased return made with no pool open lives until the process
+    /// ends, on both sides.
     pub fn autoreleasepool<R>(f: impl for<'p> FnOnce(AutoreleasePool<'p>) -> R) -> R {
         use crate::{table, wmt};
         let mut params = wmt::ObjRet::default();
@@ -266,8 +269,9 @@ pub mod runtime {
 
     /// objc2's `NSObjectProtocol`.
     pub trait NSObjectProtocol {
-        /// The facade's count of the object's references (the references this process holds, which is what a
-        /// retain-discipline test compares).
+        /// The facade's count of the object's references.
+        ///
+        /// The references this process holds, which is what a retain-discipline test compares.
         fn retainCount(&self) -> usize {
             meta::refs(core::ptr::from_ref(self).cast::<u8>() as usize as u64)
         }
@@ -276,7 +280,7 @@ pub mod runtime {
 }
 
 /// A +1 winemetal handle from a slot, as a `Retained`; `None` for 0.
-pub(crate) fn from_plus_one<P: ?Sized>(handle: u64) -> Option<Retained<runtime::ProtocolObject<P>>> {
+pub fn from_plus_one<P: ?Sized>(handle: u64) -> Option<Retained<runtime::ProtocolObject<P>>> {
     if handle == 0 {
         return None;
     }
@@ -286,7 +290,7 @@ pub(crate) fn from_plus_one<P: ?Sized>(handle: u64) -> Option<Retained<runtime::
 }
 
 /// An autoreleased (+0) winemetal handle from a slot, retained as a `Retained`; `None` for 0.
-pub(crate) fn from_autoreleased<P: ?Sized>(handle: u64) -> Option<Retained<runtime::ProtocolObject<P>>> {
+pub fn from_autoreleased<P: ?Sized>(handle: u64) -> Option<Retained<runtime::ProtocolObject<P>>> {
     if handle == 0 {
         return None;
     }

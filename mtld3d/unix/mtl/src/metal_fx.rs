@@ -1,10 +1,14 @@
-//! objc2-metal-fx's spatial scaler over winemetal (slots 57, 59, 68): the scaler keeps its textures until it is
-//! encoded, as winemetal's encode slot takes them together.
+//! objc2-metal-fx's spatial scaler over winemetal (slots 57, 59, 68).
+//!
+//! The scaler keeps its textures until it is encoded, as winemetal's encode slot takes them
+//! together.
 
 #![allow(non_snake_case)]
 
 use core::sync::atomic::{AtomicUsize, Ordering};
-use std::{collections::HashMap, sync::Mutex};
+use std::sync::Mutex;
+
+use rustc_hash::FxHashMap;
 
 pub use crate::metal::MTLFXSpatialScalerColorProcessingMode;
 use crate::{
@@ -45,6 +49,8 @@ fn lock(d: &Mutex<wmt::SpatialScalerInfo>) -> std::sync::MutexGuard<'_, wmt::Spa
 }
 
 impl MTLFXSpatialScalerDescriptor {
+    /// objc2's `new`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// None (objc2-metal-fx generates it `unsafe`).
     #[must_use]
@@ -53,29 +59,43 @@ impl MTLFXSpatialScalerDescriptor {
         // SAFETY: a new object with its one reference.
         unsafe { Retained::from_raw(ptr).unwrap_unchecked() }
     }
+    /// objc2's `setColorTextureFormat`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setColorTextureFormat(&self, v: MTLPixelFormat) { lock(&self.d).color_format = v.0 as u32; }
+    /// objc2's `setOutputTextureFormat`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setOutputTextureFormat(&self, v: MTLPixelFormat) { lock(&self.d).output_format = v.0 as u32; }
+    /// objc2's `setInputWidth`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setInputWidth(&self, v: NSUInteger) { lock(&self.d).input_width = v as u32; }
+    /// objc2's `setInputHeight`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setInputHeight(&self, v: NSUInteger) { lock(&self.d).input_height = v as u32; }
+    /// objc2's `setOutputWidth`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setOutputWidth(&self, v: NSUInteger) { lock(&self.d).output_width = v as u32; }
+    /// objc2's `setOutputHeight`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setOutputHeight(&self, v: NSUInteger) { lock(&self.d).output_height = v as u32; }
-    /// Perceptual only: winemetal's scaler has no processing mode (HDR is left out under the facade).
+    /// Perceptual only: winemetal's scaler has no processing mode (HDR is left out here).
     ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setColorProcessingMode(&self, _v: MTLFXSpatialScalerColorProcessingMode) {}
+    /// objc2's `newSpatialScalerWithDevice`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn newSpatialScalerWithDevice(&self, device: &ProtocolObject<dyn MTLDevice>) -> Option<Retained<ProtocolObject<dyn MTLFXSpatialScaler>>> {
@@ -88,6 +108,8 @@ impl MTLFXSpatialScalerDescriptor {
         meta::with(params.ret, |e| e.device = d);
         Some(scaler)
     }
+    /// objc2's `supportsDevice`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn supportsDevice(device: &ProtocolObject<dyn MTLDevice>) -> bool {
@@ -99,29 +121,48 @@ impl MTLFXSpatialScalerDescriptor {
 }
 
 /// Each scaler's colour and output textures, set until it is encoded.
-static TEXTURES: Mutex<Option<HashMap<u64, (u64, u64)>>> = Mutex::new(None);
+static TEXTURES: Mutex<Option<FxHashMap<u64, (u64, u64)>>> = Mutex::new(None);
 
-fn textures<R>(f: impl FnOnce(&mut HashMap<u64, (u64, u64)>) -> R) -> R {
-    f(TEXTURES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new))
+fn textures<R>(f: impl FnOnce(&mut FxHashMap<u64, (u64, u64)>) -> R) -> R {
+    f(TEXTURES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(FxHashMap::default))
 }
 
 /// A scaler's last facade reference: its textures go with it.
-pub(crate) fn forget(handle: u64) {
+pub fn forget(handle: u64) {
     textures(|map| map.remove(&handle));
 }
 
 /// objc2-metal-fx's `MTLFXSpatialScalerBase`.
+///
+/// # Safety
+/// Implemented for the facade's scaler objects only, as objc2 requires.
 pub unsafe trait MTLFXSpatialScalerBase: NSObjectProtocol {
+    /// objc2-metal-fx's `colorTextureUsage`.
+    ///
+    /// # Safety
+    /// objc2's contract.
     unsafe fn colorTextureUsage(&self) -> MTLTextureUsage {
         MTLTextureUsage::ShaderRead
     }
+    /// objc2-metal-fx's `outputTextureUsage`.
+    ///
+    /// # Safety
+    /// objc2's contract.
     unsafe fn outputTextureUsage(&self) -> MTLTextureUsage {
         MTLTextureUsage::RenderTarget | MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite
     }
+    /// objc2-metal-fx's `setColorTexture`.
+    ///
+    /// # Safety
+    /// objc2's contract.
     unsafe fn setColorTexture(&self, color_texture: Option<&ProtocolObject<dyn MTLTexture>>) {
         let t = color_texture.map_or(0, |t| t.handle());
         textures(|m| m.entry(handle_of(self)).or_default().0 = t);
     }
+    /// objc2-metal-fx's `setOutputTexture`.
+    ///
+    /// # Safety
+    /// objc2's contract.
     unsafe fn setOutputTexture(&self, output_texture: Option<&ProtocolObject<dyn MTLTexture>>) {
         let t = output_texture.map_or(0, |t| t.handle());
         textures(|m| m.entry(handle_of(self)).or_default().1 = t);
@@ -129,7 +170,14 @@ pub unsafe trait MTLFXSpatialScalerBase: NSObjectProtocol {
 }
 
 /// objc2-metal-fx's `MTLFXSpatialScaler`.
+///
+/// # Safety
+/// Implemented for the facade's scaler objects only, as objc2 requires.
 pub unsafe trait MTLFXSpatialScaler: MTLFXSpatialScalerBase {
+    /// objc2-metal-fx's `encodeToCommandBuffer`.
+    ///
+    /// # Safety
+    /// objc2's contract.
     unsafe fn encodeToCommandBuffer(&self, command_buffer: &ProtocolObject<dyn MTLCommandBuffer>) {
         let (color, output) = textures(|m| m.get(&handle_of(self)).copied().unwrap_or_default());
         let mut params = wmt::SpatialScale { cmdbuf: command_buffer.handle(), scaler: handle_of(self), color, output, fence: 0 };

@@ -23,8 +23,10 @@ use crate::DLL_THREAD_DETACH;
 #[unsafe(export_name = "??_7type_info@@6B@")]
 pub static TYPE_INFO_VFTABLE: [usize; 1] = [0];
 
-/// MSVC's marker that an image uses floating point, which LLVM's x86 code for the
-/// `-msvc` targets references and MSVC's CRT defines; nothing reads it.
+/// MSVC's marker that an image uses floating point.
+///
+/// Which LLVM's x86 code for the `-msvc` targets references and MSVC's CRT defines; nothing reads
+/// it.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[unsafe(no_mangle)]
 pub static _fltused: i32 = 0;

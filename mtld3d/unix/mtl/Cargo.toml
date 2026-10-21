@@ -10,3 +10,4 @@ authors.workspace = true
 [dependencies]
 bitflags = { workspace = true }
 log = { workspace = true }
+rustc-hash = { workspace = true }

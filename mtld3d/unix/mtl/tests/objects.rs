@@ -1,4 +1,6 @@
-//! Objects, resources, state objects, libraries and pipelines through the facade (M2a plan, Task 2).
+//! Objects, resources.
+//!
+//! State objects, libraries and pipelines through the facade (M2a plan, Task 2).
 
 mod common;
 
@@ -15,7 +17,7 @@ use mtld3d_mtl::{
     },
 };
 #[cfg(target_os = "linux")]
-use mtld3d_mtl::objc2_metal::MTLCommandQueue;
+use mtld3d_mtl::objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
 #[cfg(target_vendor = "apple")]
 use mtld3d_mtl::table::Table;
 
@@ -33,14 +35,16 @@ unsafe extern "C" {
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
 }
 
-/// macOS's winemetal.so names each slot's function; the VM guest's forwards every slot through one stub each.
+/// macOS's winemetal.so names each slot's function.
+///
+/// The VM guest's forwards every slot through one stub each.
 #[cfg(target_vendor = "apple")]
 #[test]
 fn each_slot_is_the_function_the_facade_means() {
     let _ = common::device();
     let path = std::env::var("MTLD3D_WINEMETAL").unwrap();
     let nm = std::process::Command::new("nm").args(["-a", &path]).output().expect("nm");
-    let symbols: std::collections::HashMap<String, usize> = String::from_utf8_lossy(&nm.stdout)
+    let symbols: rustc_hash::FxHashMap<String, usize> = String::from_utf8_lossy(&nm.stdout)
         .lines()
         .filter_map(|line| {
             let mut words = line.split_whitespace();
@@ -61,7 +65,9 @@ fn each_slot_is_the_function_the_facade_means() {
     }
 }
 
-/// The VM guest's memory (D3D9 M2b): 16 KiB pages a buffer is made over, zeroed, written and read back through it.
+/// The VM guest's memory (D3D9 M2b).
+///
+/// 16 KiB pages a buffer is made over, zeroed, written and read back through it.
 #[cfg(target_os = "linux")]
 #[test]
 fn winemetal_memory_makes_no_copy_buffers() {
@@ -116,19 +122,27 @@ fn guest_live_handles() -> u64 {
     stats.live
 }
 
-/// The VM's guest: an autoreleased return goes with the pool it was made in (with none open it would live until the
-/// process ends, on both sides).
+/// In the VM's guest, an autoreleased return goes with the pool it was made in.
+///
+/// With none open it would live until the process ends, on both sides.
 #[cfg(target_os = "linux")]
 #[test]
 fn autoreleased_returns_go_with_their_pool() {
     let device = common::device();
     let queue = device.newCommandQueue().expect("a queue");
     let before = guest_live_handles();
-    for _ in 0..100 {
-        mtld3d_mtl::objc2::rc::autoreleasepool(|_| drop(queue.commandBuffer().expect("a command buffer")));
+    // Committed, as mtld3d's are: a queue holds at most 64 buffers not yet completed, and the host's Metal waits for
+    // one to complete before it makes another (an uncommitted buffer never does).
+    for _ in 0..1000 {
+        mtld3d_mtl::objc2::rc::autoreleasepool(|_| {
+            let cb = queue.commandBuffer().expect("a command buffer");
+            cb.commit();
+            cb.waitUntilCompleted();
+        });
     }
     let after = guest_live_handles();
-    assert!(after < before + 10, "{} handles left of 100 command buffers", after - before);
+    // Other tests run beside this one and hold handles of their own meanwhile.
+    assert!(after < before + 100, "{} handles left of 1000 command buffers", after.saturating_sub(before));
 }
 
 #[test]

@@ -270,9 +270,10 @@ pub struct PageBox {
     readers: AtomicU32,
 }
 
-/// MacNeutron: where `PageBox` pages come from when the Unix side asks for them (`PAGES_FROM_UNIX`): the VM's guest
-/// Metal is made only over memory winemetal handed out. Zeroed pages of a whole number of [`PAGE_SIZE`]s.
-#[derive(Clone, Copy)]
+/// Where `PageBox` pages come from when the Unix side asks for them.
+///
+/// The `PAGES_FROM_UNIX` case: the VM's guest Metal is made only over memory winemetal handed out.
+/// Zeroed pages of a whole number of [`PAGE_SIZE`]s.
 pub struct PageAllocator {
     pub alloc: fn(usize) -> Option<NonNull<u8>>,
     pub free: fn(NonNull<u8>, usize),
@@ -280,15 +281,20 @@ pub struct PageAllocator {
 
 /// Where the allocator comes from, `set_page_allocator_source`'s; asked at the first page.
 ///
-/// Process-wide by necessity: every `PageBox` constructor reads it, from any device and thread, and the Unix side's
-/// answer it follows is one per process (the `GetDeviceInfo` cache). Set once, before the first page.
+/// Process-wide by necessity: every `PageBox` constructor reads it, from any device and thread, and
+/// the Unix side's answer it follows is one per process (the `GetDeviceInfo` cache). Set once,
+/// before the first page.
 static PAGE_ALLOCATOR_SOURCE: std::sync::OnceLock<fn() -> Option<PageAllocator>> = std::sync::OnceLock::new();
 
-/// The source's answer, latched at the first page after it was set: a machine fact, immutable after.
+/// The source's answer, latched at the first page after it was set.
+///
+/// A machine fact, immutable after.
 static PAGE_ALLOCATOR: std::sync::OnceLock<Option<PageAllocator>> = std::sync::OnceLock::new();
 
-/// Names where the Unix side's page allocator comes from, asked at the first `PageBox` (so that nothing queries the
-/// device before a page is needed); `None` there keeps the native pages. Each page keeps the allocator it came from.
+/// Names where the Unix side's page allocator comes from.
+///
+/// Asked at the first `PageBox` (so that nothing queries the device before a page is needed);
+/// `None` there keeps the native pages. Each page keeps the allocator it came from.
 pub fn set_page_allocator_source(source: fn() -> Option<PageAllocator>) {
     let _ = PAGE_ALLOCATOR_SOURCE.set(source);
 }
@@ -302,7 +308,7 @@ fn page_allocator() -> Option<&'static PageAllocator> {
 /// The runtime responsible for releasing a page allocation.
 enum PageOwnership {
     Native(Layout),
-    /// MacNeutron: pages from the [`PageAllocator`].
+    /// Pages from the [`PageAllocator`].
     Hooked,
     #[cfg(not(windows))]
     Guest {
@@ -391,7 +397,7 @@ impl PageBox {
         Some(Self::adopt(ptr, len, logical_len, layout))
     }
 
-    /// MacNeutron: zeroed pages from the installed allocator, counted as `adopt` counts.
+    /// Zeroed pages from the installed allocator, counted as `adopt` counts.
     fn try_new_hooked(allocator: &PageAllocator, logical_len: usize) -> Option<Self> {
         let (len, _) = Self::try_layout_for(logical_len)?;
         let ptr = (allocator.alloc)(len)?;

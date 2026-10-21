@@ -1,13 +1,15 @@
-//! winemetal's parameter and info structs (`winemetal.h`, `winemetal_thunks.h`, `#pragma pack(8)`), the ones the facade
-//! passes, laid out as the 64-bit Unix side reads them. Enums are their C base types: `WMTLoadAction`,
-//! `WMTStoreAction` and `WMTGPUFamily` have none and are `int`.
+//! winemetal's parameter and info structs (`winemetal.h`, `winemetal_thunks.h`, `#pragma pack(8)`).
+//!
+//! The ones the facade passes, laid out as the 64-bit Unix side reads them. Enums are their C base
+//! types: `WMTLoadAction`, `WMTStoreAction` and `WMTGPUFamily` have none and are `int`.
 
-#![allow(dead_code)]
 
-/// A winemetal object: on macOS the Objective-C object's address, in the VM's guest a handle the guest picked.
+/// A winemetal object.
+///
+/// On macOS the Objective-C object's address, in the VM's guest a handle the guest picked.
 pub type Handle = u64;
 
-// Slots (`__wine_unix_call_funcs` of winemetal.so; the VM catalog, docs/research/2026-10-15-vm-route/winemetal-calls.md).
+// Slots: the entries of winemetal.so's `__wine_unix_call_funcs`, numbered as the VM guest's catalog does.
 pub const RETAIN: u32 = 0;
 pub const RELEASE: u32 = 1;
 pub const NSARRAY_OBJECT: u32 = 2;
@@ -78,12 +80,16 @@ pub const COMMAND_BUFFER_PROPERTY: u32 = 130;
 pub const DEVICE_NEW_LIBRARY_WITH_SOURCE: u32 = 144;
 pub const DEVICE_NEW_RENDER_PIPELINE_STATE_WITH_VERTEX_DESCRIPTOR: u32 = 156;
 pub const DEVICE_NEW_LIBRARY_WITH_SOURCE_OPTIONS: u32 = 157;
-/// The VM guest's own (DXMT 0071's `WMTMemoryAlloc`/`WMTMemoryFree`): memory both sides map, which a no-copy buffer
-/// there must be made over. macOS's table refuses them; they are not in [`SLOTS`].
+/// The VM guest's own (DXMT 0071's `WMTMemoryAlloc`/`WMTMemoryFree`).
+///
+/// Memory both sides map, which a no-copy buffer there must be made over. macOS's table refuses
+/// them; they are not in [`SLOTS`].
 pub const MEMORY_ALLOC: u32 = 153;
 pub const MEMORY_FREE: u32 = 154;
 
-/// Every slot the facade calls, with winemetal's function name for it (the table check in tests/objects.rs).
+/// Every slot the facade calls.
+///
+/// With winemetal's function name for it (the table check in tests/objects.rs).
 pub const SLOTS: &[(u32, &str)] = &[
     (RETAIN, "_NSObject_retain"),
     (RELEASE, "_NSObject_release"),
@@ -199,8 +205,6 @@ pub struct ObjCmdNoRet { pub encoder: Handle, pub cmd_head: *const core::ffi::c_
 
 #[repr(C)]
 pub struct NSStringGetCString { pub str: Handle, pub buffer_ptr: u64, pub max_length: u64, pub encoding: u64, pub ret: u32 }
-#[repr(C)]
-pub struct NSStringString { pub buffer_ptr: *const core::ffi::c_void, pub encoding: u64, pub ret: Handle }
 pub const UTF8_STRING_ENCODING: u64 = 4;
 
 #[repr(C)]
@@ -237,7 +241,7 @@ pub struct CompileOptions { pub language_version: u64, pub preserve_invariance: 
 pub struct BufferInfo { pub length: u64, pub options: u64, pub memory: *mut core::ffi::c_void, pub gpu_address: u64 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct SamplerInfo {
     pub min_filter: u8,
     pub mag_filter: u8,
@@ -257,7 +261,7 @@ pub struct SamplerInfo {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct StencilInfo {
     pub enabled: bool,
     pub depth_stencil_pass_op: u8,
@@ -269,7 +273,7 @@ pub struct StencilInfo {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct DepthStencilInfo {
     pub depth_compare_function: u8,
     pub depth_write_enabled: bool,
@@ -277,9 +281,11 @@ pub struct DepthStencilInfo {
     pub back_stencil: StencilInfo,
 }
 
-/// `WMTTextureInfo`: `packed` holds the four 8-bit bitfields, low byte first (type, mip count, sample count, usage).
+/// `WMTTextureInfo`.
+///
+/// `packed` holds the four 8-bit bitfields, low byte first (type, mip count, sample count, usage).
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct TextureInfo {
     pub pixel_format: u32,
     pub width: u32,
@@ -301,7 +307,7 @@ impl TextureInfo {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct TextureSwizzleChannels { pub r: u8, pub g: u8, pub b: u8, pub a: u8 }
 
 #[repr(C)]
@@ -334,7 +340,6 @@ pub struct ColorAttachmentBlendInfo {
 
 /// `WMTRenderPipelineInfo`.
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub struct RenderPipelineInfo {
     pub colors: [ColorAttachmentBlendInfo; 8],
     pub alpha_to_coverage_enabled: bool,
@@ -368,7 +373,6 @@ pub struct VertexAttributeInfo { pub format: u32, pub offset: u32, pub buffer_in
 #[derive(Default, Clone, Copy)]
 pub struct VertexBufferLayoutInfo { pub stride: u32, pub step_function: u32, pub step_rate: u32 }
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub struct VertexDescriptorInfo { pub attributes: [VertexAttributeInfo; 31], pub layouts: [VertexBufferLayoutInfo; 31] }
 
 #[repr(C)]
@@ -384,11 +388,11 @@ pub struct ComputePipelineInfo {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct ClearColor { pub r: f64, pub g: f64, pub b: f64, pub a: f64 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct ColorAttachmentInfo {
     pub texture: Handle,
     pub load_action: i32,
@@ -404,7 +408,7 @@ pub struct ColorAttachmentInfo {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct DepthAttachmentInfo {
     pub texture: Handle,
     pub load_action: i32,
@@ -416,7 +420,7 @@ pub struct DepthAttachmentInfo {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct StencilAttachmentInfo {
     pub texture: Handle,
     pub load_action: i32,
@@ -428,7 +432,6 @@ pub struct StencilAttachmentInfo {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
 pub struct RenderPassSampleBufferInfo { pub sample_buffer: Handle, pub end_of_fragment_sample_index: u64, pub start_of_vertex_sample_index: u64 }
 
 impl Default for RenderPassSampleBufferInfo {
@@ -436,7 +439,7 @@ impl Default for RenderPassSampleBufferInfo {
 }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct RenderPassInfo {
     pub colors: [ColorAttachmentInfo; 8],
     pub depth: DepthAttachmentInfo,
@@ -471,10 +474,6 @@ pub struct ReplaceRegion {
     pub bytes_per_image: u64,
 }
 
-#[repr(C)]
-pub struct CaptureInfo { pub capture_object: Handle, pub output_url: *const core::ffi::c_void, pub destination: u8 }
-#[repr(C)]
-pub struct StartCapture { pub capture_manager: Handle, pub info: *mut CaptureInfo, pub ret: bool }
 
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
@@ -494,7 +493,7 @@ pub struct SpatialScale { pub cmdbuf: Handle, pub scaler: Handle, pub color: Han
 pub struct CreateMetalView { pub hwnd: u64, pub device: Handle, pub ret_view: Handle, pub ret_layer: Handle }
 
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default)]
 pub struct LayerProps {
     pub device: Handle,
     pub contents_scale: f64,

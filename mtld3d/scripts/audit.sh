@@ -22,11 +22,14 @@ COVERAGE_TESTS=windows/tests/tests
 
 # Files permitted to hold each narrowly-scoped exception. These are sets, not
 # counts: a new site fails even if an old one was deleted in the same change.
-ALLOW_SITES='unix/unix/src/metal/command.rs
+ALLOW_SITES='unix/mtl/src/foundation.rs
+unix/mtl/src/metal/command.rs
+unix/unix/src/metal/command.rs
 unix/unix/src/metal/macdrv.rs
 windows/core/src/config.rs'
 
 ONCELOCK_SITES='unix/shared/src/crumb.rs
+windows/core/src/page_box.rs
 unix/unix/src/metal/blit.rs
 unix/unix/src/metal/clear_quad.rs
 unix/unix/src/metal/null_texture.rs
@@ -35,6 +38,9 @@ unix/unix/src/metal/upload_quad.rs
 unix/unix/src/metal/upscale.rs'
 
 INLINE_ALWAYS_SITES='unix/shared/src/crumb.rs'
+
+# Vendored third-party crates keep their upstream form: the audit skips them.
+VENDOR_TREE='^windows/vendor/'
 
 # The end-to-end tests that share one process. A thread one of them spawns
 # goes through the harness's `in_flight::spawn_scoped`, which names it after
@@ -338,7 +344,7 @@ confined() {
 
 case "${1:-}" in
 --update-derives)
-    derive_scan $(git ls-files '*.rs') >"$INVENTORY"
+    derive_scan $(git ls-files '*.rs' | grep -v "$VENDOR_TREE") >"$INVENTORY"
     printf 'wrote %s (%d types)\n' "$INVENTORY" "$(wc -l <"$INVENTORY")"
     exit 0
     ;;
@@ -346,6 +352,7 @@ case "${1:-}" in
     file=${2:?--file needs a path}
     # An editor hook's view: only the checks that a single file can answer.
     case $file in *.rs) ;; *) exit 0 ;; esac
+    case $file in windows/vendor/*) exit 0 ;; esac
     [ -f "$file" ] || exit 0
 
     findings=$(doc_shape "$file")
@@ -379,7 +386,7 @@ case "${1:-}" in
     confined '^[ \t]*static .*: *OnceLock' 'LazyLock over OnceLock' \
         'OnceLock static outside the runtime-argument sites' "$ONCELOCK_SITES" "$file"
     confined '#\[allow\(' 'Warning suppressions' \
-        'lint suppression outside the three accepted per-site exceptions' "$ALLOW_SITES" "$file"
+        'lint suppression outside the accepted per-site exceptions' "$ALLOW_SITES" "$file"
     case $file in
     "$E2E_TESTS_DIR"/*.rs)
         banned "$E2E_SPAWN" 'Every end-to-end test names itself' "$E2E_SPAWN_MESSAGE" "$file"
@@ -416,7 +423,7 @@ esac
 
 # --- whole-tree audit --------------------------------------------------------
 
-set -- $(git ls-files '*.rs')
+set -- $(git ls-files '*.rs' | grep -v "$VENDOR_TREE")
 
 findings=$(doc_shape "$@")
 if [ -n "$findings" ]; then

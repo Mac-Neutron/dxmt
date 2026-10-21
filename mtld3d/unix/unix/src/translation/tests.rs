@@ -15,7 +15,7 @@ fn the_kernel_answers_for_this_process() {
     }
 }
 
-/// MacNeutron: the VM's guest asks no kernel (FEX is named by none).
+/// The VM's guest asks no kernel (FEX is named by none).
 #[cfg(target_os = "linux")]
 #[test]
 fn the_guest_says_unknown() {

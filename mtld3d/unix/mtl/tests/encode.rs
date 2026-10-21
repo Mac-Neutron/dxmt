@@ -57,8 +57,10 @@ fn one_pixel(device: &Device, rgba: [u8; 4]) -> Retained<ProtocolObject<dyn MTLT
     t
 }
 
-/// Draws `triangles` (a list of three-vertex position sets, each with its cull mode) into a 64x64 target cleared to
-/// blue, through vertex bytes, a vertex texture (red) and both sampler binds, and reads it back.
+/// Draws `triangles` into a 64x64 target cleared to blue, and reads it back.
+///
+/// A triangle is a three-vertex position set with its cull mode. The pass binds vertex bytes, a
+/// vertex texture (red) and both samplers.
 fn draw(device: &Device, triangles: &[([f32; 6], MTLCullMode)]) -> Vec<u8> {
     let library = device.newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None).expect("a library");
     let desc = MTLRenderPipelineDescriptor::new();
@@ -121,7 +123,9 @@ fn pixel(image: &[u8], x: usize, y: usize) -> [u8; 4] {
 }
 
 const LEFT: [f32; 6] = [-1.0, -1.0, -1.0, 1.0, -0.1, 0.0];
-/// The right half's triangle: whichever face its winding makes it, exactly one of `Front` and `Back` culls it.
+/// The right half's triangle.
+///
+/// Whichever face its winding makes it, exactly one of `Front` and `Back` culls it.
 const RIGHT_CCW: [f32; 6] = [0.1, 0.0, 1.0, -1.0, 1.0, 1.0];
 
 const SAMPLE_SOURCE: &str = r"
@@ -131,8 +135,10 @@ vertex float4 vs(uint vid [[vertex_id]]) { return float4(vid == 1 ? 3.0 : -1.0, 
 fragment float4 fs(texture2d<float> tex [[texture(0)]], sampler s [[sampler(0)]]) { return tex.sample(s, float2(0.75, 0.5)); }
 ";
 
-/// A sampler from a descriptor with nothing set reads as Metal's default one: normalized coordinates (u 0.75 of a
-/// 2x1 texture is its second texel; unnormalized, the first), nearest filtering.
+/// A sampler from a descriptor with nothing set reads as Metal's default one.
+///
+/// Normalized coordinates (u 0.75 of a 2x1 texture is its second texel; unnormalized, the first),
+/// nearest filtering.
 #[test]
 fn a_default_sampler_reads_normalized_coordinates() {
     let device = common::device();
@@ -234,8 +240,9 @@ fn completion_handlers_run_once_each_in_commit_order() {
     assert_eq!(*seen.lock().unwrap(), (0..100).collect::<Vec<_>>());
 }
 
-/// Metal's waitUntilCompleted returns once the buffer's completed handlers have run; mtld3d frees what they capture
-/// after it (its CPU-submit failure path).
+/// Metal's waitUntilCompleted returns once the buffer's completed handlers have run.
+///
+/// Mtld3d frees what they capture after it (its CPU-submit failure path).
 #[test]
 fn wait_until_completed_returns_after_its_handlers() {
     let device = common::device();
@@ -254,8 +261,10 @@ fn wait_until_completed_returns_after_its_handlers() {
     assert!(ran.load(std::sync::atomic::Ordering::Acquire), "waitUntilCompleted returned before the handler ran");
 }
 
-/// A buffer given up uncommitted runs its handlers then (mtld3d's return early on an unended buffer), and a later
-/// buffer, at the same address or not, runs none of them.
+/// A buffer given up uncommitted runs its handlers then.
+///
+/// Mtld3d's return early on an unended buffer; a later buffer, at the same address or not, runs
+/// none of them.
 #[test]
 fn an_uncommitted_buffer_runs_its_handlers_once_when_dropped() {
     let device = common::device();

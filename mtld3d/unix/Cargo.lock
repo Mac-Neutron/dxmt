@@ -319,6 +319,7 @@ version = "0.14.1"
 dependencies = [
  "bitflags 2.13.2",
  "log",
+ "rustc-hash",
 ]
 
 [[package]]

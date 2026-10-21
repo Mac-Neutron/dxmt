@@ -1,7 +1,8 @@
 //! objc2-metal's protocols and classes, as far as mtld3d uses them, over winemetal's slots.
 //!
-//! Protocols are traits implemented by `ProtocolObject<dyn Protocol>` (objc2's shape), their methods default
-//! bodies over the object's handle. What winemetal has no getter for comes from [`crate::meta`].
+//! Protocols are traits implemented by `ProtocolObject<dyn Protocol>` (objc2's shape), their
+//! methods default bodies over the object's handle. What winemetal has no getter for comes from
+//! [`crate::meta`].
 
 #![allow(non_snake_case, clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)]
 
@@ -10,7 +11,7 @@ mod descriptors;
 mod types;
 
 use core::{ffi::c_void, ptr::NonNull};
-use std::{ffi::CString, sync::OnceLock};
+use std::{ffi::CString, sync::LazyLock};
 
 pub use command::*;
 pub use descriptors::*;
@@ -29,13 +30,16 @@ use crate::{
 
 pub type CFTimeInterval = f64;
 
+/// A no-copy buffer's deallocator block.
+pub type Deallocator = block2::DynBlock<dyn Fn(NonNull<c_void>, NSUInteger)>;
+
 /// The handle of any facade object reference.
-pub(crate) fn handle_of<T: ?Sized>(obj: &T) -> u64 {
+pub fn handle_of<T: ?Sized>(obj: &T) -> u64 {
     core::ptr::from_ref(obj).cast::<u8>() as usize as u64
 }
 
 /// `handle`, retained, as `Retained<ProtocolObject<P>>`; `None` for 0.
-pub(crate) fn retained<P: ?Sized>(handle: u64) -> Option<Retained<ProtocolObject<P>>> {
+pub fn retained<P: ?Sized>(handle: u64) -> Option<Retained<ProtocolObject<P>>> {
     if handle == 0 {
         return None;
     }
@@ -53,7 +57,9 @@ fn label_of(handle: u64) -> Option<Retained<NSString>> {
     meta::read(handle, |e| e.and_then(|e| e.label.as_deref().map(NSString::from_str)))
 }
 
-/// A label stays in the facade: winemetal would take two slot calls per object for what only a capture shows.
+/// A label stays in the facade.
+///
+/// Winemetal would take two slot calls per object for what only a capture shows.
 fn set_label_of(handle: u64, label: Option<&NSString>) {
     let label = label.map(NSString::to_rust);
     meta::with(handle, |e| e.label = label);
@@ -397,41 +403,45 @@ protocols!(dyn MTLLibrary: MTLLibrary);
 protocols!(dyn MTLEvent: MTLEvent);
 protocols!(dyn MTLSharedEvent: MTLEvent, MTLSharedEvent);
 
-/// The process's device: winemetal's first, retained for good (mtld3d asks for it often; one device on Apple
-/// Silicon).
+/// The process's device.
+///
+/// Winemetal's first, retained for good (mtld3d asks for it often; one device on Apple Silicon).
 fn default_device() -> u64 {
-    static DEVICE: OnceLock<u64> = OnceLock::new();
-    *DEVICE.get_or_init(|| {
-        if table::Table::get().is_err() {
-            return 0;
-        }
-        let mut all = wmt::ObjRet::default();
-        // SAFETY: slot 4 returns a +1 array of devices.
-        unsafe { table::call(wmt::COPY_ALL_DEVICES, &mut all) };
-        if all.ret == 0 {
-            return 0;
-        }
-        let device = if query_u64(wmt::NSARRAY_COUNT, all.ret) == 0 {
-            0
-        } else {
-            let mut object = wmt::ObjU64ObjRet { handle: all.ret, arg: 0, ret: 0 };
-            // SAFETY: slot 2 returns the array's element 0 (+0).
-            unsafe { table::call(wmt::NSARRAY_OBJECT, &mut object) };
-            let mut retain = wmt::ObjNoRet { handle: object.ret };
-            // SAFETY: kept for the process's life.
-            unsafe { table::call(wmt::RETAIN, &mut retain) };
-            meta::adopt(object.ret);
-            object.ret
-        };
-        let mut release = wmt::ObjNoRet { handle: all.ret };
-        // SAFETY: the array's +1 given up.
-        unsafe { table::call(wmt::RELEASE, &mut release) };
-        device
-    })
+    static DEVICE: LazyLock<u64> = LazyLock::new(first_device);
+    *DEVICE
 }
 
-/// objc2's `MTLCreateSystemDefaultDevice`: winemetal's first device; `None` when winemetal can't be loaded (the log
-/// says why).
+fn first_device() -> u64 {
+    if table::Table::get().is_err() {
+        return 0;
+    }
+    let mut all = wmt::ObjRet::default();
+    // SAFETY: slot 4 returns a +1 array of devices.
+    unsafe { table::call(wmt::COPY_ALL_DEVICES, &mut all) };
+    if all.ret == 0 {
+        return 0;
+    }
+    let device = if query_u64(wmt::NSARRAY_COUNT, all.ret) == 0 {
+        0
+    } else {
+        let mut object = wmt::ObjU64ObjRet { handle: all.ret, arg: 0, ret: 0 };
+        // SAFETY: slot 2 returns the array's element 0 (+0).
+        unsafe { table::call(wmt::NSARRAY_OBJECT, &mut object) };
+        let mut retain = wmt::ObjNoRet { handle: object.ret };
+        // SAFETY: kept for the process's life.
+        unsafe { table::call(wmt::RETAIN, &mut retain) };
+        meta::adopt(object.ret);
+        object.ret
+    };
+    let mut release = wmt::ObjNoRet { handle: all.ret };
+    // SAFETY: the array's +1 given up.
+    unsafe { table::call(wmt::RELEASE, &mut release) };
+    device
+}
+
+/// objc2's `MTLCreateSystemDefaultDevice`.
+///
+/// Winemetal's first device; `None` when winemetal can't be loaded (the log says why).
 #[must_use]
 pub fn MTLCreateSystemDefaultDevice() -> Option<Retained<ProtocolObject<dyn MTLDevice>>> {
     if let Err(e) = table::Table::get() {
@@ -473,7 +483,9 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
     fn recommendedMaxWorkingSetSize(&self) -> u64 {
         query_u64(wmt::DEVICE_RECOMMENDED_MAX_WORKING_SET_SIZE, handle_of(self))
     }
-    /// Metal answers it on Apple7 and Mac2 GPUs, every Apple Silicon Mac: winemetal has no query of its own.
+    /// Metal answers it on Apple7 and Mac2 GPUs, every Apple Silicon Mac.
+    ///
+    /// Winemetal has no query of its own.
     fn supports32BitFloatFiltering(&self) -> bool {
         self.supportsFamily(MTLGPUFamily::Apple7) || self.supportsFamily(MTLGPUFamily::Mac2)
     }
@@ -498,7 +510,7 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
         pointer: NonNull<c_void>,
         length: NSUInteger,
         options: MTLResourceOptions,
-        deallocator: Option<&block2::DynBlock<dyn Fn(NonNull<c_void>, NSUInteger)>>,
+        deallocator: Option<&Deallocator>,
     ) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
         debug_assert!(deallocator.is_none(), "a no-copy buffer's deallocator: winemetal runs none");
         new_buffer(handle_of(self), length, options, pointer.as_ptr())

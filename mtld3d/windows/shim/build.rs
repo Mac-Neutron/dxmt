@@ -113,7 +113,7 @@ fn extract_unix_lib(llvm_ar: &str, archive: &str, object_arch: &str, out_dir: &s
     format!("{out_dir}/unix_lib.o")
 }
 
-/// Extract `unix_lib.o` for `object_arch` from an `archive` that stores its members under bare names.
+/// Extract `unix_lib.o` for `object_arch` from an `archive` that stores members under bare names.
 ///
 /// An archiver that drops the directories (llvm-mingw's `llvm-ar`, which a stock
 /// Wine built with llvm-mingw packs `libwinecrt0.a` with) stores an ARM64X

@@ -1,5 +1,7 @@
-//! MacNeutron: GPU capture under the winemetal facade: none. A capture is the host's (a trace path in the guest
-//! names nothing on the Mac), so the hotkey's start and stop do nothing here.
+//! GPU capture under the winemetal facade: none.
+//!
+//! A capture is the host's (a trace path in the guest names nothing on the Mac), so the hotkey's
+//! start and stop do nothing here.
 
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLDeviceKind};
 
@@ -14,7 +16,7 @@ pub const fn capture_layer_loaded() -> bool {
 }
 
 /// No Metal tools to report.
-pub fn log_metal_tools() {}
+pub const fn log_metal_tools() {}
 
 /// No capture to stop.
-pub fn stop_capture() {}
+pub const fn stop_capture() {}

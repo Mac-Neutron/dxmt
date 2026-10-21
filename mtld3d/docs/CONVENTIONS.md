@@ -12,7 +12,7 @@ Most of this document is enforced by `make check`: `cargo +nightly fmt --check`,
 | --- | --- |
 | Doc-block shape (title / blank / body) and the 100-column doc line cap | §Doc comments |
 | The `Clone` / `Copy` derive inventory, diffed against `scripts/derive_inventory.txt` | §No default `Copy` / `Clone` |
-| `#[allow(...)]` confined to the three accepted files | §Warning suppressions |
+| `#[allow(...)]` confined to the accepted files | §Warning suppressions |
 | `#[inline(always)]` confined to the one measured site | §Inline attributes |
 | `static … : OnceLock` confined to the three runtime-argument sites | §`LazyLock` over `OnceLock` |
 | `pub(crate)` = 0 | §No `pub(crate)` |
@@ -354,7 +354,7 @@ This codebase deliberately does not enable the rustc `unsafe_code` lint. Every c
 
 Default rule: **never** `#[allow(...)]`, `#[expect(...)]`, or `#[cfg_attr(..., allow(...))]`. The lint is followed. `make check` runs clippy with `clippy::nursery` and `clippy::pedantic` enabled workspace-wide, denies every warning via `build.warnings = "deny"`, and **stays clean by fixing the code, not by silencing the lint**. Every lint is treated as serious — refactor by default; reaching for `#[allow]` is the absolute last resort.
 
-The tree carries exactly **three** per-site `#[allow(clippy::...)]` attributes, plus one workspace-level `too_many_lines = "allow"`. Each is listed under "Accepted per-site exceptions" below. Adding another per-site allow needs a rationale comment that names which of the accepted exception classes applies — and the structural fix (a non-panicking `cast_unsigned`/`to_le_bytes` reinterpret, `try_from(..).expect(..)`, or a literal cross-checked by a `const` assert) clears the great majority of numeric-cast lints without one.
+The tree carries a fixed set of per-site `#[allow(clippy::...)]` attributes (three in the product code, two classes in the objc2-mirroring facade crate `unix/mtl`), plus one workspace-level `too_many_lines = "allow"`. Each is listed under "Accepted per-site exceptions" below. Adding another per-site allow needs a rationale comment that names which of the accepted exception classes applies — and the structural fix (a non-panicking `cast_unsigned`/`to_le_bytes` reinterpret, `try_from(..).expect(..)`, or a literal cross-checked by a `const` assert) clears the great majority of numeric-cast lints without one.
 
 ### Standard structural fixes
 
@@ -388,6 +388,8 @@ These handle ~95% of every clippy complaint raised in the tree. Apply the fix; d
 1. **`unix/unix/src/metal/macdrv.rs` `mod bounded_cast`** — `cast_possible_truncation` + `cast_sign_loss` + `cast_precision_loss`, mod-level. Three numeric-cast helpers (`f64_to_u32_saturating`, `f64_to_f32`, `i32_to_f32`) whose bounds are established by callers. The structural alternative (IEEE-754 bit-manipulation reimplementing `as`) is ~25 lines of mantissa/exponent extraction producing identical bits with zero precision benefit. Each fn doc names the bound; callers document why their input satisfies it.
 2. **`unix/unix/src/metal/command.rs` `PendingCmdBuf`** — `non_send_fields_in_send_ty`. Wraps `Retained<dyn MTLCommandBuffer>`; the three ops we use (refcount inc/dec, `waitUntilCompleted`) are Apple-documented thread-safe. Alternatives are `SendWrapper` (panics on cross-thread access) or raw `usize` + `Retained::retain` everywhere — both worse than a well-documented `unsafe impl Send` at one narrow site.
 3. **`windows/core/src/config.rs` `Mtld3dConfig`** — `struct_excessive_bools`. The config is a flat one-`bool`-per-`mtld3d.conf`-key bag; each field name mirrors a file key (`caps_all` ↔ `debug.capsAll`). Packing into `bitflags!` (the §"Booleans pack" default) would decouple the field names from the conf keys for no hot-path benefit — `Mtld3dConfig` is read once per `IDirect3D9`, never per-draw. The clarity of the 1:1 mapping outweighs the byte savings, so the bools stay flat.
+4. **`unix/mtl/src/metal/command.rs`, the objc2-signature Metal methods** — `too_many_arguments`. The facade crate re-implements objc2-metal's trait methods under objc2's own names and argument lists (`drawIndexedPrimitives_..._baseInstance`, the blit `copyFrom...` family), which the Metal layer calls unchanged on the macOS build; a `FooParams` struct would force a different call site per build.
+5. **`unix/mtl/src/foundation.rs` `NSString::from_str`** — `should_implement_trait`. objc2's inherent `NSString::from_str(&str) -> Retained<NSString>`, which the Metal layer calls unchanged; a `FromStr` impl cannot return a `Retained`.
 
 **Note on `as`:** even when an `as` cast is identity at compile time (e.g. `u64 as usize` on a 64-bit-only build), prefer `usize::try_from(v).expect(...)` with a one-line rationale. `as` is the smell; `try_from` keeps the bound check explicit and survives a future port to a 32-bit unix host without silent truncation.
 

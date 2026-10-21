@@ -1,4 +1,6 @@
-//! objc2-foundation's `NSString`, `NSError` and `NSRange`, as far as mtld3d's Metal layer uses them.
+//! objc2-foundation's `NSString`.
+//!
+//! `NSError` and `NSRange`, as far as mtld3d's Metal layer uses them.
 
 use core::{
     fmt,
@@ -15,7 +17,9 @@ pub type NSUInteger = usize;
 pub type NSInteger = isize;
 pub use crate::objc2::runtime::NSObjectProtocol;
 
-/// A string: one the facade made (`from_str`), kept in Rust, or one winemetal returned (an error's description).
+/// A string: one the facade made (`from_str`).
+///
+/// Kept in Rust, or one winemetal returned (an error's description).
 pub struct NSString {
     refs: AtomicUsize,
     text: Text,
@@ -60,13 +64,18 @@ impl NSString {
     }
 
     /// A string the facade keeps itself (no winemetal call).
+    ///
+    /// Named as objc2's `NSString::from_str`, which every caller of the Metal layer uses.
+    // allow: `should_implement_trait` is clippy's `style` lint, but a `FromStr` impl cannot replace
+    // objc2's inherent `NSString::from_str` returning `Retained<Self>`; renaming it breaks every caller.
+    #[allow(clippy::should_implement_trait)]
     #[must_use]
     pub fn from_str(text: &str) -> Retained<Self> {
         Self::boxed(Text::Owned(text.to_owned()))
     }
 
     /// An autoreleased winemetal string, retained; `None` for 0.
-    pub(crate) fn from_autoreleased(handle: u64) -> Option<Retained<Self>> {
+    pub fn from_autoreleased(handle: u64) -> Option<Retained<Self>> {
         if handle == 0 {
             return None;
         }
@@ -94,7 +103,7 @@ impl NSString {
 }
 
 /// The UTF-8 text of winemetal string `handle`.
-pub(crate) fn winemetal_string(handle: u64) -> String {
+pub fn winemetal_string(handle: u64) -> String {
     let mut length = wmt::ObjU64U64Ret { handle, arg: wmt::UTF8_STRING_ENCODING, ret: 0 };
     // SAFETY: slot 27 reads a live string.
     unsafe { table::call(wmt::NSSTRING_LENGTH_OF_BYTES, &mut length) };
@@ -124,8 +133,10 @@ impl fmt::Debug for NSString {
     }
 }
 
-/// An error: one winemetal returned (autoreleased, retained here), or the facade's own for a failure winemetal gave
-/// no error object for. Its text is its description.
+/// An error: one winemetal returned (autoreleased, retained here).
+///
+/// Or the facade's own for a failure winemetal gave no error object for. Its text is its
+/// description.
 pub struct NSError {
     refs: AtomicUsize,
     text: Text,
@@ -158,7 +169,7 @@ impl NSError {
     }
 
     /// An autoreleased winemetal error, retained; else one saying `fallback`.
-    pub(crate) fn from_autoreleased_or(handle: u64, fallback: &str) -> Retained<Self> {
+    pub fn from_autoreleased_or(handle: u64, fallback: &str) -> Retained<Self> {
         if handle == 0 {
             return Self::boxed(Text::Owned(fallback.to_owned()));
         }
@@ -170,7 +181,7 @@ impl NSError {
     }
 
     /// An autoreleased winemetal error, retained; `None` for 0.
-    pub(crate) fn from_autoreleased(handle: u64) -> Option<Retained<Self>> {
+    pub fn from_autoreleased(handle: u64) -> Option<Retained<Self>> {
         (handle != 0).then(|| Self::from_autoreleased_or(handle, ""))
     }
 
@@ -188,8 +199,10 @@ impl NSError {
         }
     }
 
-    /// Foundation's error code, which winemetal doesn't carry: a hash of the description instead (FNV-1a, 31 bits,
-    /// never 0), so that errors that read differently stay apart where mtld3d keys its once-only logs by code.
+    /// Foundation's error code, which winemetal doesn't carry.
+    ///
+    /// A hash of the description instead (FNV-1a, 31 bits, never 0), so that errors that read
+    /// differently stay apart where mtld3d keys its once-only logs by code.
     #[must_use]
     pub fn code(&self) -> NSInteger {
         let text = self.localizedDescription().to_rust();
@@ -212,7 +225,7 @@ impl fmt::Debug for NSError {
 
 /// Foundation's `NSRange`.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct NSRange {
     pub location: NSUInteger,
     pub length: NSUInteger,

@@ -103,6 +103,7 @@ pub fn set_gamma_ramp(
     true
 }
 
+#[cfg(not(mtl_facade))]
 /// Which table this layer carries, `0` for none.
 ///
 /// A caller that caches what it rendered against compares this: a different

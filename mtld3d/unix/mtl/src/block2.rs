@@ -1,11 +1,13 @@
-//! block2's `RcBlock` for the handlers mtld3d gives Metal: a shared closure the receiver keeps a reference to (Metal
-//! copies a block it is handed, so the caller's may drop at once) and runs on the facade's retirement thread.
+//! block2's `RcBlock` for the handlers mtld3d gives Metal.
+//!
+//! A shared closure the receiver keeps a reference to (Metal copies a block it is handed, so the
+//! caller's may drop at once) and runs on the facade's retirement thread.
 
 use std::sync::Arc;
 
 /// The block a handler parameter points at.
 pub struct DynBlock<F: ?Sized> {
-    pub(crate) f: Arc<F>,
+    pub f: Arc<F>,
 }
 
 /// A block's owner; `as_ptr` is what a `*Handler` parameter takes.
@@ -40,7 +42,7 @@ impl<F: ?Sized> RcBlock<F> {
 }
 
 /// A handler the facade keeps: the closure behind a block, sent to the thread that runs it.
-pub(crate) struct Kept<F: ?Sized>(pub(crate) Arc<F>);
+pub struct Kept<F: ?Sized>(pub Arc<F>);
 
 // SAFETY: Metal runs its handlers on threads of its own; mtld3d writes its blocks for that (they touch only
 // thread-safe state), and the facade's retirement thread stands in for Metal's.
@@ -51,7 +53,7 @@ impl<F: ?Sized> Kept<F> {
     ///
     /// # Safety
     /// `block` is a live block from [`RcBlock::as_ptr`].
-    pub(crate) unsafe fn from_block(block: *mut DynBlock<F>) -> Self {
+    pub unsafe fn from_block(block: *mut DynBlock<F>) -> Self {
         // SAFETY: the caller's contract.
         Self(Arc::clone(unsafe { &(*block).f }))
     }

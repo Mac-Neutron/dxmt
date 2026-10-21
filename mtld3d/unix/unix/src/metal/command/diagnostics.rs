@@ -11,8 +11,10 @@ use crate::mtl::objc2::{ProtocolType, runtime::AnyObject};
 use crate::mtl::objc2_foundation::NSError;
 #[cfg(not(mtl_facade))]
 use crate::mtl::objc2_foundation::{NSArray, NSObject, NSObjectNSKeyValueCoding, NSString, ns_string};
+#[cfg(not(mtl_facade))]
+use crate::mtl::objc2_metal::MTLCommandEncoderErrorState;
 use crate::mtl::objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoderErrorState, MTLCommandQueue, MTLDevice,
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue, MTLDevice,
     MTLRenderPassAttachmentDescriptor, MTLRenderPassDescriptor, MTLResource, MTLSize, MTLTexture,
 };
 #[cfg(not(mtl_facade))]
@@ -321,8 +323,9 @@ fn attachment_details(attachment: &MTLRenderPassAttachmentDescriptor) -> String 
     )
 }
 
-/// Under the winemetal facade a plain buffer: winemetal has no command buffer descriptor (error options are a debug
-/// aid).
+/// Under the winemetal facade a plain buffer.
+///
+/// Winemetal has no command buffer descriptor (error options are a debug aid).
 #[cfg(mtl_facade)]
 pub fn command_buffer(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
@@ -466,6 +469,7 @@ const fn status_name(status: MTLCommandBufferStatus) -> &'static str {
     }
 }
 
+#[cfg(not(mtl_facade))]
 const fn encoder_state_name(state: MTLCommandEncoderErrorState) -> &'static str {
     match state {
         MTLCommandEncoderErrorState::Unknown => "Unknown",
@@ -478,8 +482,9 @@ const fn encoder_state_name(state: MTLCommandEncoderErrorState) -> &'static str 
     }
 }
 
-/// Under the winemetal facade the error's description alone: winemetal carries no domain, user info or encoder
-/// details.
+/// Under the winemetal facade the error's description alone.
+///
+/// Winemetal carries no domain, user info or encoder details.
 #[cfg(mtl_facade)]
 fn error_details(error: Option<&NSError>) -> String {
     let Some(error) = error else {

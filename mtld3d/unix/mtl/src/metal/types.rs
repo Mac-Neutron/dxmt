@@ -1,9 +1,11 @@
-//! Metal's enums, option sets and plain structs, copied from objc2-metal 0.3.2 and objc2-metal-fx 0.3.2's generated
-//! bindings (their values are Metal's, and mtld3d matches on them).
+//! Metal's enums, option sets and plain structs.
 //!
-//! objc2-metal and objc2-metal-fx are the objc2 project's (github.com/madsmtm/objc2), offered under Zlib, Apache-2.0
-//! or MIT; these copies are taken under Zlib, mtld3d's own licence, and altered only by the removal of their
-//! documentation and platform attributes.
+//! Copied from objc2-metal 0.3.2 and objc2-metal-fx 0.3.2's
+//! generated bindings (their values are Metal's, and mtld3d matches on them).
+//!
+//! objc2-metal and objc2-metal-fx are the objc2 project's (github.com/madsmtm/objc2), offered under
+//! Zlib, Apache-2.0 or MIT; these copies are taken under Zlib, mtld3d's own licence, and altered
+//! only by the removal of their documentation and platform attributes.
 
 #![allow(non_upper_case_globals, clippy::all)]
 
@@ -56,7 +58,7 @@ impl MTLBlendOperation {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLBlitOption(pub NSUInteger);
 
 bitflags::bitflags! {
@@ -132,7 +134,7 @@ impl MTLCullMode {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLGPUFamily(pub NSInteger);
 
 impl MTLGPUFamily {
@@ -158,7 +160,7 @@ impl MTLGPUFamily {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLIndexType(pub NSUInteger);
 
 impl MTLIndexType {
@@ -167,7 +169,7 @@ impl MTLIndexType {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLLanguageVersion(pub NSUInteger);
 
 impl MTLLanguageVersion {
@@ -196,7 +198,7 @@ impl MTLLoadAction {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLMathMode(pub NSInteger);
 
 impl MTLMathMode {
@@ -361,7 +363,7 @@ impl MTLPixelFormat {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLPrimitiveType(pub NSUInteger);
 
 impl MTLPrimitiveType {
@@ -380,7 +382,7 @@ pub struct MTLRegion {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLResourceOptions(pub NSUInteger);
 
 bitflags::bitflags! {
@@ -400,7 +402,7 @@ bitflags::bitflags! {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLSamplerAddressMode(pub NSUInteger);
 
 impl MTLSamplerAddressMode {
@@ -413,7 +415,7 @@ impl MTLSamplerAddressMode {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLSamplerBorderColor(pub NSUInteger);
 
 impl MTLSamplerBorderColor {
@@ -423,7 +425,7 @@ impl MTLSamplerBorderColor {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLSamplerMinMagFilter(pub NSUInteger);
 
 impl MTLSamplerMinMagFilter {
@@ -432,7 +434,7 @@ impl MTLSamplerMinMagFilter {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLSamplerMipFilter(pub NSUInteger);
 
 impl MTLSamplerMipFilter {
@@ -552,7 +554,7 @@ bitflags::bitflags! {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLTriangleFillMode(pub NSUInteger);
 
 impl MTLTriangleFillMode {
@@ -561,7 +563,7 @@ impl MTLTriangleFillMode {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLVertexFormat(pub NSUInteger);
 
 impl MTLVertexFormat {
@@ -622,7 +624,7 @@ impl MTLVertexFormat {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLVertexStepFunction(pub NSUInteger);
 
 impl MTLVertexStepFunction {
@@ -645,7 +647,7 @@ pub struct MTLViewport {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLVisibilityResultMode(pub NSUInteger);
 
 impl MTLVisibilityResultMode {
@@ -655,7 +657,7 @@ impl MTLVisibilityResultMode {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLCaptureDestination(pub NSInteger);
 
 impl MTLCaptureDestination {
@@ -664,7 +666,7 @@ impl MTLCaptureDestination {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLCommandBufferErrorOption(pub NSUInteger);
 
 bitflags::bitflags! {
@@ -675,7 +677,7 @@ bitflags::bitflags! {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLCommandEncoderErrorState(pub NSInteger);
 
 impl MTLCommandEncoderErrorState {
@@ -687,7 +689,7 @@ impl MTLCommandEncoderErrorState {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLDepthClipMode(pub NSUInteger);
 
 impl MTLDepthClipMode {
@@ -706,7 +708,7 @@ impl MTLFXSpatialScalerColorProcessingMode {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLCPUCacheMode(pub NSUInteger);
 
 impl MTLCPUCacheMode {
@@ -715,7 +717,7 @@ impl MTLCPUCacheMode {
 }
 
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MTLHazardTrackingMode(pub NSUInteger);
 
 impl MTLHazardTrackingMode {

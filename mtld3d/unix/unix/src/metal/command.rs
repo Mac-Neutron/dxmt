@@ -1727,6 +1727,7 @@ pub fn encode_exact_copy(
     )
 }
 
+#[cfg(not(mtl_facade))]
 /// Encode the software cursor's sprite pass: `src` (the sprite) onto `dst` (the overlay drawable).
 ///
 /// The same fullscreen triangle as present, against a drawable sized to the

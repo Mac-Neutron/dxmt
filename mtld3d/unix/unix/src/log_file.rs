@@ -42,16 +42,20 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::AsRawFd,
         unix::ffi::OsStrExt,
     },
     path::{Path, PathBuf},
     sync::{
         Mutex, MutexGuard, TryLockError,
-        atomic::{AtomicI32, AtomicU32, Ordering},
+        atomic::{AtomicI32, Ordering},
     },
     time::SystemTime,
 };
+#[cfg(not(mtl_facade))]
+use std::sync::atomic::AtomicU32;
+#[cfg(not(target_os = "linux"))]
+use std::os::fd::FromRawFd;
 
 use mtld3d_core::crash_report::{CrashContext, CrashRoute, Severity, SinkState, crash_route};
 
@@ -102,7 +106,9 @@ enum Sink {
 /// file through `mkdir(2)` and `open(2)` on the two C strings and moves
 /// `path` into the sink, so it allocates nothing and frees nothing.
 struct EarlyLocation {
+    #[cfg(not(target_os = "linux"))]
     dir: CString,
+    #[cfg(not(target_os = "linux"))]
     file: CString,
     path: PathBuf,
 }
@@ -119,6 +125,7 @@ static LOG_FD: AtomicI32 = AtomicI32::new(-1);
 /// Where GPU traces go: the log directory plus the process prefix.
 static TRACE_BASE: Mutex<Option<(PathBuf, String, u32)>> = Mutex::new(None);
 
+#[cfg(not(mtl_facade))]
 /// Traces written by this process so far, for numbering the next one.
 static TRACE_COUNT: AtomicU32 = AtomicU32::new(0);
 
@@ -199,8 +206,13 @@ pub fn set_early_location(dir: &str, stem: &str) {
     };
     let mut guard = SINK.lock().expect("log file mutex poisoned");
     if let Sink::Pending { early, .. } = &mut *guard {
+        // The Linux crash reporter opens the file itself; the C strings are the macOS signal path's.
+        #[cfg(target_os = "linux")]
+        drop((dir_c, file_c));
         *early = Some(EarlyLocation {
+            #[cfg(not(target_os = "linux"))]
             dir: dir_c,
+            #[cfg(not(target_os = "linux"))]
             file: file_c,
             path,
         });
@@ -276,6 +288,7 @@ pub fn write_fault(bytes: &[u8]) {
     write_report(bytes, &Severity::FirstChance);
 }
 
+#[cfg(not(target_os = "linux"))]
 /// The descriptor a signal handler's terminal report goes to, opened first if need be.
 ///
 /// While the location is pending, the early location is created with
@@ -336,6 +349,7 @@ pub fn write_bytes(bytes: &[u8]) {
     unsafe { write_raw(bytes.as_ptr().cast::<c_void>(), bytes.len()) };
 }
 
+#[cfg(not(mtl_facade))]
 /// The path of the next GPU trace, next to the log: `<dir>/<stem>-<pid>-<n>.gputrace`.
 ///
 /// `None` before the location is known, when the caller keeps its own
@@ -505,6 +519,7 @@ fn write_stderr(spill: Option<Vec<u8>>) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 /// Open the early location from a signal handler and write the backlog into it.
 ///
 /// Answers the file's descriptor, or stderr's when the file cannot be
@@ -570,6 +585,7 @@ fn open_early_from_signal(sink: &mut Sink) -> i32 {
     fd
 }
 
+#[cfg(not(target_os = "linux"))]
 /// Send a pending backlog to stderr from a signal handler; later lines follow it there.
 ///
 /// The backlog and the early location are leaked rather than freed.
@@ -591,6 +607,7 @@ fn spill_from_signal(sink: &mut Sink) {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 /// Write all of `bytes` to `fd` with `write(2)`, retrying short writes; async-signal-safe.
 fn write_fd(fd: i32, bytes: &[u8]) {
     let mut rest = bytes;

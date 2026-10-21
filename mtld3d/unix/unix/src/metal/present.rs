@@ -200,8 +200,11 @@ pub enum GammaStage {
     Copy,
     Passthrough,
     Bt2446,
+    #[cfg(any(not(mtl_facade), test))]
     CursorCopy,
+    #[cfg(any(not(mtl_facade), test))]
     CursorPassthrough,
+    #[cfg(any(not(mtl_facade), test))]
     CursorBt2446,
 }
 
@@ -218,11 +221,14 @@ impl GammaStage {
                 "mtld3d_present_ps_hdr_bt2446_gamma",
                 MTLPixelFormat::RGBA16Float,
             ),
+            #[cfg(any(not(mtl_facade), test))]
             Self::CursorCopy => ("mtld3d_cursor_ps_copy_gamma", MTLPixelFormat::BGRA8Unorm),
+            #[cfg(any(not(mtl_facade), test))]
             Self::CursorPassthrough => (
                 "mtld3d_cursor_ps_hdr_passthrough_gamma",
                 MTLPixelFormat::RGBA16Float,
             ),
+            #[cfg(any(not(mtl_facade), test))]
             Self::CursorBt2446 => (
                 "mtld3d_cursor_ps_hdr_bt2446_gamma",
                 MTLPixelFormat::RGBA16Float,

@@ -1,6 +1,8 @@
-//! objc2-metal's descriptor classes as Rust objects the facade owns, with Metal's defaults, filled into winemetal's
-//! info structs when the object is created. A sub-descriptor (an attachment, a vertex attribute or layout) is a view
-//! of its parent's state, as Metal's are: setting one sets the parent.
+//! objc2-metal's descriptor classes as Rust objects the facade owns.
+//!
+//! With Metal's defaults, filled into winemetal's info structs when the object is created. A
+//! sub-descriptor (an attachment, a vertex attribute or layout) is a view of its parent's state, as
+//! Metal's are: setting one sets the parent.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -14,26 +16,24 @@ use super::{
 };
 
 /// objc2-metal's `MTLMultisampleDepthResolveFilter`.
-#[allow(non_upper_case_globals)]
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub struct MTLMultisampleDepthResolveFilter(pub NSUInteger);
-#[allow(non_upper_case_globals)]
-impl MTLMultisampleDepthResolveFilter {
-    pub const Sample0: Self = Self(0);
-    pub const Min: Self = Self(1);
-    pub const Max: Self = Self(2);
+#[repr(usize)]
+#[derive(Debug, PartialEq, Eq, Hash, Default)]
+pub enum MTLMultisampleDepthResolveFilter {
+    #[default]
+    Sample0 = 0,
+    Min = 1,
+    Max = 2,
 }
 
 /// objc2-metal's `MTLMultisampleStencilResolveFilter`.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub struct MTLMultisampleStencilResolveFilter(pub NSUInteger);
-#[allow(non_upper_case_globals)]
-impl MTLMultisampleStencilResolveFilter {
-    pub const Sample0: Self = Self(0);
-    pub const DepthResolvedSample: Self = Self(1);
+#[repr(usize)]
+#[derive(Debug, PartialEq, Eq, Hash, Default)]
+pub enum MTLMultisampleStencilResolveFilter {
+    #[default]
+    Sample0 = 0,
+    DepthResolvedSample = 1,
 }
+
 use crate::{
     foundation::{NSString, NSUInteger},
     meta,
@@ -47,7 +47,7 @@ macro_rules! object {
         $(#[$m])*
         pub struct $name {
             refs: AtomicUsize,
-            $(pub(crate) $field: $ty,)*
+            $(pub $field: $ty,)*
         }
 
         // SAFETY: a Rust count; the box goes with the last reference.
@@ -67,7 +67,6 @@ macro_rules! object {
         }
 
         impl $name {
-            #[allow(clippy::too_many_arguments)]
             fn boxed($($field: $ty),*) -> Retained<Self> {
                 let ptr = Box::into_raw(Box::new(Self { refs: AtomicUsize::new(1), $($field,)* }));
                 // SAFETY: a new object with its one reference.
@@ -90,7 +89,7 @@ fn keep_texture(texture: Option<&ProtocolObject<dyn MTLTexture>>) -> Option<Text
 // --- Textures.
 
 #[derive(Clone, Copy)]
-pub(crate) struct TextureDesc {
+pub struct TextureDesc {
     texture_type: MTLTextureType,
     pixel_format: MTLPixelFormat,
     width: usize,
@@ -133,6 +132,8 @@ impl MTLTextureDescriptor {
         Self::boxed(Mutex::new(TextureDesc::default()))
     }
 
+    /// objc2's `texture2DDescriptorWithPixelFormat_width_height_mipmapped`, unsafe as declared.
+    ///
     /// # Safety
     /// objc2's contract (sizes Metal accepts).
     #[must_use]
@@ -151,26 +152,38 @@ impl MTLTextureDescriptor {
     pub fn pixelFormat(&self) -> MTLPixelFormat { lock(&self.d).pixel_format }
     pub fn setPixelFormat(&self, v: MTLPixelFormat) { lock(&self.d).pixel_format = v; }
     pub fn width(&self) -> NSUInteger { lock(&self.d).width }
+    /// objc2's `setWidth`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setWidth(&self, v: NSUInteger) { lock(&self.d).width = v; }
     pub fn height(&self) -> NSUInteger { lock(&self.d).height }
+    /// objc2's `setHeight`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setHeight(&self, v: NSUInteger) { lock(&self.d).height = v; }
     pub fn depth(&self) -> NSUInteger { lock(&self.d).depth }
+    /// objc2's `setDepth`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setDepth(&self, v: NSUInteger) { lock(&self.d).depth = v; }
     pub fn mipmapLevelCount(&self) -> NSUInteger { lock(&self.d).mipmap_level_count }
+    /// objc2's `setMipmapLevelCount`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setMipmapLevelCount(&self, v: NSUInteger) { lock(&self.d).mipmap_level_count = v; }
     pub fn sampleCount(&self) -> NSUInteger { lock(&self.d).sample_count }
+    /// objc2's `setSampleCount`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setSampleCount(&self, v: NSUInteger) { lock(&self.d).sample_count = v; }
     pub fn arrayLength(&self) -> NSUInteger { lock(&self.d).array_length }
+    /// objc2's `setArrayLength`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setArrayLength(&self, v: NSUInteger) { lock(&self.d).array_length = v; }
@@ -190,7 +203,7 @@ impl MTLTextureDescriptor {
     pub fn setSwizzle(&self, s: MTLTextureSwizzleChannels) { lock(&self.d).swizzle = [s.red.0, s.green.0, s.blue.0, s.alpha.0]; }
 
     /// winemetal's info for slot 21, and the facade's record of the texture.
-    pub(crate) fn info(&self) -> (wmt::TextureInfo, meta::Texture) {
+    pub fn info(&self) -> (wmt::TextureInfo, meta::Texture) {
         let d = *lock(&self.d);
         let storage = d.storage_mode.0 as u64;
         let info = wmt::TextureInfo {
@@ -229,8 +242,7 @@ impl MTLTextureDescriptor {
 
 // --- Samplers.
 
-#[derive(Clone)]
-pub(crate) struct SamplerDesc {
+pub struct SamplerDesc {
     min: MTLSamplerMinMagFilter,
     mag: MTLSamplerMinMagFilter,
     mip: MTLSamplerMipFilter,
@@ -282,7 +294,7 @@ impl MTLSamplerDescriptor {
     pub fn label(&self) -> Option<Retained<NSString>> { lock(&self.d).label.as_deref().map(NSString::from_str) }
     pub fn setLabel(&self, v: Option<&NSString>) { lock(&self.d).label = v.map(NSString::to_rust); }
 
-    pub(crate) fn info(&self) -> wmt::SamplerInfo {
+    pub fn info(&self) -> wmt::SamplerInfo {
         let d = lock(&self.d);
         wmt::SamplerInfo {
             min_filter: d.min.0 as u8,
@@ -307,7 +319,7 @@ impl MTLSamplerDescriptor {
 // --- Depth and stencil.
 
 #[derive(Clone, Copy)]
-pub(crate) struct StencilDesc {
+pub struct StencilDesc {
     compare: MTLCompareFunction,
     fail: MTLStencilOperation,
     depth_fail: MTLStencilOperation,
@@ -360,7 +372,7 @@ fn stencil_info(s: Option<StencilDesc>) -> wmt::StencilInfo {
     })
 }
 
-pub(crate) struct DepthStencilDesc {
+pub struct DepthStencilDesc {
     compare: MTLCompareFunction,
     write: bool,
     front: Option<StencilDesc>,
@@ -385,7 +397,7 @@ impl MTLDepthStencilDescriptor {
     pub fn label(&self) -> Option<Retained<NSString>> { lock(&self.d).label.as_deref().map(NSString::from_str) }
     pub fn setLabel(&self, v: Option<&NSString>) { lock(&self.d).label = v.map(NSString::to_rust); }
 
-    pub(crate) fn info(&self) -> wmt::DepthStencilInfo {
+    pub fn info(&self) -> wmt::DepthStencilInfo {
         let d = lock(&self.d);
         wmt::DepthStencilInfo {
             depth_compare_function: d.compare.0 as u8,
@@ -413,7 +425,7 @@ impl MTLCompileOptions {
     pub fn setLanguageVersion(&self, v: MTLLanguageVersion) { lock(&self.d).language_version = v.0 as u64; }
     pub fn setPreserveInvariance(&self, v: bool) { lock(&self.d).preserve_invariance = u8::from(v); }
 
-    pub(crate) fn info(&self) -> wmt::CompileOptions {
+    pub fn info(&self) -> wmt::CompileOptions {
         *lock(&self.d)
     }
 }
@@ -421,7 +433,7 @@ impl MTLCompileOptions {
 // --- Vertex descriptors.
 
 #[derive(Clone, Copy)]
-pub(crate) struct VertexDesc {
+pub struct VertexDesc {
     attributes: [wmt::VertexAttributeInfo; 31],
     layouts: [wmt::VertexBufferLayoutInfo; 31],
 }
@@ -473,6 +485,8 @@ impl MTLVertexDescriptor {
 }
 
 impl MTLVertexAttributeDescriptorArray {
+    /// objc2's `objectAtIndexedSubscript`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// `index` < 31.
     pub unsafe fn objectAtIndexedSubscript(&self, index: NSUInteger) -> Retained<MTLVertexAttributeDescriptor> {
@@ -481,6 +495,8 @@ impl MTLVertexAttributeDescriptorArray {
 }
 
 impl MTLVertexBufferLayoutDescriptorArray {
+    /// objc2's `objectAtIndexedSubscript`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// `index` < 31.
     pub unsafe fn objectAtIndexedSubscript(&self, index: NSUInteger) -> Retained<MTLVertexBufferLayoutDescriptor> {
@@ -491,19 +507,27 @@ impl MTLVertexBufferLayoutDescriptorArray {
 impl MTLVertexAttributeDescriptor {
     pub fn format(&self) -> MTLVertexFormat { MTLVertexFormat(lock(&self.d).attributes[self.index].format as usize) }
     pub fn setFormat(&self, v: MTLVertexFormat) { lock(&self.d).attributes[self.index].format = v.0 as u32; }
+    /// objc2's `setOffset`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setOffset(&self, v: NSUInteger) { lock(&self.d).attributes[self.index].offset = v as u32; }
+    /// objc2's `setBufferIndex`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setBufferIndex(&self, v: NSUInteger) { lock(&self.d).attributes[self.index].buffer_index = v as u32; }
 }
 
 impl MTLVertexBufferLayoutDescriptor {
+    /// objc2's `setStride`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setStride(&self, v: NSUInteger) { lock(&self.d).layouts[self.index].stride = v as u32; }
     pub fn setStepFunction(&self, v: MTLVertexStepFunction) { lock(&self.d).layouts[self.index].step_function = v.0 as u32; }
+    /// objc2's `setStepRate`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// objc2's contract.
     pub unsafe fn setStepRate(&self, v: NSUInteger) { lock(&self.d).layouts[self.index].step_rate = v as u32; }
@@ -512,7 +536,7 @@ impl MTLVertexBufferLayoutDescriptor {
 // --- Render pipelines.
 
 #[derive(Clone, Copy)]
-pub(crate) struct ColorBlend {
+pub struct ColorBlend {
     pixel_format: MTLPixelFormat,
     blending: bool,
     src_rgb: MTLBlendFactor,
@@ -540,7 +564,7 @@ impl Default for ColorBlend {
     }
 }
 
-pub(crate) struct PipelineDesc {
+pub struct PipelineDesc {
     label: Option<String>,
     vertex: Option<Retained<ProtocolObject<dyn MTLFunction>>>,
     fragment: Option<Retained<ProtocolObject<dyn MTLFunction>>>,
@@ -579,7 +603,9 @@ object!(
     MTLRenderPipelineColorAttachmentDescriptorArray { d: Arc<Mutex<PipelineDesc>> }
 );
 object!(
-    /// objc2-metal's `MTLRenderPipelineColorAttachmentDescriptor`: colour attachment `index` of its descriptor.
+    /// objc2-metal's `MTLRenderPipelineColorAttachmentDescriptor`.
+    ///
+    /// Colour attachment `index` of its descriptor.
     MTLRenderPipelineColorAttachmentDescriptor { d: Arc<Mutex<PipelineDesc>>, index: usize }
 );
 
@@ -608,7 +634,7 @@ impl MTLRenderPipelineDescriptor {
     }
 
     /// winemetal's info for slot 34 (or 156 with the vertex descriptor).
-    pub(crate) fn info(&self) -> (wmt::RenderPipelineInfo, Option<wmt::VertexDescriptorInfo>) {
+    pub fn info(&self) -> (wmt::RenderPipelineInfo, Option<wmt::VertexDescriptorInfo>) {
         let d = lock(&self.d);
         let mut colors = [wmt::ColorAttachmentBlendInfo::default(); 8];
         for (c, b) in colors.iter_mut().zip(d.colors.iter()) {
@@ -655,6 +681,8 @@ impl MTLRenderPipelineDescriptor {
 }
 
 impl MTLRenderPipelineColorAttachmentDescriptorArray {
+    /// objc2's `objectAtIndexedSubscript`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// `index` < 8.
     pub unsafe fn objectAtIndexedSubscript(&self, index: NSUInteger) -> Retained<MTLRenderPipelineColorAttachmentDescriptor> {
@@ -681,7 +709,7 @@ impl MTLRenderPipelineColorAttachmentDescriptor {
 // --- Render passes.
 
 #[derive(Clone, Default)]
-pub(crate) struct Attachment {
+pub struct Attachment {
     texture: Option<Texture>,
     level: usize,
     slice: usize,
@@ -694,7 +722,7 @@ pub(crate) struct Attachment {
     store: MTLStoreAction,
 }
 
-pub(crate) struct PassDesc {
+pub struct PassDesc {
     colors: [Attachment; 8],
     clear_colors: [MTLClearColor; 8],
     depth: Attachment,
@@ -720,8 +748,7 @@ impl Default for PassDesc {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum Which {
+pub enum Which {
     Color(usize),
     Depth,
     Stencil,
@@ -736,8 +763,9 @@ object!(
     MTLRenderPassColorAttachmentDescriptorArray { d: Arc<Mutex<PassDesc>> }
 );
 object!(
-    /// objc2-metal's `MTLRenderPassAttachmentDescriptor` and its colour, depth and stencil subclasses: one attachment
-    /// of its pass.
+    /// objc2-metal's `MTLRenderPassAttachmentDescriptor` and its colour.
+    ///
+    /// Depth and stencil subclasses: one attachment of its pass.
     MTLRenderPassAttachmentDescriptor { d: Arc<Mutex<PassDesc>>, which: Which }
 );
 
@@ -764,7 +792,7 @@ impl MTLRenderPassDescriptor {
     }
 
     /// winemetal's info for slot 32.
-    pub(crate) fn info(&self) -> wmt::RenderPassInfo {
+    pub fn info(&self) -> wmt::RenderPassInfo {
         let d = lock(&self.d);
         let handle = |t: &Option<Texture>| t.as_ref().map_or(0, |t| t.handle());
         let mut info = wmt::RenderPassInfo::default();
@@ -807,6 +835,8 @@ impl MTLRenderPassDescriptor {
 }
 
 impl MTLRenderPassColorAttachmentDescriptorArray {
+    /// objc2's `objectAtIndexedSubscript`, unsafe as objc2 declares it.
+    ///
     /// # Safety
     /// `index` < 8.
     pub unsafe fn objectAtIndexedSubscript(&self, index: NSUInteger) -> Retained<MTLRenderPassColorAttachmentDescriptor> {

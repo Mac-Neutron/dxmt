@@ -196,8 +196,8 @@ impl Gpu {
     /// Read from the runner's own architecture: an Apple Silicon Mac carries
     /// an Apple-family GPU and nothing else, an Intel Mac carries an Intel or
     /// AMD GPU and never an Apple one, and the runner binary is always the
-    /// host's architecture. MacNeutron: a Linux runner is its microVM guest's,
-    /// whose Metal is an Apple Silicon Mac's.
+    /// host's architecture. A Linux runner is a microVM guest's, whose Metal is
+    /// an Apple Silicon Mac's.
     #[must_use]
     pub const fn host() -> Self {
         if cfg!(any(target_arch = "aarch64", target_os = "linux")) {

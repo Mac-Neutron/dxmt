@@ -1,22 +1,27 @@
-//! winemetal's Unix-call table: `winemetal.so` loaded once, its 64-bit `__wine_unix_call_funcs` slots called with
-//! winemetal's own parameter structs (`winemetal_thunks.h`). A 32-bit process ([`mark_wow64`]) calls its
-//! `__wine_unix_call_wow64_funcs` instead, whose entries for the slots the facade calls take the same structs: in
-//! the VM's guest they mark the process 32-bit, so the memory winemetal hands out lies below 2 GiB, where the i386
-//! PE side writes into it (D3D9 M2b).
+//! winemetal's Unix-call table.
 //!
-//! The library is the one beside the image holding this crate (`mtld3d.so` in Wine's `lib/wine/<arch>-unix`), or
-//! `MTLD3D_WINEMETAL` when that names one (tests). Under Wine the libraries it links (`ntdll.so`, `winemac.so` on
-//! macOS) are already loaded; outside Wine a test folder holds stand-ins beside it.
+//! `winemetal.so` loaded once, its 64-bit `__wine_unix_call_funcs` slots called with winemetal's
+//! own parameter structs (`winemetal_thunks.h`). A 32-bit process ([`mark_wow64`]) calls its
+//! `__wine_unix_call_wow64_funcs` instead, whose entries for the slots the facade calls take the
+//! same structs: in the VM's guest they mark the process 32-bit, so the memory winemetal hands out
+//! lies below 2 GiB, where the i386 PE side writes into it (D3D9 M2b).
+//!
+//! The library is the one beside the image holding this crate (`mtld3d.so` in Wine's
+//! `lib/wine/<arch>-unix`), or `MTLD3D_WINEMETAL` when that names one (tests). Under Wine the
+//! libraries it links (`ntdll.so`, `winemac.so` on macOS) are already loaded; outside Wine a test
+//! folder holds stand-ins beside it.
 
 use core::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::{
-    OnceLock,
+    LazyLock,
     atomic::{AtomicBool, Ordering},
 };
 
 type Slot = unsafe extern "C" fn(*mut c_void) -> i32;
 
-/// The loaded table: process-wide, as the library is (one `dlopen` handle per process, never closed).
+/// The loaded table.
+///
+/// Process-wide, as the library is (one `dlopen` handle per process, never closed).
 pub struct Table {
     funcs: *const Slot,
 }
@@ -26,14 +31,18 @@ unsafe impl Send for Table {}
 // SAFETY: as above; every slot is callable from any thread (winemetal's own contract).
 unsafe impl Sync for Table {}
 
-static TABLE: OnceLock<Result<Table, String>> = OnceLock::new();
+static TABLE: LazyLock<Result<Table, String>> = LazyLock::new(Table::load);
 
-/// Whether the process is 32-bit. The resource is process-wide (one 32-bit address space) and a machine fact, latched
-/// once: mtld3d.so's own WoW64 table sets it at its first thunk, before any Metal call, and the table reads it once
-/// when it loads.
+/// Whether the process is 32-bit.
+///
+/// The resource is process-wide (one 32-bit address space) and a machine fact, latched once:
+/// mtld3d.so's own WoW64 table sets it at its first thunk, before any Metal call, and the table
+/// reads it once when it loads.
 static WOW64: AtomicBool = AtomicBool::new(false);
 
-/// Marks the process 32-bit: the table loads winemetal's WoW64 entries. Called before the table's first use.
+/// Marks the process 32-bit: the table loads winemetal's WoW64 entries.
+///
+/// Called before the table's first use.
 pub fn mark_wow64() {
     WOW64.store(true, Ordering::Relaxed);
 }
@@ -86,7 +95,7 @@ impl Table {
     /// # Errors
     /// The library or its table can't be loaded; the message says why.
     pub fn get() -> Result<&'static Self, &'static str> {
-        TABLE.get_or_init(Self::load).as_ref().map_err(String::as_str)
+        TABLE.as_ref().map_err(String::as_str)
     }
 
     fn load() -> Result<Self, String> {
@@ -116,17 +125,18 @@ impl Table {
 
     /// Calls slot `slot` with `params`, winemetal's parameter struct for it; its NTSTATUS.
     ///
-    /// # Safety
-    /// `params` is that slot's struct, valid for reads and writes, and every pointer and handle in it is valid for the
-    /// call.
+    /// # Safety `params` is that slot's struct, valid for reads and writes, and every pointer and
+    /// handle in it is valid for the call.
     pub unsafe fn call<P>(&self, slot: u32, params: &mut P) -> i32 {
         // SAFETY: the caller's contract; the slot index is one the facade uses (inside the table).
         unsafe { (*self.funcs.add(slot as usize))((params as *mut P).cast()) }
     }
 }
 
-/// Calls slot `slot` of the loaded table, panicking if winemetal isn't loadable (every facade object comes from it,
-/// so a call without it is a bug in the order of things).
+/// Calls slot `slot` of the loaded table.
+///
+/// Panicking if winemetal isn't loadable (every facade object comes from it, so a call without it
+/// is a bug in the order of things).
 ///
 /// # Safety
 /// As [`Table::call`].

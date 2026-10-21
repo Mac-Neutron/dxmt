@@ -45,8 +45,9 @@ pub fn translated() -> Option<bool> {
     None
 }
 
-/// MacNeutron: the VM's guest runs under FEX, which no Linux kernel names: unknown, and the startup line says the
-/// arch alone.
+/// The VM's guest runs under FEX, which no Linux kernel names.
+///
+/// Unknown, and the startup line says the arch alone.
 #[cfg(target_os = "linux")]
 pub const fn translated() -> Option<bool> {
     None

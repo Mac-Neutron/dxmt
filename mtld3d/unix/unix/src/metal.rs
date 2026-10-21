@@ -59,11 +59,12 @@ pub use texture::{
 pub use upload_quad::ensure_upload_pipeline;
 pub use upscale::is_supported as upscale_is_supported;
 
-/// MacNeutron: `len` bytes of zeroed pages Metal can be made over, or null (the `AllocPages` thunk).
+/// `len` bytes of zeroed pages Metal can be made over, or null (`AllocPages`).
 ///
-/// macOS (the facade's loopback build, and the product build, which never asks): anonymous pages aligned to the
-/// 16 KiB `PAGE_SIZE` a page lease requires; a Wine process's mappings are only 4 KiB-aligned, so the mapping is
-/// made 16 KiB larger and trimmed. The VM's guest: winemetal's own allocator (M2b).
+/// macOS (the facade's loopback build, and the product build, which never asks): anonymous pages
+/// aligned to the 16 KiB `PAGE_SIZE` a page lease requires; a Wine process's mappings are only 4
+/// KiB-aligned, so the mapping is made 16 KiB larger and trimmed. The VM's guest: winemetal's own
+/// allocator (M2b).
 #[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn alloc_pages(len: usize) -> *mut u8 {
@@ -78,28 +79,29 @@ pub fn alloc_pages(len: usize) -> *mut u8 {
     }
     let raw = raw as usize;
     let start = raw.next_multiple_of(ALIGN);
-    // SAFETY: the head and tail of the mapping just made, outside [start, start + len): both page-aligned.
-    unsafe {
-        if start > raw {
-            libc::munmap(raw as *mut libc::c_void, start - raw);
-        }
-        let end = start + len;
-        if raw + total > end {
-            libc::munmap(end as *mut libc::c_void, raw + total - end);
-        }
+    if start > raw {
+        // SAFETY: the head of the mapping just made, before `start`: page-aligned.
+        unsafe { libc::munmap(raw as *mut libc::c_void, start - raw) };
+    }
+    let end = start + len;
+    if raw + total > end {
+        // SAFETY: the tail of the mapping just made, after `end`: page-aligned.
+        unsafe { libc::munmap(end as *mut libc::c_void, raw + total - end) };
     }
     start as *mut u8
 }
 
-/// MacNeutron: the VM's guest: `len` bytes from winemetal's allocator, which both sides map (a no-copy buffer there
-/// must be made over it), in 16 KiB pages and zeroed (the guest's allocator zeroes what it hands out again).
+/// `len` bytes from winemetal's allocator, in the VM's guest.
+///
+/// Both sides map it (a no-copy buffer there must be made over it); the pages are 16 KiB and
+/// zeroed (the guest's allocator zeroes what it hands out again).
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn alloc_pages(len: usize) -> *mut u8 {
     mtld3d_mtl::memory::alloc(len)
 }
 
-/// MacNeutron: gives back `alloc_pages`' pages (the `FreePages` thunk).
+/// Gives back `alloc_pages`' pages (the `FreePages` thunk).
 #[cfg(not(target_os = "linux"))]
 pub fn free_pages(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
@@ -109,7 +111,9 @@ pub fn free_pages(ptr: *mut u8, len: usize) {
     }
 }
 
-/// MacNeutron: gives back `alloc_pages`' pages to winemetal, which keeps them until no buffer is made over them.
+/// Gives back `alloc_pages`' pages to winemetal.
+///
+/// Which keeps them until no buffer is made over them.
 #[cfg(target_os = "linux")]
 pub fn free_pages(ptr: *mut u8, _len: usize) {
     if !ptr.is_null() {

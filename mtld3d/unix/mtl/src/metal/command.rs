@@ -1,16 +1,18 @@
 //! objc2-metal's command queue, buffers and encoders over winemetal.
 //!
-//! An encoder records its calls as winemetal command nodes (`wmtcmd_*`) and hands the list over in one
-//! `encodeCommands` call when it ends (or every 65,536 nodes, the VM's limit per call): per-draw calls never become
-//! slot calls. Completion handlers, which winemetal has no form of, run on a retirement thread per queue that waits
-//! on each committed buffer in commit order; a drawable's presented handler runs when the buffer that presents it
-//! completes, and its presented time is that moment.
+//! An encoder records its calls as winemetal command nodes (`wmtcmd_*`) and hands the list over in
+//! one `encodeCommands` call when it ends (or every 65,536 nodes, the VM's limit per call):
+//! per-draw calls never become slot calls. Completion handlers, which winemetal has no form of, run
+//! on a retirement thread per queue that waits on each committed buffer in commit order; a
+//! drawable's presented handler runs when the buffer that presents it completes, and its presented
+//! time is that moment.
 
 use core::{cell::RefCell, ffi::c_void, ptr::NonNull};
+
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
-    sync::{Condvar, Mutex, OnceLock, mpsc},
+    sync::{Condvar, LazyLock, Mutex, mpsc},
     time::Instant,
 };
 
@@ -43,7 +45,6 @@ const MAX_NODES: usize = 65_536;
 const MAX_BYTES: usize = 4 << 20;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
 struct Node<T> {
     ty: u16,
     reserved: [u16; 3],
@@ -51,8 +52,10 @@ struct Node<T> {
     body: T,
 }
 
-/// One encoder's list being built: nodes and their payloads in one 8-byte-aligned buffer, linked when it is handed
-/// over (the buffer doesn't move during that call).
+/// One encoder's list being built.
+///
+/// Nodes and their payloads in one 8-byte-aligned buffer, linked when it is handed over (the buffer
+/// doesn't move during that call).
 #[derive(Default)]
 struct Nodes {
     words: Vec<u64>,
@@ -73,7 +76,9 @@ impl Nodes {
         start
     }
 
-    /// A node whose body field at byte `pointer_at` (from the body's start) points at a copy of `bytes`.
+    /// A node whose body field at `pointer_at` points at a copy of `bytes`.
+    ///
+    /// `pointer_at` is a byte offset from the body's start.
     fn push_payload<T: Copy>(&mut self, ty: u16, body: T, pointer_at: usize, bytes: &[u8]) {
         let start = self.push(ty, body);
         let at = self.words.len();
@@ -127,13 +132,17 @@ struct EncoderState {
     slot: u32,
     nodes: Nodes,
     raster: Raster,
-    /// A compute encoder's current pipeline (a dispatch with another size needs a node of its own for it).
+    /// A compute encoder's current pipeline.
+    ///
+    /// A dispatch with another size needs a node of its own for it.
     compute_pso: u64,
 }
 
 thread_local! {
-    /// The lists of the encoders this thread is recording (Metal's encoders are used from one thread at a time).
-    static ENCODERS: RefCell<HashMap<u64, EncoderState>> = RefCell::new(HashMap::new());
+    /// The lists of the encoders this thread is recording.
+    ///
+    /// Metal's encoders are used from one thread at a time.
+    static ENCODERS: RefCell<FxHashMap<u64, EncoderState>> = RefCell::new(FxHashMap::default());
 }
 
 fn record(encoder: u64, f: impl FnOnce(&mut EncoderState)) {
@@ -362,6 +371,7 @@ pub unsafe trait MTLRenderCommandEncoder: MTLCommandEncoder {
             );
         });
     }
+    // allow: objc2's signature for this Metal method, which every caller of the facade uses.
     #[allow(clippy::too_many_arguments)]
     unsafe fn drawIndexedPrimitives_indexCount_indexType_indexBuffer_indexBufferOffset_instanceCount_baseVertex_baseInstance(
         &self,
@@ -393,7 +403,9 @@ pub unsafe trait MTLRenderCommandEncoder: MTLCommandEncoder {
     }
 }
 
-/// Cull, fill and depth bias as one rasterizer node: winemetal sets the five together, so the facade keeps them.
+/// Cull, fill and depth bias as one rasterizer node.
+///
+/// Winemetal sets the five together, so the facade keeps them.
 fn raster(encoder: u64, f: impl FnOnce(&mut Raster)) {
     record(encoder, |s| {
         let before = s.raster;
@@ -412,6 +424,7 @@ fn raster(encoder: u64, f: impl FnOnce(&mut Raster)) {
 pub unsafe trait MTLBlitCommandEncoder: MTLCommandEncoder {
     /// A managed resource's sync: storage is shared on Apple Silicon, so there is nothing to do.
     fn synchronizeResource(&self, _resource: &ProtocolObject<dyn MTLResource>) {}
+    // allow: objc2's signature for this Metal method, which every caller of the facade uses.
     #[allow(clippy::too_many_arguments)]
     unsafe fn copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
         &self,
@@ -438,6 +451,7 @@ pub unsafe trait MTLBlitCommandEncoder: MTLCommandEncoder {
         };
         record(handle_of(self), |s| { s.nodes.push(BLIT_TEXTURE_TO_TEXTURE, body); });
     }
+    // allow: objc2's signature for this Metal method, which every caller of the facade uses.
     #[allow(clippy::too_many_arguments)]
     unsafe fn copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin(
         &self,
@@ -459,6 +473,7 @@ pub unsafe trait MTLBlitCommandEncoder: MTLCommandEncoder {
             );
         }
     }
+    // allow: objc2's signature for this Metal method, which every caller of the facade uses.
     #[allow(clippy::too_many_arguments)]
     unsafe fn copyFromBuffer_sourceOffset_sourceBytesPerRow_sourceBytesPerImage_sourceSize_toTexture_destinationSlice_destinationLevel_destinationOrigin_options(
         &self,
@@ -490,6 +505,7 @@ pub unsafe trait MTLBlitCommandEncoder: MTLCommandEncoder {
         let ty = if options.is_empty() { BLIT_BUFFER_TO_TEXTURE } else { BLIT_BUFFER_TO_TEXTURE_OPTION };
         record(handle_of(self), |s| { s.nodes.push(ty, body); });
     }
+    // allow: objc2's signature for this Metal method, which every caller of the facade uses.
     #[allow(clippy::too_many_arguments)]
     unsafe fn copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
         &self,
@@ -511,6 +527,7 @@ pub unsafe trait MTLBlitCommandEncoder: MTLCommandEncoder {
             );
         }
     }
+    // allow: objc2's signature for this Metal method, which every caller of the facade uses.
     #[allow(clippy::too_many_arguments)]
     unsafe fn copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage_options(
         &self,
@@ -586,7 +603,9 @@ pub unsafe trait MTLComputeCommandEncoder: MTLCommandEncoder {
         let texture = handle_or_zero(texture);
         record(handle_of(self), |s| { s.nodes.push(COMPUTE_SET_TEXTURE, SetObject { object: texture, index: index as u8 }); });
     }
-    /// winemetal's dispatch takes the threadgroup size from the last pipeline node: the facade gives it there.
+    /// winemetal's dispatch takes the threadgroup size from the last pipeline node.
+    ///
+    /// The facade gives it there.
     fn dispatchThreadgroups_threadsPerThreadgroup(&self, threadgroups_per_grid: MTLSize, threads_per_threadgroup: MTLSize) {
         let groups = size(threadgroups_per_grid);
         let threads = size(threads_per_threadgroup);
@@ -619,7 +638,9 @@ unsafe impl MTLCommandEncoder for ProtocolObject<dyn MTLComputeCommandEncoder> {
 unsafe impl MTLComputeCommandEncoder for ProtocolObject<dyn MTLComputeCommandEncoder> {}
 unsafe impl MTLCommandEncoder for ProtocolObject<dyn MTLCommandEncoder> {}
 
-/// An encoder from `slot`: slot 30 (blit) takes the buffer alone, 31 and 32 (compute, render) an argument too.
+/// An encoder from `slot`.
+///
+/// Slot 30 (blit) takes the buffer alone, 31 and 32 (compute, render) an argument too.
 fn new_encoder<P: ?Sized>(cb: u64, slot: u32, arg: Option<u64>, list_slot: u32) -> Option<Retained<ProtocolObject<P>>> {
     let handle = if let Some(arg) = arg {
         let mut params = wmt::ObjU64ObjRet { handle: cb, arg, ret: 0 };
@@ -651,14 +672,14 @@ enum Handler {
 }
 
 /// Handlers registered on command buffers and drawables not yet committed (few a frame).
-static PENDING: Mutex<Option<HashMap<u64, Vec<Handler>>>> = Mutex::new(None);
+static PENDING: Mutex<Option<FxHashMap<u64, Vec<Handler>>>> = Mutex::new(None);
 
-fn pending() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Vec<Handler>>>> {
+fn pending() -> std::sync::MutexGuard<'static, Option<FxHashMap<u64, Vec<Handler>>>> {
     PENDING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn add_pending(handle: u64, handler: Handler) {
-    pending().get_or_insert_with(HashMap::new).entry(handle).or_default().push(handler);
+    pending().get_or_insert_with(FxHashMap::default).entry(handle).or_default().push(handler);
 }
 
 fn take_pending(handle: u64) -> Vec<Handler> {
@@ -674,24 +695,28 @@ struct Committed {
 unsafe impl Send for Committed {}
 
 /// The retirement thread of each queue that has had a handler: commits arrive in commit order.
-static RETIRERS: Mutex<Option<HashMap<u64, mpsc::Sender<Committed>>>> = Mutex::new(None);
+static RETIRERS: Mutex<Option<FxHashMap<u64, mpsc::Sender<Committed>>>> = Mutex::new(None);
 
-/// Committed buffers whose completed handlers haven't all run yet, which `waitUntilCompleted` waits out as Metal's
-/// does. The caller has no object to reach: a retirement thread clears what a commit on any thread added.
-static RETIRING: (Mutex<Option<HashSet<u64>>>, Condvar) = (Mutex::new(None), Condvar::new());
+/// Committed buffers whose completed handlers haven't all run yet.
+///
+/// Which `waitUntilCompleted` waits out as Metal's does. The caller has no object to reach: a
+/// retirement thread clears what a commit on any thread added.
+static RETIRING: (Mutex<Option<FxHashSet<u64>>>, Condvar) = (Mutex::new(None), Condvar::new());
 
 thread_local! {
-    /// On a retirement thread: a handler that waits on a buffer must not wait for handlers this thread runs.
+    /// On a retirement thread.
+    ///
+    /// A handler that waits on a buffer must not wait for handlers this thread runs.
     static RETIRER: Cell<bool> = const { Cell::new(false) };
 }
 
-fn retiring() -> std::sync::MutexGuard<'static, Option<HashSet<u64>>> {
+fn retiring() -> std::sync::MutexGuard<'static, Option<FxHashSet<u64>>> {
     RETIRING.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn retirer(queue: u64) -> mpsc::Sender<Committed> {
     let mut map = RETIRERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    map.get_or_insert_with(HashMap::new)
+    map.get_or_insert_with(FxHashMap::default)
         .entry(queue)
         .or_insert_with(|| {
             let (tx, rx) = mpsc::channel::<Committed>();
@@ -723,7 +748,9 @@ fn retire(done: Committed) {
     RETIRING.1.notify_all();
 }
 
-/// Runs `cb`'s handlers: completed ones with the buffer, presented ones with their drawable presented at `time` (0: not
+/// Runs `cb`'s handlers.
+///
+/// Completed ones with the buffer, presented ones with their drawable presented at `time` (0: not
 /// presented), each drawable then given back.
 fn run_handlers(cb: u64, handlers: Vec<Handler>, time: f64) {
     for handler in handlers {
@@ -741,9 +768,9 @@ fn run_handlers(cb: u64, handlers: Vec<Handler>, time: f64) {
 }
 
 fn now() -> f64 {
-    static START: OnceLock<Instant> = OnceLock::new();
+    static START: LazyLock<Instant> = LazyLock::new(Instant::now);
     // Never 0: mtld3d reads 0 as "not presented".
-    1.0 + START.get_or_init(Instant::now).elapsed().as_secs_f64()
+    1.0 + START.elapsed().as_secs_f64()
 }
 
 /// Gives back the reference `keep_drawable` took for a presented handler.
@@ -758,10 +785,12 @@ fn keep_drawable(drawable: u64) {
     unsafe { <ProtocolObject<dyn MTLDrawable> as objc2::Message>::retain_raw(drawable as usize as *const _) };
 }
 
-/// The facade's last reference to `handle` (objc2.rs): a buffer or drawable given up with handlers pending runs them
-/// now, as an uncommitted Metal buffer's run (mtld3d's return early on a buffer that never ran; a drawable never
-/// presented has presented time 0); a queue's retirement thread ends after what it was sent; a test status goes.
-pub(crate) fn forget(handle: u64, entry: &meta::Entry) {
+/// The facade's last reference to `handle` (objc2.rs).
+///
+/// A buffer or drawable given up with handlers pending runs them now, as an uncommitted Metal
+/// buffer's run (mtld3d's return early on a buffer that never ran; a drawable never presented has
+/// presented time 0); a queue's retirement thread ends after what it was sent; a test status goes.
+pub fn forget(handle: u64, entry: &meta::Entry) {
     let handlers = take_pending(handle);
     if !handlers.is_empty() {
         run_handlers(handle, handlers, if entry.presented_by != 0 { now() } else { 0.0 });
@@ -775,12 +804,14 @@ pub(crate) fn forget(handle: u64, entry: &meta::Entry) {
 }
 
 /// The status a test makes a buffer report (`set_status_for_test`), in place of winemetal's.
-static STATUS_OVERRIDE: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+static STATUS_OVERRIDE: Mutex<Option<FxHashMap<u64, u64>>> = Mutex::new(None);
 
-/// Makes `cb` report `status`, for a test of the error path (a real GPU fault isn't deterministic on Apple Silicon).
+/// Makes `cb` report `status`.
+///
+/// For a test of the error path (a real GPU fault isn't deterministic on Apple Silicon).
 #[doc(hidden)]
 pub fn set_status_for_test(cb: &ProtocolObject<dyn MTLCommandBuffer>, status: MTLCommandBufferStatus) {
-    STATUS_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(HashMap::new).insert(cb.handle(), status.0 as u64);
+    STATUS_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(FxHashMap::default).insert(cb.handle(), status.0 as u64);
 }
 
 /// Commits in the order their retirement runs (Metal runs a queue's handlers in commit order).
@@ -790,7 +821,7 @@ static COMMIT_ORDER: Mutex<()> = Mutex::new(());
 fn send_retire(cb: u64, handlers: Vec<Handler>) {
     let queue = meta::read(cb, |e| e.map_or(0, |e| e.queue));
     let committed = Committed { cb: retained(cb).expect("a committed buffer"), handlers };
-    retiring().get_or_insert_with(HashSet::new).insert(cb);
+    retiring().get_or_insert_with(FxHashSet::default).insert(cb);
     let _ = retirer(queue).send(committed);
 }
 
@@ -885,8 +916,9 @@ pub unsafe trait MTLCommandBuffer: NSObjectProtocol {
         // SAFETY: a live block (objc2's contract).
         add_pending(handle_of(self), Handler::Completed(unsafe { Kept::from_block(block) }));
     }
-    /// Returns once the buffer has completed and, as Metal's does, its completed handlers have run (unless called
-    /// from one of them).
+    /// Returns once the buffer has completed and its completed handlers have run.
+    ///
+    /// As Metal's does (unless called from one of the handlers).
     fn waitUntilCompleted(&self) {
         let cb = handle_of(self);
         let mut params = wmt::ObjNoRet { handle: cb };
@@ -939,13 +971,17 @@ unsafe impl MTLCommandBuffer for ProtocolObject<dyn MTLCommandBuffer> {}
 const GPU_START_TIME: u64 = 2;
 const GPU_END_TIME: u64 = 3;
 
-/// A command buffer's GPU start or end time in seconds (winemetal's property slot answers nanoseconds).
+/// A command buffer's GPU start or end time in seconds.
+///
+/// Winemetal's property slot answers nanoseconds.
 fn gpu_time(cb: u64, which: u64) -> CFTimeInterval {
     super::query_u64_arg(wmt::COMMAND_BUFFER_PROPERTY, cb, which) as f64 / 1e9
 }
 
-/// A drawable's presented handlers go with the buffer that presents it, each with a reference on the drawable; the
-/// drawable remembers that buffer for handlers added after (addPresentedHandler).
+/// A drawable's presented handlers go with the buffer that presents it.
+///
+/// Each with a reference on the drawable; the drawable remembers that buffer for handlers added
+/// after (addPresentedHandler).
 fn move_presented(cb: u64, drawable: u64) {
     let mut map = pending();
     meta::with(drawable, |e| e.presented_by = cb);
@@ -953,7 +989,7 @@ fn move_presented(cb: u64, drawable: u64) {
     for handler in handlers {
         if let Handler::Presented(_, h) = handler {
             keep_drawable(drawable);
-            map.get_or_insert_with(HashMap::new).entry(cb).or_default().push(Handler::Presented(drawable, h));
+            map.get_or_insert_with(FxHashMap::default).entry(cb).or_default().push(Handler::Presented(drawable, h));
         }
     }
 }
@@ -964,9 +1000,11 @@ pub unsafe trait MTLDrawable: NSObjectProtocol {
     fn present(&self) {
         log::warn!(target: "mtld3d::mtl", "MTLDrawable::present without a command buffer: not presented");
     }
-    /// Before present the handler waits with the drawable; after, it goes with the presenting buffer: into its
-    /// pending handlers while uncommitted (mtld3d adds its own then), else to its queue's retirement thread, which
-    /// runs it once the buffer has completed.
+    /// Before present the handler waits with the drawable.
+    ///
+    /// After, it goes with the presenting buffer: into its pending handlers while uncommitted
+    /// (mtld3d adds its own then), else to its queue's retirement thread, which runs it once the
+    /// buffer has completed.
     unsafe fn addPresentedHandler(&self, block: MTLDrawablePresentedHandler) {
         let drawable = handle_of(self);
         // SAFETY: a live block (objc2's contract).
@@ -974,12 +1012,12 @@ pub unsafe trait MTLDrawable: NSObjectProtocol {
         let mut map = pending();
         let cb = meta::read(drawable, |e| e.map_or(0, |e| e.presented_by));
         if cb == 0 {
-            map.get_or_insert_with(HashMap::new).entry(drawable).or_default().push(Handler::Presented(drawable, handler));
+            map.get_or_insert_with(FxHashMap::default).entry(drawable).or_default().push(Handler::Presented(drawable, handler));
             return;
         }
         keep_drawable(drawable);
         if !meta::read(cb, |e| e.is_some_and(|e| e.committed)) {
-            map.get_or_insert_with(HashMap::new).entry(cb).or_default().push(Handler::Presented(drawable, handler));
+            map.get_or_insert_with(FxHashMap::default).entry(cb).or_default().push(Handler::Presented(drawable, handler));
             return;
         }
         drop(map);
