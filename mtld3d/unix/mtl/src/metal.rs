@@ -195,7 +195,7 @@ pub unsafe trait MTLTexture: MTLResource {
             size: wmt::Size { width: region.size.width as u64, height: region.size.height as u64, depth: region.size.depth as u64 },
             level: level as u64,
             slice: slice as u64,
-            data: pixel_bytes.as_ptr(),
+            data: wmt::Ptr::new(pixel_bytes.as_ptr()),
             bytes_per_row: bytes_per_row as u64,
             bytes_per_image: bytes_per_image as u64,
         };
@@ -258,6 +258,7 @@ fn texture_view(
         slice_start: slices.location as u16,
         slice_count: slices.length as u16,
         swizzle: wmt::TextureSwizzleChannels { r: s[0], g: s[1], b: s[2], a: s[3] },
+        padding: [0; 4],
         ret: 0,
         gpu_resource_id: 0,
     };
@@ -452,15 +453,15 @@ pub fn MTLCreateSystemDefaultDevice() -> Option<Retained<ProtocolObject<dyn MTLD
 }
 
 fn new_buffer(device: u64, length: usize, options: MTLResourceOptions, memory: *mut c_void) -> Option<Retained<ProtocolObject<dyn MTLBuffer>>> {
-    let mut info = wmt::BufferInfo { length: length as u64, options: options.bits() as u64, memory, gpu_address: 0 };
-    let mut params = wmt::NewWithInfo { device, info: (&raw mut info).cast(), ret: 0 };
+    let mut info = wmt::BufferInfo { length: length as u64, options: options.bits() as u64, memory: wmt::Ptr::new(memory), gpu_address: 0 };
+    let mut params = wmt::NewWithInfo { device, info: wmt::Ptr::new((&raw mut info).cast()), ret: 0 };
     // SAFETY: slot 18 fills the info's memory and GPU address.
     unsafe { table::call(wmt::DEVICE_NEW_BUFFER, &mut params) };
     let buffer = objc2::from_plus_one(params.ret)?;
     meta::with(params.ret, |e| {
         e.device = device;
         e.buffer_length = length as u64;
-        e.buffer_contents = info.memory as usize;
+        e.buffer_contents = info.memory.get() as usize;
         e.storage_mode = ((options.bits() >> MTLResourceStorageModeShift) & 0xf) as u64;
     });
     Some(buffer)
@@ -517,7 +518,7 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
     }
     fn newDepthStencilStateWithDescriptor(&self, descriptor: &MTLDepthStencilDescriptor) -> Option<Retained<ProtocolObject<dyn MTLDepthStencilState>>> {
         let info = descriptor.info();
-        let mut params = wmt::NewWithConstInfo { device: handle_of(self), info: (&raw const info).cast(), ret: 0 };
+        let mut params = wmt::NewWithConstInfo { device: handle_of(self), info: wmt::Ptr::new((&raw const info).cast()), ret: 0 };
         // SAFETY: slot 20 reads the info.
         unsafe { table::call(wmt::DEVICE_NEW_DEPTH_STENCIL_STATE, &mut params) };
         let state = objc2::from_plus_one(params.ret)?;
@@ -527,7 +528,7 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
     }
     fn newTextureWithDescriptor(&self, descriptor: &MTLTextureDescriptor) -> Option<Retained<ProtocolObject<dyn MTLTexture>>> {
         let (mut info, texture) = descriptor.info();
-        let mut params = wmt::NewWithInfo { device: handle_of(self), info: (&raw mut info).cast(), ret: 0 };
+        let mut params = wmt::NewWithInfo { device: handle_of(self), info: wmt::Ptr::new((&raw mut info).cast()), ret: 0 };
         // SAFETY: slot 21 reads the info and fills its GPU resource id.
         unsafe { table::call(wmt::DEVICE_NEW_TEXTURE, &mut params) };
         let created = objc2::from_plus_one(params.ret)?;
@@ -541,7 +542,7 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
     }
     fn newSamplerStateWithDescriptor(&self, descriptor: &MTLSamplerDescriptor) -> Option<Retained<ProtocolObject<dyn MTLSamplerState>>> {
         let mut info = descriptor.info();
-        let mut params = wmt::NewWithInfo { device: handle_of(self), info: (&raw mut info).cast(), ret: 0 };
+        let mut params = wmt::NewWithInfo { device: handle_of(self), info: wmt::Ptr::new((&raw mut info).cast()), ret: 0 };
         // SAFETY: slot 19 reads the info and fills its GPU resource id.
         unsafe { table::call(wmt::DEVICE_NEW_SAMPLER_STATE, &mut params) };
         let sampler = objc2::from_plus_one(params.ret)?;
@@ -560,9 +561,9 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
             let opts = options.info();
             let mut params = wmt::NewLibrarySourceOptions {
                 device,
-                source: text.as_ptr(),
+                source: wmt::Ptr::new(text.as_ptr()),
                 length: text.len() as u64,
-                options: &raw const opts,
+                options: wmt::Ptr::new(&raw const opts),
                 ret_error: 0,
                 ret_library: 0,
             };
@@ -570,7 +571,7 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
             unsafe { table::call(wmt::DEVICE_NEW_LIBRARY_WITH_SOURCE_OPTIONS, &mut params) };
             (params.ret_library, params.ret_error)
         } else {
-            let mut params = wmt::NewLibrarySource { device, source: text.as_ptr(), length: text.len() as u64, ret_error: 0, ret_library: 0 };
+            let mut params = wmt::NewLibrarySource { device, source: wmt::Ptr::new(text.as_ptr()), length: text.len() as u64, ret_error: 0, ret_library: 0 };
             // SAFETY: slot 144 reads the source.
             unsafe { table::call(wmt::DEVICE_NEW_LIBRARY_WITH_SOURCE, &mut params) };
             (params.ret_library, params.ret_error)
@@ -592,8 +593,8 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
         let (pso, error) = if let Some(vertex) = vertex {
             let mut params = wmt::NewPipelineVertex {
                 device,
-                info: (&raw const info).cast(),
-                vertex: (&raw const vertex).cast(),
+                info: wmt::Ptr::new((&raw const info).cast()),
+                vertex: wmt::Ptr::new((&raw const vertex).cast()),
                 ret_error: 0,
                 ret_pso: 0,
             };
@@ -601,7 +602,7 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
             unsafe { table::call(wmt::DEVICE_NEW_RENDER_PIPELINE_STATE_WITH_VERTEX_DESCRIPTOR, &mut params) };
             (params.ret_pso, params.ret_error)
         } else {
-            let mut params = wmt::NewPipeline { device, info: (&raw const info).cast(), ret_error: 0, ret_pso: 0 };
+            let mut params = wmt::NewPipeline { device, info: wmt::Ptr::new((&raw const info).cast()), ret_error: 0, ret_pso: 0 };
             // SAFETY: slot 34 reads the info.
             unsafe { table::call(wmt::DEVICE_NEW_RENDER_PIPELINE_STATE, &mut params) };
             (params.ret_pso, params.ret_error)
@@ -623,7 +624,7 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, Retained<NSError>> {
         let info = wmt::ComputePipelineInfo {
             compute_function: compute_function.handle(),
-            binary_archives_for_lookup: core::ptr::null(),
+            binary_archives_for_lookup: wmt::Ptr::null(),
             binary_archive_for_serialization: 0,
             num_binary_archives_for_lookup: 0,
             fail_on_binary_archive_miss: false,
@@ -632,7 +633,7 @@ pub unsafe trait MTLDevice: NSObjectProtocol {
             immutable_buffers: 0,
         };
         let device = handle_of(self);
-        let mut params = wmt::NewPipeline { device, info: (&raw const info).cast(), ret_error: 0, ret_pso: 0 };
+        let mut params = wmt::NewPipeline { device, info: wmt::Ptr::new((&raw const info).cast()), ret_error: 0, ret_pso: 0 };
         // SAFETY: slot 29 reads the info.
         unsafe { table::call(wmt::DEVICE_NEW_COMPUTE_PIPELINE_STATE, &mut params) };
         match objc2::from_plus_one(params.ret_pso) {

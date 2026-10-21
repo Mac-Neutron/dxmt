@@ -100,7 +100,7 @@ impl MTLFXSpatialScalerDescriptor {
     /// objc2's contract.
     pub unsafe fn newSpatialScalerWithDevice(&self, device: &ProtocolObject<dyn MTLDevice>) -> Option<Retained<ProtocolObject<dyn MTLFXSpatialScaler>>> {
         let info = *lock(&self.d);
-        let mut params = wmt::NewWithConstInfo { device: device.handle(), info: (&raw const info).cast(), ret: 0 };
+        let mut params = wmt::NewWithConstInfo { device: device.handle(), info: wmt::Ptr::new((&raw const info).cast()), ret: 0 };
         // SAFETY: slot 57 reads the info.
         unsafe { table::call(wmt::DEVICE_NEW_SPATIAL_SCALER, &mut params) };
         let scaler = objc2::from_plus_one(params.ret)?;

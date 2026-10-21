@@ -2,12 +2,45 @@
 //!
 //! The ones the facade passes, laid out as the 64-bit Unix side reads them. Enums are their C base
 //! types: `WMTLoadAction`, `WMTStoreAction` and `WMTGPUFamily` have none and are `int`.
+//!
+//! The same layouts on i686 Linux (old WoW64's Unix side in the VM's guest), whose winemetal.so
+//! takes DXMT's i386 ones: a pointer is a [`Ptr`], and a struct the C side aligns to 8 says so
+//! (`align(8)`), as this target's `u64` aligns to 4 (MacNeutron's `mtld3d-layout32-check.sh`
+//! compares the two builds).
 
 
 /// A winemetal object.
 ///
 /// On macOS the Objective-C object's address, in the VM's guest a handle the guest picked.
 pub type Handle = u64;
+
+/// A pointer in winemetal's structs (`WMTMemoryPointer`).
+///
+/// 8 bytes on either width, its upper half 0 in a 32-bit process.
+#[repr(C)]
+pub struct Ptr<T> {
+    ptr: *mut T,
+    #[cfg(target_pointer_width = "32")]
+    high: u32,
+}
+
+impl<T> Ptr<T> {
+    /// `ptr`, mutable or not.
+    #[must_use]
+    pub const fn new(ptr: *const T) -> Self {
+        Self {
+            ptr: ptr.cast_mut(),
+            #[cfg(target_pointer_width = "32")]
+            high: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn null() -> Self { Self::new(core::ptr::null()) }
+
+    #[must_use]
+    pub const fn get(&self) -> *mut T { self.ptr }
+}
 
 // Slots: the entries of winemetal.so's `__wine_unix_call_funcs`, numbered as the VM guest's catalog does.
 pub const RETAIN: u32 = 0;
@@ -195,40 +228,40 @@ pub struct ObjObjDoubleNoRet { pub handle: Handle, pub arg0: Handle, pub arg1: f
 #[derive(Default)]
 pub struct ObjObjU64NoRet { pub handle: Handle, pub arg0: Handle, pub arg1: u64 }
 #[repr(C)]
-pub struct ObjPtrNoRet { pub handle: Handle, pub arg: *mut core::ffi::c_void }
+pub struct ObjPtrNoRet { pub handle: Handle, pub arg: Ptr<core::ffi::c_void> }
 #[repr(C)]
-pub struct Memory { pub length: u64, pub ptr: *mut core::ffi::c_void }
+pub struct Memory { pub length: u64, pub ptr: Ptr<core::ffi::c_void> }
 #[repr(C)]
-pub struct ObjConstPtrNoRet { pub handle: Handle, pub arg: *const core::ffi::c_void }
+pub struct ObjConstPtrNoRet { pub handle: Handle, pub arg: Ptr<core::ffi::c_void> }
 #[repr(C)]
-pub struct ObjCmdNoRet { pub encoder: Handle, pub cmd_head: *const core::ffi::c_void }
+pub struct ObjCmdNoRet { pub encoder: Handle, pub cmd_head: Ptr<core::ffi::c_void> }
 
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct NSStringGetCString { pub str: Handle, pub buffer_ptr: u64, pub max_length: u64, pub encoding: u64, pub ret: u32 }
 pub const UTF8_STRING_ENCODING: u64 = 4;
 
 #[repr(C)]
-pub struct NewWithInfo { pub device: Handle, pub info: *mut core::ffi::c_void, pub ret: Handle }
+pub struct NewWithInfo { pub device: Handle, pub info: Ptr<core::ffi::c_void>, pub ret: Handle }
 #[repr(C)]
-pub struct NewWithConstInfo { pub device: Handle, pub info: *const core::ffi::c_void, pub ret: Handle }
+pub struct NewWithConstInfo { pub device: Handle, pub info: Ptr<core::ffi::c_void>, pub ret: Handle }
 #[repr(C)]
-pub struct NewPipeline { pub device: Handle, pub info: *const core::ffi::c_void, pub ret_error: Handle, pub ret_pso: Handle }
+pub struct NewPipeline { pub device: Handle, pub info: Ptr<core::ffi::c_void>, pub ret_error: Handle, pub ret_pso: Handle }
 #[repr(C)]
 pub struct NewPipelineVertex {
     pub device: Handle,
-    pub info: *const core::ffi::c_void,
-    pub vertex: *const core::ffi::c_void,
+    pub info: Ptr<core::ffi::c_void>,
+    pub vertex: Ptr<core::ffi::c_void>,
     pub ret_error: Handle,
     pub ret_pso: Handle,
 }
 #[repr(C)]
-pub struct NewLibrarySource { pub device: Handle, pub source: *const u8, pub length: u64, pub ret_error: Handle, pub ret_library: Handle }
+pub struct NewLibrarySource { pub device: Handle, pub source: Ptr<u8>, pub length: u64, pub ret_error: Handle, pub ret_library: Handle }
 #[repr(C)]
 pub struct NewLibrarySourceOptions {
     pub device: Handle,
-    pub source: *const u8,
+    pub source: Ptr<u8>,
     pub length: u64,
-    pub options: *const CompileOptions,
+    pub options: Ptr<CompileOptions>,
     pub ret_error: Handle,
     pub ret_library: Handle,
 }
@@ -238,7 +271,7 @@ pub struct NewLibrarySourceOptions {
 pub struct CompileOptions { pub language_version: u64, pub preserve_invariance: u8, pub math_mode: u8, pub padding: [u8; 6] }
 
 #[repr(C)]
-pub struct BufferInfo { pub length: u64, pub options: u64, pub memory: *mut core::ffi::c_void, pub gpu_address: u64 }
+pub struct BufferInfo { pub length: u64, pub options: u64, pub memory: Ptr<core::ffi::c_void>, pub gpu_address: u64 }
 
 #[repr(C)]
 #[derive(Default)]
@@ -320,6 +353,7 @@ pub struct NewTextureView {
     pub slice_start: u16,
     pub slice_count: u16,
     pub swizzle: TextureSwizzleChannels,
+    pub padding: [u8; 4],
     pub ret: Handle,
     pub gpu_resource_id: u64,
 }
@@ -359,7 +393,7 @@ pub struct RenderPipelineInfo {
     pub tessellation_output_winding_order: u8,
     pub tessellation_factor_step: u8,
     pub binary_archive_for_serialization: Handle,
-    pub binary_archives_for_lookup: *const core::ffi::c_void,
+    pub binary_archives_for_lookup: Ptr<core::ffi::c_void>,
     pub num_binary_archives_for_lookup: u8,
     pub fail_on_binary_archive_miss: bool,
     pub support_indirect_command_buffers: bool,
@@ -378,7 +412,7 @@ pub struct VertexDescriptorInfo { pub attributes: [VertexAttributeInfo; 31], pub
 #[repr(C)]
 pub struct ComputePipelineInfo {
     pub compute_function: Handle,
-    pub binary_archives_for_lookup: *const core::ffi::c_void,
+    pub binary_archives_for_lookup: Ptr<core::ffi::c_void>,
     pub binary_archive_for_serialization: Handle,
     pub num_binary_archives_for_lookup: u8,
     pub fail_on_binary_archive_miss: bool,
@@ -407,7 +441,7 @@ pub struct ColorAttachmentInfo {
     pub resolve_depth_plane: u32,
 }
 
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Default)]
 pub struct DepthAttachmentInfo {
     pub texture: Handle,
@@ -419,7 +453,7 @@ pub struct DepthAttachmentInfo {
     pub clear_depth: f32,
 }
 
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Default)]
 pub struct StencilAttachmentInfo {
     pub texture: Handle,
@@ -469,7 +503,7 @@ pub struct ReplaceRegion {
     pub size: Size,
     pub level: u64,
     pub slice: u64,
-    pub data: *mut core::ffi::c_void,
+    pub data: Ptr<core::ffi::c_void>,
     pub bytes_per_row: u64,
     pub bytes_per_image: u64,
 }

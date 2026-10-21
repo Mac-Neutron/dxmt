@@ -15,6 +15,7 @@ unix/mtl/src/metal/command.rs Dispatch Clone,Copy
 unix/mtl/src/metal/command.rs Draw Clone,Copy
 unix/mtl/src/metal/command.rs DrawIndexed Clone,Copy
 unix/mtl/src/metal/command.rs Raster Clone,Copy,PartialEq
+unix/mtl/src/metal/command.rs ScissorRect Clone,Copy
 unix/mtl/src/metal/command.rs SetBuffer Clone,Copy
 unix/mtl/src/metal/command.rs SetBytes Clone,Copy
 unix/mtl/src/metal/command.rs SetHandle Clone,Copy

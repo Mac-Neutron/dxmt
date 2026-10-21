@@ -64,7 +64,7 @@ impl CAMetalLayer {
 
     fn props(&self) -> wmt::LayerProps {
         let mut props = wmt::LayerProps::default();
-        let mut params = wmt::ObjPtrNoRet { handle: handle_of(self), arg: (&raw mut props).cast() };
+        let mut params = wmt::ObjPtrNoRet { handle: handle_of(self), arg: wmt::Ptr::new((&raw mut props).cast()) };
         // SAFETY: slot 71 fills the props.
         unsafe { table::call(wmt::LAYER_GET_PROPS, &mut params) };
         props
@@ -73,7 +73,7 @@ impl CAMetalLayer {
     fn set(&self, f: impl FnOnce(&mut wmt::LayerProps)) {
         let mut props = self.props();
         f(&mut props);
-        let mut params = wmt::ObjConstPtrNoRet { handle: handle_of(self), arg: (&raw const props).cast() };
+        let mut params = wmt::ObjConstPtrNoRet { handle: handle_of(self), arg: wmt::Ptr::new((&raw const props).cast()) };
         // SAFETY: slot 70 reads the props.
         unsafe { table::call(wmt::LAYER_SET_PROPS, &mut params) };
     }

@@ -44,7 +44,8 @@ const MAX_NODES: usize = 65_536;
 /// Bytes of nodes and payloads past which a list is handed over before it ends.
 const MAX_BYTES: usize = 4 << 20;
 
-#[repr(C)]
+// `align(8)` where the C node is (i686 Linux's own `u64` aligns to 4; see `wmt`).
+#[repr(C, align(8))]
 struct Node<T> {
     ty: u16,
     reserved: [u16; 3],
@@ -108,7 +109,7 @@ impl Nodes {
             unsafe { *base.add(pointer) = base.add(payload) as u64 };
         }
         // SAFETY: start 0 is the head; the list stays put for the call.
-        let mut params = wmt::ObjCmdNoRet { encoder, cmd_head: unsafe { base.add(self.starts[0]) }.cast() };
+        let mut params = wmt::ObjCmdNoRet { encoder, cmd_head: wmt::Ptr::new(unsafe { base.add(self.starts[0]) }.cast()) };
         // SAFETY: an encodeCommands slot over a well-formed list.
         unsafe { table::call(slot, &mut params) };
         self.words.clear();
@@ -182,13 +183,13 @@ fn handle_or_zero<T: ?Sized>(obj: Option<&T>) -> u64 {
 
 // --- Node bodies (`wmtcmd_*` past the header).
 
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct SetBuffer { buffer: u64, offset: u64, index: u8 }
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct SetBytes { bytes: u64, length: u64, index: u8 }
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct SetObject { object: u64, index: u8 }
 #[repr(C)]
@@ -197,15 +198,29 @@ struct SetHandle { handle: u64 }
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SetRasterizer { fill: u8, cull: u8, clip: u8, winding: u8, bias: f32, slope: f32, clamp: f32 }
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Clone, Copy)]
 struct SetVisibility { offset: u64, mode: u8 }
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Draw { primitive: u8, start: u64, count: u64, instances: u32, base_instance: u32 }
+struct Draw { primitive: u8, padding: [u8; 7], start: u64, count: u64, instances: u32, base_instance: u32 }
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+struct DrawIndexed {
+    primitive: u8,
+    index_type: u8,
+    padding: [u8; 6],
+    count: u64,
+    buffer: u64,
+    offset: u64,
+    instances: u32,
+    base_vertex: i32,
+    base_instance: u32,
+}
+/// `WMTScissorRect`: objc2's `MTLScissorRect` holds `NSUInteger`s.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct DrawIndexed { primitive: u8, index_type: u8, count: u64, buffer: u64, offset: u64, instances: u32, base_vertex: i32, base_instance: u32 }
+struct ScissorRect { x: u64, y: u64, width: u64, height: u64 }
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct BlendColor { red: f32, green: f32, blue: f32, alpha: f32, stencil_ref: u8 }
@@ -316,6 +331,7 @@ pub unsafe trait MTLRenderCommandEncoder: MTLCommandEncoder {
         });
     }
     fn setScissorRect(&self, rect: MTLScissorRect) {
+        let rect = ScissorRect { x: rect.x as u64, y: rect.y as u64, width: rect.width as u64, height: rect.height as u64 };
         record(handle_of(self), |s| { s.nodes.push(wmt::RENDER_SET_SCISSOR_RECT, rect); });
     }
     fn setTriangleFillMode(&self, fill_mode: MTLTriangleFillMode) {
@@ -367,7 +383,14 @@ pub unsafe trait MTLRenderCommandEncoder: MTLCommandEncoder {
         record(handle_of(self), |s| {
             s.nodes.push(
                 wmt::RENDER_DRAW,
-                Draw { primitive: primitive_type.0 as u8, start: vertex_start as u64, count: vertex_count as u64, instances: 1, base_instance: 0 },
+                Draw {
+                    primitive: primitive_type.0 as u8,
+                    padding: [0; 7],
+                    start: vertex_start as u64,
+                    count: vertex_count as u64,
+                    instances: 1,
+                    base_instance: 0,
+                },
             );
         });
     }
@@ -391,6 +414,7 @@ pub unsafe trait MTLRenderCommandEncoder: MTLCommandEncoder {
                 DrawIndexed {
                     primitive: primitive_type.0 as u8,
                     index_type: index_type.0 as u8,
+                    padding: [0; 6],
                     count: index_count as u64,
                     buffer,
                     offset: index_buffer_offset as u64,

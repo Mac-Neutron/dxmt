@@ -24,14 +24,22 @@ use super::{
 // smashing the PE return address. This is the wow64-divergence the host-only
 // `#[test]` size checks could never catch. The self-contained probe proves the
 // alignment property; the per-struct asserts pin the device-lifecycle layouts.
+//
+// MacNeutron: i686 Linux (its old-WoW64 Unix side in the VM's guest)
+// aligns `u64` to 4, so the probe skips it; there MacNeutron's
+// `mtld3d-layout32-check.sh` compares every `repr(C)` struct with the
+// x86_64 build's instead.
 const _: () = {
-    #[repr(C)]
-    struct U64After4 {
-        a: u32,
-        b: u64,
+    #[cfg(not(all(target_arch = "x86", target_os = "linux")))]
+    {
+        #[repr(C)]
+        struct U64After4 {
+            a: u32,
+            b: u64,
+        }
+        // 8 (not 4) ⇒ repr(C) u64 is 8-aligned on this target.
+        assert!(core::mem::offset_of!(U64After4, b) == 8);
     }
-    // 8 (not 4) ⇒ repr(C) u64 is 8-aligned on this target.
-    assert!(core::mem::offset_of!(U64After4, b) == 8);
     // Device create / render / destroy structs: align must be 8 and size
     // identical on all targets.
     assert!(core::mem::align_of::<CreateCommandQueueParams>() == 8);

@@ -669,7 +669,7 @@ impl MTLRenderPipelineDescriptor {
             tessellation_output_winding_order: 0,
             tessellation_factor_step: 0,
             binary_archive_for_serialization: 0,
-            binary_archives_for_lookup: core::ptr::null(),
+            binary_archives_for_lookup: wmt::Ptr::null(),
             num_binary_archives_for_lookup: 0,
             fail_on_binary_archive_miss: false,
             support_indirect_command_buffers: false,
