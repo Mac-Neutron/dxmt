@@ -14,6 +14,7 @@ use mtld3d_shared::{
     mtl_handle::MTLTextureKind,
     record_handle::DeviceRecordHandle,
 };
+#[cfg(target_vendor = "apple")]
 use objc2_core_foundation::kCFRunLoopCommonModes;
 
 use crate::{LOG_TARGET, metal};
@@ -171,6 +172,13 @@ fn log_identity() {
         ""
     };
     info!(target: LOG_TARGET, "mtld3d.so {build} {id} initialized as {arch}{rosetta}");
+    #[cfg(target_vendor = "apple")]
+    log_core_foundation();
+}
+
+/// Name the CoreFoundation this process runs, after this build's line.
+#[cfg(target_vendor = "apple")]
+fn log_core_foundation() {
     let Some(image) = core_foundation_image() else {
         warn!(target: LOG_TARGET, "CoreFoundation image identity unavailable");
         return;
@@ -500,6 +508,7 @@ pub fn task_faults() -> mtld3d_core::perf::TaskFaults {
 /// `TASK_VM_INFO`'s `phys_footprint` also reports and the Metal HUD shows
 /// as app memory: resident and compressed private memory plus the driver and
 /// GPU allocations charged to the process.
+#[cfg(not(target_os = "linux"))]
 pub fn process_footprint() -> u64 {
     // SAFETY: rusage_info_v2 is plain data initialized before the kernel fills it.
     let mut info: libc::rusage_info_v2 = unsafe { core::mem::zeroed() };
@@ -525,6 +534,7 @@ pub fn process_footprint() -> u64 {
 /// layer. It takes each zone's lock in turn: 10 to 25 microseconds with about
 /// 100 MB in use on the `x86_64` Wine, about 160 microseconds on the first call,
 /// so it is read once per summary window.
+#[cfg(not(target_os = "linux"))]
 pub fn malloc_in_use() -> u64 {
     let mut stats = libc::malloc_statistics_t {
         blocks_in_use: 0,
@@ -535,6 +545,24 @@ pub fn malloc_in_use() -> u64 {
     // SAFETY: a null zone asks libmalloc to sum every zone into stats, a live writable struct.
     unsafe { libc::malloc_zone_statistics(core::ptr::null_mut(), &raw mut stats) };
     u64::try_from(stats.size_in_use).unwrap_or(u64::MAX)
+}
+
+/// MacNeutron: the VM's guest: resident pages (`/proc/self/statm`), 0 when it can't be read.
+#[cfg(target_os = "linux")]
+pub fn process_footprint() -> u64 {
+    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
+    let resident = statm.split_whitespace().nth(1).and_then(|pages| pages.parse::<u64>().ok()).unwrap_or(0);
+    // SAFETY: sysconf only answers a query.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+    resident.saturating_mul(page)
+}
+
+/// MacNeutron: the VM's guest: glibc's `malloc` bytes in use, its arenas' and its mapped blocks'.
+#[cfg(target_os = "linux")]
+pub fn malloc_in_use() -> u64 {
+    // SAFETY: mallinfo2 only reads glibc's allocator statistics.
+    let info = unsafe { libc::mallinfo2() };
+    u64::try_from(info.uordblks.saturating_add(info.hblkhd)).unwrap_or(u64::MAX)
 }
 
 pub extern "C" fn destroy_command_queue_handler(args: *mut c_void) -> i32 {
@@ -848,6 +876,7 @@ pub fn destroy_resources_bulk(kind: DestroyKind, slice: &[u64]) {
 }
 
 /// Resolve the public export's storage, without following a CF object pointer.
+#[cfg(target_vendor = "apple")]
 fn core_foundation_image() -> Option<identity::LoadedImage> {
     // The address of the exported variable belongs to CoreFoundation. Reading
     // its value instead would follow a CF object, and a Rust wrapper function

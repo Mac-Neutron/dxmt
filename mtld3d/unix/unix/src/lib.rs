@@ -1,8 +1,16 @@
+// MacNeutron: the winemetal facade's builds (the loopback and the Linux one) leave out macOS's window code, the
+// cursor overlay and the crash reporter's Mach half; what only those call stays for the product build.
+#![cfg_attr(mtl_facade, allow(dead_code, reason = "code only the product macOS build's window paths reach"))]
+
 use core::ffi::c_void;
 
 use mtld3d_shared::Thunks;
 use strum::{EnumCount, VariantArray};
 
+#[cfg(not(target_os = "linux"))]
+mod crash;
+#[cfg(target_os = "linux")]
+#[path = "crash_linux.rs"]
 mod crash;
 mod draw;
 mod encoder;
@@ -39,11 +47,12 @@ const LOG_TARGET: &str = "mtld3d::unix";
 pub static __wine_unix_call_funcs: [UnixCallFn; Thunks::COUNT] = DISPATCH_TABLE;
 
 #[unsafe(no_mangle)]
-pub static __wine_unix_call_wow64_funcs: [UnixCallFn; Thunks::COUNT] = DISPATCH_TABLE;
+pub static __wine_unix_call_wow64_funcs: [UnixCallFn; Thunks::COUNT] = WOW64_DISPATCH_TABLE;
 
 type UnixCallFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
 const DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = build_dispatch_table();
+
 
 /// Every native Rust allocation goes through snmalloc, the allocator the PE side uses.
 ///
@@ -78,6 +87,20 @@ macro_rules! arp {
         }
         arp_wrap as UnixCallFn
     }};
+}
+
+/// MacNeutron: a 32-bit process's table, the 64-bit one but for `InitLogger`, the first thunk any process makes
+/// (`DllMain`), which first marks the process 32-bit for the winemetal facade (`mtl::mark_wow64`) before any Metal
+/// call loads winemetal's table. ponytail: marks at the first thunk only; every entry would mark if one ever ran first.
+const WOW64_DISPATCH_TABLE: [UnixCallFn; Thunks::COUNT] = {
+    let mut table = DISPATCH_TABLE;
+    table[Thunks::InitLogger as usize] = arp!(wow64_init_logger);
+    table
+};
+
+fn wow64_init_logger(args: *mut c_void) -> i32 {
+    mtl::mark_wow64();
+    handlers::init_logger_handler(args)
 }
 
 const fn dispatch(code: Thunks) -> UnixCallFn {

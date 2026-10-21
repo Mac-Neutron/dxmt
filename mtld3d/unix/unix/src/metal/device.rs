@@ -23,6 +23,7 @@ use super::{
 use crate::LOG_TARGET;
 
 // MTLCreateSystemDefaultDevice requires CoreGraphics to be linked.
+#[cfg(target_vendor = "apple")]
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {}
 

@@ -64,6 +64,7 @@ pub use upscale::is_supported as upscale_is_supported;
 /// macOS (the facade's loopback build, and the product build, which never asks): anonymous pages aligned to the
 /// 16 KiB `PAGE_SIZE` a page lease requires; a Wine process's mappings are only 4 KiB-aligned, so the mapping is
 /// made 16 KiB larger and trimmed. The VM's guest: winemetal's own allocator (M2b).
+#[cfg(not(target_os = "linux"))]
 #[must_use]
 pub fn alloc_pages(len: usize) -> *mut u8 {
     const ALIGN: usize = 16 * 1024;
@@ -90,11 +91,28 @@ pub fn alloc_pages(len: usize) -> *mut u8 {
     start as *mut u8
 }
 
+/// MacNeutron: the VM's guest: `len` bytes from winemetal's allocator, which both sides map (a no-copy buffer there
+/// must be made over it), in 16 KiB pages and zeroed (the guest's allocator zeroes what it hands out again).
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn alloc_pages(len: usize) -> *mut u8 {
+    mtld3d_mtl::memory::alloc(len)
+}
+
 /// MacNeutron: gives back `alloc_pages`' pages (the `FreePages` thunk).
+#[cfg(not(target_os = "linux"))]
 pub fn free_pages(ptr: *mut u8, len: usize) {
     if !ptr.is_null() {
         // SAFETY: a mapping alloc_pages made of `len` bytes, no longer used (the PE side frees a PageBox once
         // Metal no longer reads it).
         unsafe { libc::munmap(ptr.cast(), len) };
+    }
+}
+
+/// MacNeutron: gives back `alloc_pages`' pages to winemetal, which keeps them until no buffer is made over them.
+#[cfg(target_os = "linux")]
+pub fn free_pages(ptr: *mut u8, _len: usize) {
+    if !ptr.is_null() {
+        mtld3d_mtl::memory::free(ptr);
     }
 }

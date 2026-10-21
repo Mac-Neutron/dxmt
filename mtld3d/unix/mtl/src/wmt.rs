@@ -77,6 +77,10 @@ pub const COMMAND_BUFFER_PROPERTY: u32 = 130;
 pub const DEVICE_NEW_LIBRARY_WITH_SOURCE: u32 = 144;
 pub const DEVICE_NEW_RENDER_PIPELINE_STATE_WITH_VERTEX_DESCRIPTOR: u32 = 156;
 pub const DEVICE_NEW_LIBRARY_WITH_SOURCE_OPTIONS: u32 = 157;
+/// The VM guest's own (DXMT 0071's `WMTMemoryAlloc`/`WMTMemoryFree`): memory both sides map, which a no-copy buffer
+/// there must be made over. macOS's table refuses them; they are not in [`SLOTS`].
+pub const MEMORY_ALLOC: u32 = 153;
+pub const MEMORY_FREE: u32 = 154;
 
 /// Every slot the facade calls, with winemetal's function name for it (the table check in tests/objects.rs).
 pub const SLOTS: &[(u32, &str)] = &[
@@ -184,6 +188,8 @@ pub struct ObjObjDoubleNoRet { pub handle: Handle, pub arg0: Handle, pub arg1: f
 pub struct ObjObjU64NoRet { pub handle: Handle, pub arg0: Handle, pub arg1: u64 }
 #[repr(C)]
 pub struct ObjPtrNoRet { pub handle: Handle, pub arg: *mut core::ffi::c_void }
+#[repr(C)]
+pub struct Memory { pub length: u64, pub ptr: *mut core::ffi::c_void }
 #[repr(C)]
 pub struct ObjConstPtrNoRet { pub handle: Handle, pub arg: *const core::ffi::c_void }
 #[repr(C)]

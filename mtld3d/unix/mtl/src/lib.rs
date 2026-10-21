@@ -36,3 +36,24 @@ pub mod objc2_foundation {
 
 /// winemetal's slots the facade calls, with their function names (tests check the table against them).
 pub use wmt::SLOTS;
+
+/// The VM guest's memory (D3D9 M2b): what a no-copy buffer there is made over, since the host maps it too.
+pub mod memory {
+    use crate::{table, wmt};
+
+    /// `len` bytes from winemetal's allocator (slot 153), aligned to the guest's pages; null when it has none.
+    #[must_use]
+    pub fn alloc(len: usize) -> *mut u8 {
+        let mut params = wmt::Memory { length: len as u64, ptr: core::ptr::null_mut() };
+        // SAFETY: slot 153 writes the allocation's address, or null.
+        let status = unsafe { table::call(wmt::MEMORY_ALLOC, &mut params) };
+        if status == 0 { params.ptr.cast() } else { core::ptr::null_mut() }
+    }
+
+    /// Gives back memory [`alloc`] returned (slot 154); winemetal keeps it until no buffer is made over it.
+    pub fn free(ptr: *mut u8) {
+        let mut params = wmt::Memory { length: 0, ptr: ptr.cast() };
+        // SAFETY: slot 154 on an allocation of slot 153's.
+        unsafe { table::call(wmt::MEMORY_FREE, &mut params) };
+    }
+}

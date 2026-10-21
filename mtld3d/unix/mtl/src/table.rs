@@ -1,12 +1,18 @@
 //! winemetal's Unix-call table: `winemetal.so` loaded once, its 64-bit `__wine_unix_call_funcs` slots called with
-//! winemetal's own parameter structs (`winemetal_thunks.h`).
+//! winemetal's own parameter structs (`winemetal_thunks.h`). A 32-bit process ([`mark_wow64`]) calls its
+//! `__wine_unix_call_wow64_funcs` instead, whose entries for the slots the facade calls take the same structs: in
+//! the VM's guest they mark the process 32-bit, so the memory winemetal hands out lies below 2 GiB, where the i386
+//! PE side writes into it (D3D9 M2b).
 //!
 //! The library is the one beside the image holding this crate (`mtld3d.so` in Wine's `lib/wine/<arch>-unix`), or
 //! `MTLD3D_WINEMETAL` when that names one (tests). Under Wine the libraries it links (`ntdll.so`, `winemac.so` on
 //! macOS) are already loaded; outside Wine a test folder holds stand-ins beside it.
 
 use core::ffi::{CStr, c_char, c_int, c_void};
-use std::sync::OnceLock;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 type Slot = unsafe extern "C" fn(*mut c_void) -> i32;
 
@@ -21,6 +27,16 @@ unsafe impl Send for Table {}
 unsafe impl Sync for Table {}
 
 static TABLE: OnceLock<Result<Table, String>> = OnceLock::new();
+
+/// Whether the process is 32-bit. The resource is process-wide (one 32-bit address space) and a machine fact, latched
+/// once: mtld3d.so's own WoW64 table sets it at its first thunk, before any Metal call, and the table reads it once
+/// when it loads.
+static WOW64: AtomicBool = AtomicBool::new(false);
+
+/// Marks the process 32-bit: the table loads winemetal's WoW64 entries. Called before the table's first use.
+pub fn mark_wow64() {
+    WOW64.store(true, Ordering::Relaxed);
+}
 
 unsafe extern "C" {
     fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
@@ -81,12 +97,13 @@ impl Table {
         if handle.is_null() {
             return Err(format!("dlopen {path}: {}", last_error()));
         }
+        let symbol = if WOW64.load(Ordering::Relaxed) { c"__wine_unix_call_wow64_funcs" } else { c"__wine_unix_call_funcs" };
         // SAFETY: a symbol lookup in the handle just opened.
-        let funcs = unsafe { dlsym(handle, c"__wine_unix_call_funcs".as_ptr()) };
+        let funcs = unsafe { dlsym(handle, symbol.as_ptr()) };
         if funcs.is_null() {
-            return Err(format!("{path} has no __wine_unix_call_funcs: {}", last_error()));
+            return Err(format!("{path} has no {}: {}", symbol.to_string_lossy(), last_error()));
         }
-        log::info!(target: "mtld3d::mtl", "winemetal: {path}");
+        log::info!(target: "mtld3d::mtl", "winemetal: {path} ({})", symbol.to_string_lossy());
         Ok(Self { funcs: funcs.cast() })
     }
 

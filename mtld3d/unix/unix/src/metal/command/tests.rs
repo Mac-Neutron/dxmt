@@ -41,11 +41,9 @@ use mtld3d_shared::{
     ExtraColorDesc, MetalHandle, PassDescriptor,
     mtl::{BlockLayout, LoadAction, PixelFormat, PresentDebugFlags, StoreAction},
 };
-use crate::mtl::objc2::{
-    Message as _,
-    rc::Retained,
-    runtime::{AnyObject, ProtocolObject},
-};
+use crate::mtl::objc2::{Message as _, rc::Retained, runtime::ProtocolObject};
+#[cfg(not(mtl_facade))]
+use crate::mtl::objc2::runtime::AnyObject;
 #[cfg(not(mtl_facade))]
 use crate::mtl::objc2_foundation::{NSDictionary, NSError, NSLocalizedDescriptionKey};
 use crate::mtl::objc2_foundation::NSString;
@@ -56,10 +54,11 @@ use crate::mtl::objc2_metal::{
     MTLTextureDescriptor, MTLTextureUsage,
 };
 
+#[cfg(not(mtl_facade))]
+use super::command_buffer_error;
 use super::{
     CopyBufferEndpoint, CopyEndpoint, CopyRegion, CopyRejectReason, DeviceRecord, EncodeContext,
-    PendingCmdBuf, PresentGeometry, PresentRoute, SETTLED_PRESENTS, command_buffer_error,
-    commit_registered, copy_buffer_to_texture_reject, copy_texture_reject,
+    PendingCmdBuf, PresentGeometry, PresentRoute, SETTLED_PRESENTS, commit_registered, copy_buffer_to_texture_reject, copy_texture_reject,
     copy_texture_to_buffer_reject, encode_upload_cmd_buf, first_pending, geometry_settled,
     install_frame_handler, present_route, publish_idle_upload, readback_completed, retire_finished,
     submit_frame, submit_frame_with, wait_for_gpu_retire,

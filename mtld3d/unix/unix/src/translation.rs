@@ -7,12 +7,15 @@
 //! and 0 for a native one. A kernel without Rosetta, an Intel Mac's, has no
 //! such name and answers `ENOENT`, which means native too.
 
+#[cfg(not(target_os = "linux"))]
 use core::ffi::{c_int, c_void};
 
 /// The sysctl that answers whether the calling process runs translated.
+#[cfg(not(target_os = "linux"))]
 const PROC_TRANSLATED: &core::ffi::CStr = c"sysctl.proc_translated";
 
 /// Whether the calling process runs under Rosetta 2; `None` when the kernel would not say.
+#[cfg(not(target_os = "linux"))]
 pub fn translated() -> Option<bool> {
     let mut value: c_int = 0;
     let mut size = size_of::<c_int>();
@@ -39,6 +42,13 @@ pub fn translated() -> Option<bool> {
         "sysctl.proc_translated: {}; whether this process runs translated is unknown",
         std::io::Error::last_os_error()
     );
+    None
+}
+
+/// MacNeutron: the VM's guest runs under FEX, which no Linux kernel names: unknown, and the startup line says the
+/// arch alone.
+#[cfg(target_os = "linux")]
+pub const fn translated() -> Option<bool> {
     None
 }
 

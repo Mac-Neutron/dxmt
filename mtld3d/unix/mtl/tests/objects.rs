@@ -28,6 +28,8 @@ unsafe extern "C" {
     fn dladdr(addr: *const c_void, info: *mut DlInfo) -> c_int;
 }
 
+/// macOS's winemetal.so names each slot's function; the VM guest's forwards every slot through one stub each.
+#[cfg(target_vendor = "apple")]
 #[test]
 fn each_slot_is_the_function_the_facade_means() {
     let _ = common::device();
@@ -52,6 +54,33 @@ fn each_slot_is_the_function_the_facade_means() {
         let expected = symbols.get(&format!("_{name}")).unwrap_or_else(|| panic!("{path} has no {name} (slot {slot})"));
         assert_eq!(offset, *expected, "slot {slot} is not {name}");
     }
+}
+
+/// The VM guest's memory (D3D9 M2b): 16 KiB pages a buffer is made over, zeroed, written and read back through it.
+#[cfg(target_os = "linux")]
+#[test]
+fn winemetal_memory_makes_no_copy_buffers() {
+    let device = common::device();
+    let pages = mtld3d_mtl::memory::alloc(65536);
+    assert!(!pages.is_null(), "slot 153 gave no memory");
+    assert_eq!(pages as usize % 16384, 0, "not on a 16 KiB page");
+    // SAFETY: 65536 bytes winemetal just handed out.
+    let bytes = unsafe { core::slice::from_raw_parts_mut(pages, 65536) };
+    assert!(bytes.iter().all(|&b| b == 0), "not zeroed");
+    bytes[40000] = 0x5a;
+    // SAFETY: the pages are live until freed below, after the buffer is gone.
+    let buffer = unsafe {
+        device.newBufferWithBytesNoCopy_length_options_deallocator(
+            core::ptr::NonNull::new(pages.cast()).unwrap(),
+            65536,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        )
+    }
+    .expect("a buffer over the pages");
+    assert_eq!(buffer.contents().as_ptr().cast::<u8>(), pages);
+    drop(buffer);
+    mtld3d_mtl::memory::free(pages);
 }
 
 #[test]

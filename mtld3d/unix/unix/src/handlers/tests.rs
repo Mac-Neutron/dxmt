@@ -1,5 +1,7 @@
+#[cfg(target_vendor = "apple")]
 use super::{core_foundation_image, identity, kCFRunLoopCommonModes};
 
+#[cfg(target_vendor = "apple")]
 #[test]
 fn core_foundation_identity_names_the_framework() {
     let framework = core_foundation_image().expect("linked CoreFoundation image");
