@@ -140,8 +140,14 @@ fn autoreleased_returns_go_with_their_pool() {
             cb.waitUntilCompleted();
         });
     }
-    let after = guest_live_handles();
-    // Other tests run beside this one and hold handles of their own meanwhile.
+    // Other tests run beside this one and hold handles of their own meanwhile, and the retirement threads' last
+    // releases may still be queued on their rings (the VM host has one executor for every ring): up to 10 s for them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut after = guest_live_handles();
+    while after >= before + 100 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        after = guest_live_handles();
+    }
     assert!(after < before + 100, "{} handles left of 1000 command buffers", after.saturating_sub(before));
 }
 

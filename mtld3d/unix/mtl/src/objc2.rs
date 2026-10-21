@@ -23,7 +23,10 @@ pub fn addr_of(handle: u64) -> usize {
     {
         let index = (handle & 0xffff_ffff) as usize;
         if let Some(slot) = guest_handles().get(index) {
-            slot.store(handle, core::sync::atomic::Ordering::Release);
+            // An older generation of the index (a handler's handle that outlived its object) never replaces the live
+            // object's.
+            let newer = |old: u64| (old == 0 || handle >> 32 >= old >> 32).then_some(handle);
+            let _ = slot.try_update(core::sync::atomic::Ordering::Release, core::sync::atomic::Ordering::Relaxed, newer);
         }
         index
     }
@@ -345,3 +348,6 @@ pub fn from_autoreleased<P: ?Sized>(handle: u64) -> Option<Retained<runtime::Pro
     // SAFETY: a live object (its pool hasn't drained: we're inside the call that returned it).
     unsafe { Retained::retain(addr_of(handle) as *mut runtime::ProtocolObject<P>) }
 }
+
+#[cfg(test)]
+mod tests;
