@@ -120,3 +120,23 @@ pub fn free_pages(ptr: *mut u8, _len: usize) {
         mtld3d_mtl::memory::free(ptr);
     }
 }
+
+/// The Unix side's own `PageBox`es from `alloc_pages` too, in the VM's guest.
+///
+/// The encoder's staging rows become no-copy buffers, which there must be made over the guest
+/// allocator's memory, the host's mapping; any other page fails (the PE side's boxes take the same
+/// pages through `PAGES_FROM_UNIX`). Set at the first device, before the encoder's first page.
+#[cfg(target_os = "linux")]
+pub fn install_page_allocator() {
+    fn alloc(len: usize) -> Option<core::ptr::NonNull<u8>> {
+        core::ptr::NonNull::new(alloc_pages(len))
+    }
+    fn free(ptr: core::ptr::NonNull<u8>, len: usize) {
+        free_pages(ptr.as_ptr(), len);
+    }
+    mtld3d_core::page_box::set_page_allocator_source(|| Some(mtld3d_core::page_box::PageAllocator { alloc, free }));
+}
+
+/// Native pages on macOS: Metal takes any page-aligned memory there.
+#[cfg(not(target_os = "linux"))]
+pub const fn install_page_allocator() {}

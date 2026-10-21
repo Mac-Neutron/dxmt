@@ -293,6 +293,7 @@ pub extern "C" fn create_command_queue_handler(args: *mut c_void) -> i32 {
         return -1;
     };
     let params: &mut CreateCommandQueueParams = &mut params;
+    metal::install_page_allocator();
 
     let gate = if params.gate_file_ptr == 0 || params.gate_file_len == 0 {
         None
