@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use objc2_metal::MTLCreateSystemDefaultDevice;
+use crate::mtl::objc2_metal::MTLCreateSystemDefaultDevice;
 
 use super::*;
 

@@ -3,8 +3,8 @@ use mtld3d_shared::{
     BufferCreateDesc, MetalHandle,
     mtl::{BufferKind, StorageMode},
 };
-use objc2::rc::{Retained, autoreleasepool};
-use objc2_metal::{MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
+use crate::mtl::objc2::rc::{Retained, autoreleasepool};
+use crate::mtl::objc2_metal::{MTLBuffer, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
 
 use crate::metal::handle::IntoRetained;
 

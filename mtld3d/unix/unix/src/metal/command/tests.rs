@@ -41,13 +41,13 @@ use mtld3d_shared::{
     ExtraColorDesc, MetalHandle, PassDescriptor,
     mtl::{BlockLayout, LoadAction, PixelFormat, PresentDebugFlags, StoreAction},
 };
-use objc2::{
+use crate::mtl::objc2::{
     Message as _,
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
 };
-use objc2_foundation::{NSDictionary, NSError, NSLocalizedDescriptionKey, NSString};
-use objc2_metal::{
+use crate::mtl::objc2_foundation::{NSDictionary, NSError, NSLocalizedDescriptionKey, NSString};
+use crate::mtl::objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat,
     MTLResource, MTLResourceOptions, MTLSharedEvent, MTLSize, MTLStorageMode, MTLTexture,
@@ -763,13 +763,13 @@ fn cpu_submit_failure_drain(upload_committed: bool) {
     let upload_counter = atomic_address(&upload);
     let handler_done = Arc::new(AtomicBool::new(false));
     let handler_flag = Arc::clone(&handler_done);
-    let handler = block2::RcBlock::new(
+    let handler = crate::mtl::block2::RcBlock::new(
         move |_cb: core::ptr::NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             handler_flag.store(true, Ordering::Release);
         },
     );
     // SAFETY: Metal retains the block, whose only capture owns its atomic.
-    unsafe { cb.addCompletedHandler(block2::RcBlock::as_ptr(&handler)) };
+    unsafe { cb.addCompletedHandler(crate::mtl::block2::RcBlock::as_ptr(&handler)) };
     let record = test_record(&queue);
     record
         .pending()
@@ -1232,7 +1232,7 @@ fn readback_completion_preserves_driver_error_details() {
 /// A failed upscale after HDR preflight must still convert the original SDR frame.
 #[test]
 fn hdr_upscale_failure_reencodes_the_original_source() {
-    use objc2_metal::{MTLClearColor, MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction};
+    use crate::mtl::objc2_metal::{MTLClearColor, MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction};
     let queue = test_queue();
     let device = queue.device();
     if !crate::metal::upscale::is_available(&device) {
@@ -1301,7 +1301,7 @@ fn hdr_upscale_failure_reencodes_the_original_source() {
 #[test]
 fn depth_plane_failure_aborts_the_pair_and_retry_retains_sources() {
     use mtld3d_shared::{BlitCommand, BlitCommandType, CopyBufferToTextureInfo};
-    use objc2_metal::{MTLBlitOption, MTLEvent};
+    use crate::mtl::objc2_metal::{MTLBlitOption, MTLEvent};
 
     let queue = test_queue();
     let device = queue.device();
@@ -1508,7 +1508,7 @@ fn a_buffer_released_uncommitted_never_advances_a_counter() {
     }
     let texture = upload_test_texture(&queue);
     let upload_pass = upload_test_pass(&texture);
-    objc2::rc::autoreleasepool(|_| {
+    crate::mtl::objc2::rc::autoreleasepool(|_| {
         let frame = queue.commandBuffer().expect("frame");
         install_frame_handler(&frame, &record, &params);
         let upload_cb = encode_test_upload(

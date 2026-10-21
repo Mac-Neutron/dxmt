@@ -9,12 +9,12 @@ use mtld3d_core::{
 };
 use mtld3d_shared::{MetalHandle, mtl::PixelFormat};
 use mtld3d_types::MAX_STREAMS;
-use objc2::{
+use crate::mtl::objc2::{
     rc::Retained,
     runtime::{NSObjectProtocol, ProtocolObject},
 };
-use objc2_foundation::NSString;
-use objc2_metal::{
+use crate::mtl::objc2_foundation::NSString;
+use crate::mtl::objc2_metal::{
     MTLCreateSystemDefaultDevice, MTLDevice, MTLFunction, MTLLibrary, MTLRenderPipelineDescriptor,
     MTLRenderPipelineState,
 };
@@ -107,7 +107,7 @@ impl NativeObjects {
 
 #[test]
 fn failed_prewarm_send_releases_native_payload() {
-    objc2::rc::autoreleasepool(|_| {
+    crate::mtl::objc2::rc::autoreleasepool(|_| {
         let objects = NativeObjects::new("failed_send_probe");
         let baseline = objects.counts();
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -125,7 +125,7 @@ fn failed_prewarm_send_releases_native_payload() {
 
 #[test]
 fn unread_prewarm_payload_releases_native_objects() {
-    objc2::rc::autoreleasepool(|_| {
+    crate::mtl::objc2::rc::autoreleasepool(|_| {
         let objects = NativeObjects::new("unread_payload_probe");
         let baseline = objects.counts();
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -141,7 +141,7 @@ fn unread_prewarm_payload_releases_native_objects() {
 
 #[test]
 fn adopted_prewarm_retains_transfer_once_and_release_in_dependency_order() {
-    objc2::rc::autoreleasepool(|_| {
+    crate::mtl::objc2::rc::autoreleasepool(|_| {
         let objects = NativeObjects::new("adopted_prewarm_probe");
         let baseline = objects.counts();
         let mut source = objects.warm();
@@ -188,7 +188,7 @@ fn native_shader_build_resets_empty_inputs_and_retains_outputs_after_pool_drain(
 
     use crate::metal::handle::IntoRetained;
 
-    objc2::rc::autoreleasepool(|_| {
+    crate::mtl::objc2::rc::autoreleasepool(|_| {
         for (source, entry) in [("", "probe"), ("invalid MSL", "")] {
             let mut timings = ShaderTimings {
                 preparation_ns: u64::MAX,
@@ -675,8 +675,8 @@ fn a_failed_submission_ends_the_frame_latency_wait() {
     };
 
     use mtld3d_shared::mtl::PresentDebugFlags;
-    use objc2::{rc::Retained, runtime::ProtocolObject};
-    use objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
+    use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+    use crate::mtl::objc2_metal::{MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice};
 
     use crate::metal::{
         DeviceRecord, FrameWait,

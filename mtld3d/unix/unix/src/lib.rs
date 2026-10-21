@@ -8,10 +8,19 @@ mod draw;
 mod encoder;
 mod encoder_service;
 mod handlers;
+#[cfg(not(mtl_facade))]
+mod hud_state;
+#[cfg(mtl_facade)]
+#[path = "hud_state_wm.rs"]
 mod hud_state;
 mod log_file;
+#[cfg(not(mtl_facade))]
+mod main_thread_checker;
+#[cfg(mtl_facade)]
+#[path = "main_thread_checker_wm.rs"]
 mod main_thread_checker;
 mod metal;
+mod mtl;
 mod shader_prewarm;
 mod shader_programs;
 mod stack_page;
@@ -65,7 +74,7 @@ macro_rules! arp {
     ($inner:path) => {{
         extern "C" fn arp_wrap(args: *mut c_void) -> i32 {
             mtld3d_shared::crumb!(stringify!($inner), args as usize as u64);
-            objc2::rc::autoreleasepool(|_| $inner(args))
+            crate::mtl::objc2::rc::autoreleasepool(|_| $inner(args))
         }
         arp_wrap as UnixCallFn
     }};

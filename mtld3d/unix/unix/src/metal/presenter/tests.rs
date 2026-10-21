@@ -14,7 +14,7 @@ use mtld3d_shared::{
     mtl::PresentDebugFlags,
     mtl_handle::{CAMetalLayerKind, MTLCommandQueueKind, MTLTextureKind},
 };
-use objc2_metal::MTLPixelFormat;
+use crate::mtl::objc2_metal::MTLPixelFormat;
 
 use super::*;
 
@@ -76,7 +76,7 @@ fn state_with(inner: Inner) -> Arc<PresentState> {
 /// a crash at thread start.
 #[test]
 fn a_record_keeps_the_queue_alive_for_its_thread() {
-    use objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
+    use crate::mtl::objc2_metal::{MTLCreateSystemDefaultDevice, MTLDevice};
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
         return;

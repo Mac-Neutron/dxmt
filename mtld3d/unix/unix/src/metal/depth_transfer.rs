@@ -5,9 +5,9 @@ use mtld3d_shared::{
     mtl::DepthTransferKind,
     mtl_handle::{MTLComputePipelineStateKind, MTLDeviceKind, MTLTextureKind},
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::NSString;
-use objc2_metal::{
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_foundation::NSString;
+use crate::mtl::objc2_metal::{
     MTLBlitCommandEncoder, MTLBlitOption, MTLBuffer, MTLCommandBuffer, MTLCommandEncoder,
     MTLCompileOptions, MTLComputeCommandEncoder, MTLDevice, MTLLanguageVersion, MTLLibrary,
     MTLMathMode, MTLOrigin, MTLPixelFormat, MTLResource, MTLResourceOptions, MTLSize,

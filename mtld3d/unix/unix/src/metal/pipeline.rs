@@ -5,8 +5,8 @@ use mtld3d_shared::{
     mtl::{BlendOperation, VertexFormat, VertexStepFunction},
     mtl_handle::MTLRenderPipelineStateKind,
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_metal::{
     MTLBlendOperation, MTLColorWriteMask, MTLDevice, MTLFunction, MTLPixelFormat,
     MTLRenderPipelineDescriptor, MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction,
 };
@@ -100,7 +100,7 @@ pub fn create_render_pipeline(
             format!(" mrt={:#x}", params.extra_present_mask)
         };
         let label =
-            objc2_foundation::NSString::from_str(&format!("{vs_name} + {ps_name}{suffix}{mrt}"));
+            crate::mtl::objc2_foundation::NSString::from_str(&format!("{vs_name} + {ps_name}{suffix}{mrt}"));
         desc.setLabel(Some(&label));
     }
 

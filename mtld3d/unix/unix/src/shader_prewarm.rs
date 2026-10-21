@@ -32,7 +32,7 @@ use mtld3d_shared::{
     mtl_handle::{MTLDeviceKind, MTLRenderPipelineStateKind},
     perf::NanosSetTimer,
 };
-use objc2::rc::autoreleasepool;
+use crate::mtl::objc2::rc::autoreleasepool;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{

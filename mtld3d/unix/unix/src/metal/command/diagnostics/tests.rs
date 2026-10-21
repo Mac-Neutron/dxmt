@@ -1,13 +1,13 @@
 use log::{Level, log_enabled};
-use objc2::{
+use crate::mtl::objc2::{
     define_class, extern_methods,
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
 };
-use objc2_foundation::{
+use crate::mtl::objc2_foundation::{
     NSArray, NSDictionary, NSError, NSLocalizedDescriptionKey, NSObject, NSObjectProtocol, NSString,
 };
-use objc2_metal::{
+use crate::mtl::objc2_metal::{
     MTLBuffer, MTLCommandBufferEncoderInfo, MTLCommandBufferEncoderInfoErrorKey,
     MTLCommandBufferErrorOption, MTLCommandBufferStatus, MTLCommandEncoderErrorState,
     MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat, MTLResource,

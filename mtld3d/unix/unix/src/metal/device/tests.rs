@@ -7,7 +7,7 @@
 //! dual-GPU divergence, which needs graphics switching to observe.
 
 use mtld3d_shared::mtl::PresentDebugFlags;
-use objc2_metal::MTLDevice;
+use crate::mtl::objc2_metal::MTLDevice;
 
 use super::{DeviceCaps, create_command_queue, default_device_info, is_paravirtual_name};
 use crate::metal::handle::{IntoRetained, ReleaseRetain};

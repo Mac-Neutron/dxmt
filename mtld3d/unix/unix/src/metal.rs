@@ -1,5 +1,9 @@
 mod blit;
 mod buffer;
+#[cfg(not(mtl_facade))]
+mod capture;
+#[cfg(mtl_facade)]
+#[path = "metal/capture_wm.rs"]
 mod capture;
 mod clear_quad;
 mod command;
@@ -9,6 +13,10 @@ mod frame_signal;
 mod gamma;
 mod gpu_time;
 pub mod handle;
+#[cfg(not(mtl_facade))]
+mod macdrv;
+#[cfg(mtl_facade)]
+#[path = "metal/macdrv_wm.rs"]
 mod macdrv;
 mod null_texture;
 mod pipeline;

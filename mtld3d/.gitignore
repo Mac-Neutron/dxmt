@@ -1,6 +1,7 @@
 /target
 /windows/target
 /unix/target
+/unix/target-wm
 /.wine-isolated
 .DS_Store
 

@@ -3,8 +3,8 @@ use mtld3d_shared::{
     MetalHandle,
     mtl_handle::{MTLDeviceKind, MTLFunctionKind, MTLLibraryKind},
 };
-use objc2::rc::Retained;
-use objc2_metal::{MTLCompileOptions, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode};
+use crate::mtl::objc2::rc::Retained;
+use crate::mtl::objc2_metal::{MTLCompileOptions, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode};
 
 use crate::{
     LOG_TARGET,
@@ -37,7 +37,7 @@ pub fn compile_shader_library(
     let preparation = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.preparation_ns);
     let device = device_handle.into_retained()?;
 
-    let source = objc2_foundation::NSString::from_str(msl);
+    let source = crate::mtl::objc2_foundation::NSString::from_str(msl);
     let options = MTLCompileOptions::new();
     options.setLanguageVersion(MTLLanguageVersion::Version2_4);
     // Documented prerequisite for `[[position, invariant]]` to take effect.
@@ -65,7 +65,7 @@ pub fn compile_shader_library(
     };
 
     let function = mtld3d_shared::perf::NanosSetTimer::start(&raw mut timings.function_ns);
-    let name = objc2_foundation::NSString::from_str(entry);
+    let name = crate::mtl::objc2_foundation::NSString::from_str(entry);
     // `setLabel` makes the per-shader entry name surface in Xcode views
     // that show the library/object identity rather than the function-source
     // text — at minimum the GPU-trace timeline's pipeline-state list and

@@ -21,12 +21,12 @@
 //! in SDR and HDR.
 
 use mtld3d_shared::mtl::PixelFormat;
-use objc2::runtime::ProtocolObject;
-use objc2_metal::{
+use crate::mtl::objc2::runtime::ProtocolObject;
+use crate::mtl::objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLPixelFormat,
     MTLStorageMode, MTLTexture, MTLTextureDescriptor, MTLTextureUsage,
 };
-use objc2_metal_fx::{MTLFXSpatialScaler, MTLFXSpatialScalerColorProcessingMode};
+use crate::mtl::objc2_metal_fx::{MTLFXSpatialScaler, MTLFXSpatialScalerColorProcessingMode};
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -533,7 +533,7 @@ fn evicted_scratch_targets_wait_for_a_command_buffer_of_their_device() {
     assert_eq!(scratch_entries(&cache), MAX_CACHED_SCRATCH);
     assert_eq!(pending_scratch_releases(&cache), 2);
     let cmd = queue.commandBuffer().expect("command buffer");
-    cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+    cmd.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
         "mtld3d-test-scratch-eviction",
     )));
     super::retire_evicted(&cmd, &cache);
@@ -558,7 +558,7 @@ fn two_devices_get_their_own_scratch_and_a_retire_takes_only_its_own() {
     let (first_cache, second_cache) = (UpscaleCache::new(), UpscaleCache::new());
     let scratch = |cache: &UpscaleCache| {
         super::scratch_target(&device, cache, 64, 64, PixelFormat::Bgra8Unorm)
-            .map(|texture| objc2::rc::Retained::as_ptr(&texture) as usize)
+            .map(|texture| crate::mtl::objc2::rc::Retained::as_ptr(&texture) as usize)
     };
 
     let Some(first_scratch) = scratch(&first_cache) else {
@@ -603,7 +603,7 @@ fn two_devices_get_their_own_scratch_and_a_retire_takes_only_its_own() {
 }
 
 /// GPU fixtures fail on unexpected allocation errors once `MetalFX` is supported.
-fn gpu() -> Option<objc2::rc::Retained<ProtocolObject<dyn MTLDevice>>> {
+fn gpu() -> Option<crate::mtl::objc2::rc::Retained<ProtocolObject<dyn MTLDevice>>> {
     let device = MTLCreateSystemDefaultDevice()?;
     if !super::is_available(&device) {
         eprintln!("MetalFX unsupported, skipping GPU regression");
@@ -618,7 +618,7 @@ fn target(
     format: MTLPixelFormat,
     storage: MTLStorageMode,
     usage: MTLTextureUsage,
-) -> objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLTexture>> {
+) -> crate::mtl::objc2::rc::Retained<ProtocolObject<dyn crate::mtl::objc2_metal::MTLTexture>> {
     // SAFETY: a small, single-level, square texture with a supported color format.
     let desc = unsafe {
         MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(
@@ -630,9 +630,9 @@ fn target(
     let texture = device
         .newTextureWithDescriptor(&desc)
         .expect("test texture");
-    objc2_metal::MTLResource::setLabel(
+    crate::mtl::objc2_metal::MTLResource::setLabel(
         &*texture,
-        Some(&objc2_foundation::NSString::from_str("mtld3d-test-upscale")),
+        Some(&crate::mtl::objc2_foundation::NSString::from_str("mtld3d-test-upscale")),
     );
     texture
 }
@@ -642,7 +642,7 @@ fn drawable(
     device: &ProtocolObject<dyn MTLDevice>,
     size: usize,
     format: MTLPixelFormat,
-) -> objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLTexture>> {
+) -> crate::mtl::objc2::rc::Retained<ProtocolObject<dyn crate::mtl::objc2_metal::MTLTexture>> {
     target(
         device,
         size,
@@ -654,17 +654,17 @@ fn drawable(
 
 fn fill(
     cmd: &ProtocolObject<dyn MTLCommandBuffer>,
-    texture: &ProtocolObject<dyn objc2_metal::MTLTexture>,
+    texture: &ProtocolObject<dyn crate::mtl::objc2_metal::MTLTexture>,
     red: f64,
 ) {
-    use objc2_metal::{MTLCommandEncoder, MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction};
+    use crate::mtl::objc2_metal::{MTLCommandEncoder, MTLLoadAction, MTLRenderPassDescriptor, MTLStoreAction};
     let pass = MTLRenderPassDescriptor::new();
     // SAFETY: attachment zero exists on every render pass descriptor.
     let color = unsafe { pass.colorAttachments().objectAtIndexedSubscript(0) };
     color.setTexture(Some(texture));
     color.setLoadAction(MTLLoadAction::Clear);
     color.setStoreAction(MTLStoreAction::Store);
-    color.setClearColor(objc2_metal::MTLClearColor {
+    color.setClearColor(crate::mtl::objc2_metal::MTLClearColor {
         red,
         green: 0.25,
         blue: 0.5,
@@ -673,7 +673,7 @@ fn fill(
     let encoder = cmd
         .renderCommandEncoderWithDescriptor(&pass)
         .expect("clear encoder");
-    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+    encoder.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
         "mtld3d-test-upscale-clear",
     )));
     encoder.endEncoding();
@@ -681,9 +681,9 @@ fn fill(
 
 fn pixels(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
-    texture: &ProtocolObject<dyn objc2_metal::MTLTexture>,
+    texture: &ProtocolObject<dyn crate::mtl::objc2_metal::MTLTexture>,
 ) -> Vec<u8> {
-    use objc2_metal::{
+    use crate::mtl::objc2_metal::{
         MTLBlitCommandEncoder, MTLBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
         MTLResourceOptions,
     };
@@ -698,26 +698,26 @@ fn pixels(
         .device()
         .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
         .expect("readback");
-    objc2_metal::MTLResource::setLabel(
+    crate::mtl::objc2_metal::MTLResource::setLabel(
         &*buffer,
-        Some(&objc2_foundation::NSString::from_str(
+        Some(&crate::mtl::objc2_foundation::NSString::from_str(
             "mtld3d-test-upscale-pixels",
         )),
     );
     let cmd = queue.commandBuffer().expect("readback command buffer");
-    cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+    cmd.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
         "mtld3d-test-upscale-readback",
     )));
     let blit = cmd.blitCommandEncoder().expect("readback encoder");
-    blit.setLabel(Some(&objc2_foundation::NSString::from_str(
+    blit.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
         "mtld3d-test-upscale-readback-copy",
     )));
     // SAFETY: the full texture fits the aligned buffer; both resources stay
     // alive until the command buffer completes below.
     unsafe {
         blit.copyFromTexture_sourceSlice_sourceLevel_sourceOrigin_sourceSize_toBuffer_destinationOffset_destinationBytesPerRow_destinationBytesPerImage(
-            texture, 0, 0, objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
-            objc2_metal::MTLSize { width: texture.width(), height: texture.height(), depth: 1 },
+            texture, 0, 0, crate::mtl::objc2_metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            crate::mtl::objc2_metal::MTLSize { width: texture.width(), height: texture.height(), depth: 1 },
             &buffer, 0, stride, length,
         );
     }
@@ -763,7 +763,7 @@ fn output_count(cache: &UpscaleCache) -> usize {
 /// The scaler's own output, cached on the slot, of the one geometry `cache` holds.
 fn cached_output(
     cache: &UpscaleCache,
-) -> objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLTexture>> {
+) -> crate::mtl::objc2::rc::Retained<ProtocolObject<dyn crate::mtl::objc2_metal::MTLTexture>> {
     let scalers = cache.scalers.lock().expect("cache lock");
     assert_eq!(scalers.scalers.len(), 1, "one geometry, one scaler");
     let output = scalers
@@ -774,7 +774,7 @@ fn cached_output(
         .expect("one cached scaler");
     // SAFETY: the cache holds the output's canonical retain under the lock
     // taken above; this adds a retain of the test's own.
-    let retained = unsafe { objc2::rc::Retained::retain(output) };
+    let retained = unsafe { crate::mtl::objc2::rc::Retained::retain(output) };
     drop(scalers);
     retained.expect("the scaler wrote an intermediate")
 }
@@ -786,7 +786,7 @@ fn cached_output(
 /// must read back byte for byte what the intermediate holds.
 #[test]
 fn drawable_outputs_equal_the_intermediate_in_sdr_and_hdr() {
-    use objc2_metal::MTLCommandBufferStatus;
+    use crate::mtl::objc2_metal::MTLCommandBufferStatus;
     let Some(device) = gpu() else { return };
     let queue = device.newCommandQueue().expect("queue");
     let cache = UpscaleCache::new();
@@ -811,7 +811,7 @@ fn drawable_outputs_equal_the_intermediate_in_sdr_and_hdr() {
         );
         let dst = drawable(&device, 64, format);
         let cmd = queue.commandBuffer().expect("command buffer");
-        cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+        cmd.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
             "mtld3d-test-upscale-pair",
         )));
         fill(&cmd, &src, red);
@@ -925,7 +925,7 @@ fn allocation_scaler_and_copy_failures_remain_recoverable() {
 /// Resizing two live devices keeps each output private to its device and bounded.
 #[test]
 fn queued_resizes_bound_outputs_and_preserve_two_devices_pixels() {
-    use objc2_metal::MTLCommandBufferStatus;
+    use crate::mtl::objc2_metal::MTLCommandBufferStatus;
     let Some(device) = gpu() else { return };
     let queues = [
         device.newCommandQueue().expect("first queue"),
@@ -945,7 +945,7 @@ fn queued_resizes_bound_outputs_and_preserve_two_devices_pixels() {
             );
             let dst = drawable(&device, 32 + step * 2, MTLPixelFormat::BGRA8Unorm);
             let cmd = queue.commandBuffer().expect("command buffer");
-            cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+            cmd.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
                 "mtld3d-test-upscale-resize",
             )));
             fill(&cmd, &src, if index == 0 { 0.25 } else { 0.75 });
@@ -1038,7 +1038,7 @@ fn fallback_submission_drains_preflight_evictions() {
     // evicted the least recently used scaler: eight outputs and one scaler.
     assert_eq!(pending_release_count(&cache), MAX_CACHED_SCALERS + 1);
     let cmd = queue.commandBuffer().expect("fallback command buffer");
-    cmd.setLabel(Some(&objc2_foundation::NSString::from_str(
+    cmd.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
         "mtld3d-test-upscale-fallback",
     )));
     super::retire_evicted(&cmd, &cache);
@@ -1056,8 +1056,8 @@ fn fallback_submission_drains_preflight_evictions() {
 /// the shader read of the copy pass.
 #[test]
 fn the_intermediate_serves_the_scaler_and_the_copy_and_invalid_input_is_refused() {
-    use objc2_metal::MTLResource;
-    use objc2_metal_fx::MTLFXSpatialScalerBase;
+    use crate::mtl::objc2_metal::MTLResource;
+    use crate::mtl::objc2_metal_fx::MTLFXSpatialScalerBase;
     let Some(device) = gpu() else { return };
     let cache = UpscaleCache::new();
     let src = target(

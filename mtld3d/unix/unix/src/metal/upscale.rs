@@ -43,18 +43,18 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use block2::RcBlock;
+use crate::mtl::block2::RcBlock;
 use mtld3d_shared::{
     MetalHandle,
     mtl::PixelFormat,
     mtl_handle::{MTLDeviceKind, MTLTextureKind},
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_metal::{
     MTLCommandBuffer, MTLDevice, MTLPixelFormat, MTLResource, MTLStorageMode, MTLTexture,
     MTLTextureDescriptor, MTLTextureUsage,
 };
-use objc2_metal_fx::{
+use crate::mtl::objc2_metal_fx::{
     MTLFXSpatialScaler, MTLFXSpatialScalerBase, MTLFXSpatialScalerColorProcessingMode,
     MTLFXSpatialScalerDescriptor,
 };
@@ -302,7 +302,7 @@ fn create_output(
             dst.width(), dst.height(), dst.pixelFormat(), usage);
         return None;
     };
-    texture.setLabel(Some(&objc2_foundation::NSString::from_str(
+    texture.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
         "mtld3d-upscale-output",
     )));
     log::info!(target: LOG_TARGET,

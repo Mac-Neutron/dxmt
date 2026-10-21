@@ -1,7 +1,7 @@
 use log::{info, warn};
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLDeviceKind};
-use objc2_foundation::{NSString, NSURL};
-use objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
+use crate::mtl::objc2_foundation::{NSString, NSURL};
+use crate::mtl::objc2_metal::{MTLCaptureDescriptor, MTLCaptureDestination, MTLCaptureManager};
 
 use crate::{LOG_TARGET, metal::handle::IntoRetained};
 

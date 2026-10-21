@@ -13,6 +13,13 @@ fn main() {
     }
 
     let target = std::env::var("TARGET").unwrap();
+    // MacNeutron: `mtl_facade` when the Metal layer goes through winemetal (src/mtl.rs): the `winemetal` feature, and
+    // every build off Apple targets.
+    println!("cargo::rustc-check-cfg=cfg(mtl_facade)");
+    let facade = std::env::var_os("CARGO_FEATURE_WINEMETAL").is_some() || !target.contains("apple");
+    if facade {
+        println!("cargo:rustc-cfg=mtl_facade");
+    }
     if !target.contains("apple") {
         return;
     }
@@ -22,6 +29,9 @@ fn main() {
     // Every Rust frame of this crate aborts on unwind (`panic = "abort"`),
     // so a message send whose Objective-C exception has to be caught keeps
     // its `@try` and the send together in Objective-C.
+    if facade {
+        return;
+    }
     println!("cargo:rerun-if-changed={DELEGATE_FORWARD}");
     cc::Build::new()
         .file(DELEGATE_FORWARD)

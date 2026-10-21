@@ -36,9 +36,9 @@ use mtld3d_shared::{
     mtl::{ClearQuadFlags, PixelFormat},
     mtl_handle::{MTLFunctionKind, MTLRenderPipelineStateKind},
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::NSString;
-use objc2_metal::{
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_foundation::NSString;
+use crate::mtl::objc2_metal::{
     MTLCompileOptions, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode, MTLPixelFormat,
     MTLRenderPipelineDescriptor,
 };
@@ -277,7 +277,7 @@ fn color_ps_function(
     device: &ProtocolObject<dyn MTLDevice>,
     cache: &ClearQuadCache,
     extra_present_mask: u8,
-) -> Option<Retained<ProtocolObject<dyn objc2_metal::MTLFunction>>> {
+) -> Option<Retained<ProtocolObject<dyn crate::mtl::objc2_metal::MTLFunction>>> {
     if extra_present_mask == 0 {
         return cache.ps_color_fn.into_retained();
     }
@@ -331,7 +331,7 @@ fn declare_extra_color_attachments(
         let color = unsafe { desc.colorAttachments().objectAtIndexedSubscript(i + 1) };
         color.setPixelFormat(mtl_pixel_format(key.extra_formats[i]));
         if !write {
-            color.setWriteMask(objc2_metal::MTLColorWriteMask::empty());
+            color.setWriteMask(crate::mtl::objc2_metal::MTLColorWriteMask::empty());
         }
     }
 }
@@ -375,7 +375,7 @@ fn build_pipeline(
             // subscript 0 is always valid.
             let color0 = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
             color0.setPixelFormat(mtl_pixel_format(key.color_format));
-            color0.setWriteMask(objc2_metal::MTLColorWriteMask::empty());
+            color0.setWriteMask(crate::mtl::objc2_metal::MTLColorWriteMask::empty());
             declare_extra_color_attachments(&desc, key, false);
         }
     }

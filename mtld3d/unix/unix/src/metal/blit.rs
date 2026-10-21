@@ -23,9 +23,9 @@ use mtld3d_shared::{
     mtl::PixelFormat,
     mtl_handle::{MTLFunctionKind, MTLRenderPipelineStateKind},
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::NSString;
-use objc2_metal::{
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_foundation::NSString;
+use crate::mtl::objc2_metal::{
     MTLCompileOptions, MTLDevice, MTLLanguageVersion, MTLLibrary, MTLMathMode,
     MTLRenderPipelineDescriptor,
 };

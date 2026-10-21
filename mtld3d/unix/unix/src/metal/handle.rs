@@ -17,15 +17,15 @@ use mtld3d_shared::{
         MTLLibraryKind, MTLRenderPipelineStateKind, MTLSamplerStateKind, MTLTextureKind,
     },
 };
-use objc2::{
+use crate::mtl::objc2::{
     rc::Retained,
     runtime::{NSObjectProtocol, ProtocolObject},
 };
-use objc2_metal::{
+use crate::mtl::objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandQueue, MTLComputePipelineState, MTLDepthStencilState,
     MTLDevice, MTLFunction, MTLLibrary, MTLRenderPipelineState, MTLSamplerState, MTLTexture,
 };
-use objc2_quartz_core::CAMetalLayer;
+use crate::mtl::objc2_quartz_core::CAMetalLayer;
 use rustc_hash::FxHashMap;
 
 /// Maps a wire-side marker kind to the real Metal protocol type.

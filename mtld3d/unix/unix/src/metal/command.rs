@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use block2::RcBlock;
+use crate::mtl::block2::RcBlock;
 use log::{debug, error, trace};
 use mtld3d_shared::{
     BlitCommand, BlitCommandType, Command, CommandType, ExtraColorDesc, MetalHandle,
@@ -22,9 +22,9 @@ use mtld3d_shared::{
     },
     perf::{CommandBufferRole, NanosSetTimer},
 };
-use objc2::{Message, rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::{NSError, NSRange};
-use objc2_metal::{
+use crate::mtl::objc2::{Message, rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_foundation::{NSError, NSRange};
+use crate::mtl::objc2_metal::{
     MTLBlitCommandEncoder, MTLBlitOption, MTLBuffer, MTLClearColor, MTLCommandBuffer,
     MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue, MTLCullMode, MTLDevice,
     MTLDrawable, MTLIndexType, MTLLoadAction, MTLOrigin, MTLPixelFormat, MTLPrimitiveType,
@@ -32,8 +32,8 @@ use objc2_metal::{
     MTLSamplerState, MTLScissorRect, MTLSize, MTLStoreAction, MTLTexture, MTLTextureType,
     MTLTriangleFillMode, MTLViewport, MTLVisibilityResultMode,
 };
-use objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
-use objc2_quartz_core::CAMetalDrawable;
+use crate::mtl::objc2_metal_fx::MTLFXSpatialScalerColorProcessingMode;
+use crate::mtl::objc2_quartz_core::CAMetalDrawable;
 
 use crate::{
     LOG_TARGET,
@@ -625,7 +625,7 @@ fn encode_frame(
     };
     {
         let label =
-            objc2_foundation::NSString::from_str(&format!("mtld3d-frame-{:#x}", params.submit_seq));
+            crate::mtl::objc2_foundation::NSString::from_str(&format!("mtld3d-frame-{:#x}", params.submit_seq));
         cmd_buf.setLabel(Some(&label));
     }
 
@@ -1131,7 +1131,7 @@ fn encode_upload_cmd_buf(
         return None;
     };
     {
-        let label = objc2_foundation::NSString::from_str(&format!("mtld3d-upload-{submit_seq:#x}"));
+        let label = crate::mtl::objc2_foundation::NSString::from_str(&format!("mtld3d-upload-{submit_seq:#x}"));
         upload_cb.setLabel(Some(&label));
     }
     if !blits.is_empty() {
@@ -1399,7 +1399,7 @@ fn clear_texture(
         mtld3d_shared::log_once_warn!(target: LOG_TARGET, "{label}: clear encoder allocation failed");
         return false;
     };
-    let label = objc2_foundation::NSString::from_str(label);
+    let label = crate::mtl::objc2_foundation::NSString::from_str(label);
     enc.setLabel(Some(&label));
     enc.endEncoding();
     true
@@ -1820,7 +1820,7 @@ fn encode_fullscreen_pass(
         );
         return false;
     };
-    let label = objc2_foundation::NSString::from_str(label);
+    let label = crate::mtl::objc2_foundation::NSString::from_str(label);
     enc.setLabel(Some(&label));
     enc.setRenderPipelineState(&pipeline);
     // SAFETY: objc2 typed binding; `src` is a retained `MTLTexture` live
@@ -2291,7 +2291,7 @@ fn encode_leading_blits(
     let mut blit = if needs_encoder {
         if let Some(b) = cmd_buf.blitCommandEncoder() {
             let label =
-                objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{site}"));
+                crate::mtl::objc2_foundation::NSString::from_str(&format!("mtld3d-leading-blits-{site}"));
             b.setLabel(Some(&label));
             Some(b)
         } else {
@@ -2321,7 +2321,7 @@ fn encode_leading_blits(
                         error!(target: LOG_TARGET, "depth transfer: following blit encoder failed");
                         return false;
                     };
-                    encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+                    encoder.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
                         "mtld3d-depth-transfer-following-blits",
                     )));
                     blit = Some(encoder);
@@ -2788,7 +2788,7 @@ fn encode_pass(
         // stays 0 there and selects the array/cube face everywhere else.
         // The PE side packs both into one subresource field because the
         // texture's own type is what decides which one Metal wants.
-        if texture.textureType() == objc2_metal::MTLTextureType::Type3D {
+        if texture.textureType() == crate::mtl::objc2_metal::MTLTextureType::Type3D {
             color0.setDepthPlane(pass.color_slice() as usize);
         } else {
             color0.setSlice(pass.color_slice() as usize);
@@ -2812,7 +2812,7 @@ fn encode_pass(
         match pass.color_load_action {
             LoadAction::Clear => {
                 color0.setLoadAction(MTLLoadAction::Clear);
-                color0.setClearColor(objc2_metal::MTLClearColor {
+                color0.setClearColor(crate::mtl::objc2_metal::MTLClearColor {
                     red: f64::from(f32::from_bits(pass.clear_r)),
                     green: f64::from(f32::from_bits(pass.clear_g)),
                     blue: f64::from(f32::from_bits(pass.clear_b)),
@@ -2868,7 +2868,7 @@ fn encode_pass(
         match extra.load_action {
             LoadAction::Clear => {
                 color.setLoadAction(MTLLoadAction::Clear);
-                color.setClearColor(objc2_metal::MTLClearColor {
+                color.setClearColor(crate::mtl::objc2_metal::MTLClearColor {
                     red: f64::from(f32::from_bits(pass.clear_r)),
                     green: f64::from(f32::from_bits(pass.clear_g)),
                     blue: f64::from(f32::from_bits(pass.clear_b)),
@@ -2958,7 +2958,7 @@ fn encode_pass(
         return false;
     };
     {
-        let label = objc2_foundation::NSString::from_str(&format!("mtld3d-pass-{pass_idx}"));
+        let label = crate::mtl::objc2_foundation::NSString::from_str(&format!("mtld3d-pass-{pass_idx}"));
         encoder.setLabel(Some(&label));
     }
 
@@ -2981,7 +2981,7 @@ fn encode_pass(
             match CommandType::from_repr(cmd.cmd) {
                 Some(CommandType::PushDebugGroup) => {
                     let label =
-                        objc2_foundation::NSString::from_str(&format!("draw {}", cmd.param_a));
+                        crate::mtl::objc2_foundation::NSString::from_str(&format!("draw {}", cmd.param_a));
                     encoder.pushDebugGroup(&label);
                     debug_group_depth += 1;
                 }
@@ -3838,7 +3838,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
         return false;
     };
     {
-        let label = objc2_foundation::NSString::from_str("mtld3d-readback");
+        let label = crate::mtl::objc2_foundation::NSString::from_str("mtld3d-readback");
         dst_buffer.setLabel(Some(&label));
     }
 
@@ -3847,7 +3847,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
         return false;
     };
     {
-        let label = objc2_foundation::NSString::from_str("mtld3d-readback");
+        let label = crate::mtl::objc2_foundation::NSString::from_str("mtld3d-readback");
         cmd_buf.setLabel(Some(&label));
     }
     // Under `render.scale` the source is rasterized smaller than the resolution
@@ -3959,7 +3959,7 @@ pub fn blit_texture_to_buffer(args: &BlitArgs<'_>) -> bool {
         return false;
     };
     {
-        let label = objc2_foundation::NSString::from_str("mtld3d-readback-blit");
+        let label = crate::mtl::objc2_foundation::NSString::from_str("mtld3d-readback-blit");
         blit.setLabel(Some(&label));
     }
 

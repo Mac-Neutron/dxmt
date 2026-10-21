@@ -4,8 +4,8 @@ use mtld3d_shared::{
     mtl::{AddressMode, BorderColor, MinMagFilter, MipFilter},
     mtl_handle::MTLSamplerStateKind,
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_metal::{
     MTLCompareFunction, MTLDevice, MTLSamplerAddressMode, MTLSamplerBorderColor,
     MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
 };
@@ -118,7 +118,7 @@ pub fn create_sampler_state(
         "samp"
     };
     let label =
-        objc2_foundation::NSString::from_str(&format!("mtld3d-{label_kind}-{:#x}", params.id));
+        crate::mtl::objc2_foundation::NSString::from_str(&format!("mtld3d-{label_kind}-{:#x}", params.id));
     desc.setLabel(Some(&label));
 
     let Some(sampler) = device.newSamplerStateWithDescriptor(&desc) else {

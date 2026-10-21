@@ -20,8 +20,8 @@
 use std::sync::{LazyLock, Mutex, MutexGuard, PoisonError};
 
 use mtld3d_shared::{MetalHandle, mtl_handle::CAMetalLayerKind};
-use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLRenderCommandEncoder;
+use crate::mtl::objc2::runtime::ProtocolObject;
+use crate::mtl::objc2_metal::MTLRenderCommandEncoder;
 use rustc_hash::FxHashMap;
 
 use crate::{LOG_TARGET, metal::macdrv::attachment};

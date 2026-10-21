@@ -12,8 +12,8 @@
 use std::sync::OnceLock;
 
 use mtld3d_shared::{MetalHandle, NullTextureKind, mtl_handle::MTLSamplerStateKind};
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_metal::{
     MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLDevice, MTLLoadAction, MTLOrigin,
     MTLPixelFormat, MTLRegion, MTLRenderPassDescriptor, MTLResource, MTLSamplerDescriptor,
     MTLSamplerState, MTLSize, MTLStorageMode, MTLStoreAction, MTLTexture, MTLTextureDescriptor,
@@ -161,7 +161,7 @@ fn make_black_texture(
         );
         return None;
     };
-    let label = objc2_foundation::NSString::from_str("mtld3d-null-black");
+    let label = crate::mtl::objc2_foundation::NSString::from_str("mtld3d-null-black");
     texture.setLabel(Some(&label));
 
     let black: [u8; 4] = [0, 0, 0, 255];
@@ -213,15 +213,15 @@ fn make_zero_depth_texture(
         );
         return None;
     };
-    texture.setLabel(Some(&objc2_foundation::NSString::from_str(
+    texture.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
         "mtld3d-null-depth",
     )));
     let cleared = device.newCommandQueue().and_then(|queue| {
-        queue.setLabel(Some(&objc2_foundation::NSString::from_str(
+        queue.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
             "mtld3d-null-depth-clear",
         )));
         let cmd_buf = queue.commandBuffer()?;
-        cmd_buf.setLabel(Some(&objc2_foundation::NSString::from_str(
+        cmd_buf.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
             "mtld3d-null-depth-clear",
         )));
         let pass_desc = MTLRenderPassDescriptor::new();
@@ -231,7 +231,7 @@ fn make_zero_depth_texture(
         depth.setClearDepth(0.0);
         depth.setStoreAction(MTLStoreAction::Store);
         let encoder = cmd_buf.renderCommandEncoderWithDescriptor(&pass_desc)?;
-        encoder.setLabel(Some(&objc2_foundation::NSString::from_str(
+        encoder.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(
             "mtld3d-null-depth-clear",
         )));
         encoder.endEncoding();

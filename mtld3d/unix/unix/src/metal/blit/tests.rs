@@ -13,7 +13,7 @@ use super::*;
 /// the game first.
 #[test]
 fn blit_quad_msl_compiles_under_metal() {
-    use objc2_metal::MTLCreateSystemDefaultDevice;
+    use crate::mtl::objc2_metal::MTLCreateSystemDefaultDevice;
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil — skipping");
         return;

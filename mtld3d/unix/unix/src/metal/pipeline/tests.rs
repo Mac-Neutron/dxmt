@@ -38,8 +38,8 @@ use mtld3d_types::{
     D3DTSS_TEXTURETRANSFORMFLAGS, D3DTTFF_COUNT3, D3DTTFF_PROJECTED, D3DVBF_1WEIGHTS,
     D3DVERTEXELEMENT9, render_state_defaults,
 };
-use objc2::rc::Retained;
-use objc2_metal::MTLCreateSystemDefaultDevice;
+use crate::mtl::objc2::rc::Retained;
+use crate::mtl::objc2_metal::MTLCreateSystemDefaultDevice;
 
 use super::{create_render_pipeline, destroy_render_pipeline};
 use crate::metal::{

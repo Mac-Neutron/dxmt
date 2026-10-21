@@ -14,7 +14,7 @@ use super::*;
 /// to the game first.
 #[test]
 fn clear_quad_msl_compiles_under_metal() {
-    use objc2_metal::MTLCreateSystemDefaultDevice;
+    use crate::mtl::objc2_metal::MTLCreateSystemDefaultDevice;
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil — skipping");
         return;
@@ -37,7 +37,7 @@ fn clear_quad_msl_compiles_under_metal() {
 /// The generated multi-target colour function compiles for every present mask.
 #[test]
 fn multi_target_clear_quad_msl_compiles_under_metal() {
-    use objc2_metal::MTLCreateSystemDefaultDevice;
+    use crate::mtl::objc2_metal::MTLCreateSystemDefaultDevice;
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil — skipping");
         return;

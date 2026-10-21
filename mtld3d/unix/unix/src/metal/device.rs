@@ -9,8 +9,8 @@ use mtld3d_shared::{
     mtl_handle::{MTLCommandQueueKind, MTLDeviceKind, MTLTextureKind, NSViewKind},
     record_handle::DeviceRecordHandle,
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_metal::{
     MTLCommandBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily,
     MTLPixelFormat, MTLStorageMode,
 };
@@ -252,7 +252,7 @@ pub fn create_command_queue(
 ) -> Option<DeviceCaps> {
     let device = pinned_device()?;
     let queue = device.newCommandQueue()?;
-    let queue_label = objc2_foundation::NSString::from_str("mtld3d");
+    let queue_label = crate::mtl::objc2_foundation::NSString::from_str("mtld3d");
     queue.setLabel(Some(&queue_label));
     // The record takes the queue's retain before the presenter thread
     // exists, so the thread's own retain at start lands on a live object.
@@ -325,7 +325,7 @@ pub fn destroy_command_queue(
     if let Some(queue) = queue_handle.into_retained()
         && let Some(fence) = queue.commandBuffer()
     {
-        let label = objc2_foundation::NSString::from_str("mtld3d-shutdown-fence");
+        let label = crate::mtl::objc2_foundation::NSString::from_str("mtld3d-shutdown-fence");
         fence.setLabel(Some(&label));
         fence.commit();
         fence.waitUntilCompleted();

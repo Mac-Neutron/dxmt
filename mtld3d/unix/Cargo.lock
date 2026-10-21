@@ -314,6 +314,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mtld3d-mtl"
+version = "0.14.1"
+dependencies = [
+ "bitflags 2.13.2",
+ "log",
+]
+
+[[package]]
 name = "mtld3d-shared"
 version = "0.14.1"
 dependencies = [
@@ -342,6 +350,7 @@ dependencies = [
  "libloading",
  "log",
  "mtld3d-core",
+ "mtld3d-mtl",
  "mtld3d-shared",
  "mtld3d-types",
  "objc2",

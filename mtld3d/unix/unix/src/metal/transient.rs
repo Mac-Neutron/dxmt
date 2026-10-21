@@ -12,9 +12,9 @@
 use std::sync::atomic::AtomicU64;
 
 use mtld3d_shared::{MetalHandle, mtl_handle::MTLBufferKind};
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_foundation::NSString;
-use objc2_metal::{MTLBuffer, MTLDevice, MTLResource, MTLResourceOptions};
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_foundation::NSString;
+use crate::mtl::objc2_metal::{MTLBuffer, MTLDevice, MTLResource, MTLResourceOptions};
 
 use super::{
     handle::{BorrowRetained, ReleaseRetain},

@@ -1,7 +1,7 @@
 //! Unit tests for the handle conversions, and for which of them touch the refcount.
 
-use objc2_foundation::NSString;
-use objc2_metal::{
+use crate::mtl::objc2_foundation::NSString;
+use crate::mtl::objc2_metal::{
     MTLCompileOptions, MTLCreateSystemDefaultDevice, MTLDepthStencilDescriptor, MTLLanguageVersion,
     MTLPixelFormat, MTLRenderPipelineDescriptor, MTLResourceOptions, MTLSamplerDescriptor,
     MTLTextureDescriptor,

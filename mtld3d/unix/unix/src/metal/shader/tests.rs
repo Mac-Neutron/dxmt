@@ -1,6 +1,6 @@
 use mtld3d_shared::{MetalHandle, perf::ShaderTimings};
-use objc2::rc::Retained;
-use objc2_metal::MTLCreateSystemDefaultDevice;
+use crate::mtl::objc2::rc::Retained;
+use crate::mtl::objc2_metal::MTLCreateSystemDefaultDevice;
 
 use super::{compile_shader_library, destroy_function, destroy_library};
 

@@ -82,11 +82,11 @@ use mtld3d_shared::{
 #[cfg(perf_tracking)]
 use mtld3d_shared::{mtl::SnapshotFlags, perf::SubmitTimings};
 use mtld3d_types::{D3DSAMP_MIPMAPLODBIAS, SAMPLER_STATE_COUNT};
-use objc2::{
+use crate::mtl::objc2::{
     rc::{Retained, autoreleasepool},
     runtime::ProtocolObject,
 };
-use objc2_metal::MTLDevice;
+use crate::mtl::objc2_metal::MTLDevice;
 // Fast non-cryptographic hasher for the per-draw resource caches below
 // (texture/lib/pipeline/sampler/buffer/...). Keys are small trusted integers
 // or fixed structs; SipHash's DoS resistance buys nothing here and its

@@ -39,6 +39,7 @@ use std::{
 };
 
 use mtld3d_shared::mtl::{ClientSurfaceRequest, ColorSpacePolicy};
+#[cfg(not(mtl_facade))]
 use objc2::{MainThreadMarker, rc::Retained};
 use rustc_hash::FxHashMap;
 
@@ -697,6 +698,7 @@ pub fn live() -> Vec<Arc<Attachment>> {
     lock().values().cloned().collect()
 }
 
+#[cfg(not(mtl_facade))]
 /// Retain the record's `NSView`, or `None` once it is no longer live.
 ///
 /// The marker is the caller's proof that it is on the main thread, where it
@@ -718,6 +720,7 @@ pub fn retain_view(
     unsafe { Retained::retain(att.view as *mut objc2_app_kit::NSView) }
 }
 
+#[cfg(not(mtl_facade))]
 /// Retain the record's `CAMetalLayer`, or `None` once it is no longer live.
 ///
 /// The marker is the caller's proof that it is on the main thread, where it
@@ -787,6 +790,8 @@ pub fn request_cursor_kick_all() {
 /// `1.0` until the first refresh lands, which is still correct for the HDR
 /// shader: BT.2446-A at `L_hdr = L_sdr = 100` is the identity curve.
 pub fn current_headroom(att: &Arc<Attachment>) -> f32 {
+    // MacNeutron: under the winemetal facade the layer is SDR and the screen out of reach: headroom stays 1.0.
+    #[cfg(not(mtl_facade))]
     if att.begin_headroom_refresh() {
         let att = Arc::clone(att);
         super::run_on_main_thread_async(move || super::refresh_attachment_on_main(&att));

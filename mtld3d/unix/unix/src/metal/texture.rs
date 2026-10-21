@@ -13,8 +13,8 @@ use mtld3d_shared::{
     mtl_handle::{MTLCommandQueueKind, MTLDepthStencilStateKind, MTLDeviceKind, MTLTextureKind},
     texture_views::TextureViews,
 };
-use objc2::{rc::Retained, runtime::ProtocolObject};
-use objc2_metal::{
+use crate::mtl::objc2::{rc::Retained, runtime::ProtocolObject};
+use crate::mtl::objc2_metal::{
     MTLBlendFactor, MTLClearColor, MTLCommandBuffer, MTLCommandEncoder, MTLCompareFunction,
     MTLDepthStencilDescriptor, MTLDevice, MTLLoadAction, MTLPixelFormat, MTLRenderPassDescriptor,
     MTLResource, MTLStencilDescriptor, MTLStencilOperation, MTLStorageMode, MTLStoreAction,
@@ -59,7 +59,7 @@ const REFUSED_CREATE_BACKOFF: [Duration; 8] = [
 ///
 /// Every texture handle that reaches the PE side is minted here, so the
 /// ledger and [`destroy_texture`]'s check agree on what is live.
-fn mint<T: objc2::Message>(texture: Retained<T>) -> u64 {
+fn mint<T: crate::mtl::objc2::Message>(texture: Retained<T>) -> u64 {
     let raw = Retained::into_raw(texture).cast::<core::ffi::c_void>() as usize as u64;
     LIVE_TEXTURES
         .lock()
@@ -114,10 +114,10 @@ pub fn create_backbuffer(
 
 /// The channel order a view leaves untouched.
 const IDENTITY_SWIZZLE: MTLTextureSwizzleChannels = MTLTextureSwizzleChannels {
-    red: objc2_metal::MTLTextureSwizzle::Red,
-    green: objc2_metal::MTLTextureSwizzle::Green,
-    blue: objc2_metal::MTLTextureSwizzle::Blue,
-    alpha: objc2_metal::MTLTextureSwizzle::Alpha,
+    red: crate::mtl::objc2_metal::MTLTextureSwizzle::Red,
+    green: crate::mtl::objc2_metal::MTLTextureSwizzle::Green,
+    blue: crate::mtl::objc2_metal::MTLTextureSwizzle::Blue,
+    alpha: crate::mtl::objc2_metal::MTLTextureSwizzle::Alpha,
 };
 
 /// Usage bits for a texture, by what it serves.
@@ -186,8 +186,8 @@ fn srgb_twin_view_native(
             texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
                 mtl_pixel_format(srgb_format),
                 texture.textureType(),
-                objc2_foundation::NSRange::new(0, levels),
-                objc2_foundation::NSRange::new(0, slices),
+                crate::mtl::objc2_foundation::NSRange::new(0, levels),
+                crate::mtl::objc2_foundation::NSRange::new(0, slices),
                 swizzle,
             )
         }
@@ -232,7 +232,7 @@ fn srgb_twin_view_native(
         );
         return None;
     };
-    let srgb_label = objc2_foundation::NSString::from_str(&format!("{label}-srgb"));
+    let srgb_label = crate::mtl::objc2_foundation::NSString::from_str(&format!("{label}-srgb"));
     view.setLabel(Some(&srgb_label));
     Some(view)
 }
@@ -336,7 +336,7 @@ impl TextureClearBatch {
             );
             return None;
         };
-        let cmd_label = objc2_foundation::NSString::from_str("mtld3d-init-clear");
+        let cmd_label = crate::mtl::objc2_foundation::NSString::from_str("mtld3d-init-clear");
         cmd_buf.setLabel(Some(&cmd_label));
         for texture in textures {
             clear_one_texture(&cmd_buf, &texture, clear_color);
@@ -386,7 +386,7 @@ fn clear_one_texture(
                     // One batch clears the whole render-target working set, so
                     // each pass names its texture and subresource: a capture is
                     // how anyone answers which surface a stray pixel came from.
-                    let label = objc2_foundation::NSString::from_str(&format!(
+                    let label = crate::mtl::objc2_foundation::NSString::from_str(&format!(
                         "{name}-init-clear-l{level}s{slice}p{plane}"
                     ));
                     enc.setLabel(Some(&label));
@@ -441,10 +441,10 @@ pub fn create_depth_texture(
     }
 
     // Depth textures must be in private storage on Apple Silicon
-    desc.setStorageMode(objc2_metal::MTLStorageMode::Private);
+    desc.setStorageMode(crate::mtl::objc2_metal::MTLStorageMode::Private);
 
     let texture = new_texture(&device, &desc, "mtld3d-depth")?;
-    let label = objc2_foundation::NSString::from_str("mtld3d-depth");
+    let label = crate::mtl::objc2_foundation::NSString::from_str("mtld3d-depth");
     texture.setLabel(Some(&label));
     // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
     // adopts it as canonical.
@@ -547,7 +547,7 @@ fn create_color_texture(
         log_texture_refused(device, &desc, pixel_format, label);
         return None;
     };
-    let label = objc2_foundation::NSString::from_str(label);
+    let label = crate::mtl::objc2_foundation::NSString::from_str(label);
     texture.setLabel(Some(&label));
     Some(texture)
 }
@@ -767,7 +767,7 @@ pub fn create_msaa_companion(
         log_texture_refused(&device, &desc, pixel_format, label);
         return None;
     };
-    let ns_label = objc2_foundation::NSString::from_str(label);
+    let ns_label = crate::mtl::objc2_foundation::NSString::from_str(label);
     texture.setLabel(Some(&ns_label));
     let srgb_handle = srgb_twin_view(&texture, pixel_format, 1, 1, IDENTITY_SWIZZLE, label);
     // SAFETY: `Retained::into_raw` transfers the retain; `MetalHandle::new`
@@ -800,7 +800,7 @@ pub fn create_depth_stencil_state(
     }
 
     let id = params.id;
-    let label = objc2_foundation::NSString::from_str(&format!("mtld3d-dss-{id:#x}"));
+    let label = crate::mtl::objc2_foundation::NSString::from_str(&format!("mtld3d-dss-{id:#x}"));
     desc.setLabel(Some(&label));
 
     let state = device.newDepthStencilStateWithDescriptor(&desc)?;
@@ -937,7 +937,7 @@ pub fn create_texture(
     // shared with the 2D path below.
     let tex_desc = if desc.flags.contains(TextureCreateFlags::TYPE_CUBE) {
         let d = MTLTextureDescriptor::new();
-        d.setTextureType(objc2_metal::MTLTextureType::TypeCube);
+        d.setTextureType(crate::mtl::objc2_metal::MTLTextureType::TypeCube);
         d.setPixelFormat(mtl_format);
         // SAFETY: objc2 typed property setters on a fresh descriptor.
         unsafe { d.setWidth(desc.width as usize) };
@@ -947,7 +947,7 @@ pub fn create_texture(
         d
     } else if desc.flags.contains(TextureCreateFlags::TYPE_3D) {
         let d = MTLTextureDescriptor::new();
-        d.setTextureType(objc2_metal::MTLTextureType::Type3D);
+        d.setTextureType(crate::mtl::objc2_metal::MTLTextureType::Type3D);
         d.setPixelFormat(mtl_format);
         // SAFETY: objc2 typed property setters on a freshly-allocated descriptor.
         unsafe { d.setWidth(desc.width as usize) };
@@ -983,7 +983,7 @@ pub fn create_texture(
     // Depth textures must live in private storage on Apple Silicon, regardless
     // of what the PE side requested (CPU upload of a depth texture is meaningless).
     if is_depth {
-        tex_desc.setStorageMode(objc2_metal::MTLStorageMode::Private);
+        tex_desc.setStorageMode(crate::mtl::objc2_metal::MTLStorageMode::Private);
     } else {
         tex_desc.setStorageMode(mtl_storage_mode(desc.storage_mode));
     }
@@ -999,7 +999,7 @@ pub fn create_texture(
     } else {
         format!("mtld3d-tex-{:#x}", desc.tex_id)
     };
-    let label = objc2_foundation::NSString::from_str(&label_str);
+    let label = crate::mtl::objc2_foundation::NSString::from_str(&label_str);
 
     texture.setLabel(Some(&label));
     let has_swizzle = !is_depth && desc.flags.contains(TextureCreateFlags::HAS_SWIZZLE);
@@ -1117,8 +1117,8 @@ fn required_sample_view(
             texture.newTextureViewWithPixelFormat_textureType_levels_slices_swizzle(
                 mtl_pixel_format(format),
                 texture.textureType(),
-                objc2_foundation::NSRange::new(0, texture.mipmapLevelCount()),
-                objc2_foundation::NSRange::new(0, slices),
+                crate::mtl::objc2_foundation::NSRange::new(0, texture.mipmapLevelCount()),
+                crate::mtl::objc2_foundation::NSRange::new(0, slices),
                 swizzle,
             )
         }
@@ -1130,7 +1130,7 @@ fn required_sample_view(
             "{label}: Metal declined the required {format:?} sampling view; texture creation failed");
         return None;
     };
-    view.setLabel(Some(&objc2_foundation::NSString::from_str(&format!(
+    view.setLabel(Some(&crate::mtl::objc2_foundation::NSString::from_str(&format!(
         "{label}-sample"
     ))));
     Some(view)
@@ -1196,15 +1196,15 @@ pub fn create_texture_slice_view(
             texture.newTextureViewWithPixelFormat_textureType_levels_slices(
                 texture.pixelFormat(),
                 MTLTextureType::Type2D,
-                objc2_foundation::NSRange::new(0, levels),
-                objc2_foundation::NSRange::new(slice as usize, 1),
+                crate::mtl::objc2_foundation::NSRange::new(0, levels),
+                crate::mtl::objc2_foundation::NSRange::new(slice as usize, 1),
             )
         }
     };
     let label = format!("mtld3d-sliceview-{texture_handle:#x}-{slice}");
     let view = create()
         .or_else(|| retry_refused_create(&texture.device(), &label, "slice view", &create))?;
-    let label = objc2_foundation::NSString::from_str(&label);
+    let label = crate::mtl::objc2_foundation::NSString::from_str(&label);
     view.setLabel(Some(&label));
     // SAFETY: `Retained::into_raw` hands over the view's only retain, which
     // the typed handle carries to the PE side.

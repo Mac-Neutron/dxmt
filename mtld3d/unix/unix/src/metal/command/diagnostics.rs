@@ -1,18 +1,24 @@
 use std::fmt::Write;
 
-use block2::RcBlock;
+use crate::mtl::block2::RcBlock;
 use log::{Level, debug, log_enabled};
-use objc2::{
-    ProtocolType,
+use crate::mtl::objc2::{
     rc::{Retained, autoreleasepool},
-    runtime::{AnyObject, ProtocolObject},
+    runtime::ProtocolObject,
 };
-use objc2_foundation::{NSArray, NSError, NSObject, NSObjectNSKeyValueCoding, NSString, ns_string};
-use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo,
-    MTLCommandBufferEncoderInfoErrorKey, MTLCommandBufferErrorOption, MTLCommandBufferStatus,
-    MTLCommandEncoderErrorState, MTLCommandQueue, MTLDevice, MTLRenderPassAttachmentDescriptor,
-    MTLRenderPassDescriptor, MTLResource, MTLSize, MTLTexture,
+#[cfg(not(mtl_facade))]
+use crate::mtl::objc2::{ProtocolType, runtime::AnyObject};
+use crate::mtl::objc2_foundation::NSError;
+#[cfg(not(mtl_facade))]
+use crate::mtl::objc2_foundation::{NSArray, NSObject, NSObjectNSKeyValueCoding, NSString, ns_string};
+use crate::mtl::objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoderErrorState, MTLCommandQueue, MTLDevice,
+    MTLRenderPassAttachmentDescriptor, MTLRenderPassDescriptor, MTLResource, MTLSize, MTLTexture,
+};
+#[cfg(not(mtl_facade))]
+use crate::mtl::objc2_metal::{
+    MTLCommandBufferDescriptor, MTLCommandBufferEncoderInfo, MTLCommandBufferEncoderInfoErrorKey,
+    MTLCommandBufferErrorOption,
 };
 
 use super::{BlitSite, CopyBufferEndpoint, CopyEndpoint, CopyRegion};
@@ -315,6 +321,16 @@ fn attachment_details(attachment: &MTLRenderPassAttachmentDescriptor) -> String 
     )
 }
 
+/// Under the winemetal facade a plain buffer: winemetal has no command buffer descriptor (error options are a debug
+/// aid).
+#[cfg(mtl_facade)]
+pub fn command_buffer(
+    queue: &ProtocolObject<dyn MTLCommandQueue>,
+) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+    queue.commandBuffer()
+}
+
+#[cfg(not(mtl_facade))]
 pub fn command_buffer(
     queue: &ProtocolObject<dyn MTLCommandQueue>,
 ) -> Option<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
@@ -406,6 +422,7 @@ pub fn failure(
     );
 }
 
+#[cfg(not(mtl_facade))]
 fn diagnostic_descriptor(enabled: bool) -> Option<Retained<MTLCommandBufferDescriptor>> {
     enabled.then(|| {
         let descriptor = MTLCommandBufferDescriptor::new();
@@ -461,6 +478,21 @@ const fn encoder_state_name(state: MTLCommandEncoderErrorState) -> &'static str 
     }
 }
 
+/// Under the winemetal facade the error's description alone: winemetal carries no domain, user info or encoder
+/// details.
+#[cfg(mtl_facade)]
+fn error_details(error: Option<&NSError>) -> String {
+    let Some(error) = error else {
+        return "error=missing encoder_info=unavailable".to_owned();
+    };
+    format!(
+        "error=present code={} description={:?} encoder_info=unavailable",
+        error.code(),
+        error.localizedDescription().to_string(),
+    )
+}
+
+#[cfg(not(mtl_facade))]
 fn error_details(error: Option<&NSError>) -> String {
     let Some(error) = error else {
         return "error=missing encoder_info=unavailable".to_owned();
@@ -478,6 +510,7 @@ fn error_details(error: Option<&NSError>) -> String {
     output
 }
 
+#[cfg(not(mtl_facade))]
 fn append_encoder_info(output: &mut String, payload: Option<&AnyObject>) {
     let Some(payload) = payload else {
         output.push_str(" encoder_info=missing-key");
@@ -540,6 +573,7 @@ fn append_encoder_info(output: &mut String, payload: Option<&AnyObject>) {
     }
 }
 
+#[cfg(not(mtl_facade))]
 fn metadata_string(value: Option<&AnyObject>) -> String {
     let Some(value) = value else {
         return optional_string(None);
@@ -550,6 +584,7 @@ fn metadata_string(value: Option<&AnyObject>) -> String {
     )
 }
 
+#[cfg(not(mtl_facade))]
 fn append_signposts(output: &mut String, signposts: Option<&AnyObject>) {
     let Some(signposts) = signposts else {
         output.push_str("missing");

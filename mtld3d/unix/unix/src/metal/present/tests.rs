@@ -20,7 +20,7 @@ use super::*;
 /// rename landed on one side only.
 #[test]
 fn present_msl_compiles_under_metal() {
-    use objc2_metal::MTLCreateSystemDefaultDevice;
+    use crate::mtl::objc2_metal::MTLCreateSystemDefaultDevice;
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil — skipping");
         return;
@@ -54,7 +54,7 @@ fn present_msl_compiles_under_metal() {
 /// first show up as a black frame on a user's machine.
 #[test]
 fn present_pipelines_build_for_both_drawable_formats() {
-    use objc2_metal::MTLCreateSystemDefaultDevice;
+    use crate::mtl::objc2_metal::MTLCreateSystemDefaultDevice;
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil — skipping");
         return;
@@ -72,7 +72,7 @@ fn present_pipelines_build_for_both_drawable_formats() {
 /// fullscreen game with its brightness slider moved.
 #[test]
 fn gamma_pipelines_build_for_every_stage() {
-    use objc2_metal::MTLCreateSystemDefaultDevice;
+    use crate::mtl::objc2_metal::MTLCreateSystemDefaultDevice;
     let Some(device) = MTLCreateSystemDefaultDevice() else {
         eprintln!("MTLCreateSystemDefaultDevice returned nil, skipping");
         return;
