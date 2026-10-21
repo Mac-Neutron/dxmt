@@ -125,7 +125,8 @@ pub fn free_pages(ptr: *mut u8, _len: usize) {
 ///
 /// The encoder's staging rows become no-copy buffers, which there must be made over the guest
 /// allocator's memory, the host's mapping; any other page fails (the PE side's boxes take the same
-/// pages through `PAGES_FROM_UNIX`). Set at the first device, before the encoder's first page.
+/// pages through `PAGES_FROM_UNIX`). Set when the library loads (`INSTALL_PAGE_ALLOCATOR`), before
+/// any page: the source latches at the first.
 #[cfg(target_os = "linux")]
 pub fn install_page_allocator() {
     fn alloc(len: usize) -> Option<core::ptr::NonNull<u8>> {
@@ -137,6 +138,13 @@ pub fn install_page_allocator() {
     mtld3d_core::page_box::set_page_allocator_source(|| Some(mtld3d_core::page_box::PageAllocator { alloc, free }));
 }
 
-/// Native pages on macOS: Metal takes any page-aligned memory there.
-#[cfg(not(target_os = "linux"))]
-pub const fn install_page_allocator() {}
+/// `install_page_allocator` at the library's load, a test binary's included.
+#[cfg(target_os = "linux")]
+#[used]
+#[unsafe(link_section = ".init_array")]
+static INSTALL_PAGE_ALLOCATOR: extern "C" fn() = {
+    extern "C" fn install() {
+        install_page_allocator();
+    }
+    install
+};
