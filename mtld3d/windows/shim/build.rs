@@ -49,8 +49,11 @@ fn main() {
     // image by the Makefile, and cargo hands link arguments to a cdylib only.
     // So for those the object travels inside the static library instead, as a
     // native library rustc bundles into it; the link that follows pulls it in
-    // through the unix-call symbols the shim references.
-    if matches!(object_arch, "aarch64-windows" | "arm64ec-windows") {
+    // through the unix-call symbols the shim references. MacNeutron: so do the
+    // x86 DLLs linked on llvm-mingw's CRT (`MTLD3D_MINGW_CRT`, the VM guest's).
+    if matches!(object_arch, "aarch64-windows" | "arm64ec-windows")
+        || std::env::var_os("MTLD3D_MINGW_CRT").is_some()
+    {
         bundle_unix_lib(&llvm_ar, &unix_lib_path, &out_dir);
     } else {
         println!("cargo:rustc-link-arg-cdylib={unix_lib_path}");
@@ -60,6 +63,7 @@ fn main() {
     }
 
     println!("cargo:rerun-if-env-changed=WINE_SDK");
+    println!("cargo:rerun-if-env-changed=MTLD3D_MINGW_CRT");
     println!("cargo:rerun-if-env-changed=LLVM_AR");
 }
 

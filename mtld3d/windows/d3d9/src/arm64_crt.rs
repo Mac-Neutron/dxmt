@@ -3,7 +3,8 @@
 //! The i386 and `x86_64` DLLs link MSVC's `msvcrt.lib`, whose static part defines
 //! everything below. The two ARM64X halves link llvm-mingw's CRT instead (see
 //! `windows-arm64x` in the Makefile), which defines none of it, and MSVC's
-//! ARM64 and ARM64EC libraries are not available to this build.
+//! ARM64 and ARM64EC libraries are not available to this build. MacNeutron: so
+//! do the x86 DLLs of its VM guest (`cfg(mingw_crt)`, `MTLD3D_MINGW_CRT`).
 
 use core::ffi::c_void;
 
@@ -21,6 +22,12 @@ use crate::DLL_THREAD_DETACH;
 /// and then by decorated name, never through the vtable.
 #[unsafe(export_name = "??_7type_info@@6B@")]
 pub static TYPE_INFO_VFTABLE: [usize; 1] = [0];
+
+/// MSVC's marker that an image uses floating point, which LLVM's x86 code for the
+/// `-msvc` targets references and MSVC's CRT defines; nothing reads it.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[unsafe(no_mangle)]
+pub static _fltused: i32 = 0;
 
 /// The TLS callback that tears down snmalloc's per-thread allocator.
 ///

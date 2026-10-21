@@ -21,6 +21,15 @@ fn main() {
         println!("cargo:rustc-cfg=mtld3d_crumb");
     }
 
+    // MacNeutron: the x86 DLLs linked as static libraries on llvm-mingw's CRT, as
+    // the ARM64X halves are (the VM guest's, `MTLD3D_MINGW_CRT`), take the CRT
+    // pieces `src/arm64_crt.rs` supplies.
+    println!("cargo::rustc-check-cfg=cfg(mingw_crt)");
+    println!("cargo:rerun-if-env-changed=MTLD3D_MINGW_CRT");
+    if std::env::var_os("MTLD3D_MINGW_CRT").is_some() {
+        println!("cargo:rustc-cfg=mingw_crt");
+    }
+
     println!("cargo::rustc-check-cfg=cfg(perf_tracking)");
     println!("cargo:rerun-if-env-changed=MTLD3D_PERF");
     if std::env::var("MTLD3D_PERF").is_ok_and(|v| !v.is_empty() && v != "0") {
