@@ -914,6 +914,12 @@ pub unsafe trait MTLCommandBuffer: NSObjectProtocol {
         let mut params = wmt::ObjNoRet { handle: cb };
         // SAFETY: slot 12 commits a live buffer.
         unsafe { table::call(wmt::COMMAND_BUFFER_COMMIT, &mut params) };
+        // In the VM's guest the commit is queued on this thread's ring, and the host takes each ring's calls in that
+        // ring's order only: a synchronous call here has the host commit the buffer before another thread's wait on
+        // it (the retirement thread's, a readback's) arrives from that thread's ring. A wait on a buffer not yet
+        // committed returns at once, and its handlers ran before the GPU did (Wine's visual tests: 32 sites).
+        #[cfg(target_os = "linux")]
+        let _ = super::query_u64(wmt::COMMAND_BUFFER_STATUS, cb);
         let handlers = {
             // Marked under the pending lock, which a presented handler added now checks it under.
             let mut map = pending();
