@@ -205,7 +205,7 @@ impl Default for GpuBusy {
 /// entries are the command buffers of this device that completed since the
 /// previous submission reported, whichever frame they belong to, so each
 /// completion is reported exactly once.
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct SubmitTimings {
     /// Encoding the frame-leading blits, in whichever buffer carries them.
     pub leading_blits_ns: u64,
