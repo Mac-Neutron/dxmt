@@ -73,6 +73,12 @@ pub fn release(handle: u64) {
     }
 }
 
+/// The facade's count of `handle`'s references (0 for an object it holds none of).
+#[must_use]
+pub fn refs(handle: u64) -> usize {
+    read(handle, |e| e.map_or(0, |e| e.refs as usize))
+}
+
 /// Runs `f` on `handle`'s entry, made if the object is unknown (one winemetal made, such as a drawable's texture).
 pub fn with<R>(handle: u64, f: impl FnOnce(&mut Entry) -> R) -> R {
     let mut table = lock();

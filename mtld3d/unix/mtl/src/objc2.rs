@@ -209,6 +209,13 @@ pub mod runtime {
             unsafe { &*(core::ptr::from_ref(obj).cast::<Self>()) }
         }
 
+        /// The same reference through this protocol (objc2's `from_retained`).
+        #[must_use]
+        pub fn from_retained<T: Message>(obj: super::Retained<T>) -> super::Retained<Self> {
+            // SAFETY: a zero-sized view of the same object, its +1 handed over.
+            unsafe { super::Retained::cast_unchecked(obj) }
+        }
+
         /// The object's winemetal handle.
         #[must_use]
         pub fn handle(&self) -> u64 {
@@ -261,7 +268,13 @@ pub mod runtime {
     pub type AnyObject = ProtocolObject<dyn core::any::Any>;
 
     /// objc2's `NSObjectProtocol`.
-    pub trait NSObjectProtocol {}
+    pub trait NSObjectProtocol {
+        /// The facade's count of the object's references (the references this process holds, which is what a
+        /// retain-discipline test compares).
+        fn retainCount(&self) -> usize {
+            meta::refs(core::ptr::from_ref(self).cast::<u8>() as usize as u64)
+        }
+    }
     impl<P: ?Sized> NSObjectProtocol for ProtocolObject<P> {}
 }
 

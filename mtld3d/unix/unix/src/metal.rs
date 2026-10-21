@@ -61,15 +61,33 @@ pub use upscale::is_supported as upscale_is_supported;
 
 /// MacNeutron: `len` bytes of zeroed pages Metal can be made over, or null (the `AllocPages` thunk).
 ///
-/// macOS (the facade's loopback build, and the product build, which never asks): anonymous pages, 16 KiB-aligned as
-/// the kernel maps them on Apple Silicon. The VM's guest: winemetal's own allocator (M2b).
+/// macOS (the facade's loopback build, and the product build, which never asks): anonymous pages aligned to the
+/// 16 KiB `PAGE_SIZE` a page lease requires; a Wine process's mappings are only 4 KiB-aligned, so the mapping is
+/// made 16 KiB larger and trimmed. The VM's guest: winemetal's own allocator (M2b).
 #[must_use]
 pub fn alloc_pages(len: usize) -> *mut u8 {
+    const ALIGN: usize = 16 * 1024;
+    let Some(total) = len.checked_add(ALIGN) else { return core::ptr::null_mut() };
     // SAFETY: an anonymous private mapping; nothing else names the range.
-    let ptr = unsafe {
-        libc::mmap(core::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
+    let raw = unsafe {
+        libc::mmap(core::ptr::null_mut(), total, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_ANON | libc::MAP_PRIVATE, -1, 0)
     };
-    if ptr == libc::MAP_FAILED { core::ptr::null_mut() } else { ptr.cast() }
+    if raw == libc::MAP_FAILED {
+        return core::ptr::null_mut();
+    }
+    let raw = raw as usize;
+    let start = raw.next_multiple_of(ALIGN);
+    // SAFETY: the head and tail of the mapping just made, outside [start, start + len): both page-aligned.
+    unsafe {
+        if start > raw {
+            libc::munmap(raw as *mut libc::c_void, start - raw);
+        }
+        let end = start + len;
+        if raw + total > end {
+            libc::munmap(end as *mut libc::c_void, raw + total - end);
+        }
+    }
+    start as *mut u8
 }
 
 /// MacNeutron: gives back `alloc_pages`' pages (the `FreePages` thunk).

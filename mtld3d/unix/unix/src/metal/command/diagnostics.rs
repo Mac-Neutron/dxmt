@@ -608,5 +608,6 @@ fn append_signposts(output: &mut String, signposts: Option<&AnyObject>) {
     output.push(']');
 }
 
-#[cfg(test)]
+// MacNeutron: the encoder-info fixtures are Objective-C classes the winemetal facade doesn't have.
+#[cfg(all(test, not(mtl_facade)))]
 mod tests;

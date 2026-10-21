@@ -46,7 +46,9 @@ use crate::mtl::objc2::{
     rc::Retained,
     runtime::{AnyObject, ProtocolObject},
 };
-use crate::mtl::objc2_foundation::{NSDictionary, NSError, NSLocalizedDescriptionKey, NSString};
+#[cfg(not(mtl_facade))]
+use crate::mtl::objc2_foundation::{NSDictionary, NSError, NSLocalizedDescriptionKey};
+use crate::mtl::objc2_foundation::NSString;
 use crate::mtl::objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLOrigin, MTLPixelFormat,
@@ -1201,6 +1203,8 @@ fn readback_completion_rejects_failed_and_unfinished_states() {
 }
 
 /// A real `NSError` crosses the same completion decision without any GPU submission.
+// MacNeutron: the driver error's details are Foundation objects the winemetal facade doesn't make.
+#[cfg(not(mtl_facade))]
 #[test]
 fn readback_completion_preserves_driver_error_details() {
     let description = "Caused GPU Hang Error (00000003:kIOAccelCommandBufferCallbackErrorHang)";

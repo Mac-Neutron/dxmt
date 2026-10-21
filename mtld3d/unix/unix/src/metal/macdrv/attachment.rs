@@ -800,4 +800,5 @@ pub fn current_headroom(att: &Arc<Attachment>) -> f32 {
 }
 
 #[cfg(test)]
+#[cfg_attr(mtl_facade, path = "attachment/tests.rs")]
 mod tests;
