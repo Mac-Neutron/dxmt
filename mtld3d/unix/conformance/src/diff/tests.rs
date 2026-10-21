@@ -393,3 +393,13 @@ fn an_unknown_tests_version_skips_the_comparison() {
         );
     }
 }
+
+#[test]
+fn subtest_line_names_the_tests_executed() {
+    let base = baseline_with(&[(1, 5)], false);
+    let classes = classes_with(&[(1, Classification::Real)]);
+    let mut cur = current_with(&[(1, 5)], false);
+    cur.get_mut(&key()).unwrap().executed = 4242;
+    let report = diff(&base, &classes, &cur);
+    assert!(report.text.contains("crash=0) executed=4242 ok"), "{}", report.text);
+}

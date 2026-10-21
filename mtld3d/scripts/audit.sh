@@ -23,7 +23,15 @@ COVERAGE_TESTS=windows/tests/tests
 # Files permitted to hold each narrowly-scoped exception. These are sets, not
 # counts: a new site fails even if an old one was deleted in the same change.
 ALLOW_SITES='unix/mtl/src/foundation.rs
+unix/mtl/src/lib.rs
+unix/mtl/src/metal.rs
 unix/mtl/src/metal/command.rs
+unix/mtl/src/metal/types.rs
+unix/mtl/src/metal_fx.rs
+unix/mtl/src/quartz_core.rs
+unix/mtl/tests/common.rs
+unix/shared/src/ftol.rs
+unix/shared/src/trig.rs
 unix/unix/src/metal/command.rs
 unix/unix/src/metal/macdrv.rs
 windows/core/src/config.rs'
@@ -385,7 +393,7 @@ case "${1:-}" in
         '#[inline(always)] outside the one measured site' "$INLINE_ALWAYS_SITES" "$file"
     confined '^[ \t]*static .*: *OnceLock' 'LazyLock over OnceLock' \
         'OnceLock static outside the runtime-argument sites' "$ONCELOCK_SITES" "$file"
-    confined '#\[allow\(' 'Warning suppressions' \
+    confined '#!?\[allow\(' 'Warning suppressions' \
         'lint suppression outside the accepted per-site exceptions' "$ALLOW_SITES" "$file"
     case $file in
     "$E2E_TESTS_DIR"/*.rs)
@@ -471,8 +479,8 @@ confined 'inline\(always\)' 'Inline attributes' \
     '#[inline(always)] outside the one measured site' "$INLINE_ALWAYS_SITES" "$@"
 confined '^[ \t]*static .*: *OnceLock' 'LazyLock over OnceLock' \
     'OnceLock static outside the runtime-argument sites' "$ONCELOCK_SITES" "$@"
-confined '#\[allow\(' 'Warning suppressions' \
-    'lint suppression outside the three accepted per-site exceptions' "$ALLOW_SITES" "$@"
+confined '#!?\[allow\(' 'Warning suppressions' \
+    'lint suppression outside the accepted per-site exceptions' "$ALLOW_SITES" "$@"
 
 e2e_tests=$(git ls-files "$E2E_TESTS_DIR/*.rs" || true)
 if [ -n "$e2e_tests" ]; then

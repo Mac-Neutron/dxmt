@@ -137,3 +137,13 @@ fn crash_marker_inside_a_failure_message_does_not_false_positive() {
         "a marker inside a Test failed message must not set the crash bit"
     );
 }
+
+#[test]
+fn executed_counts_sum_every_summary_line() {
+    // A test's child processes print a summary of their own; an early return
+    // prints one too, with fewer tests, which is how a run cut short without a
+    // crash shows.
+    let out = "0104:device: 9 tests executed (1 marked as todo, 0 as flaky, 1 failures), 0 skipped.\n\
+               0108:device: 3 tests executed (0 marked as todo, 0 as flaky, 0 failures), 0 skipped.\n";
+    assert_eq!(parse_subtest_output(out, false).executed, 12);
+}

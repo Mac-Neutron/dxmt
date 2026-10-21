@@ -206,7 +206,8 @@ pub fn set_early_location(dir: &str, stem: &str) {
     };
     let mut guard = SINK.lock().expect("log file mutex poisoned");
     if let Sink::Pending { early, .. } = &mut *guard {
-        // The Linux crash reporter opens the file itself; the C strings are the macOS signal path's.
+        // The C strings are the macOS signal path's. Linux has no crash reporter (crash_linux.rs): a crash
+        // there before OpenLog loses the early backlog.
         #[cfg(target_os = "linux")]
         drop((dir_c, file_c));
         *early = Some(EarlyLocation {

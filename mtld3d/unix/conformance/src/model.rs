@@ -153,6 +153,12 @@ pub struct SubtestResult {
     pub todo_marked: BTreeMap<Site, u32>,
     /// Assertions bypassed by a recognized upstream skip, with the full skip line as evidence.
     pub skipped: BTreeMap<Site, String>,
+    /// Tests Wine's end-of-run summaries say ran, summed over every summary line.
+    ///
+    /// A test's child processes print a summary of their own. A run that
+    /// returned early without crashing fails fewer sites and executes fewer
+    /// tests: the count tells it from an improvement.
+    pub executed: u64,
 }
 
 impl SubtestResult {

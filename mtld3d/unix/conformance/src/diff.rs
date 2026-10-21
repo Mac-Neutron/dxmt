@@ -161,9 +161,10 @@ pub fn diff(
             stale |= sub_stale;
             let _ = writeln!(
                 text,
-                "{leg}/{subtest}  baseline(failed={base_failed} crash={}) current(failed={cur_failed} crash={}) {status}",
+                "{leg}/{subtest}  baseline(failed={base_failed} crash={}) current(failed={cur_failed} crash={}) executed={} {status}",
                 u8::from(base_crash),
-                u8::from(cur.crash)
+                u8::from(cur.crash),
+                cur.executed
             );
             for detail in &details {
                 text.push_str(detail);

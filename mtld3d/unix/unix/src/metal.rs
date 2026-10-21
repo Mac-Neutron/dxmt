@@ -126,7 +126,8 @@ pub fn free_pages(ptr: *mut u8, _len: usize) {
 /// The encoder's staging rows become no-copy buffers, which there must be made over the guest
 /// allocator's memory, the host's mapping; any other page fails (the PE side's boxes take the same
 /// pages through `PAGES_FROM_UNIX`). Set when the library loads (`INSTALL_PAGE_ALLOCATOR`), before
-/// any page: the source latches at the first.
+/// any page: the source latches at the first. It only stores the functions: nothing at load may
+/// call winemetal, whose table a 32-bit process picks at the first call, after its entries mark it.
 #[cfg(target_os = "linux")]
 pub fn install_page_allocator() {
     fn alloc(len: usize) -> Option<core::ptr::NonNull<u8>> {

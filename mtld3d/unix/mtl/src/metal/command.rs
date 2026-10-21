@@ -838,9 +838,6 @@ pub fn set_status_for_test(cb: &ProtocolObject<dyn MTLCommandBuffer>, status: MT
     STATUS_OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get_or_insert_with(FxHashMap::default).insert(cb.handle(), status.0 as u64);
 }
 
-/// Commits in the order their retirement runs (Metal runs a queue's handlers in commit order).
-static COMMIT_ORDER: Mutex<()> = Mutex::new(());
-
 /// Hands `cb` and its `handlers` to its queue's retirement thread.
 fn send_retire(cb: u64, handlers: Vec<Handler>) {
     let queue = meta::read(cb, |e| e.map_or(0, |e| e.queue));
@@ -909,15 +906,23 @@ pub unsafe trait MTLCommandBuffer: NSObjectProtocol {
     fn enqueue(&self) {}
     fn commit(&self) {
         let cb = handle_of(self);
+        /// Commits in their retirement's order, and in the VM in the host's.
+        ///
+        /// Metal runs a queue's handlers in commit order, and in the VM a queue runs its
+        /// buffers in the order the host commits them. The resource is process-wide: the
+        /// one `MTLDevice`'s queues, which every thread commits to.
+        static COMMIT_ORDER: Mutex<()> = Mutex::new(());
         // Commit and retirement in one order. ponytail: one lock for every queue's commits; per queue if it shows.
         let _order = COMMIT_ORDER.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut params = wmt::ObjNoRet { handle: cb };
         // SAFETY: slot 12 commits a live buffer.
         unsafe { table::call(wmt::COMMAND_BUFFER_COMMIT, &mut params) };
         // In the VM's guest the commit is queued on this thread's ring, and the host takes each ring's calls in that
-        // ring's order only: a synchronous call here has the host commit the buffer before another thread's wait on
-        // it (the retirement thread's, a readback's) arrives from that thread's ring. A wait on a buffer not yet
-        // committed returns at once, and its handlers ran before the GPU did (Wine's visual tests: 32 sites).
+        // ring's order only, while a queue runs its buffers in the order the host commits them: a synchronous call
+        // here has the host commit this buffer before the next commit, from any thread's ring, is sent. mtld3d
+        // commits from several threads (the submit thread, uploads, the presenter): reordered, a readback ran before
+        // the draws it reads (Wine's visual tests: 32 sites). A wait needs no such order: Metal's blocks until a
+        // later commit (eac-vm's memory-test, wait-uncommitted).
         #[cfg(target_os = "linux")]
         let _ = super::query_u64(wmt::COMMAND_BUFFER_STATUS, cb);
         let handlers = {

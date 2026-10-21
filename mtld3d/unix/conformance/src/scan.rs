@@ -81,7 +81,11 @@ pub fn parse_subtest_output(output: &str, signaled: bool) -> SubtestResult {
     // (`panicked at <loc>:\n<message>`); set when the header is seen so the next
     // line is appended to the captured location.
     let mut want_panic_msg = false;
+    let mut executed = 0;
     for line in output.lines() {
+        if let Some(idx) = line.find(SUMMARY_MARKER) {
+            executed += line[..idx].rsplit(' ').next().and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
+        }
         if want_panic_msg {
             want_panic_msg = false;
             if let Some(p) = panic.as_mut() {
@@ -132,6 +136,7 @@ pub fn parse_subtest_output(output: &str, signaled: bool) -> SubtestResult {
         flaky_marked,
         todo_marked,
         skipped,
+        executed,
     }
 }
 
