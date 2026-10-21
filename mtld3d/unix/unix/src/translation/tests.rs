@@ -5,6 +5,7 @@
 
 use super::translated;
 
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn the_kernel_answers_for_this_process() {
     let answer = translated();
@@ -12,4 +13,11 @@ fn the_kernel_answers_for_this_process() {
     if cfg!(target_arch = "aarch64") {
         assert_eq!(answer, Some(false), "an arm64 process is never translated");
     }
+}
+
+/// MacNeutron: the VM's guest asks no kernel (FEX is named by none).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_guest_says_unknown() {
+    assert_eq!(translated(), None);
 }
