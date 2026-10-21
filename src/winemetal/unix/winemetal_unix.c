@@ -16,6 +16,7 @@
 typedef int NTSTATUS;
 #define STATUS_SUCCESS 0
 #define STATUS_UNSUCCESSFUL 0xC0000001
+#define STATUS_NOT_IMPLEMENTED 0xC0000002
 
 void
 execute_on_main(dispatch_block_t block) {
@@ -601,10 +602,9 @@ MTLMeshRenderPipelineDescriptor ()
 
 #endif
 
-static NTSTATUS
-_MTLDevice_newRenderPipelineState(void *obj) {
-  struct unixcall_mtldevice_newrenderpso *params = obj;
-  const struct WMTRenderPipelineInfo *info = params->info.ptr;
+/* The descriptor slot 34 and MacNeutron's slot 156 share: +1, the caller releases it. */
+static MTLRenderPipelineDescriptor *
+render_pipeline_descriptor(const struct WMTRenderPipelineInfo *info) {
   MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
 
   for (unsigned i = 0; i < 8; i++) {
@@ -650,19 +650,62 @@ _MTLDevice_newRenderPipelineState(void *obj) {
   if (info->num_binary_archives_for_lookup && info->binary_archives_for_lookup.ptr)
     descriptor.binaryArchives = [NSArray arrayWithObjects:(id<MTLBinaryArchive> *)info->binary_archives_for_lookup.ptr
                                                     count:info->num_binary_archives_for_lookup];
+  return descriptor;
+}
+
+/* Slots 34 and 156: the pipeline of `descriptor` (released here) and its error. */
+static void
+render_pipeline_state(
+    obj_handle_t device, const struct WMTRenderPipelineInfo *info, MTLRenderPipelineDescriptor *descriptor,
+    obj_handle_t *ret_pso, obj_handle_t *ret_error
+) {
   NSError *err = NULL;
   MTLPipelineOption options =
       info->fail_on_binary_archive_miss ? MTLPipelineOptionFailOnBinaryArchiveMiss : MTLPipelineOptionNone;
-  params->ret_pso = (obj_handle_t)[(id<MTLDevice>)params->device newRenderPipelineStateWithDescriptor:descriptor
+  *ret_pso = (obj_handle_t)[(id<MTLDevice>)device newRenderPipelineStateWithDescriptor:descriptor
                                                                                               options:options
                                                                                            reflection:nil
                                                                                                 error:&err];
-  params->ret_error = (obj_handle_t)err;
+  *ret_error = (obj_handle_t)err;
   if (!err && info->binary_archive_for_serialization) {
     [(id<MTLBinaryArchive>)info->binary_archive_for_serialization addRenderPipelineFunctionsWithDescriptor:descriptor
                                                                                                      error:&err];
   }
   [descriptor release];
+}
+
+static NTSTATUS
+_MTLDevice_newRenderPipelineState(void *obj) {
+  struct unixcall_mtldevice_newrenderpso *params = obj;
+  const struct WMTRenderPipelineInfo *info = params->info.ptr;
+  render_pipeline_state(
+      params->device, info, render_pipeline_descriptor(info), &params->ret_pso, &params->ret_error
+  );
+  return STATUS_SUCCESS;
+}
+
+/* MacNeutron: slot 34's pipeline with a vertex descriptor (Direct3D 9 on winemetal). */
+static NTSTATUS
+_MTLDevice_newRenderPipelineStateWithVertexDescriptor(void *obj) {
+  struct unixcall_mtldevice_newrenderpso_vertex *params = obj;
+  const struct WMTRenderPipelineInfo *info = params->info.ptr;
+  const struct WMTVertexDescriptorInfo *vertex = params->vertex.ptr;
+  MTLRenderPipelineDescriptor *descriptor = render_pipeline_descriptor(info);
+  MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+  for (unsigned i = 0; i < 31; i++) {
+    if (vertex->attributes[i].format) {
+      vd.attributes[i].format = (MTLVertexFormat)vertex->attributes[i].format;
+      vd.attributes[i].offset = vertex->attributes[i].offset;
+      vd.attributes[i].bufferIndex = vertex->attributes[i].buffer_index;
+    }
+    if (vertex->layouts[i].stride) {
+      vd.layouts[i].stride = vertex->layouts[i].stride;
+      vd.layouts[i].stepFunction = (MTLVertexStepFunction)vertex->layouts[i].step_function;
+      vd.layouts[i].stepRate = vertex->layouts[i].step_rate;
+    }
+  }
+  descriptor.vertexDescriptor = vd;
+  render_pipeline_state(params->device, info, descriptor, &params->ret_pso, &params->ret_error);
   return STATUS_SUCCESS;
 }
 
@@ -1069,6 +1112,26 @@ _MTLRenderCommandEncoder_encodeCommands(void *obj) {
     case WMTRenderCommandSetDepthStencilState: {
       struct wmtcmd_render_setdepthstencilstate *body = (struct wmtcmd_render_setdepthstencilstate *)next;
       [encoder setDepthStencilState:(id<MTLDepthStencilState>)body->depth_stencil_state];
+      break;
+    }
+    case WMTRenderCommandSetVertexBytes: {
+      struct wmtcmd_render_setbytes *body = (struct wmtcmd_render_setbytes *)next;
+      [encoder setVertexBytes:body->bytes.ptr length:body->length atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexTexture: {
+      struct wmtcmd_render_settexture *body = (struct wmtcmd_render_settexture *)next;
+      [encoder setVertexTexture:(id<MTLTexture>)body->texture atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetVertexSamplerState: {
+      struct wmtcmd_render_setsampler *body = (struct wmtcmd_render_setsampler *)next;
+      [encoder setVertexSamplerState:(id<MTLSamplerState>)body->sampler atIndex:body->index];
+      break;
+    }
+    case WMTRenderCommandSetFragmentSamplerState: {
+      struct wmtcmd_render_setsampler *body = (struct wmtcmd_render_setsampler *)next;
+      [encoder setFragmentSamplerState:(id<MTLSamplerState>)body->sampler atIndex:body->index];
       break;
     }
     case WMTRenderCommandSetBlendFactorAndStencilRef: {
@@ -3410,6 +3473,33 @@ _MTLDevice_newLibraryWithSource(void *obj) {
   return STATUS_SUCCESS;
 }
 
+/* MacNeutron: slot 144 with compile options (Direct3D 9 on winemetal). */
+static NTSTATUS
+_MTLDevice_newLibraryWithSourceOptions(void *obj) {
+  struct unixcall_mtldevice_newlibrarywithsource_options *params = obj;
+  const struct WMTCompileOptions *info = params->options.ptr;
+  id<MTLDevice> device = (id<MTLDevice>)params->device;
+  NSString *source =
+      [[NSString alloc] initWithBytes:params->source.ptr length:params->length encoding:NSASCIIStringEncoding];
+  MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
+  if (info->language_version)
+    options.languageVersion = (MTLLanguageVersion)info->language_version;
+  options.preserveInvariance = info->preserve_invariance;
+  options.mathMode = (MTLMathMode)info->math_mode;
+  NSError *err = NULL;
+  params->ret_library = (obj_handle_t)[device newLibraryWithSource:source options:options error:&err];
+  params->ret_error = (obj_handle_t)err;
+  [options release];
+  [source release];
+  return STATUS_SUCCESS;
+}
+
+/* MacNeutron: the guest's own slots (153-154, its memory; 155, Direct3D forwarding) in this table's place. */
+static NTSTATUS
+_MacNeutron_guestOnly(void *obj) {
+  return STATUS_NOT_IMPLEMENTED;
+}
+
 static NTSTATUS
 _MTLTexture_getBytes(void *obj) {
   struct unixcall_mtltexture_replaceregion *params = obj;
@@ -3599,6 +3689,11 @@ const void *__wine_unix_call_funcs[] = {
     &_MTLDevice_temporalScalerScaleRange,
     &_MTLDevice_newFrameInterpolator,
     &_MTLCommandBuffer_encodeFrameInterpolate,
+    &_MacNeutron_guestOnly,
+    &_MacNeutron_guestOnly,
+    &_MacNeutron_guestOnly,
+    &_MTLDevice_newRenderPipelineStateWithVertexDescriptor,
+    &_MTLDevice_newLibraryWithSourceOptions,
 };
 
 #ifndef DXMT_NATIVE

@@ -1316,6 +1316,41 @@ MTLDevice_newLibraryWithSource(obj_handle_t device, const char *source, uint64_t
   return params.ret_library;
 }
 
+WINEMETAL_API obj_handle_t
+MTLDevice_newLibraryWithSourceOptions(
+    obj_handle_t device, const char *source, uint64_t length, const struct WMTCompileOptions *options,
+    obj_handle_t *err_out
+) {
+  struct unixcall_mtldevice_newlibrarywithsource_options params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.source, source);
+  params.length = length;
+  WMT_MEMPTR_SET(params.options, options);
+  params.ret_error = 0;
+  params.ret_library = 0;
+  UNIX_CALL(157, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  return params.ret_library;
+}
+
+WINEMETAL_API obj_handle_t
+MTLDevice_newRenderPipelineStateWithVertexDescriptor(
+    obj_handle_t device, const struct WMTRenderPipelineInfo *info, const struct WMTVertexDescriptorInfo *vertex,
+    obj_handle_t *err_out
+) {
+  struct unixcall_mtldevice_newrenderpso_vertex params;
+  params.device = device;
+  WMT_MEMPTR_SET(params.info, info);
+  WMT_MEMPTR_SET(params.vertex, vertex);
+  params.ret_error = 0;
+  params.ret_pso = 0;
+  UNIX_CALL(156, &params);
+  if (err_out)
+    *err_out = params.ret_error;
+  return params.ret_pso;
+}
+
 WINEMETAL_API void
 MTLTexture_getBytes(
     obj_handle_t texture, struct WMTOrigin origin, struct WMTSize size, uint64_t level, uint64_t slice,

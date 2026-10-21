@@ -875,6 +875,30 @@ struct WMTMeshRenderPipelineInfo {
 WINEMETAL_API obj_handle_t
 MTLDevice_newRenderPipelineState(obj_handle_t device, const struct WMTRenderPipelineInfo *info, obj_handle_t *err_out);
 
+/* MacNeutron: a render pipeline whose vertex function reads [[stage_in]] (Direct3D 9 on winemetal). Metal's raw values:
+ * an attribute of format 0 (MTLVertexFormatInvalid) and a layout of stride 0 are left unset. */
+struct WMTVertexAttributeInfo {
+  uint32_t format;
+  uint32_t offset;
+  uint32_t buffer_index;
+};
+
+struct WMTVertexBufferLayoutInfo {
+  uint32_t stride;
+  uint32_t step_function;
+  uint32_t step_rate;
+};
+
+struct WMTVertexDescriptorInfo {
+  struct WMTVertexAttributeInfo attributes[31];
+  struct WMTVertexBufferLayoutInfo layouts[31];
+};
+
+WINEMETAL_API obj_handle_t MTLDevice_newRenderPipelineStateWithVertexDescriptor(
+    obj_handle_t device, const struct WMTRenderPipelineInfo *info, const struct WMTVertexDescriptorInfo *vertex,
+    obj_handle_t *err_out
+);
+
 WINEMETAL_API obj_handle_t MTLDevice_newMeshRenderPipelineState(
     obj_handle_t device, const struct WMTMeshRenderPipelineInfo *info, obj_handle_t *err_out
 );
@@ -1244,6 +1268,13 @@ enum WMTRenderCommandType : uint16_t {
   WMTRenderCommandSetBlendFactor,
   WMTRenderCommandSetStencilRef,
   WMTRenderCommandSetDepthStencilState,
+  /* MacNeutron: mtld3d's direct binds (Direct3D 9 on winemetal), appended so every value above stays. Vertex bytes
+   * and the vertex texture take wmtcmd_render_setbytes and wmtcmd_render_settexture, both samplers
+   * wmtcmd_render_setsampler. */
+  WMTRenderCommandSetVertexBytes,
+  WMTRenderCommandSetVertexTexture,
+  WMTRenderCommandSetVertexSamplerState,
+  WMTRenderCommandSetFragmentSamplerState,
 };
 
 struct wmtcmd_render_nop {
@@ -1499,6 +1530,14 @@ struct wmtcmd_render_setdepthstencilstate {
   uint16_t reserved[3];
   struct WMTMemoryPointer next;
   obj_handle_t depth_stencil_state;
+};
+
+struct wmtcmd_render_setsampler {
+  enum WMTRenderCommandType type;
+  uint16_t reserved[3];
+  struct WMTMemoryPointer next;
+  obj_handle_t sampler;
+  uint8_t index;
 };
 
 struct wmtcmd_render_setblendcolor {
@@ -2233,6 +2272,20 @@ WINEMETAL_API obj_handle_t MTLDevice_newIndirectCommandBuffer(
 
 WINEMETAL_API obj_handle_t
 MTLDevice_newLibraryWithSource(obj_handle_t device, const char *source, uint64_t length, obj_handle_t *err_out);
+
+/* MacNeutron: newLibraryWithSource:options:error: with the options Direct3D 9 on winemetal sets, Metal's raw values
+ * (MTLLanguageVersion, MTLMathMode); language_version 0 keeps Metal's default. */
+struct WMTCompileOptions {
+  uint64_t language_version;
+  uint8_t preserve_invariance;
+  uint8_t math_mode;
+  uint8_t padding[6];
+};
+
+WINEMETAL_API obj_handle_t MTLDevice_newLibraryWithSourceOptions(
+    obj_handle_t device, const char *source, uint64_t length, const struct WMTCompileOptions *options,
+    obj_handle_t *err_out
+);
 
 WINEMETAL_API void MTLTexture_getBytes(
     obj_handle_t texture, struct WMTOrigin origin, struct WMTSize size, uint64_t level, uint64_t slice,
