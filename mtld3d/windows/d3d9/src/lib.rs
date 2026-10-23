@@ -132,12 +132,12 @@ unsafe extern "system" {
 }
 
 #[unsafe(export_name = "DllMain")]
-pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *mut c_void) -> i32 {
+pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, reserved: *mut c_void) -> i32 {
     if reason == DLL_PROCESS_DETACH && USED.load(Ordering::Relaxed) {
         // The process is exiting. A device was created, which pinned the
         // image, so no `FreeLibrary` reaches this detach unless the pin
         // failed, which was logged; only process exit does (Wine passes
-        // `_reserved` as 1 here and as 0 for the detach of a
+        // `reserved` as 1 here and as 0 for the detach of a
         // `FreeLibrary`). Skip every remaining destructor on the calling
         // thread: snmalloc's C++ thread_local teardown walks pools deeply
         // enough to overflow the 1 MB Wine main-thread stack and Wine then
@@ -171,7 +171,7 @@ pub extern "system" fn dll_main(instance: *mut c_void, reason: u32, _reserved: *
     #[cfg(any(target_arch = "aarch64", target_arch = "arm64ec", mingw_crt))]
     arm64_crt::attach();
     init_logger(instance);
-    attach_process(instance);
+    attach_process(instance, !reserved.is_null());
     1
 }
 
@@ -436,11 +436,25 @@ fn write_out(out: *mut *mut c_void, value: *mut c_void) {
 /// `not_unsafe_ptr_arg_deref` only checks `pub` functions.
 /// `DisableThreadLibraryCalls` so per-thread `DllMain` notifications don't
 /// fire.
-fn attach_process(instance: *mut c_void) {
+///
+/// The main module's imports are redirected only when the loader maps this
+/// image with the process (`static_load`: a non-null `lpvReserved`, the
+/// contract Windows documents and Wine's loader keeps), which is how a game
+/// built on Direct3D 9 has it. A run-time load, such as a diagnostics or
+/// video component's in a game built on another API, leaves them alone: a
+/// protected executable that finds its import table changed ends itself.
+fn attach_process(instance: *mut c_void, static_load: bool) {
     // SAFETY: `instance` is the HMODULE passed by the loader to `DllMain`
     // during `DLL_PROCESS_ATTACH`; Win32 `DisableThreadLibraryCalls` is
     // safe to call from `DLL_PROCESS_ATTACH` with that module handle.
     unsafe { DisableThreadLibraryCalls(instance) };
+    if !static_load {
+        log::info!(
+            target: LOG_TARGET,
+            "loaded at run time: the main module's imports stay as they are (no mode list or exit status redirection)"
+        );
+        return;
+    }
     mode_list_hook::install();
     exit_code_hook::install();
 }

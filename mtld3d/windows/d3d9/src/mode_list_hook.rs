@@ -6,8 +6,9 @@
 //! size once) sees the whole list a fullscreen device may set, which under
 //! Wine's `EmulateModeset` is forty-odd sizes and overflows a menu built for
 //! a driver's short list. The `EnumDisplaySettings*` imports of the process's
-//! main module are redirected here at `DllMain`: an index into the list maps
-//! onto the n-th mode whose size `EnumAdapterModes` serves, so both menu
+//! main module are redirected here at `DllMain` when that module imports
+//! `d3d9.dll` itself (a run-time load leaves them alone): an index into the
+//! list maps onto the n-th mode whose size `EnumAdapterModes` serves, so both menu
 //! paths show one bounded list ([`served_mode_sizes`]). `ENUM_CURRENT_SETTINGS`
 //! and `ENUM_REGISTRY_SETTINGS` pass through untouched, user32's own list is
 //! never changed (a mode-set validates against all of it), and this DLL's own

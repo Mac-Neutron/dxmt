@@ -14,9 +14,9 @@
 //! Three entry points cover the ways a main module ends its own process:
 //! `ExitProcess`, `RtlExitUserProcess` under it, and the C runtime's `exit`,
 //! which the statically linked startup stub calls with what `main` returned.
-//! A process that resolves one of them through `GetProcAddress`, or that
-//! exits from a call inside another module, is not covered and still ends
-//! with 0.
+//! A process that resolves one of them through `GetProcAddress`, that
+//! exits from a call inside another module, or that loads `d3d9.dll` at run
+//! time rather than importing it, is not covered and still ends with 0.
 
 use core::{
     ffi::c_int,
